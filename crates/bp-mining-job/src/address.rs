@@ -2,7 +2,9 @@
 
 //! BTC address normalization and script derivation.
 
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{LazyLock, Mutex};
 
 use bitcoin::{Address, Network, ScriptBuf};
 
@@ -32,16 +34,67 @@ pub fn normalize_btc_address(address: &str) -> String {
     }
 }
 
+/// Memo for [`address_to_script`], keyed by `(network, address)`.
+///
+/// The network belongs in the key because the same address string is
+/// accepted on one network and rejected on another — keying by address
+/// alone would serve a mainnet script to a regtest job.
+///
+/// Only successes are stored. Failures are cheap (the parse bails early)
+/// and caching them would pin unbounded attacker-chosen garbage: the
+/// address arrives in the stratum username, so a client can mint distinct
+/// invalid strings as fast as it can reconnect.
+static SCRIPT_MEMO: LazyLock<Mutex<HashMap<(Network, String), ScriptBuf>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Entry ceiling for [`SCRIPT_MEMO`], past which it is cleared wholesale.
+///
+/// Successes are bounded by distinct addresses that actually mined, but
+/// that set only ever grows while the PPLNS window slides, so without a
+/// ceiling the memo accumulates every address the pool has ever seen (a
+/// client can also rotate addresses deliberately). At roughly 100 bytes
+/// per entry this caps it near 10 MB.
+///
+/// Clearing wholesale rather than evicting an LRU keeps the hot path a
+/// single map op with no per-entry bookkeeping: the working set is one
+/// template's payout addresses, which the next build re-populates
+/// immediately. A real pool never reaches this.
+const MEMO_MAX_ENTRIES: usize = 100_000;
+
 /// Convert a BTC address to its `scriptPubKey` bytes for the given network.
 /// All address types supported by `rust-bitcoin` are handled (P2PKH, P2SH,
 /// P2WPKH, P2WSH, P2TR). A network mismatch (e.g. testnet address with
 /// `Network::Bitcoin`) is rejected.
+///
+/// Memoized: this runs once per payout output per coinbase build, and the
+/// PPLNS finder bonus makes each connection's payout list distinct, so the
+/// job cache's per-list memo can no longer collapse the parses across
+/// connections — the same few hundred addresses would otherwise be
+/// re-parsed once per connection per template. The parse is pure, so a hit
+/// is indistinguishable from a fresh parse.
 pub fn address_to_script(network: Network, address: &str) -> Result<ScriptBuf, AddressError> {
+    // A poisoned lock means another thread panicked mid-map-op. The memo is
+    // pure cache, so recover and carry on rather than propagating.
+    if let Some(hit) = SCRIPT_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(network, address.to_string()))
+    {
+        return Ok(hit.clone());
+    }
+
     let unchecked = Address::from_str(address).map_err(|e| AddressError::Parse(e.to_string()))?;
     let checked = unchecked
         .require_network(network)
         .map_err(|e| AddressError::NetworkMismatch(e.to_string()))?;
-    Ok(checked.script_pubkey())
+    let script = checked.script_pubkey();
+
+    let mut memo = SCRIPT_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    if memo.len() >= MEMO_MAX_ENTRIES {
+        memo.clear();
+    }
+    memo.insert((network, address.to_string()), script.clone());
+    Ok(script)
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -140,5 +193,95 @@ mod tests {
     fn address_to_script_rejects_garbage() {
         let result = address_to_script(Network::Bitcoin, "definitely-not-an-address");
         assert!(matches!(result, Err(AddressError::Parse(_))));
+    }
+
+    // ----- memoization -----
+
+    #[test]
+    fn memo_returns_the_same_script_on_repeat_calls() {
+        let a = address_to_script(
+            Network::Bitcoin,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        )
+        .expect("first parse");
+        let b = address_to_script(
+            Network::Bitcoin,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        )
+        .expect("memo hit");
+        assert_eq!(a, b, "a memo hit must be indistinguishable from a parse");
+    }
+
+    /// The reason `network` is in the key. A regtest bech32 and a mainnet
+    /// bech32 encoding the SAME witness program differ only by HRP, so a
+    /// memo keyed on the address alone could not tell them apart — and
+    /// each must still be rejected on the other's network.
+    #[test]
+    fn memo_does_not_leak_scripts_across_networks() {
+        const MAINNET: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        const REGTEST: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+        let mainnet_script = address_to_script(Network::Bitcoin, MAINNET).expect("mainnet ok");
+        let regtest_script = address_to_script(Network::Regtest, REGTEST).expect("regtest ok");
+        // Same witness program, so the scripts genuinely do match — which
+        // is exactly why the HRP/network must key the memo.
+        assert_eq!(mainnet_script, regtest_script);
+
+        // Populating the memo must not make either address valid on the
+        // other network.
+        assert!(matches!(
+            address_to_script(Network::Regtest, MAINNET),
+            Err(AddressError::NetworkMismatch(_))
+        ));
+        assert!(matches!(
+            address_to_script(Network::Bitcoin, REGTEST),
+            Err(AddressError::NetworkMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn memo_never_caches_failures() {
+        // Assert on the keys themselves, not on `len()`: this memo is
+        // process-global, so a sibling test inserting a valid address
+        // concurrently would move the count.
+        let keys: Vec<String> = (0..50).map(|i| format!("garbage-address-{i}")).collect();
+        for k in &keys {
+            let _ = address_to_script(Network::Bitcoin, k);
+        }
+        let memo = SCRIPT_MEMO.lock().unwrap();
+        for k in &keys {
+            assert!(
+                !memo.contains_key(&(Network::Bitcoin, k.clone())),
+                "invalid address {k} was cached — clients supply these, so \
+                 caching them would let one pin unbounded memory"
+            );
+        }
+    }
+
+    /// The ceiling is enforced against the process-global memo, so this
+    /// test would fight every sibling that touches it. Exercise the same
+    /// clear-at-ceiling rule against a local map instead — the assertion is
+    /// about the policy, and the hot path applies it verbatim.
+    #[test]
+    fn memo_clears_at_the_entry_ceiling() {
+        let mut memo: HashMap<(Network, String), ScriptBuf> = HashMap::new();
+        for i in 0..MEMO_MAX_ENTRIES {
+            memo.insert(
+                (Network::Bitcoin, format!("synthetic-{i}")),
+                ScriptBuf::new(),
+            );
+        }
+        assert_eq!(memo.len(), MEMO_MAX_ENTRIES);
+
+        // The rule as `address_to_script` applies it before inserting.
+        if memo.len() >= MEMO_MAX_ENTRIES {
+            memo.clear();
+        }
+        memo.insert((Network::Bitcoin, "fresh".to_string()), ScriptBuf::new());
+        assert_eq!(
+            memo.len(),
+            1,
+            "at the ceiling the memo resets, so it can never grow unbounded"
+        );
     }
 }
