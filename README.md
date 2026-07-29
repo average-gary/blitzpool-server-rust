@@ -120,6 +120,7 @@ Configuration is **TOML-first** (parsed by `bp-config`), grouped into sections â
 |---|---|
 | `[tdp].socket_path` | bitcoin-core IPC socket for the template streams |
 | `[pplns].coinbase_weight_budget` | PPLNS budget **floor** (default 50 000 WU); autoscaler grows from here |
+| `[pplns].finder_bonus_sats` | Flat block-finder bonus in sats, as its own coinbase output (omit = none). Carved out of the reward **before** the proportional split, so every other payout shrinks by that amount regardless of who wins. Rejected at boot above 1 BTC or at exactly `0` (omit the key to disable); clamped at runtime to 95 % of the miner cut, and suppressed entirely if what remains is below `min_payout_sats` |
 | `[coinbase_autoscale]` | `max_weight_budget` (ceiling), `up/down_threshold`, `step_factor`, debounce, cooldown |
 | `[group_fees].coinbase_weight_budget` | Group-Solo + Blockparty fixed budget (default 10 000 WU â‰ˆ 50 members) |
 | `[group_fees].address` / `.percent` | Shared Group-Solo/Blockparty fee lane (falls back to `[pplns]` fee) |

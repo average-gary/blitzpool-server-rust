@@ -258,6 +258,16 @@ submit_latency = false
 # bonus (the default). It is carved out of the reward BEFORE the proportional
 # split, so every other miner's payout shrinks by the same amount no matter who
 # wins. 17760000 = 0.1776 BTC.
+#
+# Rejected at boot above 1 BTC, or at exactly 0 (omit the key to disable —
+# a literal 0 is read as a typo). At runtime it is clamped to 95% of the
+# miner cut, and dropped entirely if what remains is under min_payout_sats.
+#
+# Note the interaction with min_payout_sats: the bonus is carved out first,
+# so it lowers every miner's proportional share. Raise min_payout_sats far
+# enough (above `(reward - bonus) / miners`) and NO miner clears the
+# threshold, leaving the bonus output as the entire coinbase and everyone
+# else on carry-forward credit. The default 5000 is nowhere near that.
 # finder_bonus_sats = 17760000
 # Shares per count-bucket for the sliding window (default 10000). The window
 # is stored as per-address buckets of this many shares instead of one entry
