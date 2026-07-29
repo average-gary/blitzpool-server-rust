@@ -616,11 +616,59 @@ pub fn build_coinbase_distribution(
         // Nothing kept at all: with a finder bonus emitted that output is
         // the whole coinbase, so the builder would sweep the leftover onto
         // it — fold it in here instead of letting the ledger disagree.
-        // Group-Solo only; PPLNS emits no finder bonus. Without a bonus
-        // either, `payouts` ends up empty and the fee-100 fallback at the
-        // end of Phase 6 takes over.
+        // Without a bonus either, `payouts` ends up empty and the fee-100
+        // fallback at the end of Phase 6 takes over.
         if fee_bonus_sats > 0 && bonus_emitted {
             bonus_sats += fee_bonus_sats;
+            // Unlike the kept-miner arm above, the recipient here is the
+            // finder — a third party, not one of the miners the sats came
+            // from. Their carry-forward therefore has to be debited
+            // explicitly or the pool would owe the credit AND have paid it
+            // on-chain to the finder. Take it from this block's share
+            // (`raw_fair`) proportionally, which leaves past-block claims
+            // (`balance_old`) untouched, and clamp per miner so no balance
+            // is driven negative.
+            if !input.suppress_matching_debits {
+                let mut debtors: Vec<AddressId> = computations
+                    .values()
+                    .filter(|c| c.raw_fair > 0 && c.balance_new > 0)
+                    .map(|c| c.address.clone())
+                    .collect();
+                debtors.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                let debtor_fair: i64 = debtors
+                    .iter()
+                    .filter_map(|a| computations.get(a))
+                    .map(|c| c.raw_fair)
+                    .sum();
+                if debtor_fair > 0 {
+                    let mut applied: i64 = 0;
+                    for addr in &debtors {
+                        if let Some(c) = computations.get_mut(addr) {
+                            let want = ((fee_bonus_sats as f64) * c.raw_fair as f64
+                                / debtor_fair as f64)
+                                .floor() as i64;
+                            let cut = want.min(c.balance_new);
+                            c.balance_new -= cut;
+                            applied += cut;
+                        }
+                    }
+                    // Second pass for the per-miner floor loss, same shape
+                    // as the Phase-5a.5 top-up: spread what pass 1 left
+                    // across whoever still has headroom.
+                    for addr in &debtors {
+                        if applied >= fee_bonus_sats {
+                            break;
+                        }
+                        if let Some(c) = computations.get_mut(addr) {
+                            let cut = (fee_bonus_sats - applied).min(c.balance_new);
+                            if cut > 0 {
+                                c.balance_new -= cut;
+                                applied += cut;
+                            }
+                        }
+                    }
+                }
+            }
             fee_bonus_sats = 0;
         }
     }
@@ -1331,6 +1379,58 @@ mod tests {
         assert_eq!(
             total, block_reward,
             "the sole output must claim the whole reward"
+        );
+    }
+
+    /// The PPLNS twin of the test above, and the case the "Group-Solo only"
+    /// comment on that Phase 5c arm used to exclude: PPLNS *does* emit a
+    /// finder bonus now, so the arm is reachable with matching debits on.
+    ///
+    /// Raising `min_payout_sats` above every miner's post-carve-out share
+    /// makes all of them ineligible, so `kept` is empty and the bonus
+    /// output is the whole coinbase. Those sats are the miners'
+    /// carry-forward credit; paying them to the finder without debiting the
+    /// miners left the pool owing ~2.9 BTC it had already paid away.
+    #[test]
+    fn pplns_bonus_only_coinbase_debits_the_miners_it_pays_from() {
+        let finder = addr("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        let mut shares: HashMap<AddressId, f64> = HashMap::new();
+        shares.insert(finder.clone(), 1.0);
+        for i in 0..400u32 {
+            shares.insert(addr(&format!("activeminer{i:04}")), 1.0);
+        }
+        let balances = HashMap::new();
+        let block_reward = 312_500_000_i64;
+        let input = CoinbaseDistributionInput {
+            fee_percent: 0.0,
+            fee_address: None,
+            coinbase_weight_budget: 50_000,
+            // Just above the ~735 012-sat per-miner share of
+            // `block_reward - bonus`, so nothing is eligible.
+            min_payout_sats: Some(Sats(1_000_000)),
+            finder_bonus_sats: Some(Sats(17_760_000)),
+            finder_address: Some(&finder),
+            ..make_input(&shares, &balances, None, block_reward)
+        };
+        let r = build_coinbase_distribution(input);
+
+        assert_eq!(r.payouts.len(), 1, "only the finder-bonus output survives");
+        assert_eq!(r.payouts[0].address, finder);
+        let on_chain: i64 = r.payouts.iter().map(|p| p.sats.to_i64()).sum();
+        assert_eq!(
+            on_chain, block_reward,
+            "the sole output must claim the whole reward"
+        );
+
+        // The invariant that failed: total obligation is what the pool paid
+        // on-chain plus what it still owes, and it cannot exceed the block.
+        let owed: i64 = r.balance_after.values().map(|s| s.to_i64()).sum();
+        assert!(
+            on_chain + owed <= block_reward,
+            "pool owes {owed} on top of the {on_chain} it paid, exceeding the \
+             {block_reward}-sat reward by {} sats — the finder was paid the \
+             miners' carry-forward without debiting them",
+            on_chain + owed - block_reward
         );
     }
 
