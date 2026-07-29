@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use bp_common::{AddressId, InvalidAddressError, Sats};
 use bp_db::{find_pplns_balances_for_addresses, DbError, PplnsBalanceRow};
+use bp_pplns::CoinbaseDistributionEntry;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
@@ -595,8 +596,10 @@ impl PplnsEngine {
     /// Three categories of rows produced:
     ///
     /// 1. **Coinbase** — one `PayoutRowType::Coinbase` row per
-    ///    `snapshot.distribution` entry, plus a `BalanceWrite` that adds
-    ///    the on-chain sats to the miner's lifetime `totalPaidSats`.
+    ///    *distinct address* in `snapshot.distribution`, plus a
+    ///    `BalanceWrite` that adds the on-chain sats to the miner's
+    ///    lifetime `totalPaidSats`. Multiple outputs to one address are
+    ///    merged first — see [`merge_distribution_by_address`].
     /// 2. **Pending** — one `PayoutRowType::Pending` row per
     ///    `snapshot.balance_after` entry that has no coinbase output
     ///    (sub-dust accruals, debit carry-forwards). `paid_sats` carries
@@ -622,9 +625,16 @@ impl PplnsEngine {
         // balance 0) is omitted from `balance_after`, but we still need its
         // existing `totalPaidSats` so the lifetime total ACCUMULATES instead
         // of being overwritten with just this block's coinbase payout.
+        //
+        // One coinbase output per distinct address from here on: the
+        // distribution may name an address twice (finder bonus + that
+        // finder's own proportional share) and every consumer below keys
+        // on the address.
+        let distribution = merge_distribution_by_address(&snapshot.distribution);
+
         let mut address_set: std::collections::HashSet<String> =
             snapshot.balance_after.keys().cloned().collect();
-        for entry in &snapshot.distribution {
+        for entry in &distribution {
             address_set.insert(entry.address.as_str().to_string());
         }
         let addresses: Vec<String> = address_set.into_iter().collect();
@@ -642,7 +652,7 @@ impl PplnsEngine {
         let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // 1. Coinbase rows + corresponding balance writes.
-        for entry in &snapshot.distribution {
+        for entry in &distribution {
             audit_rows.push(coinbase_row(entry));
             emitted.insert(entry.address.as_str().to_string());
 
@@ -785,6 +795,55 @@ impl PplnsEngine {
     }
 }
 
+/// Fold a coinbase distribution down to one entry per address, summing
+/// sats and percent.
+///
+/// The distribution can name the same address more than once: with a
+/// finder bonus configured, the finder gets a dedicated bonus output AND
+/// their proportional share output. Both are valid on-chain TxOuts and
+/// the block pays both — but the PPLNS ledger keys on `address`, and
+/// neither write survives the duplicate:
+///
+/// - `pplns_balance` is `ON CONFLICT (address) DO UPDATE`, and Postgres
+///   refuses a second conflict hit on one key in one statement
+///   (SQLSTATE 21000). Since both writes share a transaction, the abort
+///   rolls the booking back entirely — the block pays on-chain and can
+///   never be recorded.
+/// - `pplns_payout_history` is `ON CONFLICT ("blockHeight", address) DO
+///   NOTHING`, which does not error but silently drops the second row,
+///   leaving the audit trail short by whatever that output paid.
+///
+/// Merging here means each address yields exactly one audit row and one
+/// balance write, both carrying the total the coinbase actually paid it.
+/// Mirrors `bp_group_solo_engine::engine`, which needs the same fold for
+/// the same reason.
+///
+/// Insertion order is preserved so the rows are deterministic; the
+/// surviving entry for a merged address takes the position of its first
+/// output.
+fn merge_distribution_by_address(
+    distribution: &[CoinbaseDistributionEntry],
+) -> Vec<CoinbaseDistributionEntry> {
+    let mut merged: Vec<CoinbaseDistributionEntry> = Vec::with_capacity(distribution.len());
+    // address → index into `merged`. Avoids the O(n²) linear scan a
+    // 400-output coinbase would otherwise pay on every entry.
+    let mut seen: HashMap<&str, usize> = HashMap::with_capacity(distribution.len());
+    for entry in distribution {
+        match seen.get(entry.address.as_str()) {
+            Some(&idx) => {
+                let acc = &mut merged[idx];
+                acc.sats = Sats(acc.sats.0 + entry.sats.0);
+                acc.percent += entry.percent;
+            }
+            None => {
+                seen.insert(entry.address.as_str(), merged.len());
+                merged.push(entry.clone());
+            }
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -925,5 +984,95 @@ mod tests {
             audit_rows.is_empty(),
             "on-time miner must not get a late-arriver row"
         );
+    }
+
+    // ── merge_distribution_by_address ───────────────────────────────
+
+    fn entry(address: &str, sats: i64, percent: f64) -> CoinbaseDistributionEntry {
+        CoinbaseDistributionEntry {
+            address: AddressId::new(address.to_string()).expect("test address is well-formed"),
+            percent,
+            sats: Sats(sats),
+        }
+    }
+
+    /// The shape a finder bonus produces: bonus output first, then the
+    /// same address again for its proportional share. Both must fold into
+    /// one entry carrying the sum, so the ledger writes one row.
+    #[test]
+    fn merge_folds_the_finders_two_outputs_into_one() {
+        let finder = "bc1qfinder00000000000000000000000";
+        let dist = vec![
+            entry("bc1qpoolfee0000000000000000000000", 4_762_500, 1.5),
+            entry(finder, 17_760_000, 5.594),
+            entry("bc1qotherminer00000000000000000000", 1_474_887, 0.464),
+            entry(finder, 1_474_887, 0.464),
+        ];
+
+        let merged = merge_distribution_by_address(&dist);
+
+        assert_eq!(merged.len(), 3, "one entry per distinct address");
+        let f = merged
+            .iter()
+            .find(|e| e.address.as_str() == finder)
+            .expect("finder present");
+        assert_eq!(
+            f.sats.0, 19_234_887,
+            "the finder's entry must carry bonus + proportional, not one of them"
+        );
+        assert!(
+            (f.percent - 6.058).abs() < 1e-9,
+            "percent must sum too, got {}",
+            f.percent
+        );
+        // Merging must not create or destroy satoshi — the payout list IS
+        // the coinbase.
+        assert_eq!(
+            merged.iter().map(|e| e.sats.0).sum::<i64>(),
+            dist.iter().map(|e| e.sats.0).sum::<i64>(),
+        );
+    }
+
+    /// A merged address keeps the position of its FIRST output, and every
+    /// other entry keeps its relative order — the audit rows a block
+    /// books must not depend on `HashMap` iteration order.
+    #[test]
+    fn merge_preserves_first_occurrence_order() {
+        let dist = vec![
+            entry("bc1qaaa000000000000000000000000000", 100, 0.1),
+            entry("bc1qbbb000000000000000000000000000", 200, 0.2),
+            entry("bc1qaaa000000000000000000000000000", 300, 0.3),
+            entry("bc1qccc000000000000000000000000000", 400, 0.4),
+        ];
+
+        let merged = merge_distribution_by_address(&dist);
+
+        let addrs: Vec<&str> = merged.iter().map(|e| e.address.as_str()).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                "bc1qaaa000000000000000000000000000",
+                "bc1qbbb000000000000000000000000000",
+                "bc1qccc000000000000000000000000000",
+            ]
+        );
+        assert_eq!(merged[0].sats.0, 400, "aaa merged in place at index 0");
+    }
+
+    /// The overwhelmingly common case — no bonus configured, so no
+    /// address repeats. The fold must be a no-op, entry for entry.
+    #[test]
+    fn merge_is_identity_without_duplicates() {
+        let dist = vec![
+            entry("bc1qaaa000000000000000000000000000", 100, 0.1),
+            entry("bc1qbbb000000000000000000000000000", 200, 0.2),
+        ];
+
+        assert_eq!(merge_distribution_by_address(&dist), dist);
+    }
+
+    #[test]
+    fn merge_of_empty_distribution_is_empty() {
+        assert!(merge_distribution_by_address(&[]).is_empty());
     }
 }
