@@ -182,17 +182,30 @@ impl RegtestNode {
     }
 
     fn check_alive(&self) -> Result<(), RegtestError> {
-        // SAFETY-NOTE: `try_wait` does not block; we only need to peek for
-        // process death. `child` is always `Some` between construction and
-        // shutdown.
+        // `try_wait` would be the direct answer but needs `&mut self`, and
+        // the startup poll loops only hold `&self`. So probe the pid instead.
+        //
+        // `kill -0 <pid>` is the portable form of that probe: it sends no
+        // signal and merely reports whether the process is still signalable.
+        // A `/proc/<pid>` stat is the Linux-only form and silently reports
+        // EVERY process as dead on macOS/BSD (no procfs), which turned a
+        // healthy node into `ExitedDuringStartup` on the first poll — before
+        // the cookie file it was waiting for could possibly exist.
+        //
+        // Deliberately best-effort: if `kill` itself can't be run we assume
+        // alive and let the surrounding `wait_for_ready` timeout be the
+        // backstop. Reporting a live node dead is the costlier mistake — it
+        // fails the test outright, where the timeout only delays it.
         if let Some(child) = self.child.as_ref() {
-            // try_wait requires &mut, but we only have &self here. We use a
-            // workaround: send SIGCHLD is not available without raw libc, so
-            // we accept that this check is best-effort by checking the pid
-            // through /proc.
             let pid = child.id();
-            let alive = std::fs::metadata(format!("/proc/{pid}")).is_ok();
-            if !alive {
+            let dead = Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| !s.success());
+            if dead {
                 return Err(RegtestError::ExitedDuringStartup(format!(
                     "bitcoin-node pid {pid} no longer running"
                 )));
