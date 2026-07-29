@@ -149,7 +149,10 @@ fn bonus_1776_across_halvings() {
             nonfinder_with,
             paid_total == reward,
         );
-        assert_eq!(paid_total, reward, "{label}: reward must be conserved exactly");
+        assert_eq!(
+            paid_total, reward,
+            "{label}: reward must be conserved exactly"
+        );
     }
 }
 
