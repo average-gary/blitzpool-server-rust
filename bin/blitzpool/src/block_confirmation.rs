@@ -210,6 +210,22 @@ async fn collect_confirmed<T: DeserializeOwned + PendingBlockRef>(
     confirmed
 }
 
+/// Is this `apply_prepared` failure one that no retry can clear?
+///
+/// Only the variants whose outcome is a pure function of the parked record
+/// qualify: a malformed `row_type` or address in the frozen payload decodes
+/// the same way on every tick. Everything else — PG, Redis, the window —
+/// depends on state outside the record and is assumed transient, which is
+/// the safe default: a wrongly-parked block is retried, a wrongly-discarded
+/// one needs an operator.
+fn is_permanent(err: &bp_pplns_engine::engine::EngineError) -> bool {
+    use bp_pplns_engine::engine::EngineError;
+    matches!(
+        err,
+        EngineError::PreparedDecode(_) | EngineError::Address(_)
+    )
+}
+
 /// One reconciliation pass over both stores.
 async fn reconcile(
     bitcoin_rpc: &BitcoinRpc,
@@ -239,6 +255,26 @@ async fn reconcile(
                         history_inserted = outcome.history_inserted,
                         balances_affected = outcome.balances_affected,
                         "block-confirmation: confirmed → PPLNS ledger applied"
+                    );
+                    let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+                }
+                // A transient failure (PG down, Redis blip) must keep the
+                // entry parked so the next tick retries it — losing it
+                // would drop a confirmed block's accounting silently.
+                // A DETERMINISTIC failure cannot succeed on any retry, so
+                // leaving it parked spins this warning forever, one line
+                // per tick, and buries every real failure behind it. Those
+                // get discarded with a loud message instead, matching how
+                // the Group-Solo arm below handles its own undecodable
+                // records. The on-chain payment already happened either
+                // way; an operator reprocess is the only path back.
+                Err(err) if is_permanent(&err) => {
+                    warn!(
+                        %err,
+                        block_hash = %pb.block_hash,
+                        height = pb.prepared.block_height,
+                        "block-confirmation: PPLNS apply_prepared failed permanently — \
+                         discarding pending record; operator must trigger reprocessing"
                     );
                     let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
                 }
@@ -309,5 +345,35 @@ async fn reconcile(
                 ),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bp_pplns_engine::engine::EngineError;
+
+    #[test]
+    fn undecodable_prepared_records_are_permanent() {
+        assert!(is_permanent(&EngineError::PreparedDecode(
+            "unknown row_type \"garbage\"".to_string()
+        )));
+        let bad_address = AddressId::new(String::new()).expect_err("empty address is invalid");
+        assert!(is_permanent(&EngineError::Address(bad_address)));
+    }
+
+    #[test]
+    fn infrastructure_failures_stay_retryable() {
+        // The whole point of parking: these clear on their own, so the
+        // record must survive to be retried.
+        assert!(!is_permanent(&EngineError::SnapshotMissing {
+            block_height: 800_000
+        }));
+        assert!(!is_permanent(&EngineError::BlockFoundInProgress));
+        assert!(!is_permanent(&EngineError::SnapshotRewardMismatch {
+            block_height: 800_000,
+            snapshot_reward: 312_500_000,
+            actual_reward: 312_499_137,
+        }));
     }
 }
