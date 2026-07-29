@@ -46,7 +46,8 @@ use crate::submit::{RejectReason, ShareAccept};
 /// Production wiring routes through the mining-mode gate to dispatch:
 /// - **Solo**: single 100%-to-miner entry (or split with `dev_fee_*`
 ///   when the server config has one).
-/// - **PPLNS**: window-distribution from `PplnsEngine::build_distribution`.
+/// - **PPLNS**: window-distribution from
+///   `PplnsEngine::build_distribution(reward, finder_address)`.
 /// - **Group-Solo**: round-distribution from
 ///   `GroupSoloEngine::build_distribution(group_id, reward, finder_address)`.
 ///

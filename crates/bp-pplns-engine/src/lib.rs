@@ -28,7 +28,7 @@
 //! - [`sweep`] — daily 03:00 UTC `tokio`-loop that pair-cancels
 //!   abandoned credits ↔ debits. Group-solo dust-absorption lives in
 //!   the future `bp-group-solo-engine` crate.
-//! - [`inflight`] — per-block-reward dedup of concurrent
+//! - [`inflight`] — per-(block-reward, finder) dedup of concurrent
 //!   `build_distribution` calls (in-flight-future shared via
 //!   `tokio::sync::watch` / `OnceCell`-based dedup with TTL).
 //! - [`hooks`] — `bp_stratum_v1::hooks::{AcceptedShareSink,

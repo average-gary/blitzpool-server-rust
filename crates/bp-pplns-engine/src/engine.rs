@@ -384,15 +384,23 @@ impl PplnsEngine {
     }
 
     /// Build the current PPLNS payout distribution for a given
-    /// `block_reward_sats`. Wraps the inflight cache, persists a
-    /// snapshot to Redis so `on_block_found` can replay deterministically.
+    /// `block_reward_sats` and prospective finder. Wraps the inflight cache,
+    /// persists a snapshot to Redis so `on_block_found` can replay
+    /// deterministically.
+    ///
+    /// `finder_address` is the miner this list is being built *for* — the one
+    /// whose job it becomes, and so the one who would find a block on it. It
+    /// only changes the list when the operator configured
+    /// [`PplnsEngineConfig::finder_bonus_sats`], in which case that address
+    /// receives the flat bonus output on top of its proportional share.
     pub async fn build_distribution(
         &self,
         block_reward_sats: u64,
+        finder_address: &AddressId,
     ) -> Result<Arc<DistributionResult>, EngineError> {
         self.inner
             .distribution_builder
-            .build(block_reward_sats)
+            .build(block_reward_sats, finder_address)
             .await
             .map_err(EngineError::Distribution)
     }
@@ -756,13 +764,13 @@ impl PplnsEngine {
             .map_err(EngineError::from)
     }
 
-    /// Drop one cached distribution entry. Called by the engine itself
-    /// on share-record; exposed so manual admin tooling can force a
-    /// recompute too.
-    pub fn invalidate_distribution(&self, block_reward_sats: u64) {
+    /// Drop one cached distribution entry, for one (reward, finder) pair.
+    /// Called by the engine itself on share-record; exposed so manual admin
+    /// tooling can force a recompute too.
+    pub fn invalidate_distribution(&self, block_reward_sats: u64, finder_address: &AddressId) {
         self.inner
             .distribution_builder
-            .invalidate(block_reward_sats);
+            .invalidate(block_reward_sats, finder_address);
     }
 
     /// Signal both background tasks to exit. Best-effort: the tasks

@@ -13,18 +13,20 @@
 //! Two layers of `bp_inflight_cache::InflightResultCache` (30s TTL by
 //! default):
 //!
-//! - **Built distributions**, keyed by `block_reward_sats` — concurrent
-//!   callers for the same reward share one computation.
+//! - **Built distributions**, keyed by `(block_reward_sats,
+//!   prospective_finder)` — concurrent callers for the same pair share
+//!   one computation.
 //! - **Window+ledger inputs**, keyed by `()` — concurrent callers for
-//!   *different* rewards still share the Redis window read and the
-//!   Postgres ledger query, since neither depends on the reward.
+//!   *different* rewards or finders still share the Redis window read and
+//!   the Postgres ledger query, since neither depends on either.
 //!
 //! The second layer is what keeps a burst of unrelated callers cheap.
-//! The per-reward layer alone never dedups them: ext-0x0003 has every
-//! JDC report its own `available_payout_value`, so N simultaneous
-//! requests at a chain-tip change mean N distinct keys and, without the
-//! inputs layer, N window reads plus N ledger queries in the same few
-//! milliseconds.
+//! The per-key layer alone never dedups them: ext-0x0003 has every
+//! JDC report its own `available_payout_value`, and with a finder bonus
+//! configured every connection is its own prospective finder, so N
+//! simultaneous requests at a chain-tip change mean N distinct keys and,
+//! without the inputs layer, N window reads plus N ledger queries in the
+//! same few milliseconds.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -95,6 +97,16 @@ pub struct DistributionInputs {
     pub balances: HashMap<AddressId, Sats>,
 }
 
+/// Cache key — concurrent calls for the same pair share one compute.
+///
+/// The finder belongs in the key because it changes the payout list: with
+/// `finder_bonus_sats` configured, the finder gets a dedicated bonus
+/// output and everyone else's proportional share shrinks. Keying by
+/// reward alone would serve one connection's distribution to another and
+/// pay the wrong miner the bonus. The `String` (rather than `AddressId`)
+/// mirrors `bp_group_solo_engine::distribution::CacheKey`.
+type CacheKey = (u64, String);
+
 /// Result of one distribution build. Cheap to clone-via-Arc because
 /// the in-flight cache shares `Arc<DistributionResult>` across waiters.
 #[derive(Clone, Debug)]
@@ -150,6 +162,11 @@ pub struct DistributionConfig {
     pub min_payout_sats: Sats,
     /// Live, runtime-mutable coinbase weight budget shared with the autoscaler.
     pub coinbase_weight_budget: LiveBudget,
+    /// Flat bonus paid to the block's finder as its own coinbase output.
+    /// `None` ⇒ no bonus output, and the prospective finder every build
+    /// carries then makes no difference to the payout list. See
+    /// [`crate::config::PplnsEngineConfig::finder_bonus_sats`].
+    pub finder_bonus_sats: Option<Sats>,
     pub snapshot_ttl_secs: u32,
 }
 
@@ -160,6 +177,7 @@ impl DistributionConfig {
             fee_percent: cfg.fee_percent,
             min_payout_sats: cfg.min_payout_sats,
             coinbase_weight_budget: LiveBudget::new(cfg.coinbase_weight_budget),
+            finder_bonus_sats: cfg.finder_bonus_sats,
             snapshot_ttl_secs: cfg.snapshot_ttl_secs,
         }
     }
@@ -172,9 +190,9 @@ pub struct DistributionBuilder {
     pool: PgPool,
     window: WindowStore,
     config: DistributionConfig,
-    cache: InflightResultCache<u64, DistributionResult, DistributionError>,
-    /// Reward-independent window+ledger inputs, shared across every
-    /// concurrent build. Keyed by `()` — there is exactly one payout
+    cache: InflightResultCache<CacheKey, DistributionResult, DistributionError>,
+    /// Reward- and finder-independent window+ledger inputs, shared across
+    /// every concurrent build. Keyed by `()` — there is exactly one payout
     /// window — so the cache degenerates to "one load per invalidation
     /// epoch, deduped across all in-flight builds".
     inputs_cache: InflightResultCache<(), DistributionInputs, DistributionError>,
@@ -211,21 +229,33 @@ impl DistributionBuilder {
         self.inputs_loads.load(Ordering::Relaxed)
     }
 
-    /// Build the current PPLNS distribution for `block_reward_sats`.
-    /// Concurrent callers for the same reward share one compute; callers
-    /// for *different* rewards still share the window+ledger read.
+    /// Build the current PPLNS distribution for `block_reward_sats`,
+    /// treating `finder_address` as the miner who would find a block on
+    /// this list. Concurrent callers for the same pair share one compute;
+    /// callers for *different* pairs still share the window+ledger read.
+    ///
+    /// The finder only changes the outcome when the operator configured
+    /// `finder_bonus_sats`: it names the address that gets the bonus
+    /// output. It is *prospective* — the list is built at template time
+    /// for whoever is being served the job, long before any block exists.
+    /// A block found on some other job is booked from that job's own
+    /// snapshot, resolved by fingerprint, so a per-connection finder never
+    /// leaks into someone else's booking.
     pub async fn build(
         &self,
         block_reward_sats: u64,
+        finder_address: &AddressId,
     ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
+        let key: CacheKey = (block_reward_sats, finder_address.as_str().to_string());
         let pool = self.pool.clone();
         let window = self.window.clone();
         let window_for_inputs = self.window.clone();
         let config = self.config.clone();
         let inputs_cache = self.inputs_cache.clone();
         let inputs_loads = self.inputs_loads.clone();
+        let finder = finder_address.clone();
         self.cache
-            .get_or_compute(block_reward_sats, || async move {
+            .get_or_compute(key, move || async move {
                 let inputs = inputs_cache
                     .get_or_compute((), || async move {
                         inputs_loads.fetch_add(1, Ordering::Relaxed);
@@ -233,19 +263,20 @@ impl DistributionBuilder {
                     })
                     .await
                     .map_err(|e| DistributionError::Inputs(e.to_string()))?;
-                build_from_inputs(&inputs, &window, &config, block_reward_sats).await
+                build_from_inputs(&inputs, &window, &config, block_reward_sats, &finder).await
             })
             .await
     }
 
-    /// Invalidate the cache for a specific reward. Called by the
+    /// Invalidate the cache for one (reward, finder) pair. Called by the
     /// engine on hot-path state changes (a new accepted share landed,
     /// a block was found, network difficulty changed).
     ///
-    /// Common pattern: `invalidate_all` (drops every cached reward)
-    /// because the window changed for *any* reward, not just one.
-    pub fn invalidate(&self, block_reward_sats: u64) {
-        self.cache.invalidate(&block_reward_sats);
+    /// Common pattern: `invalidate_all` (drops every cached pair) because
+    /// the window changed for *every* reward and finder, not just one.
+    pub fn invalidate(&self, block_reward_sats: u64, finder_address: &AddressId) {
+        let key: CacheKey = (block_reward_sats, finder_address.as_str().to_string());
+        self.cache.invalidate(&key);
     }
 
     /// Drops the built distributions AND the shared window+ledger
@@ -319,12 +350,14 @@ async fn load_inputs(
 }
 
 /// Steps 4-5: scale the shared inputs to one concrete
-/// `block_reward_sats`, run the pure math, persist the snapshot.
+/// `(block_reward_sats, finder_address)`, run the pure math, persist the
+/// snapshot.
 async fn build_from_inputs(
     inputs: &DistributionInputs,
     window: &WindowStore,
     config: &DistributionConfig,
     block_reward_sats: u64,
+    finder_address: &AddressId,
 ) -> Result<DistributionResult, DistributionError> {
     // 4. Build inputs + call pure math. Read the *live* budget here so a
     //    runtime autoscaler change takes effect on the next build.
@@ -337,8 +370,12 @@ async fn build_from_inputs(
         coinbase_weight_budget: config.coinbase_weight_budget.get(),
         suppress_matching_debits: false, // PPLNS uses signed-ledger pair-symmetry
         min_payout_sats: Some(config.min_payout_sats),
-        finder_bonus_sats: None, // finder-bonus is a Group-Solo feature
-        finder_address: None,
+        // Both or neither: `build_coinbase_distribution` only emits a bonus
+        // output when the sats AND the address are set, and with no bonus
+        // configured the finder is inert (every prospective finder then
+        // yields the same list, which is the pre-bonus behaviour).
+        finder_bonus_sats: config.finder_bonus_sats,
+        finder_address: Some(finder_address),
     };
     let math = build_coinbase_distribution(input);
 
@@ -385,6 +422,7 @@ async fn build_from_inputs(
             warn!(
                 %err,
                 block_reward_sats,
+                finder_address = finder_address.as_str(),
                 "PPLNS snapshot write failed — the coinbase distribution stands, but a \
                  block found on this job cannot be booked automatically and needs \
                  operator reprocessing"

@@ -26,6 +26,12 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 const REDIS_URL: &str = "redis://127.0.0.1:16379";
 const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
+/// 0.1776 BTC — the bonus this feature ships with.
+const FINDER_BONUS_SATS: i64 = 17_760_000;
+/// Reward for the bonus test: subsidy plus a plausible fee total, well
+/// clear of the 95 %-of-miner-cut bonus cap.
+const BONUS_TEST_REWARD: u64 = 317_500_000;
+
 struct Harness {
     pool: PgPool,
     builder: DistributionBuilder,
@@ -33,6 +39,16 @@ struct Harness {
 }
 
 async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> {
+    connect_with_config_or_skip(redis_db, address_prefix, PplnsEngineConfig::default()).await
+}
+
+/// [`connect_or_skip`] with the engine config spelled out — for the tests
+/// whose subject is a config knob (currently `finder_bonus_sats`).
+async fn connect_with_config_or_skip(
+    redis_db: u8,
+    address_prefix: &str,
+    engine_cfg: PplnsEngineConfig,
+) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let redis_url = format!("{redis_base}/{redis_db}");
@@ -95,7 +111,7 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
     let window = WindowStore::new(
         conn, /*factor=*/ 4.0, /*bucket_shares=*/ 100, net_diff,
     );
-    let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig::default());
+    let cfg = DistributionConfig::from_engine_config(&engine_cfg);
     let builder = DistributionBuilder::new(pool.clone(), window, cfg);
 
     Some(Harness {
@@ -103,6 +119,20 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
         builder,
         address_prefix: address_prefix.to_string(),
     })
+}
+
+/// Prospective finder for builds whose subject is not the finder bonus.
+///
+/// Every [`connect_or_skip`] harness runs `PplnsEngineConfig::default()`,
+/// i.e. `finder_bonus_sats: None`, so the finder is inert there: no bonus
+/// output is emitted and the payout list is identical whoever is named.
+/// Passing one fixed address keeps the cache key stable so the dedup +
+/// invalidation assertions still measure what they mean to. The bonus
+/// itself is covered by [`finder_bonus_pays_the_named_finder`] (which
+/// configures it via [`connect_with_config_or_skip`]) and by
+/// `finder_bonus_ledger_integration.rs`.
+fn any_finder() -> AddressId {
+    AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap()
 }
 
 async fn seed_share(window: &WindowStore, address: &str, diff: f64, ts: u64) {
@@ -160,7 +190,11 @@ async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
     seed_share(&window, ADDR_A, 60.0, 1_700_000_000_001).await;
     seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
 
-    let result = h.builder.build(312_500_000).await.expect("build ok");
+    let result = h
+        .builder
+        .build(312_500_000, &any_finder())
+        .await
+        .expect("build ok");
     assert_eq!(result.block_reward_sats, 312_500_000);
     assert!(!result.payouts.is_empty(), "expected non-empty payouts");
     let addr_a_id = AddressId::new(ADDR_A).unwrap();
@@ -202,7 +236,11 @@ async fn build_folds_open_balances_into_distribution() {
     // should still consider them.
     seed_open_balance(&h.pool, ADDR_DEBTOR, -5_000, 0).await;
 
-    let result = h.builder.build(312_500_000).await.expect("build ok");
+    let result = h
+        .builder
+        .build(312_500_000, &any_finder())
+        .await
+        .expect("build ok");
     let debtor_id = AddressId::new(ADDR_DEBTOR).unwrap();
     assert!(
         result.considered_addresses.contains(&debtor_id),
@@ -234,7 +272,9 @@ async fn concurrent_builds_for_same_reward_share_one_compute() {
     let mut handles = Vec::new();
     for _ in 0..8 {
         let b = builder.clone();
-        handles.push(tokio::spawn(async move { b.build(312_500_000).await }));
+        handles.push(tokio::spawn(async move {
+            b.build(312_500_000, &any_finder()).await
+        }));
     }
 
     let mut shared_result: Option<Arc<DistributionResult>> = None;
@@ -272,15 +312,27 @@ async fn invalidate_all_triggers_fresh_compute() {
     )
     .await;
 
-    let r1 = h.builder.build(312_500_000).await.expect("ok");
-    let r2 = h.builder.build(312_500_000).await.expect("ok");
+    let r1 = h
+        .builder
+        .build(312_500_000, &any_finder())
+        .await
+        .expect("ok");
+    let r2 = h
+        .builder
+        .build(312_500_000, &any_finder())
+        .await
+        .expect("ok");
     assert!(
         Arc::ptr_eq(&r1, &r2),
         "cached call returns the same Arc as the first"
     );
 
     h.builder.invalidate_all();
-    let r3 = h.builder.build(312_500_000).await.expect("ok");
+    let r3 = h
+        .builder
+        .build(312_500_000, &any_finder())
+        .await
+        .expect("ok");
     assert!(
         !Arc::ptr_eq(&r1, &r3),
         "post-invalidate, the cache returns a freshly-built result"
@@ -307,8 +359,16 @@ async fn distinct_rewards_each_get_their_own_compute() {
     )
     .await;
 
-    let r1 = h.builder.build(300_000_000).await.expect("ok");
-    let r2 = h.builder.build(312_500_000).await.expect("ok");
+    let r1 = h
+        .builder
+        .build(300_000_000, &any_finder())
+        .await
+        .expect("ok");
+    let r2 = h
+        .builder
+        .build(312_500_000, &any_finder())
+        .await
+        .expect("ok");
     assert_eq!(r1.block_reward_sats, 300_000_000);
     assert_eq!(r2.block_reward_sats, 312_500_000);
     assert!(!Arc::ptr_eq(&r1, &r2));
@@ -346,9 +406,9 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
     // 16 callers, 16 distinct rewards — no per-reward cache hit possible.
     for i in 0..16u64 {
         let b = builder.clone();
-        handles.push(tokio::spawn(
-            async move { b.build(312_500_000 + i * 137).await },
-        ));
+        handles.push(tokio::spawn(async move {
+            b.build(312_500_000 + i * 137, &any_finder()).await
+        }));
     }
     for (i, handle) in handles.into_iter().enumerate() {
         let r = handle.await.unwrap().expect("build ok");
@@ -366,7 +426,11 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
 
     // Sanity: a build after an invalidation must load fresh again.
     h.builder.invalidate_all();
-    let _ = h.builder.build(999_000_000).await.expect("ok");
+    let _ = h
+        .builder
+        .build(999_000_000, &any_finder())
+        .await
+        .expect("ok");
     assert!(
         h.builder.inputs_loads() - before > loads,
         "invalidate_all must force the next build to reload the inputs"
@@ -402,10 +466,18 @@ async fn distinct_rewards_keep_their_own_fingerprinted_snapshot() {
     seed_share(&window, ADDR_B, 30.0, 1_700_000_000_002).await;
 
     // The pool's own template build...
-    let pool_build = h.builder.build(312_500_000).await.expect("pool build ok");
+    let pool_build = h
+        .builder
+        .build(312_500_000, &any_finder())
+        .await
+        .expect("pool build ok");
     // ...then a JDC asking for its own payout value, which is what overwrites
     // the shared key today.
-    let jdc_build = h.builder.build(312_499_137).await.expect("jdc build ok");
+    let jdc_build = h
+        .builder
+        .build(312_499_137, &any_finder())
+        .await
+        .expect("jdc build ok");
 
     assert_ne!(
         pool_build.payouts_fingerprint, jdc_build.payouts_fingerprint,
@@ -439,6 +511,121 @@ async fn distinct_rewards_keep_their_own_fingerprinted_snapshot() {
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
+// ── The configured finder bonus reaches the payout list ─────────────
+//
+// `build` takes a *prospective* finder and `DistributionConfig` carries
+// `finder_bonus_sats`; between them the builder is the only thing standing
+// between the operator's toml and a coinbase output. Both halves have to be
+// live: a bonus configured but no finder threaded through (or a finder
+// threaded but the config dropped on the floor in `from_engine_config`)
+// silently pays nobody, and every other test in this file runs with the
+// bonus off so none of them would notice.
+
+#[tokio::test]
+async fn finder_bonus_pays_the_named_finder() {
+    let engine_cfg = PplnsEngineConfig {
+        finder_bonus_sats: Some(bp_common::Sats(FINDER_BONUS_SATS)),
+        ..PplnsEngineConfig::default()
+    };
+    let h = match connect_with_config_or_skip(7, "test_dist_bonus_", engine_cfg).await {
+        Some(h) => h,
+        None => return,
+    };
+
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+
+    let window = build_window(&h).await;
+    // Equal shares, so the proportional halves are equal too and the bonus
+    // is the only thing that can separate the two miners' totals.
+    seed_share(&window, ADDR_A, 50.0, 1_700_000_000_001).await;
+    seed_share(&window, ADDR_B, 50.0, 1_700_000_000_002).await;
+
+    let finder = AddressId::new(ADDR_A).unwrap();
+    let other = AddressId::new(ADDR_B).unwrap();
+    let result = h
+        .builder
+        .build(BONUS_TEST_REWARD, &finder)
+        .await
+        .expect("build ok");
+
+    // The finder holds two outputs: the dedicated bonus and their ordinary
+    // proportional share. Both are legal coinbase `TxOut`s; folding them is
+    // the booking path's job, not the builder's.
+    let finder_entries: Vec<i64> = result
+        .payouts
+        .iter()
+        .filter(|p| p.address == finder)
+        .map(|p| p.sats.0)
+        .collect();
+    assert_eq!(
+        finder_entries.len(),
+        2,
+        "the finder must hold a bonus output AND a proportional one, got {:?}",
+        result.payouts
+    );
+    assert!(
+        finder_entries.contains(&FINDER_BONUS_SATS),
+        "one of the finder's outputs must be the configured bonus exactly \
+         ({FINDER_BONUS_SATS} sats), got {finder_entries:?}"
+    );
+
+    // The carve-out comes off the top, so the non-finder's share shrinks by
+    // half the bonus — the same haircut whoever finds the block.
+    let finder_total: i64 = finder_entries.iter().sum();
+    let other_total: i64 = result
+        .payouts
+        .iter()
+        .filter(|p| p.address == other)
+        .map(|p| p.sats.0)
+        .sum();
+    assert!(
+        finder_total > other_total,
+        "the finder must end up ahead by the bonus: finder {finder_total}, \
+         other {other_total}"
+    );
+    assert!(
+        finder_total - other_total >= FINDER_BONUS_SATS,
+        "the gap must be at least the whole bonus (largest-remainder rounding \
+         can widen it by a sat or two, never narrow it): finder {finder_total}, \
+         other {other_total}"
+    );
+
+    // The list is still the whole coinbase — a carve-out redistributes the
+    // reward, it does not consume part of it.
+    let total: i64 = result.payouts.iter().map(|p| p.sats.0).sum();
+    assert_eq!(
+        total, BONUS_TEST_REWARD as i64,
+        "the payout list IS the coinbase and must consume the entire reward"
+    );
+
+    // Same window, different finder → a different list. This is why the
+    // finder is in the cache key: serving the cached entry across finders
+    // would pay the bonus to whoever asked first.
+    let other_build = h
+        .builder
+        .build(BONUS_TEST_REWARD, &other)
+        .await
+        .expect("build ok for the other finder");
+    assert_ne!(
+        result.payouts_fingerprint, other_build.payouts_fingerprint,
+        "two finders on the same window must produce two distinct payout lists"
+    );
+    assert!(
+        other_build
+            .payouts
+            .iter()
+            .filter(|p| p.address == other)
+            .map(|p| p.sats.0)
+            .sum::<i64>()
+            > other_total,
+        "naming the other miner as finder must move the bonus to them"
+    );
+
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+}
+
 // ── Test 6 — empty window with no balances → empty distribution ─────
 
 #[tokio::test]
@@ -450,7 +637,11 @@ async fn empty_state_returns_fee_only_distribution() {
     // No shares, no balances. Default config has fee_address=None so
     // the math returns an empty (or fee-only) distribution. We just
     // assert it doesn't crash and the result is consistent.
-    let result = h.builder.build(312_500_000).await.expect("ok");
+    let result = h
+        .builder
+        .build(312_500_000, &any_finder())
+        .await
+        .expect("ok");
     assert_eq!(result.block_reward_sats, 312_500_000);
 
     // Snapshot still written (pre-condition for on-block-found
@@ -502,6 +693,7 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_inputs_" => 14,
         "test_dist_fp_" => 15,
         "test_dist_oom_" => 6,
+        "test_dist_bonus_" => 7,
         other => panic!("unknown test prefix: {other}"),
     }
 }
@@ -578,7 +770,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
     // rejected. The build must survive it.
     let result = h
         .builder
-        .build(312_500_000)
+        .build(312_500_000, &any_finder())
         .await
         .expect("a rejected snapshot write must not fail the distribution build");
     assert!(

@@ -197,7 +197,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
     // ── Distribution from the stream-fed Satellite engine ─────────
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
-        .build_distribution(reward_sats)
+        .build_distribution(reward_sats, &finder_id(&addr_alice))
         .await
         .expect("build_distribution");
     assert_eq!(
@@ -312,4 +312,12 @@ fn test_engine_config(fee_addr: &str) -> PplnsEngineConfig {
         min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
         ..PplnsEngineConfig::default()
     }
+}
+
+/// The prospective finder this build is made for — Alice, the miner whose
+/// job the coinbase becomes. `finder_bonus_sats` is left at `None` above, so
+/// no bonus output is emitted and the 4-output assertion below still
+/// describes the plain fee + 3-miner split.
+fn finder_id(address: &str) -> AddressId {
+    AddressId::new(address.to_string()).expect("regtest address is a valid AddressId")
 }

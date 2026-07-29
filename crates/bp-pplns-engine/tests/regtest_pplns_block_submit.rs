@@ -163,7 +163,7 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
     // ── Build the engine's distribution for this template's reward ──
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
-        .build_distribution(reward_sats)
+        .build_distribution(reward_sats, &finder_id(&addr_alice))
         .await
         .expect("build_distribution");
     // Bit-exact shape: 3 seeded miners + fee_address configured →
@@ -358,7 +358,7 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
     // ── Engine distribution for this template's reward (subsidy + fees) ──
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
-        .build_distribution(reward_sats)
+        .build_distribution(reward_sats, &finder_id(&addr_alice))
         .await
         .expect("build_distribution");
     let payouts: Vec<PayoutEntry> = dist
@@ -433,11 +433,13 @@ fn test_engine_config(fee_addr: &str) -> PplnsEngineConfig {
     }
 }
 
-// Silence the unused `AddressId` import if a refactor drops the only
-// call site above. Kept on the import list so future test cases that
-// need it don't have to re-add.
-#[allow(dead_code)]
-fn _force_addr_id(_: AddressId) {}
+/// The prospective finder a build is made for. These tests use Alice, the
+/// same way the Group-Solo regtest does, and [`test_engine_config`] leaves
+/// `finder_bonus_sats` at `None` — so no bonus output is emitted and the
+/// output-count assertions describe the plain proportional split.
+fn finder_id(address: &str) -> AddressId {
+    AddressId::new(address.to_string()).expect("regtest address is a valid AddressId")
+}
 
 /// The `TdpCoinbaseTemplate` view of a `NewTemplate`. Pure field lowering —
 /// extracted because all three tests in this file need the identical literal.
@@ -598,7 +600,7 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
     // ── The build this block's coinbase is made from ──────────────
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
-        .build_distribution(reward_sats)
+        .build_distribution(reward_sats, &finder_id(&addr_alice))
         .await
         .expect("build_distribution");
     let fingerprint = dist.payouts_fingerprint;
@@ -630,7 +632,7 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
 
     // ── A later build displaces any shared snapshot ──────────────
     let _jdc = engine
-        .build_distribution(reward_sats - 997)
+        .build_distribution(reward_sats - 997, &finder_id(&addr_alice))
         .await
         .expect("jdc-style build");
 

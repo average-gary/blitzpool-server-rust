@@ -18,7 +18,8 @@
 //! 1. Consult [`BlitzpoolModeGate::lookup_mode`] for the address.
 //! 2. **Solo** → [`solo_payouts`] (single 100%-to-miner OR split
 //!    with `dev_fee_address`/`dev_fee_percent` when configured).
-//! 3. **Pplns** → [`PplnsEngine::build_distribution`] →
+//! 3. **Pplns** → [`PplnsEngine::build_distribution`] (the miner's own
+//!    `AddressId` as the prospective finder, same as Group-Solo) →
 //!    `Vec<CoinbaseDistributionEntry>` → `Vec<PayoutEntry>`.
 //! 4. **GroupSolo** → [`GroupSoloEngine::build_distribution`] (need
 //!    the group_id from the gate's `MiningModeResult.group_id` field
@@ -251,7 +252,24 @@ impl ProductionPayoutResolver {
                 false,
             );
         };
-        match pplns.build_distribution(reward_sats).await {
+        // The finder is the miner this job is being built for — with
+        // `[pplns] finder_bonus_sats` configured, the engine gives that
+        // address the bonus output on top of its proportional share. Same
+        // shape as the Group-Solo arm below.
+        let finder = match AddressId::new(miner_address.to_string()) {
+            Ok(a) => a,
+            Err(_) => {
+                warn!(
+                    miner_address,
+                    "PPLNS miner address failed AddressId parse; falling back to solo"
+                );
+                return (
+                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                    false,
+                );
+            }
+        };
+        match pplns.build_distribution(reward_sats, &finder).await {
             // The build can succeed while its snapshot write does not — the
             // engine keeps the distribution on purpose, because failing it would
             // hand this miner the whole block. But the fingerprint then names a
@@ -524,6 +542,327 @@ mod tests {
     use super::*;
 
     const TEST_REWARD: u64 = 5_000_000_000;
+
+    // ── A lost snapshot must not collapse the coinbase to a solo split ──
+    //
+    // Two failure modes share one call site and only one of them may fire.
+    // `build_distribution` returning `Err` DOES go to `solo_payouts`, on
+    // purpose: without a list there is no coinbase. But a build that
+    // succeeded while its snapshot write failed still holds the correct
+    // list, and sending *that* to the fallback would hand the connecting
+    // miner a coinbase paying itself the whole block — every other miner in
+    // the window loses their share of a real, irreversible on-chain payment.
+    //
+    // The engine-side half (the build survives a rejected snapshot write) is
+    // pinned by `bp-pplns-engine`'s
+    // `snapshot_write_failure_still_returns_the_pplns_distribution`. This is
+    // the resolver-side half: what `pplns_payouts` does with that result. It
+    // has to keep the list AND report `false`, because the fingerprint now
+    // names a Redis key that does not exist and a block found on this job
+    // needs an operator reprocess.
+    //
+    // Redis is crippled for real rather than mocked, and per *connection*
+    // rather than server-wide: the engine gets an ACL user with `-@write`, so
+    // its `HGETALL` of the window still succeeds while the snapshot `DEL` +
+    // `HSET` are refused. Setting server-global `maxmemory` would reach every
+    // other test sharing this Redis.
+    mod snapshot_loss {
+        use std::time::Duration;
+
+        use bp_common::AddressId;
+        use bp_group_solo_engine::config::GroupSoloEngineConfig;
+        use bp_group_solo_engine::engine::GroupSoloEngine;
+        use bp_mining_mode::MiningModeResult;
+        use bp_pplns_engine::config::PplnsEngineConfig;
+        use bp_pplns_engine::engine::PplnsEngine;
+        use bp_pplns_engine::window::{NetworkDifficulty, WindowStore};
+        use redis::aio::ConnectionManager;
+        use sqlx::postgres::PgPoolOptions;
+        use sqlx::PgPool;
+
+        use super::*;
+        use crate::engines::BlitzpoolModeGate;
+
+        const REDIS_URL: &str = "redis://127.0.0.1:16379";
+        const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+        /// Logical DB for this test alone — every other Redis test in this
+        /// crate takes 5..=12.
+        const REDIS_DB: u8 = 13;
+
+        /// The connecting miner (and so the prospective finder), a second
+        /// miner who is only in the window, the PPLNS pool-fee address, and
+        /// the solo dev-fee address. All four distinct so the assertions can
+        /// tell a PPLNS list from a solo one by content.
+        const ADDR_MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        const ADDR_OTHER: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        const ADDR_PPLNS_FEE: &str =
+            "bc1q9d4ywgfnd8h43da5tpcxcn6ajv590cg6d3tg6axemvljvt2k76zs50lnx2";
+        const ADDR_SOLO_DEV: &str =
+            "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+
+        /// Read-only ACL user for the engine's connection. Dropped on
+        /// teardown — it is server-global state, so leaking it would leave a
+        /// stray credential behind for every later run against this Redis.
+        const RO_USER: &str = "bp_test_pplns_snapshot_ro";
+        const RO_PASS: &str = "bp_test_pplns_snapshot_ro_pw";
+
+        /// Deletes the ACL user even if the test panics.
+        struct AclUserGuard(ConnectionManager);
+
+        impl Drop for AclUserGuard {
+            fn drop(&mut self) {
+                let mut conn = self.0.clone();
+                // No blocking handle is available inside Drop, so borrow the
+                // current runtime — best effort, same shape as
+                // `bp-pplns-engine`'s `MaxMemoryGuard`.
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let _ = redis::cmd("ACL")
+                            .arg("DELUSER")
+                            .arg(RO_USER)
+                            .query_async::<()>(&mut conn)
+                            .await;
+                    })
+                });
+            }
+        }
+
+        fn redis_base() -> String {
+            std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string())
+        }
+
+        async fn connect_redis_or_skip() -> Option<ConnectionManager> {
+            let client = redis::Client::open(format!("{}/{REDIS_DB}", redis_base())).ok()?;
+            let mut conn =
+                tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client))
+                    .await
+                    .ok()?
+                    .ok()?;
+            let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.ok()?;
+            Some(conn)
+        }
+
+        async fn connect_pg_or_skip() -> Option<PgPool> {
+            let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                PgPoolOptions::new().max_connections(2).connect(&url),
+            )
+            .await
+            .ok()?
+            .ok()
+        }
+
+        /// A connection that can read this Redis but not write to it.
+        /// `None` when the server refuses the ACL (an old Redis, or a
+        /// deployment that restricts `ACL SETUSER`) — the test skips rather
+        /// than passing against a connection that can still write, which
+        /// would prove nothing.
+        async fn connect_write_denied_or_skip(
+            admin: &ConnectionManager,
+        ) -> Option<ConnectionManager> {
+            let mut admin = admin.clone();
+            // `+@all -@write` keeps HGETALL/HLEN/ZCARD and refuses DEL/HSET.
+            if redis::cmd("ACL")
+                .arg("SETUSER")
+                .arg(RO_USER)
+                .arg("on")
+                .arg(format!(">{RO_PASS}"))
+                .arg("~*")
+                .arg("&*")
+                .arg("+@all")
+                .arg("-@write")
+                .query_async::<()>(&mut admin)
+                .await
+                .is_err()
+            {
+                eprintln!("redis refused ACL SETUSER — skipping snapshot-loss test");
+                return None;
+            }
+            let url = format!(
+                "redis://{RO_USER}:{RO_PASS}@{}/{REDIS_DB}",
+                redis_base()
+                    .trim_start_matches("redis://")
+                    .trim_end_matches('/')
+            );
+            let client = redis::Client::open(url).ok()?;
+            tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client))
+                .await
+                .ok()?
+                .ok()
+        }
+
+        fn pplns_config() -> PplnsEngineConfig {
+            PplnsEngineConfig {
+                fee_address: Some(AddressId::new(ADDR_PPLNS_FEE).expect("fee addr valid")),
+                fee_percent: 1.5,
+                dust_sweep_enabled: false,
+                touch_flush_interval_secs: 3_600,
+                ..PplnsEngineConfig::default()
+            }
+        }
+
+        async fn cleanup(pool: &PgPool) {
+            for addr in [ADDR_MINER, ADDR_OTHER, ADDR_PPLNS_FEE, ADDR_SOLO_DEV] {
+                let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+                    .bind(addr)
+                    .execute(pool)
+                    .await;
+            }
+        }
+
+        /// `block_in_place` in [`AclUserGuard`] needs a multi-thread runtime.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lost_snapshot_keeps_the_pplns_list_and_withholds_the_promise() {
+            let Some(admin) = connect_redis_or_skip().await else {
+                eprintln!("redis unreachable — skipping snapshot-loss resolver test");
+                return;
+            };
+            let Some(pg) = connect_pg_or_skip().await else {
+                eprintln!("pg unreachable — skipping snapshot-loss resolver test");
+                return;
+            };
+            cleanup(&pg).await;
+
+            // Seed the window over the writable connection, before the
+            // engine's read-only one exists. Two miners with equal shares:
+            // the second is the witness — a solo fallback could never name an
+            // address that never connected.
+            let window = WindowStore::new(
+                admin.clone(),
+                PplnsEngineConfig::default().window_factor,
+                PplnsEngineConfig::default().bucket_shares,
+                NetworkDifficulty::new(1_000.0),
+            );
+            for (i, addr) in [ADDR_MINER, ADDR_OTHER].iter().enumerate() {
+                window
+                    .record_share(None, addr, 50.0, 1_700_000_000_000 + i as u64)
+                    .await
+                    .expect("seed share");
+            }
+
+            let _acl_guard = AclUserGuard(admin.clone());
+            let Some(ro_conn) = connect_write_denied_or_skip(&admin).await else {
+                return;
+            };
+
+            // The PPLNS engine reads the window it cannot write to. Core mode:
+            // no ledger crons, which would only fail against `-@write` and
+            // are not what this test is about.
+            let pplns = PplnsEngine::spawn_core(
+                pplns_config(),
+                ro_conn,
+                pg.clone(),
+                NetworkDifficulty::new(1_000.0),
+            )
+            .await
+            .expect("PplnsEngine::spawn_core — bootstrap only reads");
+            // Group-Solo is just a constructor argument here; give it the
+            // writable connection so nothing about it is under test.
+            let group_solo = GroupSoloEngine::spawn_core(
+                GroupSoloEngineConfig::default(),
+                admin.clone(),
+                pg.clone(),
+            )
+            .await
+            .expect("GroupSoloEngine::spawn_core");
+
+            let mode_gate = Arc::new(BlitzpoolModeGate::new());
+            mode_gate.set_mode(ADDR_MINER, MiningModeResult::pplns());
+            let resolver = ProductionPayoutResolver::new(
+                mode_gate,
+                Some(pplns.clone()),
+                group_solo.clone(),
+                SoloFeeConfig {
+                    dev_fee_address: Some(ADDR_SOLO_DEV.to_string()),
+                    dev_fee_percent: 1.5,
+                },
+                None,
+            );
+
+            let miner = AddressId::new(ADDR_MINER).expect("miner addr valid");
+            let (payouts, vouchable) = resolver
+                .resolve_payouts_reporting_source(&miner, TEST_REWARD)
+                .await;
+
+            // The whole point: the other miner's share survives. A solo
+            // fallback pays only `ADDR_SOLO_DEV` + `ADDR_MINER`, so its
+            // presence is proof the PPLNS list was kept.
+            assert!(
+                payouts.iter().any(|p| p.address == ADDR_OTHER),
+                "a lost snapshot must NOT collapse the coinbase to a solo split — \
+                 every miner in the window still has to be paid, and this block \
+                 is irreversible once mined. Got {payouts:?}"
+            );
+            assert!(
+                !payouts.iter().any(|p| p.address == ADDR_SOLO_DEV),
+                "the solo dev-fee output only appears on the fallback path; \
+                 seeing it means `pplns_payouts` fell through. Got {payouts:?}"
+            );
+            assert!(
+                payouts.iter().any(|p| p.address == ADDR_PPLNS_FEE),
+                "the PPLNS pool-fee output must still be there. Got {payouts:?}"
+            );
+            let total: u64 = payouts.iter().map(|p| p.sats).sum();
+            assert_eq!(
+                total, TEST_REWARD,
+                "the list is the coinbase and must still consume the whole reward"
+            );
+
+            // And the accounting promise is withheld: the fingerprint this
+            // list hashes to names a Redis key the write never created, so
+            // ext-0x0003 must not tell a JD-client the block will be booked.
+            assert!(
+                !vouchable,
+                "with the snapshot lost there is nothing to book against — the \
+                 promise has to be withheld even though the coinbase stands"
+            );
+
+            // Confirm the crippled connection is really why, rather than some
+            // unrelated build failure that happened to keep the list: the same
+            // resolver over a writable engine both keeps the list AND vouches.
+            let writable_pplns = PplnsEngine::spawn_core(
+                pplns_config(),
+                admin.clone(),
+                pg.clone(),
+                NetworkDifficulty::new(1_000.0),
+            )
+            .await
+            .expect("PplnsEngine::spawn_core over the writable connection");
+            let writable_gate = Arc::new(BlitzpoolModeGate::new());
+            writable_gate.set_mode(ADDR_MINER, MiningModeResult::pplns());
+            let writable_resolver = ProductionPayoutResolver::new(
+                writable_gate,
+                Some(writable_pplns.clone()),
+                group_solo.clone(),
+                SoloFeeConfig {
+                    dev_fee_address: Some(ADDR_SOLO_DEV.to_string()),
+                    dev_fee_percent: 1.5,
+                },
+                None,
+            );
+            let (ok_payouts, ok_vouchable) = writable_resolver
+                .resolve_payouts_reporting_source(&miner, TEST_REWARD)
+                .await;
+            assert!(
+                ok_vouchable,
+                "control: the identical build over a writable Redis must land its \
+                 snapshot and vouch — otherwise the assertion above is measuring \
+                 something other than the lost write"
+            );
+            assert_eq!(
+                ok_payouts.len(),
+                payouts.len(),
+                "control: the payout list itself must be unaffected by whether \
+                 the snapshot landed"
+            );
+
+            pplns.shutdown();
+            writable_pplns.shutdown();
+            group_solo.shutdown();
+            cleanup(&pg).await;
+        }
+    }
 
     /// The promise this flag carries gates the whole block-found emission, not
     /// just a snapshot lookup: without it nothing is emitted, so the durable

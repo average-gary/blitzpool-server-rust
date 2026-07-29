@@ -110,6 +110,18 @@ fn test_config() -> PplnsEngineConfig {
     }
 }
 
+/// Prospective finder for builds whose subject is not the finder bonus.
+///
+/// [`test_config`] leaves `finder_bonus_sats` at its default `None`, so the
+/// finder is inert here: no bonus output is emitted and the payout list is
+/// the same whoever is named. One fixed address keeps the per-(reward,
+/// finder) cache key stable so the tests that count builds and compare
+/// fingerprints still measure what they mean to. The bonus path itself is
+/// covered by `finder_bonus_ledger_integration.rs`.
+fn any_finder() -> AddressId {
+    AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap()
+}
+
 async fn spawn_or_skip(redis_db: u8, prefix: &str) -> Option<EngineHarness> {
     let (conn, pool) = connect_or_skip(redis_db, prefix).await?;
     let net_diff = NetworkDifficulty::new(1_000_000.0);
@@ -192,7 +204,11 @@ async fn build_distribution_returns_payouts_after_shares() {
         .await
         .unwrap();
 
-    let result = h.engine.build_distribution(312_500_000).await.expect("ok");
+    let result = h
+        .engine
+        .build_distribution(312_500_000, &any_finder())
+        .await
+        .expect("ok");
     assert_eq!(result.block_reward_sats, 312_500_000);
     assert!(!result.payouts.is_empty());
     assert!(result
@@ -220,7 +236,11 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         .record_share(None, &a, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let result = h.engine.build_distribution(312_500_000).await.expect("ok");
+    let result = h
+        .engine
+        .build_distribution(312_500_000, &any_finder())
+        .await
+        .expect("ok");
     let block_height = 9_997_001;
     let outcome = h
         .engine
@@ -281,7 +301,7 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
     const MINED_REWARD: u64 = 312_500_000;
     let mined = h
         .engine
-        .build_distribution(MINED_REWARD)
+        .build_distribution(MINED_REWARD, &any_finder())
         .await
         .expect("mined build ok");
     assert!(
@@ -294,7 +314,7 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
     // shared key today.
     let jdc = h
         .engine
-        .build_distribution(MINED_REWARD - 863)
+        .build_distribution(MINED_REWARD - 863, &any_finder())
         .await
         .expect("jdc build ok");
     assert_ne!(
@@ -542,7 +562,11 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         .record_share(None, TINY, 1.0, 1_700_000_000_002)
         .await
         .unwrap();
-    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h
+        .engine
+        .build_distribution(REWARD, &any_finder())
+        .await
+        .expect("build 1");
     assert!(
         !d1.payouts.iter().any(|p| p.address.as_str() == TINY),
         "sub-threshold miner must NOT get a block-1 coinbase output"
@@ -570,7 +594,11 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         .record_share(None, TINY, 1.0, 1_700_000_060_002)
         .await
         .unwrap();
-    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h
+        .engine
+        .build_distribution(REWARD, &any_finder())
+        .await
+        .expect("build 2");
     assert!(
         d2.payouts.iter().any(|p| p.address.as_str() == TINY),
         "accrued credit must push the tiny miner over min_payout into a block-2 output"
@@ -616,7 +644,11 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .record_share(None, MINER, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h
+        .engine
+        .build_distribution(REWARD, &any_finder())
+        .await
+        .expect("build 1");
     let p1 = h
         .engine
         .prepare_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
@@ -631,7 +663,11 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
-    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h
+        .engine
+        .build_distribution(REWARD, &any_finder())
+        .await
+        .expect("build 2");
     let p2 = h
         .engine
         .prepare_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
@@ -673,7 +709,11 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
         .record_share(None, MINER, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h
+        .engine
+        .build_distribution(REWARD, &any_finder())
+        .await
+        .expect("build 1");
     let p1 = h
         .engine
         .prepare_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
@@ -685,7 +725,11 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
-    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h
+        .engine
+        .build_distribution(REWARD, &any_finder())
+        .await
+        .expect("build 2");
     let p2 = h
         .engine
         .prepare_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
@@ -764,7 +808,10 @@ async fn spawn_core_skips_crons_but_build_distribution_works() {
     );
 
     // The Core's read path still produces a distribution.
-    let result = engine.build_distribution(312_500_000).await.expect("ok");
+    let result = engine
+        .build_distribution(312_500_000, &any_finder())
+        .await
+        .expect("ok");
     assert_eq!(result.block_reward_sats, 312_500_000);
     assert!(!result.payouts.is_empty());
     assert!(result
@@ -804,7 +851,11 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
     const REWARD: u64 = 312_500_000;
     // A perfectly good shared snapshot for exactly this reward exists — so a
     // fallback would succeed and pass the reward check.
-    let _ = h.engine.build_distribution(REWARD).await.expect("build ok");
+    let _ = h
+        .engine
+        .build_distribution(REWARD, &any_finder())
+        .await
+        .expect("build ok");
 
     let never_written = [0x5au8; 32];
     let err = h
@@ -848,7 +899,11 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
         .unwrap();
 
     const REWARD: u64 = 312_500_000;
-    let dist = h.engine.build_distribution(REWARD).await.expect("build ok");
+    let dist = h
+        .engine
+        .build_distribution(REWARD, &any_finder())
+        .await
+        .expect("build ok");
     let fp = dist.payouts_fingerprint;
     let height = 9_997_301;
 
@@ -931,10 +986,14 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         .unwrap();
 
     // Two blocks in flight, BOTH frozen against the same (empty) ledger.
-    let dist_first = h.engine.build_distribution(REWARD_FIRST).await.expect("ok");
+    let dist_first = h
+        .engine
+        .build_distribution(REWARD_FIRST, &any_finder())
+        .await
+        .expect("ok");
     let dist_second = h
         .engine
-        .build_distribution(REWARD_SECOND)
+        .build_distribution(REWARD_SECOND, &any_finder())
         .await
         .expect("ok");
     let fp_second = dist_second.payouts_fingerprint;

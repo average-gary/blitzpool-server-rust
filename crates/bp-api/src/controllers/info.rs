@@ -497,7 +497,10 @@ where
                         }
                     }
                     "pplns" => match s.pplns.as_ref() {
-                        Some(engine) => match engine.build_distribution(reward_sats).await {
+                        // Same prospective finder the template path would use
+                        // for this address, so the preview shows the list this
+                        // client would actually mine — bonus output included.
+                        Some(engine) => match engine.build_distribution(reward_sats, &addr).await {
                             Ok(dist) => dist
                                 .payouts
                                 .iter()
