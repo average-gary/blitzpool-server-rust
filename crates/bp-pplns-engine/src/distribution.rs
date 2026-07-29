@@ -229,6 +229,14 @@ impl DistributionBuilder {
         self.inputs_loads.load(Ordering::Relaxed)
     }
 
+    /// Cached-plus-in-flight distribution count. One entry per distinct
+    /// `(reward, finder)` pair since the last invalidation, so with a bonus
+    /// configured this tracks the number of connections served this
+    /// template — the footprint the scale sweep measures.
+    pub fn cache_entries(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Build the current PPLNS distribution for `block_reward_sats`,
     /// treating `finder_address` as the miner who would find a block on
     /// this list. Concurrent callers for the same pair share one compute;
