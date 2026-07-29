@@ -582,6 +582,15 @@ pub struct PplnsConfig {
     /// pending credit in the signed ledger. Always clamped upward
     /// to `DUST_LIMIT_SATS` (546) by the engine.
     pub min_payout_sats: i64,
+    /// Flat per-block bonus, in sats, paid as its own coinbase output to
+    /// whoever finds the block — on top of their ordinary proportional
+    /// share. **Absent** ⇒ no bonus, the historical behaviour. The bonus
+    /// is carved out of the reward *before* the proportional split, so
+    /// every other miner's payout shrinks by the same amount regardless
+    /// of who finds the block. Rejected at spawn if `0` (omit the key to
+    /// disable) or above `MAX_FINDER_BONUS_SATS`.
+    #[serde(default)]
+    pub finder_bonus_sats: Option<u64>,
     /// Enable the daily 03:00 UTC PPLNS dust-sweep cron (pair-cancels
     /// abandoned positive credit against abandoned debit on
     /// `pplns_balance`). Manual sweeps via admin trigger still work
@@ -1284,6 +1293,64 @@ mod tests {
         let c: PplnsConfig = toml::from_str(text).expect("parses");
         assert!(!c.dust_sweep_enabled);
         assert_eq!(c.abandoned_balance_days, 45);
+    }
+
+    /// A `[pplns]` body with every required key and nothing optional, for
+    /// the finder-bonus round-trip cases. `{extra}` is appended verbatim.
+    fn pplns_toml(extra: &str) -> String {
+        format!(
+            r#"
+            port = 3340
+            high_diff_port = 3349
+            start_difficulty = 1000
+            target_shares_per_minute = 6
+            fee_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+            fee_percent = 1.5
+            coinbase_weight_budget = 50000
+            min_difficulty = 500
+            warmup_shares = 5
+            min_payout_sats = 5000
+            {extra}
+        "#
+        )
+    }
+
+    /// Absent ⇒ `None` ⇒ no bonus output. Every config predating the key
+    /// keeps working unchanged, which is the point of `#[serde(default)]`.
+    #[test]
+    fn pplns_finder_bonus_absent_is_none() {
+        let c: PplnsConfig = toml::from_str(&pplns_toml("")).expect("parses without the key");
+        assert_eq!(c.finder_bonus_sats, None);
+    }
+
+    #[test]
+    fn pplns_finder_bonus_parses_from_toml() {
+        let c: PplnsConfig =
+            toml::from_str(&pplns_toml("finder_bonus_sats = 17760000")).expect("parses");
+        assert_eq!(c.finder_bonus_sats, Some(17_760_000));
+    }
+
+    /// `0` parses here — rejecting it is `PplnsEngineConfig::try_new`'s
+    /// job, where the rest of the `[pplns]` range checks live. This pins
+    /// the division of labour so nobody "fixes" it in both places.
+    #[test]
+    fn pplns_finder_bonus_zero_parses_and_defers_to_engine_validation() {
+        let c: PplnsConfig = toml::from_str(&pplns_toml("finder_bonus_sats = 0")).expect("parses");
+        assert_eq!(c.finder_bonus_sats, Some(0));
+    }
+
+    /// Well past `MAX_FINDER_BONUS_SATS`, also deferred to the engine —
+    /// but a NEGATIVE value must fail here, since the field is `u64`.
+    #[test]
+    fn pplns_finder_bonus_over_ceiling_parses_but_negative_does_not() {
+        let c: PplnsConfig =
+            toml::from_str(&pplns_toml("finder_bonus_sats = 500000000")).expect("parses");
+        assert_eq!(c.finder_bonus_sats, Some(500_000_000));
+
+        assert!(
+            toml::from_str::<PplnsConfig>(&pplns_toml("finder_bonus_sats = -1")).is_err(),
+            "a negative bonus must not even parse — the field is unsigned"
+        );
     }
 
     #[test]

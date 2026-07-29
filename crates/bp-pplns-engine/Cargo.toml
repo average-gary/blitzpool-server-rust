@@ -14,6 +14,10 @@ workspace = true
 # Internal — pure math + domain types
 bp-common = { workspace = true }
 bp-pplns = { workspace = true }
+# `MAX_FINDER_BONUS_SATS` — the finder-bonus ceiling, shared with the
+# Group-Solo path so both modes reject the same absurd configs. A leaf
+# crate of pure domain constants + validators.
+bp-group-mgmt = { workspace = true }
 bp-db = { workspace = true }
 # Shared snapshot persistence + ledger row-type primitives (also used
 # by bp-group-solo-engine — one source of truth for the wire formats).

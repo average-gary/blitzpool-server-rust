@@ -451,6 +451,7 @@ mod tests {
                 min_difficulty: 1024,
                 warmup_shares: 5,
                 min_payout_sats: 100_000,
+                finder_bonus_sats: None,
                 dust_sweep_enabled: true,
                 abandoned_balance_days: 90,
                 confirmation_depth: 3,

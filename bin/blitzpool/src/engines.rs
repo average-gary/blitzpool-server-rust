@@ -258,6 +258,13 @@ fn to_pplns_engine_config(cfg: &TomlPplnsConfig) -> Result<PplnsEngineConfig, En
         fee_percent: cfg.fee_percent,
         min_payout_sats: Sats(cfg.min_payout_sats),
         coinbase_weight_budget: cfg.coinbase_weight_budget,
+        // `u64` in the toml so a negative can't be written at all; the
+        // engine's range check rejects 0 and the absurd upper end.
+        // Saturating rather than wrapping so a past-`i64::MAX` value is
+        // reported against the ceiling instead of as a negative.
+        finder_bonus_sats: cfg
+            .finder_bonus_sats
+            .map(|s| Sats(i64::try_from(s).unwrap_or(i64::MAX))),
         min_difficulty: cfg.min_difficulty,
         warmup_shares: cfg.warmup_shares,
         dust_sweep_enabled: cfg.dust_sweep_enabled,

@@ -253,6 +253,12 @@ submit_latency = false
 # min_difficulty = 500
 # warmup_shares = 5
 # min_payout_sats = 5000
+# Flat bonus, in sats, paid to whoever finds the block as its own coinbase
+# output — on top of their normal proportional share. Leave the key out for no
+# bonus (the default). It is carved out of the reward BEFORE the proportional
+# split, so every other miner's payout shrinks by the same amount no matter who
+# wins. 17760000 = 0.1776 BTC.
+# finder_bonus_sats = 17760000
 # Shares per count-bucket for the sliding window (default 10000). The window
 # is stored as per-address buckets of this many shares instead of one entry
 # per share; bigger = less Redis memory + coarser trim, smaller = more memory

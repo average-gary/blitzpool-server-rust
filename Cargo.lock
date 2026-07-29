@@ -889,6 +889,7 @@ dependencies = [
  "bp-common",
  "bp-cron-utils",
  "bp-db",
+ "bp-group-mgmt",
  "bp-inflight-cache",
  "bp-mining-job",
  "bp-pplns",

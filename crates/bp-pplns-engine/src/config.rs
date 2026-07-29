@@ -13,6 +13,7 @@
 //! `SessionState` per the 2026-05-16 decision) and not duplicated here.
 
 use bp_common::{AddressId, Sats};
+use bp_group_mgmt::MAX_FINDER_BONUS_SATS;
 use bp_pplns::{
     validate_fee_payout_budget, FeePayoutBudgetError, DEFAULT_COINBASE_WEIGHT_BUDGET,
     DEFAULT_MIN_PAYOUT_SATS,
@@ -44,6 +45,19 @@ pub struct PplnsEngineConfig {
     /// `blockreservedweight`. Default 50_000 (≈400 P2WPKH outputs).
     /// Env var: `PPLNS_COINBASE_WEIGHT_BUDGET`.
     pub coinbase_weight_budget: u32,
+
+    /// Flat per-block bonus paid to the block's finder as a dedicated
+    /// coinbase output, on top of their proportional share. `None` ⇒ no
+    /// bonus output (the historical behaviour). Carved out of the reward
+    /// *before* the proportional split, so the haircut is identical for
+    /// every non-finder no matter who wins. Toml key:
+    /// `[pplns] finder_bonus_sats`.
+    ///
+    /// Rejected by [`PplnsEngineConfig::try_new`] at `0` — `None` is how
+    /// the feature is turned off, and a literal `0` in the toml more
+    /// likely means "I meant to set this" than "disable" — and above
+    /// [`MAX_FINDER_BONUS_SATS`].
+    pub finder_bonus_sats: Option<Sats>,
 
     /// Sliding-window size factor: `window_size = factor *
     /// network_difficulty`. Defaults to `4` (no env override).
@@ -112,6 +126,7 @@ impl Default for PplnsEngineConfig {
             fee_percent: 0.0,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
+            finder_bonus_sats: None,
             window_factor: 4.0,
             snapshot_ttl_secs: 1_200,
             trim_batch_size: 100,
@@ -138,6 +153,18 @@ impl PplnsEngineConfig {
             self.min_payout_sats.0,
             self.coinbase_weight_budget,
         )?;
+        // `None` is how the bonus is disabled, so any value that IS set
+        // has to be payable: `0` would be an inert output, and past the
+        // shared ceiling it is a config typo rather than an intent.
+        if let Some(bonus) = self.finder_bonus_sats {
+            let value = bonus.to_i64();
+            if !(1..=MAX_FINDER_BONUS_SATS).contains(&value) {
+                return Err(ConfigError::FinderBonusOutOfRange {
+                    value,
+                    max: MAX_FINDER_BONUS_SATS,
+                });
+            }
+        }
         if !self.window_factor.is_finite() || self.window_factor <= 0.0 {
             return Err(ConfigError::InvalidWindowFactor {
                 value: self.window_factor,
@@ -187,6 +214,8 @@ pub enum ConfigError {
     MinPayoutBelowDustLimit { value: i64, dust: u64 },
     #[error("coinbase_weight_budget must be > {min} (base + safety margin), got {value}")]
     WeightBudgetTooLow { value: u32, min: u32 },
+    #[error("finder_bonus_sats must be in [1, {max}] sats (omit the key to disable), got {value}")]
+    FinderBonusOutOfRange { value: i64, max: i64 },
     #[error("window_factor must be > 0.0 and finite, got {value}")]
     InvalidWindowFactor { value: f64 },
     #[error("{field} must be > 0, got 0")]
@@ -290,6 +319,78 @@ mod tests {
         };
         let err = cfg.try_new().unwrap_err();
         assert!(matches!(err, ConfigError::WeightBudgetTooLow { .. }));
+    }
+
+    /// Absent is the default and the off switch — it must validate.
+    #[test]
+    fn finder_bonus_absent_accepts() {
+        let cfg = PplnsEngineConfig::default();
+        assert!(cfg.finder_bonus_sats.is_none());
+        cfg.try_new().expect("no bonus configured is valid");
+    }
+
+    #[test]
+    fn finder_bonus_valid_accepts() {
+        let cfg = PplnsEngineConfig {
+            finder_bonus_sats: Some(Sats(17_760_000)),
+            ..PplnsEngineConfig::default()
+        };
+        let validated = cfg.try_new().expect("0.1776 BTC is a valid bonus");
+        assert_eq!(validated.finder_bonus_sats, Some(Sats(17_760_000)));
+    }
+
+    /// A literal `0` is more likely a half-finished edit than an intent to
+    /// disable — `None` already means off, so `0` is an error rather than
+    /// a silently inert output.
+    #[test]
+    fn finder_bonus_zero_rejects() {
+        let cfg = PplnsEngineConfig {
+            finder_bonus_sats: Some(Sats(0)),
+            ..PplnsEngineConfig::default()
+        };
+        assert_eq!(
+            cfg.try_new().unwrap_err(),
+            ConfigError::FinderBonusOutOfRange {
+                value: 0,
+                max: MAX_FINDER_BONUS_SATS,
+            }
+        );
+    }
+
+    #[test]
+    fn finder_bonus_negative_rejects() {
+        let cfg = PplnsEngineConfig {
+            finder_bonus_sats: Some(Sats(-1)),
+            ..PplnsEngineConfig::default()
+        };
+        assert!(matches!(
+            cfg.try_new().unwrap_err(),
+            ConfigError::FinderBonusOutOfRange { value: -1, .. }
+        ));
+    }
+
+    #[test]
+    fn finder_bonus_at_ceiling_accepts() {
+        let cfg = PplnsEngineConfig {
+            finder_bonus_sats: Some(Sats(MAX_FINDER_BONUS_SATS)),
+            ..PplnsEngineConfig::default()
+        };
+        cfg.try_new().expect("the ceiling itself is allowed");
+    }
+
+    #[test]
+    fn finder_bonus_above_ceiling_rejects() {
+        let cfg = PplnsEngineConfig {
+            finder_bonus_sats: Some(Sats(MAX_FINDER_BONUS_SATS + 1)),
+            ..PplnsEngineConfig::default()
+        };
+        assert_eq!(
+            cfg.try_new().unwrap_err(),
+            ConfigError::FinderBonusOutOfRange {
+                value: MAX_FINDER_BONUS_SATS + 1,
+                max: MAX_FINDER_BONUS_SATS,
+            }
+        );
     }
 
     #[test]
