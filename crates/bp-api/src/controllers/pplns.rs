@@ -359,6 +359,19 @@ struct FeesResponse {
     max_miner_outputs_adaptive: u32,
     min_difficulty: u64,
     warmup_shares: u32,
+    /// Configured `[pplns] finder_bonus_sats`; `null` when the operator
+    /// left the key out. Deliberately the *configured* value and not a
+    /// per-block effective one: `bp-pplns::distribution` clamps it to
+    /// `min(bonus, floor(0.95 × reward_after_fee))` and drops the output
+    /// entirely below `min_payout_sats`. Both need the block reward this
+    /// endpoint does not fetch — and note it is `coinbasevalue` (subsidy
+    /// PLUS tx fees) that the clamp divides, not the subsidy, so the
+    /// cheap `block_subsidy_sats` helper would understate the cap rather
+    /// than improve on it. This response is also cached
+    /// (`TtlKind::PplnsFees`), so an "effective" number computed here
+    /// would be served stale. The client already has `min_payout_sats`
+    /// in this same body and can apply the clamp itself.
+    finder_bonus_sats: Option<i64>,
 }
 
 async fn fees<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
@@ -416,6 +429,9 @@ where
                     max_miner_outputs_adaptive,
                     min_difficulty: raw_cfg.min_difficulty,
                     warmup_shares: raw_cfg.warmup_shares,
+                    // `to_i64()` rather than `.0` to match the per-group
+                    // finder bonus in `groups.rs`, the closest analogue.
+                    finder_bonus_sats: raw_cfg.finder_bonus_sats.map(|s| s.to_i64()),
                 })
             },
         )
@@ -688,5 +704,50 @@ mod tests {
         let created_at = v["createdAt"].as_str().unwrap();
         assert!(created_at.contains('T'), "should be ISO-8601");
         assert!(created_at.ends_with('Z'), "should be UTC");
+    }
+
+    fn fees_response(finder_bonus_sats: Option<i64>) -> FeesResponse {
+        FeesResponse {
+            fee_percent: 1.5,
+            fee_address: Some("bc1qfee".into()),
+            coinbase_weight_budget: 50_000,
+            group_fee_percent: 1.5,
+            group_fee_address: Some("bc1qgroupfee".into()),
+            dust_limit_sats: 546,
+            min_payout_sats: 5000,
+            coinbase_base_weight: 200,
+            coinbase_output_weight: 172,
+            coinbase_witness_commitment_weight: 160,
+            max_miner_outputs: 288,
+            max_miner_outputs_adaptive: 288,
+            min_difficulty: 1000,
+            warmup_shares: 10,
+            finder_bonus_sats,
+        }
+    }
+
+    #[test]
+    fn fees_response_publishes_configured_finder_bonus() {
+        // Regression: the pool-wide `[pplns] finder_bonus_sats` carve-out was
+        // toml-only, so the UI's projected-reward math overstated every
+        // per-worker figure by the whole bonus.
+        let v: Value = serde_json::to_value(fees_response(Some(17_760_000))).unwrap();
+        assert_eq!(v["finderBonusSats"], 17_760_000);
+        // Configured, not effective — the 95 % clamp needs the block reward,
+        // which this endpoint does not have.
+        assert_eq!(v["minPayoutSats"], 5000);
+    }
+
+    #[test]
+    fn fees_response_finder_bonus_is_null_when_unconfigured() {
+        // Null rather than omitted, matching the sibling `Option` fields
+        // (`feeAddress`, `groupFeeAddress`) which carry no
+        // `skip_serializing_if`.
+        let v: Value = serde_json::to_value(fees_response(None)).unwrap();
+        assert!(
+            v.get("finderBonusSats").is_some(),
+            "key stays present so the client can tell 'unset' from 'old server'"
+        );
+        assert!(v["finderBonusSats"].is_null());
     }
 }
