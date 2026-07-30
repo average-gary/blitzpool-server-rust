@@ -829,7 +829,11 @@ impl PplnsEngine {
 /// Insertion order is preserved so the rows are deterministic; the
 /// surviving entry for a merged address takes the position of its first
 /// output.
-fn merge_distribution_by_address(
+///
+/// Public because `bp-api`'s `/api/client/:address/block-template`
+/// preview needs the same one-entry-per-address shape for the same
+/// keys-on-address reason — see the call site there for what that costs.
+pub fn merge_distribution_by_address(
     distribution: &[CoinbaseDistributionEntry],
 ) -> Vec<CoinbaseDistributionEntry> {
     let mut merged: Vec<CoinbaseDistributionEntry> = Vec::with_capacity(distribution.len());

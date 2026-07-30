@@ -16,6 +16,7 @@ use bp_db::{
     find_pool_mode_hashrate_since, find_user_agents,
 };
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
+use bp_pplns_engine::{engine::merge_distribution_by_address, CoinbaseDistributionEntry};
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -374,6 +375,66 @@ struct PayoutInfoEntry {
     sats: u64,
 }
 
+/// Map a distribution to the wire shape, output for output. Every mode's
+/// arm below funnels through this so the coinbase-order → JSON-order
+/// correspondence is defined in exactly one place.
+fn to_payout_info(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutInfoEntry> {
+    entries
+        .iter()
+        .map(|p| PayoutInfoEntry {
+            address: p.address.as_str().to_string(),
+            percent: p.percent,
+            sats: p.sats.0 as u64,
+        })
+        .collect()
+}
+
+/// The two views of one distribution, because they are not always the same
+/// list: `payoutInformation` is folded to one entry per address on the
+/// `pplns` arm, while `blockHex` / `coinbaseTxHex` must keep one entry per
+/// real coinbase output.
+///
+/// Kept as a pair (rather than folding in place) so the split is named
+/// rather than remembered — feeding the folded list to the coinbase
+/// builder yields a different tx size, coinbase txid and merkle root, i.e.
+/// a preview block that could never be mined.
+struct PreviewPayouts {
+    /// What `payoutInformation` ships.
+    wire: Vec<PayoutInfoEntry>,
+    /// Set only when the coinbase view differs from `wire`. `None` means
+    /// the wire list already IS the coinbase, so there is nothing to keep
+    /// a second copy of.
+    coinbase_override: Option<Vec<PayoutInfoEntry>>,
+}
+
+impl PreviewPayouts {
+    /// The wire list and the coinbase agree — every mode except `pplns`.
+    fn identical(wire: Vec<PayoutInfoEntry>) -> Self {
+        Self {
+            wire,
+            coinbase_override: None,
+        }
+    }
+
+    /// Fold the wire view to one entry per address, keeping the unfolded
+    /// distribution for the coinbase. With a finder bonus the distribution
+    /// names the finder twice (dedicated bonus output + proportional
+    /// share); a consumer that keys `payoutInformation` by address would
+    /// keep whichever it read last and under-report them.
+    fn folded_for_wire(dist: &[CoinbaseDistributionEntry]) -> Self {
+        Self {
+            wire: to_payout_info(&merge_distribution_by_address(dist)),
+            coinbase_override: Some(to_payout_info(dist)),
+        }
+    }
+
+    /// The list the coinbase + block hex must be built from. Always one
+    /// entry per real output.
+    fn coinbase(&self) -> &[PayoutInfoEntry] {
+        self.coinbase_override.as_deref().unwrap_or(&self.wire)
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientBlockTemplateResponse {
@@ -454,25 +515,19 @@ where
                     }
                 }
 
-                let payouts: Vec<PayoutInfoEntry> = match mode {
+                let payouts: PreviewPayouts = match mode {
                     "group-solo" => {
                         let gid = group_id.expect("set when mode == group-solo");
                         match s.group_solo.as_ref() {
                             Some(engine) => {
                                 match engine.build_distribution(gid, reward_sats, &addr).await {
-                                    Ok(dist) => dist
-                                        .payouts
-                                        .iter()
-                                        .map(|p| PayoutInfoEntry {
-                                            address: p.address.as_str().to_string(),
-                                            percent: p.percent,
-                                            sats: p.sats.0 as u64,
-                                        })
-                                        .collect(),
-                                    Err(_) => Vec::new(),
+                                    Ok(dist) => {
+                                        PreviewPayouts::identical(to_payout_info(&dist.payouts))
+                                    }
+                                    Err(_) => PreviewPayouts::identical(Vec::new()),
                                 }
                             }
-                            None => Vec::new(),
+                            None => PreviewPayouts::identical(Vec::new()),
                         }
                     }
                     "blockparty" => {
@@ -482,37 +537,28 @@ where
                                 .build_payouts(gid, bp_common::Sats(reward_sats as i64))
                                 .await
                             {
-                                Ok(Some(dist)) => dist
-                                    .payouts
-                                    .iter()
-                                    .map(|p| PayoutInfoEntry {
-                                        address: p.address.as_str().to_string(),
-                                        percent: p.percent,
-                                        sats: p.sats.0 as u64,
-                                    })
-                                    .collect(),
-                                _ => Vec::new(),
+                                Ok(Some(dist)) => {
+                                    PreviewPayouts::identical(to_payout_info(&dist.payouts))
+                                }
+                                _ => PreviewPayouts::identical(Vec::new()),
                             },
-                            None => Vec::new(),
+                            None => PreviewPayouts::identical(Vec::new()),
                         }
                     }
                     "pplns" => match s.pplns.as_ref() {
                         // Same prospective finder the template path would use
                         // for this address, so the preview shows the list this
                         // client would actually mine — bonus output included.
+                        //
+                        // The only arm that folds, and `payoutInformation` only
+                        // — see [`PreviewPayouts::folded_for_wire`]. Cost the
+                        // operator accepted: the array length no longer equals
+                        // the coinbase's output count.
                         Some(engine) => match engine.build_distribution(reward_sats, &addr).await {
-                            Ok(dist) => dist
-                                .payouts
-                                .iter()
-                                .map(|p| PayoutInfoEntry {
-                                    address: p.address.as_str().to_string(),
-                                    percent: p.percent,
-                                    sats: p.sats.0 as u64,
-                                })
-                                .collect(),
-                            Err(_) => Vec::new(),
+                            Ok(dist) => PreviewPayouts::folded_for_wire(&dist.payouts),
+                            Err(_) => PreviewPayouts::identical(Vec::new()),
                         },
-                        None => Vec::new(),
+                        None => PreviewPayouts::identical(Vec::new()),
                     },
                     _ => {
                         // Solo: fee_address (if configured) + miner address. Fee %
@@ -549,7 +595,7 @@ where
                                 sats: reward_sats,
                             });
                         }
-                        entries
+                        PreviewPayouts::identical(entries)
                     }
                 };
 
@@ -557,16 +603,26 @@ where
                 // enough payout info. An empty distribution (e.g. PPLNS window
                 // empty at startup) skips block assembly so the panel still
                 // renders the template + mode tile.
-                let (coinbase_tx_hex, block_hex) = if payouts.is_empty() {
+                //
+                // `coinbase()`, never the wire list: one TxOut per real coinbase
+                // output, so the hex stays byte-comparable with the block that
+                // would land.
+                let coinbase_payouts = payouts.coinbase();
+                let (coinbase_tx_hex, block_hex) = if coinbase_payouts.is_empty() {
                     (String::new(), String::new())
                 } else {
-                    assemble_block_preview(&template, &payouts, s.network, &s.pool_identifier)
-                        .unwrap_or_else(|_| (String::new(), String::new()))
+                    assemble_block_preview(
+                        &template,
+                        coinbase_payouts,
+                        s.network,
+                        &s.pool_identifier,
+                    )
+                    .unwrap_or_else(|_| (String::new(), String::new()))
                 };
                 Ok(ClientBlockTemplateResponse {
                     block_template: template,
                     mode,
-                    payout_information: payouts,
+                    payout_information: payouts.wire,
                     group_id: group_id.map(|g| g.to_string()),
                     block_hex,
                     coinbase_tx_hex,
@@ -1547,5 +1603,214 @@ mod tests {
         for key in REJECT_REASON_KEYS {
             assert_eq!(normalise_reject_reason(key), *key);
         }
+    }
+
+    /// The finder-bonus distribution in coinbase order: fee, the finder's
+    /// dedicated bonus output, another miner, then the finder's own
+    /// proportional share. The finder is named twice — that is the shape
+    /// `entries_to_payouts` turns into a real coinbase, verbatim.
+    fn finder_bonus_distribution() -> Vec<CoinbaseDistributionEntry> {
+        use bp_common::{AddressId, Sats};
+
+        let entry = |address: &str, sats: i64, percent: f64| CoinbaseDistributionEntry {
+            address: AddressId::new(address.to_string()).expect("test address is well-formed"),
+            percent,
+            sats: Sats(sats),
+        };
+        vec![
+            entry(FEE_ADDR, 4_762_500, 1.5),
+            entry(FINDER_ADDR, 17_760_000, 5.594),
+            entry(OTHER_ADDR, 1_474_887, 0.464),
+            entry(FINDER_ADDR, 1_474_887, 0.464),
+        ]
+    }
+
+    // Real mainnet P2WPKH addresses — `assemble_block_preview` runs them
+    // through `address_to_script`, which rejects anything that isn't a
+    // valid bech32 payload.
+    const FINDER_ADDR: &str = "bc1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpyfl4f3";
+    const FEE_ADDR: &str = "bc1qqgpqyqszqgpqyqszqgpqyqszqgpqyqsz4desz8";
+    const OTHER_ADDR: &str = "bc1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcr5ac3gx";
+
+    /// The four outputs above sum to this — `build_payout_outputs`
+    /// reconciles to `coinbasevalue` exactly, so a mismatch would silently
+    /// sweep the shortfall onto output 0 and muddy the assertions below.
+    const BONUS_DIST_TOTAL_SATS: u64 = 4_762_500 + 17_760_000 + 1_474_887 + 1_474_887;
+
+    /// The PPLNS arm of `client_block_template` folds its distribution
+    /// before mapping. Driving the endpoint needs a live bitcoind + a warm
+    /// Redis window, so this pins the seam the handler calls plus the same
+    /// `PayoutInfoEntry` mapping: a finder-bonus distribution names the
+    /// finder twice and `payoutInformation` must still show it once,
+    /// carrying bonus + proportional share.
+    #[test]
+    fn pplns_preview_folds_the_finders_bonus_into_one_entry() {
+        let payouts = finder_bonus_distribution();
+        let folded = PreviewPayouts::folded_for_wire(&payouts).wire;
+
+        let finder_entries: Vec<&PayoutInfoEntry> =
+            folded.iter().filter(|e| e.address == FINDER_ADDR).collect();
+        assert_eq!(
+            finder_entries.len(),
+            1,
+            "finder must appear once so an address-keyed consumer cannot drop an entry"
+        );
+        assert_eq!(
+            finder_entries[0].sats, 19_234_887,
+            "the finder's entry must carry bonus + proportional share"
+        );
+        assert!(
+            (finder_entries[0].percent - 6.058).abs() < 1e-9,
+            "percent must sum too, got {}",
+            finder_entries[0].percent
+        );
+        assert_eq!(folded.len(), 3, "one entry per distinct address");
+        // Folding regroups sats, it must never create or destroy them.
+        assert_eq!(
+            folded.iter().map(|e| e.sats).sum::<u64>(),
+            payouts.iter().map(|p| p.sats.0 as u64).sum::<u64>(),
+        );
+    }
+
+    /// Minimal `getblocktemplate` response — every field
+    /// `assemble_block_preview` reads, and no transactions, so the merkle
+    /// root is the coinbase txid alone.
+    fn preview_template(coinbase_value_sats: u64) -> serde_json::Value {
+        serde_json::json!({
+            "height": 870_000,
+            "coinbasevalue": coinbase_value_sats,
+            // OP_RETURN OP_PUSHBYTES_36 || magic || 32-byte commitment.
+            "default_witness_commitment":
+                "6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000",
+            "version": 0x2000_0000i64,
+            "previousblockhash":
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            "bits": "170355f0",
+            "curtime": 1_700_000_000,
+            "transactions": [],
+        })
+    }
+
+    /// Count the coinbase's spendable (non-OP_RETURN) outputs by decoding
+    /// the hex the endpoint would actually ship.
+    fn coinbase_payout_output_count(coinbase_tx_hex: &str) -> usize {
+        use bitcoin::{consensus, Transaction};
+
+        let raw = hex::decode(coinbase_tx_hex).expect("coinbase hex decodes");
+        let tx: Transaction = consensus::deserialize(&raw).expect("coinbase deserializes");
+        tx.output
+            .iter()
+            .filter(|o| !o.script_pubkey.is_op_return())
+            .count()
+    }
+
+    /// `blockHex` / `coinbaseTxHex` are built from the UNFOLDED list while
+    /// `payoutInformation` is folded — the two consumers of the PPLNS arm's
+    /// distribution disagree on purpose. Folding the coinbase side changes
+    /// the tx size, the coinbase txid and the merkle root, making the
+    /// preview a block that could never be mined.
+    ///
+    /// This asserts through `PreviewPayouts::coinbase()` — the same accessor
+    /// the handler feeds to `assemble_block_preview` — and decodes the
+    /// emitted hex, so it fails if the folded list is ever what the coinbase
+    /// is built from.
+    #[test]
+    fn coinbase_preview_keeps_the_finders_two_outputs_while_wire_list_folds() {
+        let dist = finder_bonus_distribution();
+        let template = preview_template(BONUS_DIST_TOTAL_SATS);
+        let payouts = PreviewPayouts::folded_for_wire(&dist);
+
+        assert_eq!(
+            payouts.coinbase().len(),
+            4,
+            "the coinbase view keeps one entry per real TxOut"
+        );
+        assert_eq!(
+            payouts.wire.len(),
+            3,
+            "the wire view folds to one per address"
+        );
+        assert_eq!(
+            payouts
+                .coinbase()
+                .iter()
+                .filter(|e| e.address == FINDER_ADDR)
+                .count(),
+            2,
+            "bonus + proportional share stay separate coinbase outputs"
+        );
+
+        let (coinbase_hex, block_hex) = assemble_block_preview(
+            &template,
+            payouts.coinbase(),
+            bitcoin::Network::Bitcoin,
+            "blitzpool",
+        )
+        .expect("preview assembles");
+
+        assert_eq!(
+            coinbase_payout_output_count(&coinbase_hex),
+            4,
+            "the shipped coinbase must carry the finder's bonus and share as \
+             SEPARATE outputs — the resolver places entries verbatim"
+        );
+
+        // Prove the folded list would have produced a DIFFERENT block, which
+        // is exactly why it must never reach the builder.
+        let (folded_hex, folded_block) = assemble_block_preview(
+            &template,
+            &payouts.wire,
+            bitcoin::Network::Bitcoin,
+            "blitzpool",
+        )
+        .expect("folded list also assembles — that is the trap");
+        assert_eq!(
+            coinbase_payout_output_count(&folded_hex),
+            3,
+            "sanity: folding really does drop an output"
+        );
+        assert_ne!(
+            coinbase_hex, folded_hex,
+            "the two differ in bytes; the endpoint ships the unfolded one"
+        );
+        assert_ne!(
+            block_hex, folded_block,
+            "different coinbase txid ⇒ different merkle root ⇒ different block"
+        );
+
+        // Both views still pay the same total — only the grouping differs.
+        assert_eq!(
+            payouts.coinbase().iter().map(|e| e.sats).sum::<u64>(),
+            payouts.wire.iter().map(|e| e.sats).sum::<u64>(),
+        );
+    }
+
+    /// Every non-`pplns` arm builds its wire list and its coinbase from the
+    /// same entries, so `coinbase()` must hand back exactly that list — no
+    /// silent fold, no second copy to drift out of sync.
+    #[test]
+    fn non_pplns_modes_share_one_list_for_wire_and_coinbase() {
+        let dist = finder_bonus_distribution();
+        // A duplicate-address distribution is the adversarial input: if
+        // `identical` ever folded, this is where it would show.
+        let payouts = PreviewPayouts::identical(to_payout_info(&dist));
+
+        assert_eq!(payouts.coinbase().len(), 4);
+        assert_eq!(payouts.wire.len(), 4);
+        let shape: Vec<(&str, u64)> = payouts
+            .coinbase()
+            .iter()
+            .map(|e| (e.address.as_str(), e.sats))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (FEE_ADDR, 4_762_500),
+                (FINDER_ADDR, 17_760_000),
+                (OTHER_ADDR, 1_474_887),
+                (FINDER_ADDR, 1_474_887),
+            ],
+            "order and per-output amounts pass through untouched"
+        );
     }
 }

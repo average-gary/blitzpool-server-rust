@@ -61,8 +61,11 @@ pub use bp_inflight_cache as inflight;
 // Re-export the coinbase-weight constants + dust floor so consumers
 // (bp-api in particular) can render them on the /api/pplns/fees
 // endpoint without taking a direct dep on the underlying bp-pplns
-// crate.
+// crate. `CoinbaseDistributionEntry` rides along for the same reason:
+// it is already the payload of `distribution::DistributionResult` and
+// the argument of `engine::merge_distribution_by_address`, so a
+// consumer of either needs to be able to name it.
 pub use bp_pplns::{
-    max_coinbase_outputs, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
+    max_coinbase_outputs, CoinbaseDistributionEntry, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
     COINBASE_WITNESS_COMMITMENT_WEIGHT, DUST_LIMIT_SATS,
 };
