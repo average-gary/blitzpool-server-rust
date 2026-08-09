@@ -189,11 +189,41 @@ pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 /// (the whole point of the extension).
 pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 
-/// `invalid-job-param-value-coinbase_tx_outputs` — the
-/// `SetCustomMiningJob.coinbase_tx_outputs` doesn't carry one of the pool's
-/// committed ext-0x0003 payout outputs (missing / modified / reduced /
-/// under-counted vs a duplicate), or didn't parse. The mined coinbase MUST
-/// carry the committed set (spec §4); passed in via `payout_set`.
+/// `invalid-nbits` — a custom job **on the pool's own tip** whose `n_bits` is
+/// not the difficulty the pool last served that channel.
+///
+/// `n_bits` is consensus: every miner on a tip agrees on it, so a conformant
+/// JDC on our tip always matches. A job that does not cannot produce a valid
+/// block.
+///
+/// It has to be REJECTED rather than merely served, because the pool derives
+/// the job's block-candidate threshold from it
+/// (`network_difficulty_from_n_bits`). Taken on trust, a JDC declaring a
+/// trivial `n_bits` makes every ordinary share look like a found block — and
+/// since the mining side now records a block found on a custom job, that is a
+/// phantom `blocks_entity` row and a "block found" notification per share.
+///
+/// **Only on our tip.** `n_bits` moves with the tip at a difficulty retarget,
+/// so a mismatch across a tip change is the ordinary stale race and gets
+/// [`ERR_STALE_CHAIN_TIP`] — the one verdict an SRI jd-client survives. See
+/// `handle_set_custom_mining_job`.
+///
+/// The standard code from `mining_sv2`. The reference JDS answers an nbits
+/// mismatch with it too, but against a different operand — the client's OWN
+/// `DeclareMiningJob`, checked after `prev_hash` — so it never has to make
+/// this distinction and is no guide to when the code applies here.
+pub const ERR_INVALID_NBITS: &str = "invalid-nbits";
+
+/// `invalid-job-param-value-coinbase_tx_outputs` — the mined coinbase does
+/// not pay what the pool is owed, or did not parse.
+///
+/// Both payout regimes end here, because the JDC's remedy is the same in
+/// each: rebuild the coinbase from what the pool sent.
+/// - ext 0x0003: the outputs violate the §4 recompute against the
+///   referenced distribution (missing / modified / reordered).
+/// - base protocol: the outputs do not allocate sats to the §6.4.3
+///   designated pool payout output, which that section tells JDS and Pool
+///   to reject.
 pub const ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS: &str =
     "invalid-job-param-value-coinbase_tx_outputs";
 
@@ -2230,6 +2260,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     network_difficulty: template.network_difficulty,
                     coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
                     template_id: Some(template.template_id),
+                    jdp_claims_the_block: false,
                     created_at: now_ms,
                     retired_at: None,
                 };
@@ -2293,6 +2324,7 @@ pub fn apply_template_broadcast<C: Clock>(
             network_difficulty: template.network_difficulty,
             coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
             template_id: Some(template.template_id),
+            jdp_claims_the_block: false,
             created_at: now_ms,
             retired_at: None,
         };
@@ -2516,13 +2548,24 @@ pub struct SetCustomMiningJobInput {
 /// `stale-chain-tip`, the retryable stale-race classification) — and the
 /// declaration binding of [`crate::jdp::custom_job_binding`].
 ///
-/// **Fail-closed token check**: a token that resolves to neither a bridge
-/// entry nor a payout distribution is unknown (never declared here, expired,
-/// or evicted with its JDP session) → `invalid-mining-job-token`. This
-/// deliberately leaves base-protocol Coinbase-only custom jobs unsupported:
-/// without a declared job or a published distribution, a non-custodial pool
-/// has nothing to validate the coinbase against, and accepting would let
-/// arbitrary self-built jobs feed the share pipeline.
+/// **Fail-closed token check**: the token must resolve to something the
+/// coinbase can be judged against — a declared job (Full-Template), a
+/// referenced distribution (ext 0x0003), or a base-protocol allocation
+/// carrying the §6.4.3 designated payout output (Coinbase-only, passed as
+/// `allocation`). None of the three → unknown / expired / evicted with its
+/// JDP session → `invalid-mining-job-token`. Accepting an unresolvable
+/// token would let an arbitrary self-built coinbase feed the share
+/// pipeline.
+///
+/// **Base-protocol Coinbase-only** (`allocation`, no declaration and no
+/// distribution): §6.3.1 says `DeclareMiningJob` is never used in that
+/// mode, so the allocate is the pool's only record of the token. The job is
+/// held to what §6.4.3 actually requires — the coinbase allocates sats to
+/// the designated payout output — and to the token's own miner address.
+/// Order and extra outputs are the JDC's to choose, so this is a search and
+/// not a byte compare; [`crate::jdp::dynamic_outputs::pays_designated_output`]
+/// carries the reasoning. The Solo gate below then confines the path to the
+/// one stream where a self-chosen split cannot take from anyone else.
 ///
 /// **ext 0x0003 payout validation**: the IO layer resolves the job's
 /// distribution reference — the §6 TLV on this frame (Coinbase-only) or the
@@ -2543,10 +2586,12 @@ pub struct SetCustomMiningJobInput {
 /// - Channel kind ≠ Extended → `invalid-job-id` (Standard channels
 ///   don't carry an extranonce slot — custom jobs are
 ///   Extended-only).
-/// - Token unknown (no bridge entry AND no distribution reference) →
-///   `invalid-mining-job-token`.
-/// - Bridge miner-address mismatch →
+/// - Token unknown (no bridge entry, no allocation AND no distribution
+///   reference) → `invalid-mining-job-token`.
+/// - Bridge or allocation miner-address mismatch →
 ///   `invalid-job-param-value-token-mismatch`.
+/// - Base-protocol coinbase that skips the designated payout output →
+///   `invalid-job-param-value-coinbase_tx_outputs`.
 /// - Bridge declared-tip mismatch → `stale-chain-tip`.
 /// - No distribution reference on the frame AND none on the declaration +
 ///   non-Solo stream → `custom-jobs-require-solo` (base custom jobs must not
@@ -2560,6 +2605,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     state: &mut MiningSessionState<C>,
     input: &SetCustomMiningJobInput,
     bridge_job: Option<&crate::bridge::BridgeJobRef>,
+    allocation: Option<&crate::bridge::AllocatedTokenRef>,
     distribution: Option<&crate::bridge::DistributionAcceptance>,
     now_ms: u64,
 ) -> HandlerOutcome {
@@ -2581,13 +2627,72 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // Read before the borrow ends — the declaration binding below needs it,
     // and the assembly further down uses the same number.
     let full_extranonce_size = channel.full_extranonce_size();
+    // The tip the pool last built work on for this channel. A declared job
+    // binds to the tip its DECLARATION was accepted under; a Coinbase-only
+    // job has no declaration, so this is the only tip it can be held to.
+    let channel_prev_hash = channel.latest_extended_prev_hash;
+    // The difficulty the pool last served this channel. Read here for the
+    // same reason as the tip: the borrow ends below.
+    let channel_n_bits = channel.latest_extended_n_bits;
+
+    // The job's `n_bits` must be the one the pool is working on. This is NOT
+    // a per-regime rule and must not move into one of the blocks below: the
+    // pool derives this job's block-candidate threshold from the number
+    // (`network_difficulty_from_n_bits`, further down), so on trust a JDC
+    // declaring a trivial `n_bits` turns every ordinary share into a "block
+    // found" — a phantom `blocks_entity` row and a notification per share,
+    // now that the mining side records blocks found on custom jobs.
+    //
+    // `n_bits` is consensus, so on ONE tip every miner has the same one and a
+    // mismatch is the client's fault. Across two tips it is not: `n_bits`
+    // moves with the tip at a retarget, so a job built on a tip we have not
+    // reached yet — or one we have already left — disagrees for a reason that
+    // says nothing about the client. Which is why the tip decides the verdict
+    // and not just the number.
+    //
+    // `stale-chain-tip` is the retryable classification an SRI jd-client
+    // treats as benign; EVERY other `SetCustomMiningJobError` sends it into
+    // its fallback, off this pool and into solo mining
+    // (`channel_manager/upstream_message_handler.rs`, sv2-apps v0.7.0). The
+    // reference JDS never faces the question because it compares `n_bits`
+    // against the client's OWN declaration and checks `prev_hash` first; we
+    // compare against the pool's chain view, so the classification is ours to
+    // get right. Answering `invalid-nbits` here cost a conformant JDC its
+    // pool at every difficulty retarget its node saw before ours did.
+    //
+    // Rejecting either way is deliberate: a job we cannot pin a threshold to
+    // must not register. `latest_extended_n_bits` and
+    // `latest_extended_prev_hash` are written by the same `is_new_block`
+    // branch of `apply_template_broadcast`, so both are `None` together —
+    // before the pool has served this channel any extended job, and only
+    // then.
+    if let (Some(expected), Some(tip)) = (channel_n_bits, channel_prev_hash) {
+        if input.n_bits != expected {
+            let on_our_tip = input.prev_hash == tip;
+            tracing::warn!(
+                channel_id = input.channel_id,
+                job_n_bits = input.n_bits,
+                pool_n_bits = expected,
+                on_our_tip,
+                "sv2: custom job carries an n_bits the pool is not working on — rejecting (its \
+                 block-candidate threshold would come from the client). Off our tip this is the \
+                 ordinary retarget race, not a client fault."
+            );
+            return reject(if on_our_tip {
+                ERR_INVALID_NBITS
+            } else {
+                ERR_STALE_CHAIN_TIP
+            });
+        }
+    }
 
     // Fail-closed token check: the token must resolve to SOMETHING we can
-    // validate against — a declared job (Full-Template) or a referenced
-    // distribution (ext 0x0003, either mode). Neither → unknown/expired/
+    // validate against — a declared job (Full-Template), a referenced
+    // distribution (ext 0x0003, either mode), or a base-protocol allocation
+    // (Coinbase-only, which never declares). None → unknown/expired/
     // evicted token; accepting would register an arbitrary self-built
     // job whose shares feed the pipeline with nothing backing the coinbase.
-    if bridge_job.is_none() && input.distribution_id.is_none() {
+    if bridge_job.is_none() && input.distribution_id.is_none() && allocation.is_none() {
         return reject(ERR_INVALID_MINING_JOB_TOKEN);
     }
 
@@ -2685,12 +2790,61 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         }
     }
 
-    // Solo gate for base-protocol custom jobs: without an ext-0x0003
-    // distribution reference, nothing validates that the self-built
-    // coinbase pays the shared accounting its shares would enter — off
-    // Solo that's freeloading on the PPLNS window / group. With a
-    // distribution reference (validated below) the coinbase is bound to
-    // the published weights, so non-Solo is legitimate.
+    // Base-protocol Coinbase-only (§6.3.1: "the `DeclareMiningJob` message
+    // is never used"). With no declaration and no distribution reference,
+    // the allocate is the pool's only record of this token.
+    //
+    // Keyed on `allocation` rather than on the absence of the other two:
+    // the fail-closed check above already guarantees that a job with
+    // neither a declaration nor a distribution has one, so asking for it
+    // directly says the same thing without a second, unreachable rejection
+    // of the same input. Full-Template does NOT come through here — its
+    // token is never registered as an allocation, precisely so it cannot
+    // skip the declaration.
+    if let Some(allocation) = allocation {
+        // Same guard the declared path applies: one miner must not mine
+        // against another's token.
+        if channel_addr != allocation.miner_address.as_str() {
+            return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+        }
+        // Tip binding, the counterpart to the declared path's: a job built
+        // on a tip the pool has already moved past cannot produce a block,
+        // and without this it would still register and earn its shares
+        // credited hashrate for work that cannot land. `stale-chain-tip` is
+        // the retryable classification — the JDC rebuilds and resubmits.
+        // Unknowable (`None`) before the pool has served this channel any
+        // extended job, exactly as the declared path treats a missing tip.
+        if let Some(tip) = channel_prev_hash {
+            if input.prev_hash != tip {
+                return reject(ERR_STALE_CHAIN_TIP);
+            }
+        }
+        let outputs: Vec<bitcoin::TxOut> =
+            match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
+                Ok(v) => v,
+                Err(_) => return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS),
+            };
+        if !crate::jdp::dynamic_outputs::pays_designated_output(&outputs, &allocation.payout_script)
+        {
+            tracing::warn!(
+                channel_id = input.channel_id,
+                "sv2: base-protocol custom job allocates nothing to the pool's designated \
+                 payout output (§6.4.3) — rejecting"
+            );
+            return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS);
+        }
+    }
+
+    // Solo gate for base-protocol custom jobs: the check above binds the
+    // coinbase to ONE designated output, which is all §6.4.3 gives a pool.
+    // That is enough for Solo, where the designated script is the miner's
+    // own address and a self-chosen split can only shortchange itself. It
+    // is not enough off Solo: a shared window needs every payout slot
+    // pinned, and the base protocol has no way to express more than the one
+    // output — so those shares would enter PPLNS/group accounting behind a
+    // coinbase nobody validated the split of. ext 0x0003 is what expresses
+    // it, and with a distribution reference (validated below) non-Solo is
+    // legitimate.
     if distribution_ref.is_none() && state.stream != StreamKind::Solo {
         return reject(ERR_CUSTOM_JOB_REQUIRES_SOLO);
     }
@@ -2723,6 +2877,14 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // legitimately reference one distribution, and double-paying two
     // distributions at once is structurally impossible under positional
     // equality — so nothing here is consumed.
+    // Settlement identity of the distribution this job's coinbase pays,
+    // filled in by the block below. It is what lets a block found on a
+    // Coinbase-only ext 0x0003 job be BOOKED and not merely recorded: that
+    // mode never declares, so no `PayoutBooking` is ever stamped on the JDP
+    // side and this is the only carrier the fingerprint has. `None` for a
+    // base-protocol job (nothing was published) and for a Solo distribution
+    // (books without a snapshot).
+    let mut settlement_fingerprint: Option<[u8; 32]> = None;
     if distribution_ref.is_some() {
         if input.distribution_id.is_some()
             && !state
@@ -2777,6 +2939,9 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         {
             return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
         }
+        // Only now, past §7.1 — a fingerprint stamped before the recompute
+        // would name a distribution this coinbase was never proven to pay.
+        settlement_fingerprint = entry.payouts_fingerprint;
     }
 
     // Re-borrow channel mutably (the bridge cross-check above used
@@ -2822,9 +2987,12 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         ExtendedJob {
             coinbase_prefix: coinbase_tx_prefix,
             coinbase_suffix: coinbase_tx_suffix,
-            // JDC-declared coinbase — the pool built no distribution for it,
-            // so there is no snapshot to bind and nothing to look up.
-            payouts_fingerprint: [0u8; 32],
+            // JDC-declared coinbase. Zeroed on the base protocol — the pool
+            // published nothing, so there is no snapshot to bind. Under ext
+            // 0x0003 the pool DID publish, the §7.1 recompute above proved
+            // this coinbase pays it, and the fingerprint is what a found
+            // block resolves that distribution's settlement inputs by.
+            payouts_fingerprint: settlement_fingerprint.unwrap_or([0u8; 32]),
             merkle_path: input.merkle_path.clone(),
             version: input.version,
             prev_hash: input.prev_hash,
@@ -2836,10 +3004,37 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             network_difficulty: crate::mining::translator::network_difficulty_from_n_bits(
                 input.n_bits,
             ),
-            // No pool template → no reward to thread; the JDC owns block-submit
-            // + accounting (block_sink early-returns on `template_id: None`).
+            // No pool template → no reward to thread; the JDC builds and
+            // propagates the block itself.
             coinbase_tx_value_remaining: 0,
             template_id: None, // custom job — no pool-side template reference
+            // Decides who records a block found on this job, and it asks the
+            // DECLARATION's own distribution reference — the one field
+            // `handle_push_solution` builds its `CandidateBacking` from.
+            // `Bookable` and `UnbookableDistribution` both write the
+            // `blocks_entity` row over there; `BaseProtocol` writes nothing.
+            // `bridge_job` being present is the other half: Coinbase-only
+            // mode is refused at `DeclareMiningJob` (§6.3.1), so its token
+            // only ever reaches the allocation map and `PushSolution` can
+            // never claim its block.
+            //
+            // NOT `distribution_ref`. That one is the reference this job is
+            // VALIDATED against, and the two part ways on a Solo stream:
+            // `resolve_distribution_reference` refuses to inherit a
+            // declaration's reference there (inheriting it would subject a
+            // Solo job to the §7.2/§10 window for the first time), while the
+            // JDP side stamps `distribution_id` on every accepted 0x0003
+            // declaration, Solo included. Asking the wrong one said "the
+            // mining side records it" for a block the JDP path books anyway
+            // — two rows for one block on an insert with no `ON CONFLICT`,
+            // and two block-found notifications.
+            //
+            // It closes the mirror case too: a JDC that negotiated 0x0003 on
+            // the MINING connection alone declares without a reference, so
+            // `PushSolution` records nothing — but its frame TLV used to make
+            // `distribution_ref` `Some`, and the block was recorded by nobody.
+            // See `ExtendedJob::jdp_claims_the_block`.
+            jdp_claims_the_block: bridge_job.is_some_and(|job| job.distribution_id.is_some()),
             created_at: now_ms,
             retired_at: None,
         },
@@ -2877,7 +3072,7 @@ fn encode_varint(n: u64) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mining::jobs::ExtendedJob;
     use bp_vardiff::TestClock;
@@ -3860,6 +4055,7 @@ mod tests {
             network_difficulty: Difficulty(1e15),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
+            jdp_claims_the_block: false,
             created_at: 0,
             retired_at: None,
         };
@@ -5676,6 +5872,7 @@ mod tests {
                     network_difficulty: Difficulty(1e15),
                     coinbase_tx_value_remaining: 5_000_000_000,
                     template_id: None,
+                    jdp_claims_the_block: false,
                     created_at: 500,
                     retired_at: None,
                 },
@@ -5868,7 +6065,7 @@ mod tests {
     /// projection ITSELF is
     /// `custom_job_binding::tests::branch_folds_back_to_the_full_tree_root`,
     /// which recomputes the root by a different algorithm.
-    fn custom_job_matching(
+    pub(crate) fn custom_job_matching(
         channel_id: u32,
         entry: &RegisteredDeclaredJob,
     ) -> SetCustomMiningJobInput {
@@ -5898,7 +6095,11 @@ mod tests {
         custom_job_matching(channel_id, &bridge_entry_for(token, REGTEST_ADDR, 1))
     }
 
-    fn bridge_entry_for(token: Token, address: &str, session_id: u32) -> RegisteredDeclaredJob {
+    pub(crate) fn bridge_entry_for(
+        token: Token,
+        address: &str,
+        session_id: u32,
+    ) -> RegisteredDeclaredJob {
         bridge_entry_declaring(
             token,
             address,
@@ -5973,7 +6174,7 @@ mod tests {
         let mut s = fresh_session();
         let token = Token([1u8; 16]);
         let input = custom_job_input(99, token);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, None, 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, None, 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_CHANNEL_ID);
@@ -5988,7 +6189,7 @@ mod tests {
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
         let input = custom_job_input(cid, token);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, None, 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, None, 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_ID);
@@ -6007,8 +6208,14 @@ mod tests {
         let token = Token([1u8; 16]);
         let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let input = custom_job_input(cid, token);
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobSuccess {
                 channel_id,
@@ -6066,7 +6273,7 @@ mod tests {
     /// accepted. The ext-0x0003 tests deliberately keep the default (PPLNS)
     /// stream, which doubles as proof that a distribution-referenced custom
     /// job passes off Solo.
-    fn solo_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
+    pub(crate) fn solo_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
         let mut s = session_with_extended_channel();
         s.stream = StreamKind::Solo;
         s
@@ -6081,8 +6288,14 @@ mod tests {
         let token = Token([1u8; 16]);
         let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let input = custom_job_input(cid, token);
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         assert!(matches!(
             out.outbound[0],
             OutboundFrame::SetCustomMiningJobSuccess { .. }
@@ -6097,11 +6310,17 @@ mod tests {
         let mut s = session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let other_addr = "bcrt1q9h6ks0scwrsvz8ku4eqkxh5sx5xkw6vqxttzva";
+        let other_addr = "bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja";
         let entry = bridge_entry_for(token, other_addr, 42);
         let input = custom_job_input(cid, token);
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
@@ -6122,7 +6341,7 @@ mod tests {
         let mut s = session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let input = custom_job_input(cid, Token([0xEEu8; 16]));
-        let out = handle_set_custom_mining_job(&mut s, &input, None, None, 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, None, 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_MINING_JOB_TOKEN);
@@ -6131,6 +6350,304 @@ mod tests {
         }
         let ch = s.channels.get(&cid).unwrap();
         assert!(ch.extended_jobs.is_empty(), "no job may be registered");
+    }
+
+    // ── Base-protocol Coinbase-only (§6.3.1) ───────────────────────
+    //
+    // No declaration exists in that mode, so the allocate is the only
+    // record of the token and §6.4.3's designated payout output is the
+    // only thing the coinbase owes.
+
+    /// The script the pool designates for a Solo miner: its own address.
+    fn designated_script(address: &str) -> Vec<u8> {
+        bp_mining_job::address_to_script(bitcoin::Network::Regtest, address)
+            .expect("fixture address must encode")
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn base_allocation(address: &str, session_id: u32) -> crate::bridge::AllocatedTokenRef {
+        crate::bridge::AllocatedTokenRef {
+            miner_address: AddressId::new(address.to_string()).unwrap(),
+            payout_script: designated_script(address),
+            jdp_session_id: session_id,
+            // Far past every `now_ms` these tests pass in; expiry has its
+            // own coverage in the bridge.
+            expires_at_ms: u64::MAX,
+        }
+    }
+
+    /// A Coinbase-only custom job carrying `outputs` as its coinbase — the
+    /// JDC built the whole thing itself, so nothing here is derived from a
+    /// declaration.
+    fn coinbase_only_job(
+        channel_id: u32,
+        token: Token,
+        outputs: &[bitcoin::TxOut],
+    ) -> SetCustomMiningJobInput {
+        SetCustomMiningJobInput {
+            channel_id,
+            request_id: 1,
+            mining_job_token: token,
+            version: 0x2000_0000,
+            prev_hash: [0xAB; 32],
+            min_ntime: 0x6500_0001,
+            n_bits: 0x1d00_ffff,
+            coinbase_tx_version: 2,
+            coinbase_prefix: FIXTURE_SCRIPT_SIG_PREFIX.to_vec(),
+            coinbase_tx_input_n_sequence: 0xFFFF_FFFF,
+            coinbase_tx_outputs: bitcoin::consensus::serialize(&outputs.to_vec()),
+            coinbase_tx_locktime: 0,
+            merkle_path: vec![],
+            distribution_id: None,
+        }
+    }
+
+    fn txout(sats: u64, script: Vec<u8>) -> bitcoin::TxOut {
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(sats),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+        }
+    }
+
+    /// The feature: a Solo JDC that never negotiated ext 0x0003 and never
+    /// declares gets its job served, on the strength of its allocate alone.
+    /// It reorders and appends outputs the way §6.4.3 permits, so this also
+    /// pins that the check is not positional.
+    #[test]
+    fn a_coinbase_only_solo_job_is_served_off_its_allocation() {
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([0x77u8; 16]);
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let input = coinbase_only_job(
+            cid,
+            token,
+            &[
+                txout(0, vec![0x6A, 0x01, 0x42]),
+                txout(312_500_000, designated_script(REGTEST_ADDR)),
+            ],
+        );
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobSuccess { .. } => {}
+            other => panic!("expected SetCustomMiningJobSuccess, got {other:?}"),
+        }
+        let ch = s.channels.get(&cid).unwrap();
+        assert_eq!(ch.extended_jobs.len(), 1, "the job must be registered");
+    }
+
+    /// The negative control for the test above: same session, same token,
+    /// same everything except that the coinbase pays someone else. Without
+    /// it, "served off its allocation" would read the same as "served
+    /// without looking at the coinbase".
+    #[test]
+    fn a_coinbase_only_job_that_skips_the_designated_output_is_rejected() {
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([0x77u8; 16]);
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let stranger = designated_script("bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja");
+        let input = coinbase_only_job(cid, token, &[txout(312_500_000, stranger)]);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS);
+            }
+            other => panic!("expected coinbase-outputs error, got {other:?}"),
+        }
+        let ch = s.channels.get(&cid).unwrap();
+        assert!(ch.extended_jobs.is_empty(), "no job may be registered");
+    }
+
+    /// One miner must not mine against another's allocate token — the same
+    /// guard the declared path has, on the path that has no declaration.
+    #[test]
+    fn a_coinbase_only_job_on_another_miners_token_is_rejected() {
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([0x77u8; 16]);
+        let other = "bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja";
+        let alloc = base_allocation(other, 42);
+        let input = coinbase_only_job(cid, token, &[txout(312_500_000, designated_script(other))]);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+            }
+            other => panic!("expected token-mismatch error, got {other:?}"),
+        }
+    }
+
+    /// Tip binding, both directions. A Coinbase-only job has no declaration
+    /// to bind to, so it is held to the tip the pool last served this
+    /// channel. Without it a job on a superseded tip registers and earns
+    /// its shares credited hashrate for work that cannot produce a block.
+    ///
+    /// `stale-chain-tip` and not a parameter error: it is the one declare/
+    /// custom-job code an SRI jd-client treats as retryable rather than
+    /// fatal, and a tip race is exactly that.
+    #[test]
+    fn a_coinbase_only_job_is_bound_to_the_tip_the_pool_last_served() {
+        let designated = designated_script(REGTEST_ADDR);
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated)];
+
+        for (job_tip, expected) in [([0xAB; 32], None), ([0xCD; 32], Some(ERR_STALE_CHAIN_TIP))] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            // The pool has served work on 0xAB — the fixtures leave this
+            // unset, which is why the check needs its own test.
+            s.channels.get_mut(&cid).unwrap().latest_extended_prev_hash = Some([0xAB; 32]);
+
+            let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            input.prev_hash = job_tip;
+            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            match (&out.outbound[0], expected) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, Some(want)) => {
+                    assert_eq!(error_code, want);
+                }
+                (other, want) => panic!("tip {job_tip:?}: wanted {want:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// MONEY-ADJACENT: a custom job's `n_bits` must be the one the pool is
+    /// working on, because the pool derives the job's BLOCK-CANDIDATE
+    /// threshold from it.
+    ///
+    /// Taken on trust, a JDC declaring a trivial `n_bits` makes every
+    /// ordinary share clear `network_difficulty` and arrive at the block
+    /// sink as a find. Since the mining side now records a block found on a
+    /// custom job, that is a phantom `blocks_entity` row plus a "block found"
+    /// notification for every share the JDC submits.
+    ///
+    /// Both directions, and the fixture has to SET the channel's n_bits —
+    /// the shared fixtures leave it unset, which is exactly why this rule
+    /// needs its own test rather than riding along in another one.
+    #[test]
+    fn a_custom_job_must_use_the_difficulty_the_pool_is_working_on() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        const POOL_N_BITS: u32 = 0x1d00_ffff;
+        // 0x207fffff is regtest's "anything hashes" difficulty — the number a
+        // JDC would pick to turn its shares into block finds.
+        const TRIVIAL: u32 = 0x207f_ffff;
+
+        for (job_n_bits, expected) in [(POOL_N_BITS, None), (TRIVIAL, Some(ERR_INVALID_NBITS))] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            {
+                let ch = s.channels.get_mut(&cid).unwrap();
+                ch.latest_extended_prev_hash = Some([0xAB; 32]);
+                ch.latest_extended_n_bits = Some(POOL_N_BITS);
+            }
+            let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            input.n_bits = job_n_bits;
+
+            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            match (&out.outbound[0], expected) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, None) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, Some(want)) => {
+                    assert_eq!(error_code, want);
+                    assert!(
+                        s.channels.get(&cid).unwrap().extended_jobs.is_empty(),
+                        "a job whose threshold the client chose must not be registered"
+                    );
+                }
+                (other, want) => panic!("n_bits {job_n_bits:#x}: wanted {want:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// INTEROP: the same mismatch, seen from the OTHER tip, is
+    /// `stale-chain-tip` and not `invalid-nbits`.
+    ///
+    /// `n_bits` is consensus on one tip, so a client that disagrees there is
+    /// wrong — that is the test above. Across two tips it is not: `n_bits`
+    /// moves WITH the tip at a difficulty retarget, so a JDC whose node saw
+    /// the retarget block before ours sends the new number against our old
+    /// one, having done nothing wrong. It is the ordinary tip race, the one
+    /// `stale-chain-tip` exists for.
+    ///
+    /// The classification is the whole finding: an SRI jd-client treats
+    /// `stale-chain-tip` as benign and every other `SetCustomMiningJobError`
+    /// as a reason to leave the pool for solo mining
+    /// (`channel_manager/upstream_message_handler.rs`, sv2-apps v0.7.0).
+    /// Answering `invalid-nbits` here cost a conformant JDC its pool at every
+    /// retarget its node reached first.
+    ///
+    /// Both directions of the race, and the job is refused in both — a
+    /// threshold we cannot pin must not register. What differs is only which
+    /// verdict the client is sent home with.
+    #[test]
+    fn an_n_bits_mismatch_across_a_tip_change_is_the_retryable_verdict() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        const POOL_TIP: [u8; 32] = [0xAB; 32];
+        const OTHER_TIP: [u8; 32] = [0xCD; 32];
+        // A retarget moves `n_bits`; these two stand in for either side of one.
+        const POOL_N_BITS: u32 = 0x1d00_ffff;
+        const RETARGETED: u32 = 0x1c00_ffff;
+
+        // (the tip the job builds on, the n_bits it carries, the verdict)
+        for (job_tip, job_n_bits, want) in [
+            // The JDC is ahead: its node retargeted first.
+            (OTHER_TIP, RETARGETED, ERR_STALE_CHAIN_TIP),
+            // The pool is ahead: an in-flight job for the tip we just left.
+            (OTHER_TIP, POOL_N_BITS, ERR_STALE_CHAIN_TIP),
+            // Our own tip — no race to excuse it.
+            (POOL_TIP, RETARGETED, ERR_INVALID_NBITS),
+        ] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            {
+                let ch = s.channels.get_mut(&cid).unwrap();
+                ch.latest_extended_prev_hash = Some(POOL_TIP);
+                ch.latest_extended_n_bits = Some(POOL_N_BITS);
+            }
+            let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            input.prev_hash = job_tip;
+            input.n_bits = job_n_bits;
+
+            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            match &out.outbound[0] {
+                OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                    assert_eq!(error_code, want, "tip {job_tip:?} / n_bits {job_n_bits:#x}");
+                }
+                other => panic!("tip {job_tip:?}: expected {want}, got {other:?}"),
+            }
+            assert!(
+                s.channels.get(&cid).unwrap().extended_jobs.is_empty(),
+                "a job whose threshold the pool cannot pin must not register"
+            );
+        }
+    }
+
+    /// The Solo gate still owns the base-protocol path: an allocation makes
+    /// the token resolvable, it does not make a shared-payout stream
+    /// mineable. The pool refuses such an allocate in the first place —
+    /// this is the second line, for a token issued before a mode change.
+    #[test]
+    fn a_coinbase_only_job_off_solo_is_still_refused() {
+        let mut s = session_with_extended_channel();
+        assert_ne!(s.stream, StreamKind::Solo, "fixture must be non-Solo");
+        let cid = s.primary_channel.unwrap();
+        let token = Token([0x77u8; 16]);
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let input = coinbase_only_job(
+            cid,
+            token,
+            &[txout(312_500_000, designated_script(REGTEST_ADDR))],
+        );
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
+            }
+            other => panic!("expected custom-jobs-require-solo, got {other:?}"),
+        }
     }
 
     /// Tip binding: the custom job's `prev_hash` must equal the tip its
@@ -6146,8 +6663,14 @@ mod tests {
         // Declared under a DIFFERENT tip than the job builds on (0xAB).
         entry.declared_job.prev_hash = Some([0xCD; 32]);
         let input = custom_job_input(cid, token);
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_STALE_CHAIN_TIP);
@@ -6173,8 +6696,14 @@ mod tests {
         let token = Token([1u8; 16]);
         let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let input = custom_job_input(cid, token);
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
@@ -6195,8 +6724,14 @@ mod tests {
         let mut entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         entry.declared_job.prev_hash = None;
         let input = custom_job_input(cid, token);
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         assert!(matches!(
             out.outbound[0],
             OutboundFrame::SetCustomMiningJobSuccess { .. }
@@ -6262,6 +6797,239 @@ mod tests {
         s
     }
 
+    // ── Who records a block found on a custom job ──────────────────
+    //
+    // `ExtendedJob::jdp_claims_the_block` decides it, and getting it wrong
+    // in either direction loses money: `true` where the JDP path never sees
+    // the solution means the block is recorded nowhere and never settles;
+    // `false` where it does means two `blocks_entity` rows for one block on
+    // an insert with no `ON CONFLICT`.
+    //
+    // The four cases below are the whole table on `ExtendedJob`.
+
+    /// The registered job for a custom-job handler call that succeeded.
+    fn stored_custom_job(
+        s: &MiningSessionState<Arc<TestClock>>,
+        cid: u32,
+    ) -> &crate::mining::jobs::ExtendedJob {
+        let ch = s.channels.get(&cid).expect("channel");
+        assert_eq!(ch.extended_jobs.len(), 1, "the job must have been stored");
+        ch.extended_jobs.values().next().unwrap()
+    }
+
+    /// Row 3, the one that was wrong: **Coinbase-only + ext 0x0003**.
+    ///
+    /// §6.3.1 says that mode never sends `DeclareMiningJob`, so its token
+    /// resolves to no declaration — and `handle_push_solution` matches a
+    /// solution against declared jobs only, on Full-Template connections
+    /// only. Nothing on the JDP side will ever hear about this block. Read
+    /// as "distribution-backed" the flag handed it to that side anyway, and
+    /// the block ended up with no `blocks_entity` row, no notification and
+    /// no §10 settle — so the published weights kept encoding balances its
+    /// coinbase had already paid out.
+    ///
+    /// The fingerprint is the second half: recording is not enough, the
+    /// block has to be BOOKABLE, and the distribution's settlement identity
+    /// has no other carrier on this path.
+    #[test]
+    fn a_coinbase_only_distribution_job_is_recorded_by_the_mining_side_and_bookable() {
+        let mut s = negotiated_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let entry = distribution_entry(None);
+        let fingerprint = entry.payouts_fingerprint.expect("fixture must carry one");
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let acc = accepted(entry);
+        let mut input = custom_job_input(cid, Token([1u8; 16]));
+        input.distribution_id = Some(9); // §6: the TLV rides the FRAME in this mode
+        input.coinbase_tx_outputs = blob;
+
+        // No bridge entry and no allocation: nothing declared, and an ext
+        // 0x0003 allocate registers none (§2 leaves it no designated output).
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
+        assert!(matches!(
+            out.outbound[0],
+            OutboundFrame::SetCustomMiningJobSuccess { .. }
+        ));
+        let job = stored_custom_job(&s, cid);
+        assert!(
+            !job.jdp_claims_the_block,
+            "Coinbase-only never declares, so PushSolution can never claim its block — \
+             the mining side must record it"
+        );
+        assert_eq!(
+            job.payouts_fingerprint, fingerprint,
+            "the block must resolve the distribution it was proven to pay, or it is \
+             recorded but not bookable"
+        );
+    }
+
+    /// Row 1, the negative control for the test above: **declared, and the
+    /// DECLARATION referenced a distribution**. Same distribution, same
+    /// coinbase — the one difference is a declaration behind the token, and
+    /// that flips who records it. Without this pair, "the mining side records
+    /// custom-job blocks" would read the same as "the mining side records
+    /// them twice".
+    ///
+    /// The reference rides the DECLARATION and not the frame, because that is
+    /// where §6 puts it for Full-Template and because it is the field
+    /// `handle_push_solution` reads. The fixture used to stamp it on the
+    /// frame instead, which describes no conformant client and — worse — made
+    /// the test pass for a declaration the JDP path would have classified
+    /// `BaseProtocol` and recorded nowhere.
+    ///
+    /// Both streams, because they are the two answers
+    /// `resolve_distribution_reference` gives and only one of them used to
+    /// reach this flag: off Solo it inherits the declaration's reference,
+    /// on Solo it deliberately does not. The JDP side makes no such
+    /// distinction, so reading its answer instead of the declaration's own
+    /// field wrote the `blocks_entity` row twice for every Solo JDC.
+    #[test]
+    fn a_declared_distribution_job_is_left_to_the_jdp_path() {
+        for stream in [StreamKind::Pplns, StreamKind::Solo] {
+            let mut s = negotiated_session_with_extended_channel();
+            s.stream = stream;
+            let cid = s.primary_channel.unwrap();
+            let entry = distribution_entry(None);
+            // Declared WITH the conformant coinbase, so the declaration
+            // binding and §7.1 both pass and the only variable left is the
+            // declaration itself.
+            let blob = conformant_outputs(&entry, 312_500_000);
+            let bridge = declared_under_distribution(
+                bridge_entry_declaring(
+                    Token([1u8; 16]),
+                    REGTEST_ADDR,
+                    42,
+                    &FIXTURE_SCRIPT_SIG_PREFIX,
+                    &blob,
+                ),
+                9,
+            );
+            let acc = accepted(entry);
+            // No frame TLV — §6 puts a Full-Template job's reference on
+            // `DeclareMiningJob`.
+            let input = custom_job_matching(cid, &bridge);
+
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                Some(&job_ref_for(&bridge)),
+                None,
+                Some(&acc),
+                1_000,
+            );
+            assert!(
+                matches!(
+                    out.outbound[0],
+                    OutboundFrame::SetCustomMiningJobSuccess { .. }
+                ),
+                "{stream:?}: got {:?}",
+                out.outbound[0]
+            );
+            assert!(
+                stored_custom_job(&s, cid).jdp_claims_the_block,
+                "{stream:?}: a declared job's solution arrives as PushSolution and is recorded \
+                 there — recording it here as well would write the blocks_entity row twice"
+            );
+        }
+    }
+
+    /// The other half of the same rule, and the one that pins WHICH question
+    /// the flag asks: a declaration with no distribution reference is
+    /// `BaseProtocol` on the JDP side and records nothing there — so the
+    /// mining side must record it, even though the frame's own TLV made the
+    /// §7.1 gate resolve a distribution for the job.
+    ///
+    /// Reachable for real: a JDC that negotiated 0x0003 on the mining
+    /// connection but not on the JDP one declares without a reference (§2
+    /// forbids it there) and may still send the TLV here. Keying the flag on
+    /// the resolved reference left such a block recorded by nobody.
+    #[test]
+    fn a_frame_tlv_does_not_hand_an_undeclared_distribution_to_the_jdp_path() {
+        let mut s = negotiated_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let entry = distribution_entry(None);
+        let blob = conformant_outputs(&entry, 312_500_000);
+        // Declared WITHOUT a distribution — `distribution_id: None`.
+        let bridge = bridge_entry_declaring(
+            Token([1u8; 16]),
+            REGTEST_ADDR,
+            42,
+            &FIXTURE_SCRIPT_SIG_PREFIX,
+            &blob,
+        );
+        let acc = accepted(entry);
+        let mut input = custom_job_matching(cid, &bridge);
+        input.distribution_id = Some(9);
+
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&bridge)),
+            None,
+            Some(&acc),
+            1_000,
+        );
+        assert!(matches!(
+            out.outbound[0],
+            OutboundFrame::SetCustomMiningJobSuccess { .. }
+        ));
+        assert!(
+            !stored_custom_job(&s, cid).jdp_claims_the_block,
+            "PushSolution reads the DECLARATION's reference, and this one has none — leaving \
+             the block to the JDP path records it nowhere"
+        );
+    }
+
+    /// Rows 2 and 4: no distribution, so nothing is booked on the JDP side
+    /// whichever mode it is, and the mining side owns the record. Both are
+    /// held to a zeroed fingerprint — the pool published nothing, so there
+    /// is no settlement identity to invent.
+    #[test]
+    fn a_base_protocol_custom_job_is_always_the_mining_sides_to_record() {
+        // Row 2 — declared, base protocol.
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let bridge = bridge_entry_for(Token([1u8; 16]), REGTEST_ADDR, 42);
+        let input = custom_job_matching(cid, &bridge);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&bridge)),
+            None,
+            None,
+            1_000,
+        );
+        assert!(matches!(
+            out.outbound[0],
+            OutboundFrame::SetCustomMiningJobSuccess { .. }
+        ));
+        let job = stored_custom_job(&s, cid);
+        assert!(
+            !job.jdp_claims_the_block,
+            "a declaration with no distribution stamps no booking, so PushSolution \
+             records nothing and the mining side must"
+        );
+        assert_eq!(job.payouts_fingerprint, [0u8; 32]);
+
+        // Row 4 — Coinbase-only, base protocol (served off its allocation).
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let input = coinbase_only_job(
+            cid,
+            Token([0x77u8; 16]),
+            &[txout(312_500_000, designated_script(REGTEST_ADDR))],
+        );
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        assert!(matches!(
+            out.outbound[0],
+            OutboundFrame::SetCustomMiningJobSuccess { .. }
+        ));
+        let job = stored_custom_job(&s, cid);
+        assert!(!job.jdp_claims_the_block);
+        assert_eq!(job.payouts_fingerprint, [0u8; 32]);
+    }
+
     /// §7.1 recompute-and-compare: a coinbase positionally matching the
     /// referenced distribution's §4 vector is accepted.
     #[test]
@@ -6274,7 +7042,7 @@ mod tests {
         let mut input = custom_job_input(cid, Token([1u8; 16]));
         input.distribution_id = Some(9);
         input.coinbase_tx_outputs = blob;
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
         assert!(matches!(
             out.outbound[0],
             OutboundFrame::SetCustomMiningJobSuccess { .. }
@@ -6292,7 +7060,7 @@ mod tests {
         // the recomputed vector always expects at least the pool output.
         let mut input = custom_job_input(cid, Token([1u8; 16]));
         input.distribution_id = Some(9);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_PAYOUT_DISTRIBUTION);
@@ -6312,7 +7080,7 @@ mod tests {
         let mut input = custom_job_input(cid, Token([1u8; 16]));
         input.distribution_id = Some(9);
         input.coinbase_tx_outputs = vec![0x01]; // count=1, no TxOut bytes
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS);
@@ -6335,6 +7103,7 @@ mod tests {
         let out = handle_set_custom_mining_job(
             &mut s,
             &input,
+            None,
             None,
             Some(&crate::bridge::DistributionAcceptance::Stale),
             1_000,
@@ -6361,6 +7130,7 @@ mod tests {
             &mut s,
             &input,
             None,
+            None,
             Some(&crate::bridge::DistributionAcceptance::Unknown),
             1_000,
         );
@@ -6385,7 +7155,7 @@ mod tests {
         let mut input = custom_job_input(cid, Token([1u8; 16]));
         input.distribution_id = Some(9);
         input.coinbase_tx_outputs = blob;
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_PAYOUT_DISTRIBUTION);
@@ -6401,14 +7171,14 @@ mod tests {
     fn set_custom_mining_job_tailored_owner_mismatch_rejects() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let other = "bcrt1q9h6ks0scwrsvz8ku4eqkxh5sx5xkw6vqxttzva";
+        let other = "bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja";
         let entry = distribution_entry(Some(AddressId::new(other.to_string()).unwrap()));
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
         input.distribution_id = Some(9);
         input.coinbase_tx_outputs = blob;
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
@@ -6428,7 +7198,7 @@ mod tests {
         let mut input = custom_job_input(cid, Token([1u8; 16]));
         input.distribution_id = Some(9);
         input.coinbase_tx_outputs = blob;
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
         assert!(matches!(
             out.outbound[0],
             OutboundFrame::SetCustomMiningJobSuccess { .. }
@@ -6474,6 +7244,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&bridge)),
+            None,
             Some(&acc),
             1_000,
         );
@@ -6504,6 +7275,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&bridge)),
+            None,
             Some(&acc),
             1_000,
         );
@@ -6529,6 +7301,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&bridge)),
+            None,
             None, // unresolvable
             1_000,
         );
@@ -6574,6 +7347,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&with_booking)),
+            None,
             Some(&accepted(entry.clone())),
             1_000,
         );
@@ -6598,6 +7372,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&declared)),
+            None,
             Some(&accepted(entry)),
             1_000,
         );
@@ -6638,6 +7413,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&declared)),
+            None,
             Some(&accepted(distribution_entry(None))),
             1_000,
         );
@@ -6679,6 +7455,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&declared)),
+            None,
             Some(&accepted(entry)),
             1_000,
         );
@@ -6719,6 +7496,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&declared)),
+            None,
             Some(&accepted(entry)),
             1_000,
         );
@@ -6758,6 +7536,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&declared)),
+            None,
             None, // settled / superseded — nothing resolves
             1_000,
         );
@@ -6793,6 +7572,7 @@ mod tests {
             &mut s,
             &input,
             Some(&job_ref_for(&declared)),
+            None,
             None, // settled / superseded
             1_000,
         );
@@ -6823,7 +7603,7 @@ mod tests {
             let mut input = custom_job_input(cid, Token([1u8; 16]));
             input.distribution_id = Some(9);
             input.coinbase_tx_outputs = blob;
-            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+            let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
             match &out.outbound[0] {
                 OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                     assert_eq!(
@@ -6846,10 +7626,10 @@ mod tests {
         let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let job_ref = job_ref_for(&entry);
         let input1 = custom_job_input(cid, token);
-        let out1 = handle_set_custom_mining_job(&mut s, &input1, Some(&job_ref), None, 1_000);
+        let out1 = handle_set_custom_mining_job(&mut s, &input1, Some(&job_ref), None, None, 1_000);
         let mut input2 = custom_job_input(cid, token);
         input2.request_id = 2;
-        let out2 = handle_set_custom_mining_job(&mut s, &input2, Some(&job_ref), None, 2_000);
+        let out2 = handle_set_custom_mining_job(&mut s, &input2, Some(&job_ref), None, None, 2_000);
         let id1 = match out1.outbound[0] {
             OutboundFrame::SetCustomMiningJobSuccess { job_id, .. } => job_id,
             _ => unreachable!(),
@@ -6882,7 +7662,7 @@ mod tests {
         input.distribution_id = Some(9);
         input.coinbase_tx_outputs = blob;
         input.coinbase_prefix = vec![0xAA; 253];
-        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, Some(&acc), 1_000);
         assert!(
             matches!(
                 out.outbound[0],
@@ -6967,6 +7747,7 @@ mod tests {
             &mut s,
             &honest,
             Some(&job_ref_for(&bridge)),
+            None,
             Some(&accepted(entry.clone())),
             1_000,
         );
@@ -6989,6 +7770,7 @@ mod tests {
             &mut s,
             &swapped,
             Some(&job_ref_for(&bridge)),
+            None,
             Some(&accepted(entry)),
             1_000,
         );
@@ -7014,8 +7796,14 @@ mod tests {
 
         let honest = custom_job_matching(cid, &entry);
         assert!(!honest.merkle_path.is_empty(), "fixture must commit to txs");
-        let out =
-            handle_set_custom_mining_job(&mut s, &honest, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &honest,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         assert!(
             matches!(
                 out.outbound[0],
@@ -7026,8 +7814,14 @@ mod tests {
 
         let mut swapped = custom_job_matching(cid, &entry);
         swapped.merkle_path[0] = [0xEE; 32];
-        let out =
-            handle_set_custom_mining_job(&mut s, &swapped, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &swapped,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
@@ -7069,8 +7863,14 @@ mod tests {
         let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let input = custom_job_matching(cid, &entry);
 
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         assert!(
             matches!(
                 out.outbound[0],
@@ -7083,8 +7883,14 @@ mod tests {
         let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         s.channels.get_mut(&cid).unwrap().extranonce_size += 1;
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
@@ -7177,8 +7983,14 @@ mod tests {
         input.coinbase_tx_outputs = bitcoin::consensus::serialize(&tx.output);
         input.coinbase_tx_locktime = tx.lock_time.to_consensus_u32();
 
-        let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&entry)),
+            None,
+            None,
+            1_000,
+        );
         assert!(
             matches!(
                 out.outbound[0],
@@ -7204,7 +8016,7 @@ mod tests {
         entry.declared_job.coinbase_tx_prefix = vec![0x02, 0x00];
         let job_ref = job_ref_for(&entry);
         assert!(job_ref.binding.is_none(), "fixture must fail to project");
-        let out = handle_set_custom_mining_job(&mut s, &input, Some(&job_ref), None, 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, Some(&job_ref), None, None, 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);

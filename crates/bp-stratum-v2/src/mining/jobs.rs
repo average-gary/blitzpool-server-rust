@@ -99,6 +99,44 @@ pub struct ExtendedJob {
     /// jobs the caller stores the template id (or another opaque
     /// reference) so the block-found path can produce a `SubmitSolution`.
     pub template_id: Option<u64>,
+    /// `true` when a block found on this custom job will be recorded by the
+    /// JDP `PushSolution` path, so the mining side must NOT record it too
+    /// (the `blocks_entity` insert has no `ON CONFLICT`).
+    ///
+    /// Two conditions, and both are about the DECLARATION — never about the
+    /// job in hand. `PushSolution` claims a solution by matching it against a
+    /// **declared job** and drops anything arriving on a connection that is
+    /// not in Full-Template mode; and what it then writes is decided by that
+    /// declaration's own `distribution_id`
+    /// ([`crate::jdp::dynamic_outputs::CandidateBacking`]: `Bookable` and
+    /// `UnbookableDistribution` both record, `BaseProtocol` records nothing).
+    ///
+    /// | job came from | JDP claims it | who records |
+    /// |---|---|---|
+    /// | declared, declaration referenced a distribution | yes | JDP |
+    /// | declared, base protocol | no — `BaseProtocol`, nothing to record | mining side |
+    /// | Coinbase-only + ext 0x0003 | **no** — §6.3.1, that mode never declares | mining side |
+    /// | Coinbase-only, base protocol | no — never declares | mining side |
+    ///
+    /// Reading it as "distribution-backed" put row three on the JDP side,
+    /// which never hears about it: the block was credited as a share and
+    /// then recorded nowhere — no `blocks_entity` row, no notification, and
+    /// (worse) no §10 settle, so the published weights kept encoding
+    /// balances the block had already paid out.
+    ///
+    /// Reading it as "did the §7.1 gate resolve a distribution for this
+    /// job?" — i.e. `distribution_ref` in
+    /// `crate::mining::client::handle_set_custom_mining_job` — broke row ONE
+    /// on a Solo stream, in the other direction: `resolve_distribution_reference`
+    /// deliberately declines to inherit a declaration's reference there,
+    /// while the JDP side stamps one on every accepted 0x0003 declaration,
+    /// Solo included. Both sides then recorded the block: two `blocks_entity`
+    /// rows and two notifications. The two questions look identical and are
+    /// not; this field answers only the JDP one.
+    ///
+    /// Always `false` for pool-built jobs, which carry a `template_id` and
+    /// take the ordinary submit path instead.
+    pub jdp_claims_the_block: bool,
     /// Wall-clock ms when stored.
     pub created_at: u64,
     /// Wall-clock ms when superseded by a newer block. `None` while
@@ -452,6 +490,7 @@ mod tests {
             network_difficulty: Difficulty(1.0),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
+            jdp_claims_the_block: false,
             created_at: now_ms,
             retired_at: None,
         }

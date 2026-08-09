@@ -57,8 +57,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bridge::{
-    DistributionAcceptance, DistributionScope, JdpDeclaredJobRegistry, PayoutDistributionEntry,
-    RegisteredDeclaredJob,
+    AllocatedTokenRef, DistributionAcceptance, DistributionScope, JdpDeclaredJobRegistry,
+    PayoutDistributionEntry, RegisteredDeclaredJob,
 };
 use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
@@ -69,7 +69,7 @@ use crate::jdp::client::{
     parse_user_identifier_as_address, AllocateTokenContext, JdpHandlerOutcome, JdpOutboundFrame,
     JdpSessionEvent, JdpSessionState,
 };
-use crate::jdp::dynamic_outputs::PayoutBooking;
+use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::payout_distribution::WeightedOutput;
 use crate::jdp::tx_validation::{merge_provided_with_known, partition_against_template};
 use crate::jdp_server_codec::{
@@ -102,7 +102,28 @@ pub trait JdpAllocateResolver: Send + Sync {
         user_identifier: &str,
         remote_addr: &str,
         payout_distribution_negotiated: bool,
-    ) -> Option<AllocateTokenContext>;
+    ) -> AllocateOutcome;
+}
+
+/// What the pool does with an `AllocateMiningJobToken`.
+///
+/// The two negative arms are NOT the same thing, and collapsing them into
+/// `None` is what left a refused JDC hanging on an open socket: SV2 gives
+/// `AllocateMiningJobToken` no error message, so the only way to tell a
+/// client "not here" is to stop talking to it. [`Self::Refused`] does that
+/// deliberately; [`Self::Ignored`] keeps the pre-existing behaviour for an
+/// identifier that resolves to nothing at all.
+pub enum AllocateOutcome {
+    /// Issue a token with these outputs.
+    Granted(AllocateTokenContext),
+    /// The pool cannot serve this miner on this protocol at all — close
+    /// the connection so the JDC's §6.2 fallback ("JDS fails to respond …
+    /// JDC is responsible for switching to a new Pool+JDS or solo mining")
+    /// fires immediately instead of after a timeout, or never.
+    Refused { reason: &'static str },
+    /// Nothing resolvable (unparseable `user_identifier`). Dropped
+    /// silently, as before.
+    Ignored,
 }
 
 /// Snapshot the pool's template-tx cache (`wtxid → raw_tx`) for the
@@ -235,7 +256,7 @@ pub trait JdpBlockSubmissionSink: Send + Sync {
         &self,
         miner_address: AddressId,
         new_token: Token,
-        booking: Option<PayoutBooking>,
+        backing: CandidateBacking,
         coinbase_raw: Vec<u8>,
         transactions: Vec<Vec<u8>>,
         prev_hash: [u8; 32],
@@ -341,15 +362,36 @@ impl JdpAllocateResolver for NoOpJdpHooks {
         user_identifier: &str,
         _remote_addr: &str,
         payout_distribution_negotiated: bool,
-    ) -> Option<AllocateTokenContext> {
+    ) -> AllocateOutcome {
         // Pure parse — no IP fallback. Production wiring overrides.
-        parse_user_identifier_as_address(user_identifier).map(|addr| AllocateTokenContext {
+        let Some(addr) = parse_user_identifier_as_address(user_identifier) else {
+            return AllocateOutcome::Ignored;
+        };
+        if payout_distribution_negotiated {
+            return AllocateOutcome::Granted(AllocateTokenContext {
+                miner_address: addr,
+                coinbase_outputs: Vec::new(), // §2 MUST: empty under 0x0003
+            });
+        }
+        // §6.4.3 wants ONE designated payout output at 0 sats. This used to
+        // answer `vec![0u8]` — an EMPTY output vector, which designates
+        // nothing, so every base-protocol job built against a no-op harness
+        // was refused `invalid-mining-job-token` while looking like it was
+        // served. Paying the miner mirrors what production does for Solo.
+        //
+        // `bp_mining_job::address_to_script` is not used here because it
+        // enforces a configured network and a no-op hook has none; the
+        // address carries its own.
+        let Ok(parsed) = addr.as_str().parse::<bitcoin::Address<_>>() else {
+            return AllocateOutcome::Ignored;
+        };
+        let txout = bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: parsed.assume_checked().script_pubkey(),
+        };
+        AllocateOutcome::Granted(AllocateTokenContext {
             miner_address: addr,
-            coinbase_outputs: if payout_distribution_negotiated {
-                Vec::new() // §2 MUST: empty when 0x0003 is negotiated
-            } else {
-                vec![0u8]
-            },
+            coinbase_outputs: bitcoin::consensus::serialize(&vec![txout]),
         })
     }
 }
@@ -374,7 +416,7 @@ impl JdpBlockSubmissionSink for NoOpJdpHooks {
         &self,
         _: AddressId,
         _: Token,
-        _: Option<PayoutBooking>,
+        _: CandidateBacking,
         _: Vec<u8>,
         _: Vec<Vec<u8>>,
         _: [u8; 32],
@@ -896,14 +938,18 @@ async fn run_jdp_connection(
                 //
                 // Second, unchanged: the bridge must be populated by the time
                 // the JobDeclared event is visible to other hooks.
-                register_declared_jobs_in_bridge(&state, &bridge, session_id, &outcome.events);
+                register_bridge_entries(&state, &bridge, session_id, &outcome.events);
                 if let Err(err) = write_jdp_outbound_frames(&mut writer, outcome.outbound).await {
                     warn!("jdp {session_id_hex} write: {err:?}");
                     break;
                 }
                 outcome.outbound = Vec::new();
                 if let Some(reason) = disconnect {
-                    debug!("jdp {session_id_hex} closing after setup rejection: {reason}");
+                    // Two sources now: a refused `SetupConnection` (which
+                    // wrote its Error frame just above) and a refused
+                    // allocate, which has no error frame to write because
+                    // SV2 defines none — there the close IS the answer.
+                    debug!("jdp {session_id_hex} closing: {reason}");
                     break;
                 }
                 // Identity became known (allocate) on a negotiated
@@ -994,16 +1040,34 @@ async fn dispatch_jdp_inbound(
             let negotiated = state
                 .negotiated_extensions
                 .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
-            let Some(ctx) = hooks
+            match hooks
                 .allocate_resolver
                 .resolve_allocate_context(&input.user_identifier, remote_addr, negotiated)
                 .await
-            else {
+            {
+                AllocateOutcome::Granted(ctx) => handle_allocate_token(state, &input, ctx, now_ms),
+                // SV2 has no `AllocateMiningJobToken.Error`, so the only way
+                // to tell a JDC "this pool cannot serve you" is to stop
+                // talking. Closing turns an indefinite wait into the §6.2
+                // fallback the JDC already implements.
+                AllocateOutcome::Refused { reason } => {
+                    warn!(
+                        session_id,
+                        user_identifier = %input.user_identifier,
+                        reason,
+                        "jdp: refusing to allocate a token — closing the connection"
+                    );
+                    JdpHandlerOutcome {
+                        outbound: Vec::new(),
+                        events: vec![JdpSessionEvent::Disconnect {
+                            reason: format!("allocate refused: {reason}"),
+                        }],
+                    }
+                }
                 // Couldn't resolve a miner address — drop silently
                 // (return default outcome, no error frame).
-                return JdpHandlerOutcome::default();
-            };
-            handle_allocate_token(state, &input, ctx, now_ms)
+                AllocateOutcome::Ignored => JdpHandlerOutcome::default(),
+            }
         }
         InboundJdpFrame::DeclareMiningJob(input) => {
             let template_txs = hooks.template_tx_provider.snapshot().await;
@@ -1175,8 +1239,8 @@ fn wire_from_entry(entry: &PayoutDistributionEntry) -> SetPayoutDistribution {
     }
 }
 
-/// Fan out [`JdpSessionEvent`]s: SetupComplete and TokenAllocated are
-/// informational, JobDeclared was registered in the bridge before the
+/// Fan out [`JdpSessionEvent`]s: SetupComplete is informational,
+/// TokenAllocated and JobDeclared were registered in the bridge before the
 /// outbound write, BlockSubmissionCandidate goes to the
 /// block-submission sink. Disconnect is not handled here — the
 /// connection loop reads it off the outcome and breaks after the write.
@@ -1184,16 +1248,16 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
     for event in events {
         match event {
             JdpSessionEvent::SetupComplete => {}
-            JdpSessionEvent::TokenAllocated { .. } => {}
-            // Already registered, before the outbound write — see the
-            // `register_declared_jobs_in_bridge` call in
+            // Both already registered in the bridge, before the outbound
+            // write — see the `register_bridge_entries` call in
             // `run_jdp_connection`, which has the session state this
             // fan-out does not carry. Do not register here as well.
+            JdpSessionEvent::TokenAllocated { .. } => {}
             JdpSessionEvent::JobDeclared { .. } => {}
             JdpSessionEvent::BlockSubmissionCandidate {
                 miner_address,
                 new_token,
-                booking,
+                backing,
                 coinbase_raw,
                 transactions,
                 prev_hash,
@@ -1207,7 +1271,7 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
                     .submit_block_candidate(
                         miner_address,
                         new_token,
-                        booking,
+                        backing,
                         coinbase_raw,
                         transactions,
                         prev_hash,
@@ -1300,6 +1364,59 @@ pub enum WriteError {
     Io(crate::noise::NoiseError),
 }
 
+/// What the bridge does with an allocate token.
+///
+/// A value and not four inline match arms, because three of the four say
+/// "register nothing" and only ONE of those three is a fault. Told apart by
+/// outcome they are indistinguishable — which is how an ext 0x0003 allocate,
+/// whose empty `coinbase_tx_outputs` §2 REQUIRES, came to be logged as a pool
+/// bug on every Coinbase-only 0x0003 connection. As a value each reason is
+/// testable on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AllocationDisposition<'a> {
+    /// Base-protocol Coinbase-only: the allocate is the pool's ONLY record of
+    /// this token (§6.3.1 — that mode never declares), so the mining side
+    /// resolves it here and holds the custom job's coinbase to this script.
+    Register { payout_script: &'a [u8] },
+    /// Full-Template: the declaration is the record, not this. Registering
+    /// its allocate token too would let the JDC skip `DeclareMiningJob`, where
+    /// bitcoin-core validates its transaction set (§6.1), and mine a job no
+    /// node ever saw — no tip binding, no merkle-path check.
+    LeftToTheDeclaration,
+    /// ext 0x0003: §2 requires the allocate's outputs to be empty, so there is
+    /// no designated script by design. The job is judged by the §7.1 recompute
+    /// against the referenced distribution, which is the stronger check —
+    /// registering an allocation would let the weak §6.4.3 test stand in for
+    /// it. Nothing to register, and nothing wrong.
+    JudgedByTheDistribution,
+    /// A base-protocol allocate that designated nothing. The pool built that
+    /// blob, so this is OUR bug, not the client's — and it is invisible from
+    /// the client side, which just gets `invalid-mining-job-token` on every
+    /// job it ever builds.
+    DesignatedNothing,
+}
+
+/// Which of the four an allocate token is. Pure and total on purpose: it takes
+/// only the three flags that decide it, so every combination can be asserted
+/// without a connection, and a case added later has to be classified rather
+/// than fall into an existing arm.
+pub(crate) fn classify_allocation(
+    payout_script: Option<&[u8]>,
+    full_template_mode: bool,
+    payout_distribution_negotiated: bool,
+) -> AllocationDisposition<'_> {
+    match (
+        payout_script,
+        full_template_mode,
+        payout_distribution_negotiated,
+    ) {
+        (Some(payout_script), false, false) => AllocationDisposition::Register { payout_script },
+        (_, true, _) => AllocationDisposition::LeftToTheDeclaration,
+        (_, false, true) => AllocationDisposition::JudgedByTheDistribution,
+        (None, false, false) => AllocationDisposition::DesignatedNothing,
+    }
+}
+
 /// Register the latest declared job in the bridge so the mining
 /// server's `SetCustomMiningJob` handler can find it. Called from
 /// the per-connection task after `dispatch_jdp_inbound` returns —
@@ -1308,7 +1425,7 @@ pub enum WriteError {
 ///
 /// Public-`pub(crate)` so unit tests can drive it without spinning
 /// up a real connection.
-pub(crate) fn register_declared_jobs_in_bridge(
+pub(crate) fn register_bridge_entries(
     state: &JdpSessionState,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     jdp_session_id: u32,
@@ -1316,16 +1433,68 @@ pub(crate) fn register_declared_jobs_in_bridge(
 ) {
     let mut reg = bridge.write().expect("bridge RwLock poisoned");
     for event in events {
-        if let JdpSessionEvent::JobDeclared { new_token } = event {
-            if let Some(declared_job) = state.declared_jobs.get(new_token) {
-                reg.register(
-                    *new_token,
-                    RegisteredDeclaredJob {
-                        declared_job: declared_job.clone(),
-                        jdp_session_id,
-                    },
-                );
+        match event {
+            JdpSessionEvent::JobDeclared { new_token } => {
+                if let Some(declared_job) = state.declared_jobs.get(new_token) {
+                    reg.register(
+                        *new_token,
+                        RegisteredDeclaredJob {
+                            declared_job: declared_job.clone(),
+                            jdp_session_id,
+                        },
+                    );
+                }
             }
+            // Base-protocol Coinbase-only allocate: that mode never
+            // declares (§6.3.1), so this is the only record the mining side
+            // will have when its `SetCustomMiningJob` arrives.
+            //
+            // Which of the four this is: [`classify_allocation`], which owns
+            // the reasoning and is asserted over every combination. Note the
+            // negotiation flag is asked EXPLICITLY rather than inferred from
+            // `payout_script: None` — §2 empties the outputs on a negotiated
+            // session, so a legitimate 0x0003 allocate and a broken base one
+            // look identical here.
+            JdpSessionEvent::TokenAllocated {
+                token,
+                miner_address,
+                payout_script,
+                expires_at_ms,
+            } => match classify_allocation(
+                payout_script.as_deref(),
+                state.full_template_mode,
+                state
+                    .negotiated_extensions
+                    .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
+            ) {
+                AllocationDisposition::Register { payout_script } => {
+                    reg.register_allocation(
+                        *token,
+                        AllocatedTokenRef {
+                            miner_address: miner_address.clone(),
+                            payout_script: payout_script.to_vec(),
+                            jdp_session_id,
+                            expires_at_ms: *expires_at_ms,
+                        },
+                        now_ms(),
+                    );
+                }
+                AllocationDisposition::LeftToTheDeclaration
+                | AllocationDisposition::JudgedByTheDistribution => {}
+                AllocationDisposition::DesignatedNothing => {
+                    warn!(
+                        session_id = jdp_session_id,
+                        "jdp: base-protocol allocate designated no payout output — the token \
+                         cannot back a custom job (every SetCustomMiningJob on it will be \
+                         refused)"
+                    );
+                }
+            },
+            // Neither reaches the bridge. Spelled out rather than swallowed
+            // by a wildcard so a new event has to be classified here.
+            JdpSessionEvent::SetupComplete
+            | JdpSessionEvent::BlockSubmissionCandidate { .. }
+            | JdpSessionEvent::Disconnect { .. } => {}
         }
     }
 }
@@ -1435,18 +1604,36 @@ mod tests {
         server.shutdown().await;
     }
 
+    fn granted(outcome: AllocateOutcome) -> AllocateTokenContext {
+        match outcome {
+            AllocateOutcome::Granted(ctx) => ctx,
+            AllocateOutcome::Refused { reason } => panic!("refused: {reason}"),
+            AllocateOutcome::Ignored => panic!("ignored"),
+        }
+    }
+
+    /// The no-op hook has to designate a payout output like production
+    /// does, or the base-protocol path it stands in for is untestable: a
+    /// blob with no first output designates nothing, the bridge registers
+    /// no allocation, and every custom job built on the token is refused
+    /// `invalid-mining-job-token` while the harness looks green.
     #[tokio::test(flavor = "current_thread")]
-    async fn no_op_allocate_resolver_parses_user_identifier_as_address() {
+    async fn no_op_allocate_resolver_designates_the_miners_own_output() {
         let hooks = NoOpJdpHooks;
-        let ctx = hooks
-            .resolve_allocate_context(ADDR, "1.2.3.4:1234", false)
-            .await;
-        let ctx = ctx.expect("valid address resolves");
+        let ctx = granted(
+            hooks
+                .resolve_allocate_context(ADDR, "1.2.3.4:1234", false)
+                .await,
+        );
         assert_eq!(ctx.miner_address.as_str(), ADDR);
+        let outputs: Vec<bitcoin::TxOut> =
+            bitcoin::consensus::deserialize(&ctx.coinbase_outputs).expect("outputs decode");
+        assert_eq!(outputs.len(), 1, "§6.4.3 designates ONE payout output");
+        assert_eq!(outputs[0].value, bitcoin::Amount::ZERO);
         assert_eq!(
-            ctx.coinbase_outputs.as_slice(),
-            &[0u8],
-            "without 0x0003 the base §6.4.3 outputs apply"
+            crate::jdp::dynamic_outputs::designated_payout_script(&ctx.coinbase_outputs).as_deref(),
+            Some(outputs[0].script_pubkey.as_bytes()),
+            "the blob must yield a designated script the bridge can register"
         );
     }
 
@@ -1456,10 +1643,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_op_allocate_resolver_empty_outputs_when_0x0003_negotiated() {
         let hooks = NoOpJdpHooks;
-        let ctx = hooks
-            .resolve_allocate_context(ADDR, "1.2.3.4:1234", true)
-            .await;
-        let ctx = ctx.expect("valid address resolves");
+        let ctx = granted(
+            hooks
+                .resolve_allocate_context(ADDR, "1.2.3.4:1234", true)
+                .await,
+        );
         assert_eq!(ctx.miner_address.as_str(), ADDR);
         assert!(ctx.coinbase_outputs.is_empty());
     }
@@ -1467,10 +1655,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_op_allocate_resolver_rejects_garbage_user_identifier() {
         let hooks = NoOpJdpHooks;
-        let ctx = hooks
+        let outcome = hooks
             .resolve_allocate_context(&"x".repeat(200), "1.2.3.4:1234", false)
             .await;
-        assert!(ctx.is_none(), "garbage user-identifier yields None");
+        assert!(
+            matches!(outcome, AllocateOutcome::Ignored),
+            "garbage user-identifier is ignored, not refused — the connection stays open"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1500,7 +1691,14 @@ mod tests {
                 coinbase_outputs,
             } => {
                 assert_eq!(*request_id, 7);
-                assert_eq!(coinbase_outputs.as_slice(), &[0u8]);
+                // §6.4.3: one designated payout output, 0 sats. This used
+                // to assert `[0x00]` — an EMPTY output vector, i.e. the
+                // no-op hook designating nothing, which is what made every
+                // base-protocol custom job unservable.
+                let outputs: Vec<bitcoin::TxOut> =
+                    bitcoin::consensus::deserialize(coinbase_outputs).expect("outputs decode");
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].value, bitcoin::Amount::ZERO);
             }
             _ => panic!("expected AllocateMiningJobTokenSuccess"),
         }
@@ -1774,11 +1972,11 @@ mod tests {
         assert!(wire.additional_outputs.is_empty());
     }
 
-    /// `register_declared_jobs_in_bridge` pulls the declared-job
+    /// `register_bridge_entries` pulls the declared-job
     /// payload out of the session state and writes a
     /// `RegisteredDeclaredJob` into the cross-server bridge.
     #[tokio::test(flavor = "current_thread")]
-    async fn register_declared_jobs_in_bridge_pushes_to_registry() {
+    async fn register_bridge_entries_pushes_declared_jobs_to_registry() {
         use crate::jdp::declarations::DeclaredJob;
         let mut state = fresh_session();
         let token = Token([0xAA; 16]);
@@ -1798,11 +1996,105 @@ mod tests {
         state.declared_jobs.insert(job);
         let bridge = fresh_bridge();
         let events = vec![JdpSessionEvent::JobDeclared { new_token: token }];
-        register_declared_jobs_in_bridge(&state, &bridge, 42, &events);
+        register_bridge_entries(&state, &bridge, 42, &events);
         let r = bridge.read().unwrap();
         let entry = r.job_ref(&token).expect("must be registered");
         assert_eq!(entry.jdp_session_id, 42);
         assert_eq!(entry.miner_address.as_str(), ADDR);
         assert_eq!(entry.declared_prev_hash, Some([0xCC; 32]));
+    }
+
+    /// The same call registers a BASE-protocol allocate, which is the only
+    /// record Coinbase-only mode leaves — it never declares. Both
+    /// directions, because "everything registers" would read the same as
+    /// "base allocations register": an ext 0x0003 allocate carries no
+    /// designated script (§2 requires empty outputs) and must register
+    /// nothing, or the map could wave through a job that owes the §7.1
+    /// recompute.
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_bridge_entries_pushes_base_allocations_only() {
+        let state = fresh_session();
+        let bridge = fresh_bridge();
+        let base = Token([0xBB; 16]);
+        let negotiated = Token([0xCC; 16]);
+        let events = vec![
+            JdpSessionEvent::TokenAllocated {
+                token: base,
+                miner_address: AddressId::new(ADDR.to_string()).unwrap(),
+                payout_script: Some(vec![0x00, 0x14, 0xAB]),
+                expires_at_ms: 9_000,
+            },
+            JdpSessionEvent::TokenAllocated {
+                token: negotiated,
+                miner_address: AddressId::new(ADDR.to_string()).unwrap(),
+                payout_script: None,
+                expires_at_ms: 9_000,
+            },
+        ];
+        register_bridge_entries(&state, &bridge, 42, &events);
+
+        let r = bridge.read().unwrap();
+        let entry = r.allocation_ref(&base, 0).expect("base allocate registers");
+        assert_eq!(entry.jdp_session_id, 42);
+        assert_eq!(entry.miner_address.as_str(), ADDR);
+        assert_eq!(entry.payout_script, vec![0x00, 0x14, 0xAB]);
+        assert!(
+            r.allocation_ref(&negotiated, 1_000).is_none(),
+            "an ext 0x0003 allocate has no designated output to register"
+        );
+    }
+
+    /// All eight combinations, because three of the four dispositions register
+    /// nothing and the registry cannot tell them apart — only the reason
+    /// differs, and only ONE of them is a fault.
+    ///
+    /// The row this pins is `(script: None, Coinbase-only, negotiated)`.
+    /// §2 REQUIRES an ext 0x0003 allocate to carry empty
+    /// `coinbase_tx_outputs`, so it has no designated script — and reading
+    /// that absence as "the pool built a broken blob" made every Coinbase-only
+    /// 0x0003 connection log a pool bug and predict `invalid-mining-job-token`
+    /// on every job it would ever build. Those jobs are served: the §6 TLV
+    /// rides the frame in that mode and the §7.1 recompute judges them.
+    #[test]
+    fn an_allocate_is_classified_by_all_three_flags() {
+        use AllocationDisposition as D;
+        const SCRIPT: &[u8] = &[0x00, 0x14, 0xAB];
+
+        // (payout_script, full_template_mode, negotiated) → disposition
+        let cases: [(Option<&[u8]>, bool, bool, D); 8] = [
+            // Coinbase-only, base protocol: the one row that registers.
+            (
+                Some(SCRIPT),
+                false,
+                false,
+                D::Register {
+                    payout_script: SCRIPT,
+                },
+            ),
+            // Coinbase-only + ext 0x0003: NOT a fault — §2 empties the
+            // outputs and §7.1 does the judging.
+            (None, false, true, D::JudgedByTheDistribution),
+            // The same session shape with a script somehow present is still
+            // the distribution's to judge — registering would let the weak
+            // §6.4.3 check stand in for the §7.1 recompute.
+            (Some(SCRIPT), false, true, D::JudgedByTheDistribution),
+            // Full-Template: the declaration is the record, whatever else
+            // is true. Registering would let the JDC skip §6.1 validation.
+            (Some(SCRIPT), true, false, D::LeftToTheDeclaration),
+            (Some(SCRIPT), true, true, D::LeftToTheDeclaration),
+            (None, true, false, D::LeftToTheDeclaration),
+            (None, true, true, D::LeftToTheDeclaration),
+            // The only fault: a base allocate the pool designated nothing in.
+            (None, false, false, D::DesignatedNothing),
+        ];
+
+        for (script, full_template, negotiated, want) in cases {
+            assert_eq!(
+                classify_allocation(script, full_template, negotiated),
+                want,
+                "script={:?} full_template={full_template} negotiated={negotiated}",
+                script.map(|s| s.len())
+            );
+        }
     }
 }
