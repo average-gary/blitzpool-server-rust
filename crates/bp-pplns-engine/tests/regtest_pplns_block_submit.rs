@@ -164,7 +164,7 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
     // ── Build the engine's distribution for this template's reward ──
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
-        .build_distribution(reward_sats)
+        .build_distribution(reward_sats, None)
         .await
         .expect("build_distribution");
     // The §4 evaluation at this template's revenue. Bit-exact shape:
@@ -352,7 +352,7 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
     // ── Engine distribution for this template's reward (subsidy + fees) ──
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
-        .build_distribution(reward_sats)
+        .build_distribution(reward_sats, None)
         .await
         .expect("build_distribution");
     let payouts: Vec<PayoutEntry> = dist
@@ -536,7 +536,7 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
     // ── The build this block's coinbase is made from ──────────────
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
-        .build_distribution(reward_sats)
+        .build_distribution(reward_sats, None)
         .await
         .expect("build_distribution");
     let fingerprint = dist.payouts_fingerprint();
@@ -573,7 +573,7 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
     //    snapshot (the fingerprint hashes settlement inputs, not
     //    amounts) — it must not disturb the booking below. ─────────
     let jdc_style = engine
-        .build_distribution(reward_sats - 997)
+        .build_distribution(reward_sats - 997, None)
         .await
         .expect("jdc-style build");
     assert_eq!(jdc_style.payouts_fingerprint(), fingerprint);

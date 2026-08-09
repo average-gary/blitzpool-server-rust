@@ -658,6 +658,22 @@ pub struct PplnsConfig {
     /// against an empty window; lowering it is harmless.
     #[serde(default = "default_bucket_shares")]
     pub bucket_shares: u64,
+    /// Extra weight the block's finder is credited, in parts-per-million
+    /// of the miners' cut. `0` (the default) disables it; the engine
+    /// refuses anything above `bp_pplns::MAX_FINDER_BONUS_PPM`.
+    ///
+    /// Parts-per-million rather than satoshis because §4 pays every
+    /// output `weight · T / W`, so a weight IS a fraction of the block. A
+    /// satoshi amount has to be projected against one chosen revenue to
+    /// become a weight, and a job-declaring client building its coinbase
+    /// from its own template then delivers a different bonus than the one
+    /// configured.
+    ///
+    /// Pool-wide and operator-owned, unlike the Group-Solo bonus, which
+    /// is a per-group DB column a group admin PATCHes. A PPLNS window has
+    /// no admin but the operator.
+    #[serde(default)]
+    pub finder_bonus_ppm: u32,
     /// Coinbase-budget autoscaler. **Absent** ⇒ the budget stays fixed at
     /// `coinbase_weight_budget` (legacy behaviour, fully back-compatible).
     /// **Present** ⇒ the budget self-adjusts at runtime within

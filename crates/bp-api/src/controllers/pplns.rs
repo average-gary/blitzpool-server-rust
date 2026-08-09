@@ -359,6 +359,18 @@ struct FeesResponse {
     max_miner_outputs_adaptive: u32,
     min_difficulty: u64,
     warmup_shares: u32,
+    /// Configured `[pplns] finder_bonus_ppm` — the extra score weight the
+    /// block's finder is credited, in parts-per-million of the miners'
+    /// cut. `0` means no bonus.
+    ///
+    /// Exact as published, unlike the satoshi-denominated bonus this
+    /// replaced: a weight IS a fraction of the block under §4, so this
+    /// number needs no block reward to interpret and no clamp caveat.
+    /// What it is a fraction OF is the miners' cut, so the finder's gain
+    /// over their proportional share is `ppm/1e6 × (1 − their own
+    /// share)` — a client rendering "your bonus" wants that formula, not
+    /// this number alone.
+    finder_bonus_ppm: u32,
 }
 
 async fn fees<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
@@ -416,6 +428,7 @@ where
                     max_miner_outputs_adaptive,
                     min_difficulty: raw_cfg.min_difficulty,
                     warmup_shares: raw_cfg.warmup_shares,
+                    finder_bonus_ppm: raw_cfg.finder_bonus_ppm,
                 })
             },
         )
@@ -671,6 +684,44 @@ mod tests {
         assert_eq!(v["paidSats"], 5000);
         assert_eq!(v["address"], "bc1qtest");
         assert!(v["createdAt"].is_string());
+    }
+
+    /// `finderBonusPpm`, camelCased like every other key here.
+    ///
+    /// Pinned because the name is the contract: a client rendering the
+    /// bonus reads this key, and `rename_all` makes the Rust field name
+    /// and the JSON key silently different things. A rename to
+    /// `finder_bonus` in Rust would keep compiling and quietly serve
+    /// `finderBonus`, and the UI would render nothing rather than fail.
+    ///
+    /// A `u32` in JSON is a plain number, not the string-encoded form the
+    /// `ser_f64_jsnum` fields need — no precision caveat applies, because
+    /// ppm is integral by construction.
+    #[test]
+    fn fees_publishes_the_finder_bonus_as_camel_case_ppm() {
+        let v: Value = serde_json::to_value(FeesResponse {
+            fee_percent: 1.5,
+            fee_address: None,
+            coinbase_weight_budget: 0,
+            group_fee_percent: 1.5,
+            group_fee_address: None,
+            dust_limit_sats: 0,
+            min_payout_sats: 0,
+            coinbase_base_weight: 0,
+            coinbase_output_weight: 0,
+            coinbase_witness_commitment_weight: 0,
+            max_miner_outputs: 0,
+            max_miner_outputs_adaptive: 0,
+            min_difficulty: 0,
+            warmup_shares: 0,
+            finder_bonus_ppm: 177_600,
+        })
+        .unwrap();
+        assert_eq!(v["finderBonusPpm"], 177_600);
+        assert!(
+            v.get("finder_bonus_ppm").is_none(),
+            "the snake_case field name must not leak into the response"
+        );
     }
 
     #[test]

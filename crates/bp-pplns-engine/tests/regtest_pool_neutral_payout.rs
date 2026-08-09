@@ -219,7 +219,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
 
     let reward_1 = template_1.coinbase_tx_value_remaining;
     let dist_1 = engine
-        .build_distribution(reward_1)
+        .build_distribution(reward_1, None)
         .await
         .expect("build_distribution");
     let weights_1 = &dist_1.distribution;
@@ -415,7 +415,7 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     );
     let reward_2 = template_2.coinbase_tx_value_remaining;
     let dist_2 = engine
-        .build_distribution(reward_2)
+        .build_distribution(reward_2, None)
         .await
         .expect("build_distribution");
     let weights_2 = &dist_2.distribution;

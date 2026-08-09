@@ -280,6 +280,7 @@ fn to_pplns_engine_config(
         dust_sweep_enabled: cfg.dust_sweep_enabled,
         abandoned_balance_days: cfg.abandoned_balance_days,
         bucket_shares: cfg.bucket_shares,
+        finder_bonus_ppm: cfg.finder_bonus_ppm,
         subsidy_halving_interval: subsidy_halving_interval(network),
         ..PplnsEngineConfig::default()
     };

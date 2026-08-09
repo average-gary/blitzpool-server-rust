@@ -237,7 +237,11 @@ async fn build_distribution_returns_payouts_after_shares() {
         .await
         .unwrap();
 
-    let result = h.engine.build_distribution(312_500_000).await.expect("ok");
+    let result = h
+        .engine
+        .build_distribution(312_500_000, None)
+        .await
+        .expect("ok");
     assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
     assert!(result.distribution.published().count() > 0);
     for addr in [ADDR_A, ADDR_B] {
@@ -270,7 +274,11 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         .record_share(None, ADDR, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let result = h.engine.build_distribution(312_500_000).await.expect("ok");
+    let result = h
+        .engine
+        .build_distribution(312_500_000, None)
+        .await
+        .expect("ok");
     // Precondition pinning the SHAPE this test means to build: the miner
     // must really be a published payout, or the assertions below pass on
     // an empty distribution again.
@@ -386,7 +394,11 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
         .await
         .unwrap();
 
-    let result = h.engine.build_distribution(REWARD).await.expect("built");
+    let result = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("built");
     let fp = result.payouts_fingerprint();
     assert!(
         result.snapshot_written,
@@ -501,7 +513,11 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
         .await
         .unwrap();
 
-    let result = h.engine.build_distribution(REWARD).await.expect("built");
+    let result = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("built");
     let fp = result.payouts_fingerprint();
     let actual = actual_paying_exactly(&result, REWARD);
 
@@ -607,7 +623,11 @@ async fn a_different_block_at_the_same_height_is_refused_not_swallowed() {
         .await
         .unwrap();
 
-    let result = h.engine.build_distribution(REWARD).await.expect("built");
+    let result = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("built");
     let fp = result.payouts_fingerprint();
 
     // Block A confirms and books.
@@ -713,7 +733,7 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
     const MINED_REWARD: u64 = 312_500_000;
     let mined = h
         .engine
-        .build_distribution(MINED_REWARD)
+        .build_distribution(MINED_REWARD, None)
         .await
         .expect("mined build ok");
     assert!(
@@ -727,7 +747,7 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
     // inputs, not amounts), so it cannot displace anything.
     let later = h
         .engine
-        .build_distribution(MINED_REWARD - 863)
+        .build_distribution(MINED_REWARD - 863, None)
         .await
         .expect("later build ok");
     assert_eq!(
@@ -980,7 +1000,11 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         .record_share(None, TINY, 1.0, 1_700_000_000_002)
         .await
         .unwrap();
-    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("build 1");
     let entries1 = d1
         .distribution
         .payout_entries_at(REWARD)
@@ -1017,7 +1041,11 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         .record_share(None, TINY, 1.0, 1_700_000_060_002)
         .await
         .unwrap();
-    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("build 2");
     let entries2 = d2
         .distribution
         .payout_entries_at(REWARD)
@@ -1076,7 +1104,11 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .record_share(None, MINER, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("build 1");
     let _p1 = h
         .engine
         .on_block_found(
@@ -1096,7 +1128,11 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
-    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("build 2");
     let _p2 = h
         .engine
         .on_block_found(
@@ -1147,7 +1183,11 @@ async fn two_blocks_in_sequence_both_accumulate() {
         .record_share(None, MINER, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("build 1");
     let _p1 = h
         .engine
         .on_block_found(
@@ -1165,7 +1205,11 @@ async fn two_blocks_in_sequence_both_accumulate() {
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
-    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("build 2");
     let _p2 = h
         .engine
         .on_block_found(
@@ -1244,7 +1288,10 @@ async fn spawn_core_skips_crons_but_build_distribution_works() {
     );
 
     // The Core's read path still produces a distribution.
-    let result = engine.build_distribution(312_500_000).await.expect("ok");
+    let result = engine
+        .build_distribution(312_500_000, None)
+        .await
+        .expect("ok");
     assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
     assert!(result.distribution.published().count() > 0);
     assert!(result
@@ -1285,7 +1332,11 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
     const REWARD: u64 = 312_500_000;
     // A perfectly good snapshot for this window exists — a fallback
     // would succeed and pass every plausibility check.
-    let good = h.engine.build_distribution(REWARD).await.expect("build ok");
+    let good = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("build ok");
 
     let never_written = [0x5au8; 32];
     let err = h
@@ -1334,7 +1385,11 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
         .unwrap();
 
     const REWARD: u64 = 312_500_000;
-    let dist = h.engine.build_distribution(REWARD).await.expect("build ok");
+    let dist = h
+        .engine
+        .build_distribution(REWARD, None)
+        .await
+        .expect("build ok");
     let fp = dist.payouts_fingerprint();
     let height = 9_997_301;
     let actual = actual_paying_exactly(&dist, REWARD);
@@ -1424,10 +1479,14 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
 
     // Two blocks in flight, BOTH frozen against the same (empty) ledger
     // — and under the weight model from the SAME distribution snapshot.
-    let dist_first = h.engine.build_distribution(REWARD_FIRST).await.expect("ok");
+    let dist_first = h
+        .engine
+        .build_distribution(REWARD_FIRST, None)
+        .await
+        .expect("ok");
     let dist_second = h
         .engine
-        .build_distribution(REWARD_SECOND)
+        .build_distribution(REWARD_SECOND, None)
         .await
         .expect("ok");
     let fp_second = dist_second.payouts_fingerprint();
@@ -1535,7 +1594,11 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
         .record_share(None, TINY, 1.0, 1_700_000_000_002)
         .await
         .unwrap();
-    let d1 = h.engine.build_distribution(T_REF).await.expect("build 1");
+    let d1 = h
+        .engine
+        .build_distribution(T_REF, None)
+        .await
+        .expect("build 1");
     h.engine
         .on_block_found(
             h1,
@@ -1561,7 +1624,11 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
         .record_share(None, TINY, 1.0, 1_700_000_060_002)
         .await
         .unwrap();
-    let d2 = h.engine.build_distribution(T_REF).await.expect("build 2");
+    let d2 = h
+        .engine
+        .build_distribution(T_REF, None)
+        .await
+        .expect("build 2");
     // The fixture's own statement, now that no production constant defines
     // a band: T_ACTUAL must be FAR off the projection base, or the test
     // would pass on a block that never exercised the drift.
@@ -1635,7 +1702,11 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
         .record_share(None, MINER, 1_000.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let d = h.engine.build_distribution(T_REF).await.expect("build");
+    let d = h
+        .engine
+        .build_distribution(T_REF, None)
+        .await
+        .expect("build");
 
     // A §4-consistent coinbase — it just forfeits most of the block.
     let burned = actual_paying_exactly(&d, subsidy - 1);
@@ -1720,7 +1791,7 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
     .await
     .unwrap();
 
-    let d = h.engine.build_distribution(T).await.expect("build");
+    let d = h.engine.build_distribution(T, None).await.expect("build");
     let actual = actual_paying_exactly(&d, T);
     assert!(
         actual.paid_by_address.get(DORMANT).is_some_and(|p| *p > 0),
@@ -1770,7 +1841,7 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
     .await
     .unwrap();
 
-    let d = h.engine.build_distribution(T).await.expect("build");
+    let d = h.engine.build_distribution(T, None).await.expect("build");
     let actual = actual_paying_exactly(&d, T);
     assert!(
         actual.paid_by_address.get(DORMANT).is_some_and(|p| *p > 0),

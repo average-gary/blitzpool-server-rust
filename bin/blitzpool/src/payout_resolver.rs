@@ -184,13 +184,17 @@ fn books_without_a_snapshot(mode: MiningMode) -> bool {
     }
 }
 
-/// Which of the two tailored builds a mode gets. Both need a reference
+/// Which tailored build a mode gets. All of them need a reference
 /// revenue and produce a per-miner distribution; they differ only in
 /// where the weights come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TailoredMode {
     Solo,
     GroupSolo,
+    /// PPLNS with a finder bonus configured. The weights come from the
+    /// same window every other PPLNS miner is paid from; what is
+    /// per-miner is the bonus, and therefore the fingerprint.
+    Pplns,
 }
 
 /// What JDP serves a mode — the whole answer, not a yes/no.
@@ -214,8 +218,17 @@ enum JdpDistributionFor {
 /// Pure and total on purpose. It is the one place the money question
 /// "which distribution does this miner get?" is answered, so a mode added
 /// later cannot reach a builder it was never classified for — and because
-/// it takes only a [`MiningMode`], the answer is testable without engines,
-/// Redis or a template feed.
+/// its inputs are an `Option<MiningMode>` and one flag, the answer is
+/// testable without engines, Redis or a template feed.
+///
+/// `finder_bonus_active` is the PPLNS finder bonus, and it moves PPLNS —
+/// the pool's largest mode — off the pool-wide fast path onto the
+/// tailored one. A bonus makes the distribution depend on WHO is asking:
+/// one pool-wide build names a single finder, so publishing it to every
+/// client would pay that one miner the bonus on everybody's block. It is
+/// a parameter rather than a read of engine state so this function stays
+/// pure — the caller does the reading, and both PPLNS answers are
+/// exhaustively testable as data.
 ///
 /// **Blockparty gets nothing.** A Blockparty group is a rental: the
 /// hashrate is pointed straight at an address and the pool splits the
@@ -232,13 +245,21 @@ enum JdpDistributionFor {
 /// pool-wide distribution too (see [`TailoredDistribution`]), so it can
 /// declare nothing at all rather than declare something the pool cannot
 /// account for.
-fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
+fn jdp_distribution_for(mode: Option<MiningMode>, finder_bonus_active: bool) -> JdpDistributionFor {
     match mode {
         // No mining session for this address, so no port has declared its
         // mode. Taking the gate's Solo default here published a Solo plan for
         // whoever allocated first — and a JDC allocates ~8 s before its
         // channel opens, so that was every JDC, every start.
+        //
+        // A configured bonus does NOT make this PPLNS. The bonus says what a
+        // PPLNS session is served, never that an unknown address is one, and
+        // assuming it would be the same guess in the other direction: a Solo
+        // miner's block paid into the PPLNS window, plus a bonus on top.
         None => JdpDistributionFor::ModeUnknown,
+        Some(MiningMode::Pplns) if finder_bonus_active => {
+            JdpDistributionFor::Tailored(TailoredMode::Pplns)
+        }
         Some(MiningMode::Pplns) => JdpDistributionFor::PoolWide,
         Some(MiningMode::Solo) => JdpDistributionFor::Tailored(TailoredMode::Solo),
         Some(MiningMode::GroupSolo) => JdpDistributionFor::Tailored(TailoredMode::GroupSolo),
@@ -257,8 +278,19 @@ fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
 /// compares its result against `StreamKind::for_mode` to decide whether an
 /// address's mode moved. A test that restates this mapping instead of calling
 /// it proves nothing about the pair actually agreeing.
+///
+/// A bonus-tailored PPLNS build is [`DistributionAccounting::Pplns`] and NOT
+/// `PoolWide`, even though the window it pays from is the same one. `PoolWide`
+/// has no owner, and the owner is what
+/// `DistributionScope::MinerAddress` looks a tailored slot up BY — so the
+/// finder's own plan would be invisible to that lookup, the block found on a
+/// Full-Template job would be checked against the pool-wide plan instead, and
+/// the declare would fail closed. `Pplns(finder)` also keeps every OTHER PPLNS
+/// session from mining it, which `PoolWide` would wave through: that session's
+/// block would pay this finder's bonus.
 fn accounting_for(tailored: TailoredMode, miner: &AddressId) -> DistributionAccounting {
     match tailored {
+        TailoredMode::Pplns => DistributionAccounting::Pplns(miner.clone()),
         TailoredMode::Solo => DistributionAccounting::Solo(miner.clone()),
         TailoredMode::GroupSolo => DistributionAccounting::GroupSolo(miner.clone()),
     }
@@ -307,10 +339,25 @@ impl ProductionPayoutResolver {
             );
             return (ResolvedPayouts::none(), false);
         };
-        // The pool-wide build first. It is shared by every PPLNS
-        // connection, so it cannot name a claimant — an empty window comes
-        // back as `NoScoredMiners` and is answered per-miner below.
-        let built = match pplns.build_distribution(reward_sats).await {
+        // Parsed once, up front, and used both as the prospective finder
+        // and as the bootstrap claimant — the same miner in both roles.
+        //
+        // A parse failure is NOT fatal here: `sanitize_and_build` drops
+        // unparseable addresses anyway, so such a miner is unpayable and
+        // unbonusable by the same rule, and the pool-wide build below
+        // still serves every OTHER miner in the window. Only the
+        // bootstrap path, where this miner would be the sole claimant,
+        // has to refuse.
+        let asking_miner = AddressId::new(miner_address.to_string());
+        // The build is shared by every PPLNS connection unless a finder
+        // bonus is configured, in which case it is per-finder. Either way
+        // it cannot name a bootstrap CLAIMANT — that is a promise of the
+        // whole block, gated on `NoScoredMiners` below, not offered
+        // speculatively.
+        let built = match pplns
+            .build_distribution(reward_sats, asking_miner.as_ref().ok())
+            .await
+        {
             Ok(result) => Some(result),
             Err(err) if is_empty_share_window(&err) => {
                 // Nobody in the window holds a share. The distribution the
@@ -320,10 +367,10 @@ impl ProductionPayoutResolver {
                 // from accepted shares, and shares only come from jobs.
                 // So this miner claims the block — nobody else has a claim
                 // to lose, and the pool still takes exactly its fee.
-                match AddressId::new(miner_address.to_string()) {
+                match asking_miner.as_ref() {
                     Ok(claimant) => {
                         match pplns
-                            .build_bootstrap_distribution(reward_sats, &claimant)
+                            .build_bootstrap_distribution(reward_sats, claimant)
                             .await
                         {
                             Ok(result) => Some(result),
@@ -718,7 +765,29 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
     async fn build_pool_wide(&self) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
         let t_ref = self.chain.reference_revenue()?;
         let pplns = self.resolver.pplns.as_ref()?;
-        let result = match pplns.build_distribution(t_ref).await {
+        // `None` for the finder even when a bonus IS configured, and the
+        // build is deliberately bonus-free rather than skipped.
+        //
+        // This slot is not only PPLNS's job feed. It is what
+        // `current_pool_wide()` answers, which is what makes
+        // `distribution_available` true, which is the ONLY thing that
+        // lets ext 0x0003 be negotiated at all — for every mode, on
+        // every session (`jdp_server.rs`, `handle_request_extensions`).
+        // Returning `None` here because a bonus is configured therefore
+        // does not move PPLNS onto the per-finder path; it takes the
+        // whole extension down, and Solo and Group-Solo with it, and the
+        // per-finder `build_for_miner` path below is then never reached
+        // because it is gated on that same negotiation. A knob reading
+        // "pay the finder extra" would silently disable non-custodial
+        // payout enforcement pool-wide.
+        //
+        // A bonus-free pool-wide build is safe in the direction that
+        // matters. It is what a session falls back on when a tailored
+        // publish fails (see `distribution_acceptance`), and the worst it
+        // can do is pay a finder no bonus — an under-payment inside the
+        // miners' cut, never a payment to the wrong miner. Naming some
+        // arbitrary finder here would be the misdirection.
+        let result = match pplns.build_distribution(t_ref, None).await {
             Ok(r) => r,
             Err(err) => {
                 warn!(%err, "jdp distribution source: PPLNS build failed — nothing to publish");
@@ -746,7 +815,19 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         // Group-Solo finder one that pays him instead of his group.
         let known = self.resolver.mode_gate.lookup_known(miner_address.as_str());
         let mode = known.as_ref().map(|r| r.mode);
-        let tailored = match jdp_distribution_for(mode) {
+        // A configured finder bonus is what moves PPLNS from `PoolWide` to
+        // `Tailored(Pplns)` — read here, decided in `jdp_distribution_for`,
+        // so the classification stays a pure function of mode plus flag.
+        // An absent engine reads as no bonus: there is nothing to build
+        // per-finder, and the `PoolWide` that answers instead is the same
+        // `None`-yielding slot `build_pool_wide` guards, so such a session
+        // is denied rather than served a distribution nobody can book.
+        let finder_bonus_active = self
+            .resolver
+            .pplns
+            .as_ref()
+            .is_some_and(|pplns| pplns.finder_bonus_active());
+        let tailored = match jdp_distribution_for(mode, finder_bonus_active) {
             JdpDistributionFor::ModeUnknown => {
                 debug!(
                     miner = miner_address.as_str(),
@@ -776,6 +857,39 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
             return TailoredDistribution::Unavailable;
         };
         let built = match tailored {
+            // Only reachable with a finder bonus configured — the
+            // bonus-off case classified as `PoolWide` above. The window
+            // read is shared with every other build at this revenue; what
+            // is per-miner is the bonus weight and therefore the
+            // fingerprint, so this JDC's block books against a snapshot
+            // naming it as finder.
+            //
+            // Unlike Group-Solo this does NOT pass a bootstrap claimant:
+            // an empty PPLNS window is answered by
+            // `build_bootstrap_distribution` on the share path only, and
+            // a JDC that would be the sole claimant of the whole block
+            // is not a promise the publisher makes. `NoScoredMiners`
+            // therefore lands in the `Err` arm below and the session is
+            // served nothing until the window has a share in it.
+            TailoredMode::Pplns => {
+                let Some(pplns) = self.resolver.pplns.as_ref() else {
+                    unreachable!(
+                        "Tailored(Pplns) requires finder_bonus_active, which requires the engine"
+                    )
+                };
+                match pplns.build_distribution(t_ref, Some(miner_address)).await {
+                    Ok(result) => self.lower_weight_distribution(
+                        &result.distribution,
+                        Some(result.payouts_fingerprint()),
+                        result.snapshot_written,
+                    ),
+                    Err(err) => {
+                        warn!(%err, miner = miner_address.as_str(),
+                            "jdp distribution source: PPLNS per-finder build failed — no tailored distribution");
+                        None
+                    }
+                }
+            }
             TailoredMode::GroupSolo => {
                 // Total rather than an unwrap: `ModeUnknown` already
                 // returned above, so `known` is Some here — but expressing
@@ -967,47 +1081,71 @@ mod tests {
     /// job-declaring client adds nothing. `build_for_miner` used to build
     /// it one anyway, out of the Blockparty allocator — a reachable,
     /// untested money path for a feature the pool does not offer.
+    ///
+    /// Asserted at BOTH values of the finder-bonus flag, because the flag
+    /// changes exactly one of the four answers. Only PPLNS may move, and
+    /// only to `Tailored(Pplns)` — a bonus that also changed Solo,
+    /// Group-Solo or Blockparty's answer would be routing a mode to a
+    /// builder that does not read its weights.
     #[test]
     fn jdp_answers_every_mode_with_exactly_one_distribution() {
-        assert_eq!(
-            jdp_distribution_for(Some(MiningMode::Pplns)),
-            JdpDistributionFor::PoolWide,
-            "PPLNS rides the shared window — that IS its accounting"
-        );
-        assert_eq!(
-            jdp_distribution_for(Some(MiningMode::Solo)),
-            JdpDistributionFor::Tailored(TailoredMode::Solo)
-        );
-        assert_eq!(
-            jdp_distribution_for(Some(MiningMode::GroupSolo)),
-            JdpDistributionFor::Tailored(TailoredMode::GroupSolo)
-        );
-        assert_eq!(
-            jdp_distribution_for(Some(MiningMode::Blockparty)),
-            JdpDistributionFor::Nothing,
-            "a rental is not served over JDP, and must not fall back to pool-wide"
-        );
+        for finder_bonus_active in [false, true] {
+            assert_eq!(
+                jdp_distribution_for(Some(MiningMode::Solo), finder_bonus_active),
+                JdpDistributionFor::Tailored(TailoredMode::Solo),
+                "Solo's answer does not depend on a PPLNS knob"
+            );
+            assert_eq!(
+                jdp_distribution_for(Some(MiningMode::GroupSolo), finder_bonus_active),
+                JdpDistributionFor::Tailored(TailoredMode::GroupSolo),
+                "Group-Solo's answer does not depend on a PPLNS knob"
+            );
+            assert_eq!(
+                jdp_distribution_for(Some(MiningMode::Blockparty), finder_bonus_active),
+                JdpDistributionFor::Nothing,
+                "a rental is not served over JDP, and must not fall back to pool-wide"
+            );
 
-        // The fifth answer, and the one that used to be missing: no mining
-        // session for this address, so no port has said which mode it is.
-        //
-        // This is not an edge case but the state at every JDC start — a JDC
-        // allocates ~8 s before it opens its mining channel, and the gate only
-        // learns an address when a session registers. Answering anything here
-        // is a guess, and both guesses cost money in opposite directions: a
-        // tailored plan pays one miner out of a shared window, the pool-wide
-        // one pays a Solo miner's block into the PPLNS window. So the answer
-        // is "not yet", and the caller retries.
+            // The fifth answer, and the one that used to be missing: no
+            // mining session for this address, so no port has said which mode
+            // it is.
+            //
+            // This is not an edge case but the state at every JDC start — a
+            // JDC allocates ~8 s before it opens its mining channel, and the
+            // gate only learns an address when a session registers. Answering
+            // anything here is a guess, and both guesses cost money in
+            // opposite directions: a tailored plan pays one miner out of a
+            // shared window, the pool-wide one pays a Solo miner's block into
+            // the PPLNS window. So the answer is "not yet", and the caller
+            // retries.
+            //
+            // Inside the flag loop on purpose. A configured bonus says what a
+            // PPLNS session is served; it never says an unknown address IS
+            // one. Reading it as PPLNS here would be the same guess in the
+            // other direction — a Solo miner's block paid into the PPLNS
+            // window, with a bonus on top.
+            assert_eq!(
+                jdp_distribution_for(None, finder_bonus_active),
+                JdpDistributionFor::ModeUnknown,
+                "an undecided mode must not resolve to any distribution — it used to \
+                 take the mode gate's Solo default and publish a Solo plan for it"
+            );
+            assert_ne!(
+                jdp_distribution_for(None, finder_bonus_active),
+                jdp_distribution_for(Some(MiningMode::Solo), finder_bonus_active),
+                "unknown and Solo must stay distinct answers — collapsing them IS the bug"
+            );
+        }
         assert_eq!(
-            jdp_distribution_for(None),
-            JdpDistributionFor::ModeUnknown,
-            "an undecided mode must not resolve to any distribution — it used to \
-             take the mode gate's Solo default and publish a Solo plan for it"
+            jdp_distribution_for(Some(MiningMode::Pplns), false),
+            JdpDistributionFor::PoolWide,
+            "with no bonus PPLNS rides the shared window — that IS its accounting"
         );
-        assert_ne!(
-            jdp_distribution_for(None),
-            jdp_distribution_for(Some(MiningMode::Solo)),
-            "unknown and Solo must stay distinct answers — collapsing them IS the bug"
+        assert_eq!(
+            jdp_distribution_for(Some(MiningMode::Pplns), true),
+            JdpDistributionFor::Tailored(TailoredMode::Pplns),
+            "a bonus makes the build depend on who is asking, so it cannot be published \
+             pool-wide: one named finder would be paid the bonus on every client's block"
         );
     }
 
@@ -1029,47 +1167,64 @@ mod tests {
         use bp_stratum_v2::bridge::{accounting_matches_stream, DistributionAccounting as Acct};
         let miner = AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string())
             .expect("address");
-        for mode in [
-            MiningMode::Pplns,
-            MiningMode::Solo,
-            MiningMode::GroupSolo,
-            MiningMode::Blockparty,
-        ] {
-            let probed = bp_common::StreamKind::for_mode(mode);
-            // The accounting `build_for_miner` stamps onto the entry for this
-            // mode, by calling the same two functions it calls — not by
-            // restating them. Swap the arms inside `accounting_for` and this
-            // test goes red; a restated copy would stay green while every
-            // Group-Solo JDP session got a plan the mining side then refuses.
-            let built = match jdp_distribution_for(Some(mode)) {
-                JdpDistributionFor::PoolWide => Some(Acct::PoolWide),
-                JdpDistributionFor::Tailored(kind) => Some(accounting_for(kind, &miner)),
-                // Nothing is built, so there is nothing for the probe to
-                // disagree with: the session lands in the refused state, whose
-                // retry is time-throttled and never asks about the mode.
-                JdpDistributionFor::Nothing => None,
-                JdpDistributionFor::ModeUnknown => {
-                    panic!("{mode:?} is a known mode; only `None` may answer ModeUnknown")
-                }
-            };
-            let Some(built) = built else { continue };
-            assert!(
-                accounting_matches_stream(&built, probed),
-                "{mode:?} is built as {built:?} but probes as {probed:?} — a session on this \
-                 mode would rebuild its plan on every frame"
-            );
+        // Both values of the finder-bonus flag, because it changes WHICH
+        // accounting a PPLNS session is stamped with — `PoolWide` off,
+        // `Pplns(miner)` on — and a bonus plan that did not match the PPLNS
+        // stream would be refused by the mining side on every frame. That is
+        // the same failure this test exists for, reached through the new arm.
+        for finder_bonus_active in [false, true] {
+            for mode in [
+                MiningMode::Pplns,
+                MiningMode::Solo,
+                MiningMode::GroupSolo,
+                MiningMode::Blockparty,
+            ] {
+                let probed = bp_common::StreamKind::for_mode(mode);
+                // The accounting `build_for_miner` stamps onto the entry for
+                // this mode, by calling the same two functions it calls — not
+                // by restating them. Swap the arms inside `accounting_for` and
+                // this test goes red; a restated copy would stay green while
+                // every Group-Solo JDP session got a plan the mining side then
+                // refuses.
+                let built = match jdp_distribution_for(Some(mode), finder_bonus_active) {
+                    JdpDistributionFor::PoolWide => Some(Acct::PoolWide),
+                    JdpDistributionFor::Tailored(kind) => Some(accounting_for(kind, &miner)),
+                    // Nothing is built, so there is nothing for the probe to
+                    // disagree with: the session lands in the refused state,
+                    // whose retry is time-throttled and never asks about the
+                    // mode.
+                    JdpDistributionFor::Nothing => None,
+                    JdpDistributionFor::ModeUnknown => {
+                        panic!("{mode:?} is a known mode; only `None` may answer ModeUnknown")
+                    }
+                };
+                let Some(built) = built else { continue };
+                assert!(
+                    accounting_matches_stream(&built, probed),
+                    "{mode:?} at finder_bonus_active={finder_bonus_active} is built as \
+                     {built:?} but probes as {probed:?} — a session on this mode would \
+                     rebuild its plan on every frame"
+                );
+            }
         }
     }
 
-    /// The two tailored modes must not be swapped: each names the builder
-    /// that reads ITS weights. A Group-Solo miner built as Solo would get a
-    /// single-payout coinbase and its group members nothing.
+    /// The tailored modes must not be swapped: each names the builder that
+    /// reads ITS weights. A Group-Solo miner built as Solo would get a
+    /// single-payout coinbase and its group members nothing; a PPLNS miner
+    /// built as either would be paid off a window neither reads.
     #[test]
-    fn the_two_tailored_modes_are_distinct() {
-        assert_ne!(
-            jdp_distribution_for(Some(MiningMode::Solo)),
-            jdp_distribution_for(Some(MiningMode::GroupSolo))
-        );
+    fn the_tailored_modes_are_distinct() {
+        let answers = [
+            jdp_distribution_for(Some(MiningMode::Solo), true),
+            jdp_distribution_for(Some(MiningMode::GroupSolo), true),
+            jdp_distribution_for(Some(MiningMode::Pplns), true),
+        ];
+        for (i, a) in answers.iter().enumerate() {
+            for b in &answers[i + 1..] {
+                assert_ne!(a, b, "two modes must not share one tailored builder");
+            }
+        }
     }
 
     #[test]

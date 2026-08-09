@@ -15,7 +15,7 @@
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
     validate_fee_payout_budget, FeePayoutBudgetError, DEFAULT_COINBASE_WEIGHT_BUDGET,
-    DEFAULT_MIN_PAYOUT_SATS,
+    DEFAULT_MIN_PAYOUT_SATS, MAX_FINDER_BONUS_PPM,
 };
 
 /// PPLNS-engine construction knobs.
@@ -60,6 +60,18 @@ pub struct PplnsEngineConfig {
     /// Sliding-window size factor: `window_size = factor *
     /// network_difficulty`. Defaults to `4` (no env override).
     pub window_factor: f64,
+
+    /// Extra score weight credited to the block's finder, in
+    /// parts-per-million of the miners' cut. `0` disables the bonus.
+    /// `[pplns] finder_bonus_ppm`.
+    ///
+    /// Validated against [`bp_pplns::MAX_FINDER_BONUS_PPM`] — the same
+    /// constant `build_weight_distribution` clamps to — so the boot
+    /// refusal and the silent clamp cannot disagree about what the
+    /// ceiling is. Accepting a value the builder clamps would have the
+    /// operator read their own config back as 60 % while the chain paid
+    /// 50 %, with nothing logging the gap.
+    pub finder_bonus_ppm: u32,
 
     /// Snapshot TTL in seconds.
     ///
@@ -146,6 +158,7 @@ impl Default for PplnsEngineConfig {
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
             window_factor: 4.0,
+            finder_bonus_ppm: 0,
             snapshot_ttl_secs: 1_200,
             bucket_shares: crate::window::DEFAULT_BUCKET_SHARES,
             touch_flush_interval_secs: 60,
@@ -175,6 +188,14 @@ impl PplnsEngineConfig {
         if !self.window_factor.is_finite() || self.window_factor <= 0.0 {
             return Err(ConfigError::InvalidWindowFactor {
                 value: self.window_factor,
+            });
+        }
+        // Not a `ZeroUnsignedField`: 0 is the documented way to disable
+        // the bonus, so only the ceiling is checked.
+        if self.finder_bonus_ppm > MAX_FINDER_BONUS_PPM {
+            return Err(ConfigError::FinderBonusPpmTooHigh {
+                value: self.finder_bonus_ppm,
+                max: MAX_FINDER_BONUS_PPM,
             });
         }
         if self.snapshot_ttl_secs == 0 {
@@ -223,6 +244,12 @@ pub enum ConfigError {
     WeightBudgetTooLow { value: u32, min: u32 },
     #[error("window_factor must be > 0.0 and finite, got {value}")]
     InvalidWindowFactor { value: f64 },
+    #[error(
+        "finder_bonus_ppm must be in [0, {max}] parts-per-million (0 disables), got {value} — \
+         above the ceiling the coinbase builder silently clamps, so the operator would read \
+         back a bonus the chain never pays"
+    )]
+    FinderBonusPpmTooHigh { value: u32, max: u32 },
     #[error("{field} must be > 0, got 0")]
     ZeroUnsignedField { field: &'static str },
 }
@@ -431,6 +458,45 @@ mod tests {
                 field: "abandoned_balance_days",
             }
         ));
+    }
+
+    /// 0 is how an operator turns the bonus off, so it must not trip the
+    /// zero-field check every other unsigned knob here gets.
+    #[test]
+    fn finder_bonus_ppm_zero_accepts() {
+        PplnsEngineConfig {
+            finder_bonus_ppm: 0,
+            ..valid()
+        }
+        .try_new()
+        .expect("0 disables the bonus");
+    }
+
+    #[test]
+    fn finder_bonus_ppm_at_the_ceiling_accepts() {
+        PplnsEngineConfig {
+            finder_bonus_ppm: MAX_FINDER_BONUS_PPM,
+            ..valid()
+        }
+        .try_new()
+        .expect("exactly the ceiling is in range");
+    }
+
+    /// The boot refusal exists precisely because the builder would
+    /// otherwise clamp this silently.
+    #[test]
+    fn finder_bonus_ppm_above_the_ceiling_rejects() {
+        let cfg = PplnsEngineConfig {
+            finder_bonus_ppm: MAX_FINDER_BONUS_PPM + 1,
+            ..valid()
+        };
+        assert_eq!(
+            cfg.try_new().unwrap_err(),
+            ConfigError::FinderBonusPpmTooHigh {
+                value: MAX_FINDER_BONUS_PPM + 1,
+                max: MAX_FINDER_BONUS_PPM,
+            }
+        );
     }
 
     /// A non-zero fee still validates. (The `fee_suppressed()` helper this

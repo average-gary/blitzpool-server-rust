@@ -465,7 +465,8 @@ struct StoredJob {
 ///
 /// The pool builds exactly one of these per mode
 /// (`crate::jdp_server::TailoredDistribution`): PPLNS rides the pool-wide
-/// push, Solo and Group-Solo get their own, Blockparty is served none at all.
+/// push unless a finder bonus is configured, Solo and Group-Solo get their
+/// own, Blockparty is served none at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DistributionAccounting {
     /// The PPLNS window's. Every connection may REFERENCE it — that is the
@@ -477,6 +478,17 @@ pub enum DistributionAccounting {
     /// round shares, which is a different payout vector from `Solo` for the
     /// very same address.
     GroupSolo(AddressId),
+    /// Tailored to one PPLNS miner because a finder bonus is configured: the
+    /// same window split as `PoolWide` plus that address's bonus weight.
+    ///
+    /// Owned rather than pool-wide even though the window is shared, and the
+    /// reason is the owner itself. A bonus build differs from the pool-wide
+    /// one by WHO it names, so publishing it pool-wide would pay one miner the
+    /// bonus on every other client's block — and `PoolWide` has no owner to
+    /// look it up by, so the finder's own plan would be invisible to
+    /// `DistributionScope::MinerAddress` and its Full-Template block would be
+    /// checked against the pool-wide plan instead.
+    Pplns(AddressId),
 }
 
 impl DistributionAccounting {
@@ -484,7 +496,7 @@ impl DistributionAccounting {
     pub fn owner(&self) -> Option<&AddressId> {
         match self {
             Self::PoolWide => None,
-            Self::Solo(owner) | Self::GroupSolo(owner) => Some(owner),
+            Self::Solo(owner) | Self::GroupSolo(owner) | Self::Pplns(owner) => Some(owner),
         }
     }
 }
@@ -533,6 +545,12 @@ pub fn accounting_matches_stream(
         // connection could point at it: its blocks would pay the PPLNS window
         // while its shares kept earning a cut of the group's.
         (Acct::PoolWide, Sk::Pplns) => true,
+        // A bonus plan is the PPLNS window's too, so the stream is the same
+        // question. WHICH PPLNS miner may mine it is not asked here — the pair
+        // is a mode test, and every caller with an address to check does that
+        // against `owner()`. Answering `false` for a bonus plan on its own
+        // stream would deny the session the only plan built for it.
+        (Acct::Pplns(_), Sk::Pplns) => true,
 
         (Acct::PoolWide, Sk::Solo)
         | (Acct::PoolWide, Sk::GroupSolo)
@@ -542,7 +560,10 @@ pub fn accounting_matches_stream(
         | (Acct::Solo(_), Sk::Blockparty)
         | (Acct::GroupSolo(_), Sk::Pplns)
         | (Acct::GroupSolo(_), Sk::Solo)
-        | (Acct::GroupSolo(_), Sk::Blockparty) => false,
+        | (Acct::GroupSolo(_), Sk::Blockparty)
+        | (Acct::Pplns(_), Sk::Solo)
+        | (Acct::Pplns(_), Sk::GroupSolo)
+        | (Acct::Pplns(_), Sk::Blockparty) => false,
     }
 }
 

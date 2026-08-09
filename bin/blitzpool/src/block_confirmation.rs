@@ -631,7 +631,7 @@ mod declared_block_booking_regtest {
 
             let reward_sats = template.coinbase_tx_value_remaining;
             let dist = pplns
-                .build_distribution(reward_sats)
+                .build_distribution(reward_sats, None)
                 .await
                 .expect("build_distribution");
             let fingerprint = dist.payouts_fingerprint();

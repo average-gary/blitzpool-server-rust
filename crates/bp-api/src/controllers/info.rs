@@ -507,29 +507,39 @@ where
                         }
                     }
                     "pplns" => match s.pplns.as_ref() {
-                        Some(engine) => match engine.build_distribution(reward_sats).await {
-                            // The §4 evaluation at this template's revenue —
-                            // exactly what the real coinbase build runs.
-                            Ok(dist) => dist
-                                .distribution
-                                .payout_entries_at(reward_sats)
-                                .map(|entries| {
-                                    entries
-                                        .into_iter()
-                                        .map(|(address, sats)| PayoutInfoEntry {
-                                            percent: if reward_sats == 0 {
-                                                0.0
-                                            } else {
-                                                (sats as f64) * 100.0 / (reward_sats as f64)
-                                            },
-                                            address: address.as_str().to_string(),
-                                            sats,
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            Err(_) => Vec::new(),
-                        },
+                        // `&addr` as the prospective finder, matching the
+                        // group-solo arm above and the share path: this
+                        // endpoint previews what THIS address is paid, so
+                        // with a finder bonus configured it must preview
+                        // the distribution built for them finding the
+                        // block. Passing `None` would render every
+                        // querying miner a bonus-free list the pool would
+                        // never actually serve them.
+                        Some(engine) => {
+                            match engine.build_distribution(reward_sats, Some(&addr)).await {
+                                // The §4 evaluation at this template's revenue —
+                                // exactly what the real coinbase build runs.
+                                Ok(dist) => dist
+                                    .distribution
+                                    .payout_entries_at(reward_sats)
+                                    .map(|entries| {
+                                        entries
+                                            .into_iter()
+                                            .map(|(address, sats)| PayoutInfoEntry {
+                                                percent: if reward_sats == 0 {
+                                                    0.0
+                                                } else {
+                                                    (sats as f64) * 100.0 / (reward_sats as f64)
+                                                },
+                                                address: address.as_str().to_string(),
+                                                sats,
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                Err(_) => Vec::new(),
+                            }
+                        }
                         None => Vec::new(),
                     },
                     _ => {

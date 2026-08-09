@@ -469,6 +469,7 @@ mod tests {
                 abandoned_balance_days: 90,
                 confirmation_depth: 3,
                 bucket_shares: 10_000,
+                finder_bonus_ppm: 0,
                 coinbase_autoscale: None,
             }),
             solo: Default::default(),

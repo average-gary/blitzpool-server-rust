@@ -575,6 +575,7 @@ mod tests {
             abandoned_balance_days: 90,
             confirmation_depth: 3,
             bucket_shares: 10_000,
+            finder_bonus_ppm: 0,
             coinbase_autoscale: None,
         };
         let c = coinbase_constraints_from_pplns_budget(Some(&pplns));
@@ -600,6 +601,7 @@ mod tests {
             abandoned_balance_days: 90,
             confirmation_depth: 3,
             bucket_shares: 10_000,
+            finder_bonus_ppm: 0,
             coinbase_autoscale: None,
         };
         let c = coinbase_constraints_from_pplns_budget(Some(&pplns));

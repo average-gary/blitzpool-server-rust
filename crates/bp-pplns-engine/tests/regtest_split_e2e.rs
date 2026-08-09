@@ -194,7 +194,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
     // ── Distribution from the stream-fed Satellite engine ─────────
     let reward_sats = template.coinbase_tx_value_remaining;
     let dist = engine
-        .build_distribution(reward_sats)
+        .build_distribution(reward_sats, None)
         .await
         .expect("build_distribution");
     let entries = dist

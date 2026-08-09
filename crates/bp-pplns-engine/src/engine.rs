@@ -321,15 +321,35 @@ impl PplnsEngine {
     /// Build the current PPLNS payout distribution for a given
     /// `block_reward_sats`. Wraps the inflight cache, persists a
     /// snapshot to Redis so `on_block_found` can replay deterministically.
+    ///
+    /// `finder` is the miner this build is for — the prospective finder
+    /// of a block mined on a job carrying it. It only changes the result
+    /// when `[pplns] finder_bonus_ppm` is set; with no bonus configured
+    /// the build is finder-independent and callers with nobody to name
+    /// (the pool-wide JDP publisher) pass `None`.
+    ///
+    /// A caller that HAS a miner should pass them even when no bonus is
+    /// configured — the builder discards it, and doing so means enabling
+    /// the bonus later needs no change here.
     pub async fn build_distribution(
         &self,
         block_reward_sats: u64,
+        finder: Option<&AddressId>,
     ) -> Result<Arc<DistributionResult>, EngineError> {
         self.inner
             .distribution_builder
-            .build(block_reward_sats)
+            .build(block_reward_sats, finder)
             .await
             .map_err(EngineError::Distribution)
+    }
+
+    /// Is a pool-wide finder bonus configured?
+    ///
+    /// The JDP publisher's question: with a bonus configured there is no
+    /// finder-independent PPLNS distribution to publish pool-wide, so it
+    /// must build per-miner instead.
+    pub fn finder_bonus_active(&self) -> bool {
+        self.inner.distribution_builder.finder_bonus_active()
     }
 
     /// The empty-window answer for one asking miner — see
@@ -700,15 +720,6 @@ impl PplnsEngine {
         }
 
         Ok((audit_rows, balance_writes))
-    }
-
-    /// Drop one cached distribution entry. Called by the engine itself
-    /// on share-record; exposed so manual admin tooling can force a
-    /// recompute too.
-    pub fn invalidate_distribution(&self, block_reward_sats: u64) {
-        self.inner
-            .distribution_builder
-            .invalidate(block_reward_sats);
     }
 
     /// Signal both background tasks to exit. Best-effort: the tasks

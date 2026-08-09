@@ -420,6 +420,7 @@ pub mod redis_db {
     pub const RT_SPLIT_E2E: u16 = 12 * RANGE;
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
     pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
+    pub const PPLNS_FINDER_BONUS_SWEEP: u16 = 15 * RANGE;
 }
 
 /// How many logical databases this Redis actually has.

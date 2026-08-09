@@ -40,6 +40,20 @@ struct Harness {
 }
 
 async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> {
+    connect_or_skip_with_bonus(redis_db, address_prefix, 0).await
+}
+
+/// As [`connect_or_skip`], with `[pplns] finder_bonus_ppm` set.
+///
+/// A separate entry point rather than a field on `Harness`: the bonus is
+/// read at `DistributionConfig` construction, so it cannot be toggled on
+/// a built `DistributionBuilder` — which is exactly the property the
+/// cache-keying tests below depend on.
+async fn connect_or_skip_with_bonus(
+    redis_db: u8,
+    address_prefix: &str,
+    finder_bonus_ppm: u32,
+) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     // Fold this binary's local number into its own DB range — see
@@ -111,6 +125,7 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
     // structural) — mirror the production requirement in the harness.
     let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig {
         fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
+        finder_bonus_ppm,
         ..PplnsEngineConfig::default()
     });
     let builder = DistributionBuilder::new(pool.clone(), window, cfg);
@@ -185,7 +200,7 @@ async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
     seed_share(&window, ADDR_A, 60.0, 1_700_000_000_001).await;
     seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
 
-    let result = h.builder.build(312_500_000).await.expect("build ok");
+    let result = h.builder.build(312_500_000, None).await.expect("build ok");
     assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
     assert!(
         result.distribution.published().count() > 0,
@@ -245,7 +260,7 @@ async fn build_folds_open_balances_into_distribution() {
     // should still consider them.
     seed_open_balance(&h.pool, ADDR_DEBTOR, -5_000, 0).await;
 
-    let result = h.builder.build(312_500_000).await.expect("build ok");
+    let result = h.builder.build(312_500_000, None).await.expect("build ok");
     let debtor_id = AddressId::new(ADDR_DEBTOR).unwrap();
     let debtor = result
         .distribution
@@ -280,7 +295,9 @@ async fn concurrent_builds_for_same_reward_share_one_compute() {
     let mut handles = Vec::new();
     for _ in 0..8 {
         let b = builder.clone();
-        handles.push(tokio::spawn(async move { b.build(312_500_000).await }));
+        handles.push(tokio::spawn(
+            async move { b.build(312_500_000, None).await },
+        ));
     }
 
     let mut shared_result: Option<Arc<DistributionResult>> = None;
@@ -318,15 +335,15 @@ async fn invalidate_all_triggers_fresh_compute() {
     let window = build_window(&h).await;
     seed_share(&window, ADDR, 100.0, 1_700_000_000_001).await;
 
-    let r1 = h.builder.build(312_500_000).await.expect("ok");
-    let r2 = h.builder.build(312_500_000).await.expect("ok");
+    let r1 = h.builder.build(312_500_000, None).await.expect("ok");
+    let r2 = h.builder.build(312_500_000, None).await.expect("ok");
     assert!(
         Arc::ptr_eq(&r1, &r2),
         "cached call returns the same Arc as the first"
     );
 
     h.builder.invalidate_all();
-    let r3 = h.builder.build(312_500_000).await.expect("ok");
+    let r3 = h.builder.build(312_500_000, None).await.expect("ok");
     assert!(
         !Arc::ptr_eq(&r1, &r3),
         "post-invalidate, the cache returns a freshly-built result"
@@ -351,8 +368,8 @@ async fn distinct_rewards_each_get_their_own_compute() {
     let window = build_window(&h).await;
     seed_share(&window, ADDR, 50.0, 1_700_000_000_001).await;
 
-    let r1 = h.builder.build(300_000_000).await.expect("ok");
-    let r2 = h.builder.build(312_500_000).await.expect("ok");
+    let r1 = h.builder.build(300_000_000, None).await.expect("ok");
+    let r2 = h.builder.build(312_500_000, None).await.expect("ok");
     assert_eq!(r1.distribution.reference_revenue_sats, 300_000_000);
     assert_eq!(r2.distribution.reference_revenue_sats, 312_500_000);
     assert!(!Arc::ptr_eq(&r1, &r2));
@@ -390,9 +407,9 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
     // 16 callers, 16 distinct rewards — no per-reward cache hit possible.
     for i in 0..16u64 {
         let b = builder.clone();
-        handles.push(tokio::spawn(
-            async move { b.build(312_500_000 + i * 137).await },
-        ));
+        handles.push(tokio::spawn(async move {
+            b.build(312_500_000 + i * 137, None).await
+        }));
     }
     for (i, handle) in handles.into_iter().enumerate() {
         let r = handle.await.unwrap().expect("build ok");
@@ -413,7 +430,7 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
 
     // Sanity: a build after an invalidation must load fresh again.
     h.builder.invalidate_all();
-    let _ = h.builder.build(999_000_000).await.expect("ok");
+    let _ = h.builder.build(999_000_000, None).await.expect("ok");
     assert!(
         h.builder.inputs_loads() - before > loads,
         "invalidate_all must force the next build to reload the inputs"
@@ -447,8 +464,16 @@ async fn distinct_references_share_one_fingerprinted_snapshot() {
     seed_share(&window, ADDR_A, 70.0, 1_700_000_000_001).await;
     seed_share(&window, ADDR_B, 30.0, 1_700_000_000_002).await;
 
-    let first = h.builder.build(312_500_000).await.expect("first build ok");
-    let second = h.builder.build(312_499_137).await.expect("second build ok");
+    let first = h
+        .builder
+        .build(312_500_000, None)
+        .await
+        .expect("first build ok");
+    let second = h
+        .builder
+        .build(312_499_137, None)
+        .await
+        .expect("second build ok");
 
     assert_eq!(
         first.payouts_fingerprint(),
@@ -497,7 +522,7 @@ async fn an_empty_window_is_refused_by_the_shared_build() {
     };
     let err = h
         .builder
-        .build(312_500_000)
+        .build(312_500_000, None)
         .await
         .expect_err("an empty window must not yield a shared distribution");
     assert!(
@@ -529,7 +554,10 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
 
     // Precondition: the shared build really has nothing to work with, so
     // what follows is the bootstrap and not an ordinary window read.
-    assert!(h.builder.build(T).await.is_err(), "window must be empty");
+    assert!(
+        h.builder.build(T, None).await.is_err(),
+        "window must be empty"
+    );
 
     let result = h
         .builder
@@ -613,6 +641,307 @@ async fn build_window(h: &Harness) -> WindowStore {
     WindowStore::new(conn, 4.0, 100, nd)
 }
 
+// ── Finder bonus ────────────────────────────────────────────────────
+
+/// 10 % of the miners' cut to the finder, 60/40 window.
+///
+/// The number this pins is NOT "the finder got 10 % more". It is that
+/// the finder's own dilution is paid for: the bonus lands as score
+/// weight `b = S·f/(1−f)`, so after re-dividing by `S + b` the finder
+/// holds exactly `f + (1−f)·u/S` of the miners' cut. A naive `b = S·f`
+/// leaves them short, and the shortfall grows with `f` — at 10 % on a
+/// 60 % miner it is ~1.1 M sats of a 3.125 BTC block, which is the kind
+/// of error that looks like a rounding bug in a payout audit.
+///
+/// Asserted as FRACTIONS of the miners' cut rather than absolute sats so
+/// the test says what the model promises, not what one revenue happens
+/// to produce.
+#[tokio::test]
+async fn finder_bonus_pays_the_finder_their_share_plus_the_bonus_of_the_rest() {
+    const BONUS_PPM: u32 = 100_000; // 10 %
+    let h = match connect_or_skip_with_bonus(0, "test_dist_bonus_", BONUS_PPM).await {
+        Some(h) => h,
+        None => return,
+    };
+    // Own pair, per `cleanup_addresses`' doc — `pplns_balance` is keyed
+    // on the address alone, so sharing literals with another test in this
+    // binary means its cleanup deletes rows this one is asserting on.
+    const FINDER: &str = "bc1qerdj5ax2gu9jmy9nrjfmadauevy4kqap2dj750";
+    const PEER: &str = "bc1qjsucu9x4ktuus4w3le07fnyh6g7cl0pl684vrw";
+    cleanup_addresses(&h.pool, &[FINDER, PEER]).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, FINDER, 60.0, 1_700_000_000_001).await;
+    seed_share(&window, PEER, 40.0, 1_700_000_000_002).await;
+
+    const T: u64 = 312_500_000;
+    let finder_id = AddressId::new(FINDER).unwrap();
+    let built = h
+        .builder
+        .build(T, Some(&finder_id))
+        .await
+        .expect("build with bonus");
+    let entries = built
+        .distribution
+        .payout_entries_at(T)
+        .expect("§4 payout vector");
+
+    // The finder is ONE output, not two: the bonus is score weight, so
+    // it merges into the entry they already had. The old sats-denominated
+    // bonus emitted a second output and every consumer had to fold it.
+    let finder_outputs: Vec<u64> = entries
+        .iter()
+        .filter(|(a, _)| a.as_str() == FINDER)
+        .map(|(_, s)| *s)
+        .collect();
+    assert_eq!(
+        finder_outputs.len(),
+        1,
+        "the bonus must merge into the finder's own entry, not add an output: {entries:?}"
+    );
+
+    let paid_finder = finder_outputs[0] as f64;
+    let paid_peer = entries
+        .iter()
+        .find(|(a, _)| a.as_str() == PEER)
+        .map(|(_, s)| *s)
+        .expect("peer is paid") as f64;
+    // The miners' cut is what the bonus is a fraction OF — derive it
+    // from what the miners were actually paid rather than re-deriving
+    // the fee, so this does not silently track a fee-model change.
+    let miner_pot = paid_finder + paid_peer;
+
+    let f = BONUS_PPM as f64 / 1_000_000.0;
+    // finder: f + (1−f)·0.60   peer: (1−f)·0.40
+    let want_finder = f + (1.0 - f) * 0.60;
+    let want_peer = (1.0 - f) * 0.40;
+    let got_finder = paid_finder / miner_pot;
+    let got_peer = paid_peer / miner_pot;
+    assert!(
+        (got_finder - want_finder).abs() < 1e-6,
+        "finder fraction {got_finder} != {want_finder} (paid {paid_finder} of {miner_pot})"
+    );
+    assert!(
+        (got_peer - want_peer).abs() < 1e-6,
+        "peer fraction {got_peer} != {want_peer} (paid {paid_peer} of {miner_pot})"
+    );
+
+    // And the naive `b = S·f` form would have failed the above — pin the
+    // gap so a "simplification" back to it cannot pass silently.
+    let naive_finder_fraction = (0.60 + f) / (1.0 + f);
+    assert!(
+        (naive_finder_fraction - want_finder).abs() > 1e-3,
+        "this test cannot distinguish the correct closed form from the naive one"
+    );
+
+    cleanup(&h.pool, &h.address_prefix).await;
+    cleanup_addresses(&h.pool, &[FINDER, PEER]).await;
+}
+
+/// Two miners, same revenue, bonus ON — each must be served the
+/// distribution built for THEM finding the block.
+///
+/// The failure this guards is silent: with the finder dropped from the
+/// cache key whichever miner asks first mints the entry, and every other
+/// miner is then served a coinbase paying that first miner the bonus.
+/// Nothing errors, because the booking is internally consistent with the
+/// coinbase that was actually mined — it is a misdirection of the bonus,
+/// not a crash.
+#[tokio::test]
+async fn with_the_bonus_on_each_finder_gets_their_own_distribution() {
+    let h = match connect_or_skip_with_bonus(1, "test_dist_bonuskey_", 100_000).await {
+        Some(h) => h,
+        None => return,
+    };
+    const A: &str = "bc1qz73djgeh27nlhfrs8jz5sfwr84gxlwgxhqjc6h";
+    const B: &str = "bc1qrzc80e3q4vf3qcccrzegvvr7zgkrlsawx42vhf";
+    cleanup_addresses(&h.pool, &[A, B]).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, A, 50.0, 1_700_000_000_001).await;
+    seed_share(&window, B, 50.0, 1_700_000_000_002).await;
+
+    const T: u64 = 312_500_000;
+    let a_id = AddressId::new(A).unwrap();
+    let b_id = AddressId::new(B).unwrap();
+    let for_a = h.builder.build(T, Some(&a_id)).await.expect("build for A");
+    let for_b = h.builder.build(T, Some(&b_id)).await.expect("build for B");
+
+    // Distinct fingerprints: the fingerprint covers per-entry score
+    // weight, and the bonus IS score weight, so naming a different
+    // finder is a different distribution by identity — which is also
+    // what makes each block book against its own snapshot.
+    assert_ne!(
+        for_a.payouts_fingerprint(),
+        for_b.payouts_fingerprint(),
+        "a per-finder build must not collide with another finder's"
+    );
+
+    let paid = |built: &Arc<DistributionResult>, who: &str| -> u64 {
+        built
+            .distribution
+            .payout_entries_at(T)
+            .expect("§4")
+            .iter()
+            .find(|(a, _)| a.as_str() == who)
+            .map(|(_, s)| *s)
+            .expect("paid")
+    };
+    // Equal shares, so whoever is named finder must out-earn the other
+    // by exactly the bonus — and symmetrically.
+    assert!(
+        paid(&for_a, A) > paid(&for_a, B),
+        "A's own build must pay A the bonus"
+    );
+    assert!(
+        paid(&for_b, B) > paid(&for_b, A),
+        "B's own build must pay B the bonus"
+    );
+    assert_eq!(
+        paid(&for_a, A),
+        paid(&for_b, B),
+        "the bonus is symmetric between equal-weight finders"
+    );
+
+    cleanup(&h.pool, &h.address_prefix).await;
+    cleanup_addresses(&h.pool, &[A, B]).await;
+}
+
+/// Bonus OFF — the finder argument must not fragment the cache.
+///
+/// This is the regression that would tax every pool that never enabled
+/// the feature: a per-finder key with a finder-independent result means N
+/// connected miners mint N identical entries, each holding a full payout
+/// list, turning an O(N) snapshot footprint into O(N²) for no benefit.
+/// One shared entry is the pre-bonus behaviour, and it is preserved
+/// deliberately rather than by accident.
+#[tokio::test]
+async fn with_the_bonus_off_different_finders_share_one_build() {
+    let h = match connect_or_skip(2, "test_dist_nobonus_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const A: &str = "bc1q7nnuxx6mnlms6g3j52ugnxn5yvpwevx20e86qd";
+    const B: &str = "bc1qwdtvdmlqcs0w70ek862chanyv7py0n4knzmq2k";
+    cleanup_addresses(&h.pool, &[A, B]).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, A, 50.0, 1_700_000_000_001).await;
+    seed_share(&window, B, 50.0, 1_700_000_000_002).await;
+
+    const T: u64 = 312_500_000;
+    let a_id = AddressId::new(A).unwrap();
+    let b_id = AddressId::new(B).unwrap();
+    let loads_before = h.builder.inputs_loads();
+    let for_a = h.builder.build(T, Some(&a_id)).await.expect("build for A");
+    let for_b = h.builder.build(T, Some(&b_id)).await.expect("build for B");
+    let for_none = h.builder.build(T, None).await.expect("build for nobody");
+
+    // Same fingerprint AND the same cached Arc: with no bonus the finder
+    // is not part of the key at all, so these are one entry.
+    assert_eq!(
+        for_a.payouts_fingerprint(),
+        for_b.payouts_fingerprint(),
+        "no bonus configured — the build cannot depend on who is asking"
+    );
+    assert!(
+        Arc::ptr_eq(&for_a, &for_b) && Arc::ptr_eq(&for_a, &for_none),
+        "no bonus configured — every caller at one revenue must share ONE cache entry"
+    );
+    assert_eq!(
+        h.builder.inputs_loads() - loads_before,
+        1,
+        "one window+ledger load for all three callers"
+    );
+
+    cleanup(&h.pool, &h.address_prefix).await;
+    cleanup_addresses(&h.pool, &[A, B]).await;
+}
+
+/// Bonus ON, but nobody named — the build must still SUCCEED, and pay no
+/// bonus.
+///
+/// This is the pool-wide JDP publisher's call, and it is load-bearing far
+/// beyond PPLNS. `build_pool_wide` fills the slot `current_pool_wide()`
+/// answers, which is the only thing that makes `distribution_available`
+/// true, which is the only thing that lets ext 0x0003 be negotiated — on
+/// every session, in every mode. A configured bonus that made this build
+/// unavailable would take non-custodial payout enforcement down pool-wide
+/// and carry Solo and Group-Solo with it, and it would do so silently: the
+/// publisher's `else { continue }` logs nothing. It would also strand the
+/// per-finder path this feature exists for, because `build_for_miner` is
+/// reached only after that same negotiation succeeds.
+///
+/// Both directions are asserted in one test, so neither half can pass on a
+/// precondition that quietly did not hold: the same builder that serves an
+/// unnamed caller a bonus-free list must serve a named one a boosted one.
+#[tokio::test]
+async fn with_the_bonus_on_an_unnamed_caller_still_gets_a_bonus_free_build() {
+    const BONUS_PPM: u32 = 100_000; // 10 %
+    let h = match connect_or_skip_with_bonus(16, "test_dist_bonusnone_", BONUS_PPM).await {
+        Some(h) => h,
+        None => return,
+    };
+    const A: &str = "bc1qk39gw6gqt2kufm2y3qxc8mejl8sqgykgvrfc8u";
+    const B: &str = "bc1qdglsutw8wh9jucdsqse6cangz8nxj2rucvc00u";
+    cleanup_addresses(&h.pool, &[A, B]).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, A, 50.0, 1_700_000_000_001).await;
+    seed_share(&window, B, 50.0, 1_700_000_000_002).await;
+
+    const T: u64 = 312_500_000;
+    let paid = |built: &Arc<DistributionResult>, who: &str| -> u64 {
+        built
+            .distribution
+            .payout_entries_at(T)
+            .expect("§4")
+            .iter()
+            .find(|(a, _)| a.as_str() == who)
+            .map(|(_, s)| *s)
+            .expect("paid")
+    };
+
+    // The publisher's call: a bonus IS configured, and it passes `None`.
+    let pool_wide = h
+        .builder
+        .build(T, None)
+        .await
+        .expect("a configured bonus must not make the pool-wide build unavailable");
+    assert!(
+        h.builder.finder_bonus_active(),
+        "precondition: this harness must have the bonus ON, or the test proves nothing"
+    );
+    // Equal weights in, so equal sats out — nobody was named, so nobody is
+    // boosted. This is the property that makes the fallback safe: the worst
+    // it can do is pay a finder no bonus, never pay the wrong miner one.
+    assert_eq!(
+        paid(&pool_wide, A),
+        paid(&pool_wide, B),
+        "no finder named — two equal-weight miners must be paid equally, with no bonus \
+         going to whichever one happened to be built first"
+    );
+
+    // The negative control, same builder: naming a finder DOES boost them.
+    // Without this the assertion above would also hold on a build where the
+    // bonus silently never applied at all.
+    let a_id = AddressId::new(A).unwrap();
+    let for_a = h.builder.build(T, Some(&a_id)).await.expect("build for A");
+    assert!(
+        paid(&for_a, A) > paid(&for_a, B),
+        "the bonus must still reach a NAMED finder — otherwise this test is asserting \
+         equality on a feature that is simply inert"
+    );
+    assert_ne!(
+        pool_wide.payouts_fingerprint(),
+        for_a.payouts_fingerprint(),
+        "the unnamed build and A's build are different distributions"
+    );
+
+    cleanup(&h.pool, &h.address_prefix).await;
+    cleanup_addresses(&h.pool, &[A, B]).await;
+}
+
 fn redis_db_for_prefix(prefix: &str) -> u8 {
     // Mirror the manual db assignments in `#[tokio::test]`s above.
     // Brittle but kept obvious — change this table if you renumber the
@@ -630,6 +959,10 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_nopg_" => 5,
         "test_dist_nowin_" => 7,
         "test_dist_boot_" => 4,
+        "test_dist_bonus_" => 0,
+        "test_dist_bonuskey_" => 1,
+        "test_dist_nobonus_" => 2,
+        "test_dist_bonusnone_" => 16,
         other => panic!("unknown test prefix: {other}"),
     }
 }
@@ -724,7 +1057,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
     // Window read + ledger read still work; only the snapshot write is
     // rejected. The build must survive it.
     let result = ro_builder
-        .build(312_500_000)
+        .build(312_500_000, None)
         .await
         .expect("a rejected snapshot write must not fail the distribution build");
 
@@ -804,7 +1137,11 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
     seed_open_balance(&h.pool, ADDR_A, OWED, 0).await;
 
     // ── Control: with the ledger readable, the promise is IN the build ──
-    let normal = h.builder.build(REWARD).await.expect("build with ledger");
+    let normal = h
+        .builder
+        .build(REWARD, None)
+        .await
+        .expect("build with ledger");
     let a_id = AddressId::new(ADDR_A).unwrap();
     let a_normal = normal
         .distribution
@@ -832,7 +1169,7 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
             ..PplnsEngineConfig::default()
         }),
     );
-    let degraded = degraded_builder.build(REWARD).await.expect(
+    let degraded = degraded_builder.build(REWARD, None).await.expect(
         "an unreadable ledger must NOT fail the build — every PPLNS miner \
                  would lose their job over a fault that costs one block of delay",
     );
@@ -899,7 +1236,7 @@ async fn an_unreadable_window_fails_the_build_instead_of_degrading() {
 
     // Control: it builds while the window is readable.
     h.builder
-        .build(REWARD)
+        .build(REWARD, None)
         .await
         .expect("precondition: the build works before the window is broken");
 
@@ -915,7 +1252,7 @@ async fn an_unreadable_window_fails_the_build_instead_of_degrading() {
         .expect("clobber the window key");
     h.builder.invalidate_all();
 
-    let err = h.builder.build(REWARD).await.expect_err(
+    let err = h.builder.build(REWARD, None).await.expect_err(
         "an unreadable window must FAIL the build — there are no shares \
                      to distribute, and inventing a distribution would pay the wrong \
                      miners",

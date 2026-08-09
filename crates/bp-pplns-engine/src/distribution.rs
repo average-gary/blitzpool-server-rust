@@ -13,8 +13,10 @@
 //! Two layers of `bp_inflight_cache::InflightResultCache` (30s TTL by
 //! default):
 //!
-//! - **Built distributions**, keyed by `block_reward_sats` — concurrent
-//!   callers for the same reward share one computation.
+//! - **Built distributions**, keyed by `(block_reward_sats, finder)` —
+//!   concurrent callers for the same key share one computation. The
+//!   finder half is `None` unless a finder bonus is configured, because
+//!   only then does the build depend on who is asking.
 //! - **Window+ledger inputs**, keyed by `()` — concurrent callers for
 //!   *different* rewards still share the Redis window read and the
 //!   Postgres ledger query, since neither depends on the reward.
@@ -137,6 +139,9 @@ pub struct DistributionConfig {
     pub min_payout_sats: Sats,
     /// Live, runtime-mutable coinbase weight budget shared with the autoscaler.
     pub coinbase_weight_budget: LiveBudget,
+    /// Finder bonus in parts-per-million of the miners' cut; `0` disables.
+    /// Boot-validated against [`bp_pplns::MAX_FINDER_BONUS_PPM`].
+    pub finder_bonus_ppm: u32,
     pub snapshot_ttl_secs: u32,
 }
 
@@ -147,10 +152,43 @@ impl DistributionConfig {
             fee_percent: cfg.fee_percent,
             min_payout_sats: cfg.min_payout_sats,
             coinbase_weight_budget: LiveBudget::new(cfg.coinbase_weight_budget),
+            finder_bonus_ppm: cfg.finder_bonus_ppm,
             snapshot_ttl_secs: cfg.snapshot_ttl_secs,
         }
     }
+
+    /// Does a build have to name the finder?
+    ///
+    /// The one place this question is answered, because both halves of
+    /// the feature turn on it: whether the cache key needs the finder,
+    /// and whether JDP can still serve one pool-wide distribution to
+    /// every client. Two independent `> 0` checks would let those halves
+    /// drift into a per-finder cache serving a finder-blind build, or
+    /// worse, a pool-wide publish of a build that names one.
+    pub fn finder_bonus_active(&self) -> bool {
+        self.finder_bonus_ppm > 0
+    }
 }
+
+/// Cache key for a built distribution.
+///
+/// The `Option<String>` is the prospective finder, and it is `None`
+/// exactly when `finder_bonus_ppm == 0`. With the bonus off the build
+/// does not depend on who is asking, so every connection at one revenue
+/// shares a single entry — the pre-bonus behaviour, preserved rather
+/// than paid for.
+///
+/// With the bonus on the finder is load-bearing for isolation, not
+/// speed: it guarantees miner X can never be served the distribution
+/// built naming miner Y as finder. Drop it and whichever miner's request
+/// arrives first mints the entry, every other miner in the window hashes
+/// a job that pays *that* miner the bonus, and nothing errors — the
+/// booking is internally consistent, so it is a silent misdirection.
+///
+/// Mirrors `bp_group_solo_engine::distribution::CacheKey`, which carries
+/// its finder unconditionally because a Group-Solo build always names
+/// one.
+type CacheKey = (u64, Option<String>);
 
 /// Orchestrator. Cheap to clone (each field is either an `Arc`-cheap
 /// handle or `Clone`-cheap config).
@@ -159,7 +197,7 @@ pub struct DistributionBuilder {
     pool: PgPool,
     window: WindowStore,
     config: DistributionConfig,
-    cache: InflightResultCache<u64, DistributionResult, DistributionError>,
+    cache: InflightResultCache<CacheKey, DistributionResult, DistributionError>,
     /// Reward-independent window+ledger inputs, shared across every
     /// concurrent build. Keyed by `()` — there is exactly one payout
     /// window — so the cache degenerates to "one load per invalidation
@@ -198,17 +236,55 @@ impl DistributionBuilder {
         self.inputs_loads.load(Ordering::Relaxed)
     }
 
+    /// Cached-plus-in-flight distribution count. One entry per distinct
+    /// cache key since the last invalidation — so with the bonus off this
+    /// is one per template revenue, and with it on, one per connection
+    /// served that revenue. That difference IS the footprint the finder
+    /// bonus adds, so it is exposed for the scale sweep to measure rather
+    /// than left to argument.
+    pub fn cache_entries(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Build the current PPLNS weight distribution against
     /// `reference_revenue_sats` (the pool's current template value —
-    /// the projection base for balance boosts). Concurrent callers for
-    /// the same reference share one compute; callers for *different*
-    /// references still share the window+ledger read. Under the weight
-    /// model there is normally exactly ONE live reference at a time —
-    /// the reward-keyed cache is simply correct, not load-bearing.
+    /// the projection base for balance boosts).
+    ///
+    /// `finder` is the miner this build is *for* — the prospective finder
+    /// of a block mined on a job carrying it. It is ignored unless
+    /// `finder_bonus_ppm > 0`, so a pool that never configured a bonus
+    /// keeps the pre-bonus behaviour exactly: one shared build per
+    /// revenue, and the caller may pass `None`.
+    ///
+    /// With the bonus on there is no such thing as a finder-independent
+    /// PPLNS distribution: the finder's score weight differs, so the
+    /// fingerprint differs, so each connection mints its own snapshot.
+    /// That is the cost the bonus buys, and it is the reason `finder` is
+    /// a required parameter rather than an `Option` the caller may
+    /// forget — passing `None` while the bonus is on is a build that
+    /// silently pays nobody a bonus.
+    ///
+    /// Concurrent callers for the same key share one compute; callers for
+    /// *different* keys still share the window+ledger read.
     pub async fn build(
         &self,
         reference_revenue_sats: u64,
+        finder: Option<&AddressId>,
     ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
+        // The bonus being off makes the finder irrelevant to the RESULT,
+        // so it must also be irrelevant to the KEY — otherwise every
+        // connection mints its own identical entry and the O(N²)
+        // snapshot cost lands on pools that never asked for a bonus.
+        let finder = self
+            .config
+            .finder_bonus_active()
+            .then_some(finder)
+            .flatten();
+        let key: CacheKey = (
+            reference_revenue_sats,
+            finder.map(|f| f.as_str().to_string()),
+        );
+        let finder = finder.cloned();
         let pool = self.pool.clone();
         let window = self.window.clone();
         let window_for_inputs = self.window.clone();
@@ -216,7 +292,7 @@ impl DistributionBuilder {
         let inputs_cache = self.inputs_cache.clone();
         let inputs_loads = self.inputs_loads.clone();
         self.cache
-            .get_or_compute(reference_revenue_sats, || async move {
+            .get_or_compute(key, || async move {
                 let inputs = inputs_cache
                     .get_or_compute((), || async move {
                         inputs_loads.fetch_add(1, Ordering::Relaxed);
@@ -224,12 +300,20 @@ impl DistributionBuilder {
                     })
                     .await
                     .map_err(|e| DistributionError::Inputs(e.to_string()))?;
-                // No bootstrap claimant: this build is SHARED by every
-                // PPLNS miner (the cache is keyed by revenue alone), so
-                // there is no single miner it could name. An empty window
-                // therefore surfaces as `NoScoredMiners` — see
-                // [`Self::build_bootstrap`] for who resolves that.
-                build_from_inputs(&inputs, &window, &config, reference_revenue_sats, None).await
+                // No bootstrap claimant even when the finder is known: a
+                // claimant takes the WHOLE block on an empty window,
+                // which is a far bigger promise than a bonus, and it is
+                // gated on `NoScoredMiners` rather than offered
+                // speculatively. See [`Self::build_bootstrap`].
+                build_from_inputs(
+                    &inputs,
+                    &window,
+                    &config,
+                    reference_revenue_sats,
+                    None,
+                    finder.as_ref(),
+                )
+                .await
             })
             .await
     }
@@ -267,34 +351,43 @@ impl DistributionBuilder {
             })
             .await
             .map_err(|e| Arc::new(DistributionError::Inputs(e.to_string())))?;
+        // The claimant IS the prospective finder — same miner, same
+        // reason they were named. Passing them as finder too costs
+        // nothing and keeps the bonus from being the one thing that
+        // silently does not apply on a fresh window: with an empty
+        // window the claimant holds the whole score space, so the bonus
+        // resolves to a boost on a total they already own and the payout
+        // is unchanged. It matters for the FINGERPRINT — the snapshot
+        // then records the same bonus inputs every other build on this
+        // pool records, so settlement reads one shape, not two.
+        let finder = self.config.finder_bonus_active().then_some(claimant);
         build_from_inputs(
             &inputs,
             &self.window,
             &self.config,
             reference_revenue_sats,
             Some(claimant),
+            finder,
         )
         .await
         .map(Arc::new)
         .map_err(Arc::new)
     }
 
-    /// Invalidate the cache for a specific reward. Called by the
-    /// engine on hot-path state changes: a new accepted share landed, or a
-    /// block was found. (A network-difficulty change is NOT one of them —
-    /// it moves the window's trim size, and the trim already runs inside
-    /// `record_share`, whose invalidation covers it.)
-    ///
-    /// Common pattern: `invalidate_all` (drops every cached reward)
-    /// because the window changed for *any* reward, not just one.
-    pub fn invalidate(&self, block_reward_sats: u64) {
-        self.cache.invalidate(&block_reward_sats);
-    }
-
     /// Drops the built distributions AND the shared window+ledger
     /// inputs. Both must go: the callers are state-change events (a
     /// share landed, the budget moved), and keeping stale inputs would
     /// just rebuild the same stale distribution.
+    ///
+    /// The only invalidation there is. A per-reward variant used to sit
+    /// beside this one with no production caller — every real path
+    /// (share-record, settlement, the autoscaler) already reached for
+    /// this. Under a per-finder key it would have become actively wrong:
+    /// one reward now maps to one entry per connected miner, and
+    /// everything that invalidates does so because the WINDOW changed,
+    /// which staled all of them equally. Dropping one finder's entry and
+    /// leaving the rest is not a cheaper version of that — it is a
+    /// silent partial invalidation.
     pub fn invalidate_all(&self) {
         self.cache.clear();
         self.inputs_cache.clear();
@@ -304,6 +397,12 @@ impl DistributionBuilder {
     /// The autoscaler driver clones it to observe pressure + write new values.
     pub fn live_budget(&self) -> LiveBudget {
         self.config.coinbase_weight_budget.clone()
+    }
+
+    /// Is a finder bonus configured? See
+    /// [`DistributionConfig::finder_bonus_active`].
+    pub fn finder_bonus_active(&self) -> bool {
+        self.config.finder_bonus_active()
     }
 }
 
@@ -380,6 +479,7 @@ async fn build_from_inputs(
     config: &DistributionConfig,
     reference_revenue_sats: u64,
     bootstrap_claimant: Option<&AddressId>,
+    finder: Option<&AddressId>,
 ) -> Result<DistributionResult, DistributionError> {
     // 4-5. Sanitize, project onto weights, persist the snapshot — the
     //      one path both payout engines share. The *live* budget is read
@@ -398,8 +498,18 @@ async fn build_from_inputs(
             fee_percent: config.fee_percent,
             min_payout_sats: config.min_payout_sats,
             coinbase_weight_budget: config.coinbase_weight_budget.get(),
-            finder_bonus_ppm: 0, // finder-bonus is a Group-Solo feature
-            finder_address: None,
+            // Both or neither. `finder_address: None` with a non-zero
+            // ppm builds no bonus at all (the builder's `if let Some`
+            // guard), and a finder with a zero ppm is inert — either way
+            // the operator's configured bonus silently does not exist.
+            // Gating both on the one `finder_bonus_active()` predicate
+            // makes that pair unfalsifiable here.
+            finder_bonus_ppm: if finder.is_some() {
+                config.finder_bonus_ppm
+            } else {
+                0
+            },
+            finder_address: finder,
             reference_revenue_sats,
             // PPLNS keeps a withheld miner's share inside the miners' cut
             // and remembers what it owes them in `pplns_balance`. That is

@@ -3151,7 +3151,16 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // while answering a different one.
             match &entry.accounting {
                 crate::bridge::DistributionAccounting::Solo(owner)
-                | crate::bridge::DistributionAccounting::GroupSolo(owner) => {
+                | crate::bridge::DistributionAccounting::GroupSolo(owner)
+                // A finder-bonus plan names one PPLNS miner, and the same
+                // address check applies for the same reason: the plan differs
+                // from the pool-wide one by whose weight carries the bonus, so
+                // another PPLNS connection mining it would pay this address the
+                // bonus out of its own block. The stream check above passes it —
+                // both are the PPLNS window — so the owner is the only thing
+                // standing between the two, which is why the bonus plan carries
+                // one at all.
+                | crate::bridge::DistributionAccounting::Pplns(owner) => {
                     if channel_addr != owner.as_str() {
                         return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
                     }
