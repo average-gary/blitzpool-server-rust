@@ -445,6 +445,9 @@ mod declared_block_booking_regtest {
     const DB_NO_DOUBLE_BOOK: u8 = 18;
     const DB_REFUSES_WITHOUT_COINBASE: u8 = 19;
     const DB_HEIGHT_CONFLICT: u8 = 20;
+    const DB_GROUP_BOOKS_THE_COINBASE: u8 = 21;
+    const DB_GROUP_NO_OVERWRITE: u8 = 22;
+    const DB_GROUP_REFUSES_WITHOUT_COINBASE: u8 = 23;
 
     /// The production default of `[pplns] confirmation_depth`.
     const DEPTH: u32 = 3;
@@ -461,6 +464,15 @@ mod declared_block_booking_regtest {
             fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr")),
             fee_percent: 1.5,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
+            // The chain these tests run on halves every 150 blocks. Left at the
+            // mainnet default the engine expects 50 BTC where regtest already
+            // pays 25, and its "coinbase pays less than the subsidy" guard
+            // refuses to book — correctly, on a block that is fine.
+            //
+            // The four PPLNS tests sit at heights ~102-135 and never noticed;
+            // the fifth fixture to be added crossed 150 and did. Set here so
+            // the next one cannot inherit the trap.
+            subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
             ..PplnsEngineConfig::default()
         }
     }
@@ -557,6 +569,8 @@ mod declared_block_booking_regtest {
             let group_solo = bp_group_solo_engine::engine::GroupSoloEngine::spawn(
                 bp_group_solo_engine::config::GroupSoloEngineConfig {
                     fee_address: Some(AddressId::new(fee_addr.clone()).expect("fee addr")),
+                    // Regtest halves every 150 blocks — see `engine_config`.
+                    subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
                     ..Default::default()
                 }
                 .try_new()
@@ -1089,6 +1103,565 @@ mod declared_block_booking_regtest {
             "the conflict must PARK as unbookable, not report success — a silent \
              Ok lets the watcher drop a block whose miners were paid on-chain"
         );
+
+        c.teardown().await;
+    }
+
+    // ── Group-Solo: the same door, a different ledger ────────────────
+    //
+    // Group-Solo goes through the SAME `book_declared_block_found`, but
+    // diverges exactly where the PPLNS tests above put their assertions, so
+    // this is its own fixture rather than a parameter over both modes:
+    //
+    // - it needs a group + members in PG, which nothing else in this file does
+    // - the mode gate must answer `group_solo(group_id)`, not `pplns()`
+    // - the builder takes `(group_id, reward, finder)` instead of `(reward)`
+    // - it writes `pplns_group_block_history` and **no ledger, no balances** —
+    //   Group-Solo pays what the coinbase pays and owes nothing afterwards
+    //
+    // That last one is why the replay test below had to be re-invented rather
+    // than copied: PPLNS's absolute balance write makes a double-apply visible
+    // as a moved number, and there is no such number here.
+
+    /// A real regtest chain with an accepted block whose coinbase pays a real
+    /// Group-Solo distribution — everything up to, but not including, the
+    /// booking.
+    struct GroupChain {
+        node: RegtestNode,
+        tdp: TdpHandle,
+        pplns: PplnsEngine,
+        group_solo: bp_group_solo_engine::engine::GroupSoloEngine,
+        gate: Arc<crate::engines::BlitzpoolModeGate>,
+        pg: sqlx::PgPool,
+        redis: redis::aio::ConnectionManager,
+        group_id: uuid::Uuid,
+        /// `[0]` is the finder — the address the block is booked under.
+        members: [String; 3],
+        fee_addr: String,
+        fingerprint: [u8; 32],
+        intended: Vec<PayoutEntry>,
+        height: u32,
+        block_hash: String,
+        block_hex: String,
+        coinbase_tx: bitcoin::Transaction,
+        actual: bp_coinbase_snapshot::ActualCoinbase,
+    }
+
+    impl GroupChain {
+        /// `None` ⇒ the caller must return (bitcoin-node / Redis / PG missing).
+        async fn setup(redis_db: u8) -> Option<Self> {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter("blitzpool=debug,bp_group_solo_engine=debug")
+                .with_test_writer()
+                .try_init();
+            let regtest_cfg = RegtestConfig::default();
+            if !regtest_cfg.is_available() {
+                eprintln!("skipping declared-block booking regtest — bitcoin-node not found");
+                return None;
+            }
+            let redis = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, redis_db).await?;
+            let pg = connect_pg_or_skip().await?;
+
+            let tag = 0x50 + redis_db;
+            let members = [
+                bp_test_support::deterministic_p2wpkh_regtest([tag; 32]),
+                bp_test_support::deterministic_p2wpkh_regtest([tag.wrapping_add(0x40); 32]),
+                bp_test_support::deterministic_p2wpkh_regtest([tag.wrapping_add(0x80); 32]),
+            ];
+            let fee_addr =
+                bp_test_support::deterministic_p2wpkh_regtest([tag.wrapping_add(0xC0); 32]);
+            let group_id = uuid::Uuid::from_u128(
+                0x6720_0000_0000_0000_0000_0000_0000_0000u128 + u128::from(redis_db),
+            );
+
+            Self::purge(&pg, group_id, &members).await;
+
+            // `pplns_group_member.address` is UNIQUE across the whole table, so
+            // the purge above must run before the seed or a leftover row from a
+            // panicked run makes the insert fail instead of the test.
+            sqlx::query(
+                r#"INSERT INTO pplns_group
+                     (id, name, "creatorAddress", "adminTokenHash", active,
+                      "createdAt", "updatedAt", "isPublic", "finderBonusPpm",
+                      "resetRoundOnBlock")
+                   VALUES ($1, $2, $3, $4, true, 0, 0, false, NULL, true)"#,
+            )
+            .bind(group_id)
+            .bind(format!("jdp-booking-grp-{group_id}"))
+            .bind(&members[0])
+            .bind(format!("hash-{group_id}"))
+            .execute(&pg)
+            .await
+            .expect("seed group");
+            for m in &members {
+                sqlx::query(
+                    r#"INSERT INTO pplns_group_member ("groupId", address, role)
+                       VALUES ($1, $2, 'member')"#,
+                )
+                .bind(group_id)
+                .bind(m)
+                .execute(&pg)
+                .await
+                .expect("seed group member");
+            }
+
+            // Wired but unused by this block: the fan-out takes both engines,
+            // and the sink is not constructible without the PPLNS one.
+            let pplns = PplnsEngine::spawn(
+                engine_config(&fee_addr),
+                redis.clone(),
+                pg.clone(),
+                NetworkDifficulty::new(1_000.0),
+            )
+            .await
+            .expect("PplnsEngine::spawn");
+            let group_solo = bp_group_solo_engine::engine::GroupSoloEngine::spawn(
+                bp_group_solo_engine::config::GroupSoloEngineConfig {
+                    fee_address: Some(AddressId::new(fee_addr.clone()).expect("fee addr")),
+                    // Regtest halves every 150 blocks — see `engine_config`.
+                    subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
+                    ..Default::default()
+                }
+                .try_new()
+                .expect("group-solo config"),
+                redis.clone(),
+                pg.clone(),
+            )
+            .await
+            .expect("GroupSoloEngine::spawn");
+
+            // ⚠️ Membership alone earns NOTHING. Group-Solo splits by shares in
+            // the round, so a group seeded with members but no shares produces a
+            // two-entry distribution — the pool output and one address holding
+            // the entire subsidy — and every assertion below would then be about
+            // a payout nobody made. That is not hypothetical: it is what this
+            // fixture did on its first run.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            for (addr, difficulty) in [
+                (&members[0], 100.0),
+                (&members[1], 200.0),
+                (&members[2], 300.0),
+            ] {
+                group_solo
+                    .record_share(None, group_id, addr, difficulty, now_ms)
+                    .await
+                    .expect("seed group share");
+            }
+
+            // Forgetting this makes the gate answer Solo, which books nothing —
+            // the assertions then fail rather than pass silently.
+            let gate = Arc::new(crate::engines::BlitzpoolModeGate::new());
+            gate.set_mode(
+                &members[0],
+                bp_mining_mode::MiningModeResult::group_solo(group_id.to_string()),
+            );
+
+            let node = RegtestNode::start_with(regtest_cfg)
+                .await
+                .expect("regtest start");
+            // Same height-spreading rule as the PPLNS fixture, and against the
+            // same shared PG — the group history is keyed
+            // (groupId, blockHeight, address), so a collision here would be a
+            // silent DO NOTHING instead of a failure.
+            let spread = u32::from(redis_db - DB_BOOKS_THE_COINBASE) * 10;
+            node.generate_to_self(101 + spread)
+                .await
+                .expect("mine for IBD-exit + coinbase maturity");
+            let tdp =
+                TdpHandle::spawn(TdpConfig::new(node.ipc_socket_path()).with_fee_threshold(1))
+                    .expect("TdpHandle::spawn");
+            let mut rx = tdp.subscribe();
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    if rx.recv().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            node.generate_to_self(1)
+                .await
+                .expect("mine 1 for a fresh NewTemplate");
+            let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
+
+            let reward_sats = template.coinbase_tx_value_remaining;
+            let finder = AddressId::new(members[0].clone()).expect("finder addr");
+            let dist = group_solo
+                .build_distribution(group_id, reward_sats, &finder)
+                .await
+                .expect("group-solo build_distribution");
+            let fingerprint = dist.payouts_fingerprint();
+            let intended: Vec<PayoutEntry> = dist
+                .distribution
+                .payout_entries_at(reward_sats)
+                .expect("§4 payout vector")
+                .iter()
+                .map(|(a, s)| PayoutEntry {
+                    address: a.as_str().to_string(),
+                    sats: *s,
+                })
+                .collect();
+
+            // Same precondition as the PPLNS fixture, for the same reason: an
+            // unparsable address is DROPPED from the distribution, and every
+            // assertion downstream would then hold while proving nothing.
+            assert!(
+                intended.len() >= 4,
+                "expected the three seeded members plus the pool output, got {intended:?}"
+            );
+            for m in &members {
+                assert!(
+                    intended.iter().any(|p| p.address == *m && p.sats > 0),
+                    "member {m} must hold a non-zero payout — otherwise this test \
+                     books an empty distribution and asserts nothing"
+                );
+            }
+
+            let mined = Chain::shift(&intended, &members[1], &members[2]);
+            assert_eq!(
+                mined.iter().map(|p| p.sats).sum::<u64>(),
+                intended.iter().map(|p| p.sats).sum::<u64>(),
+                "the shift must keep the coinbase total — else the chain rejects it"
+            );
+
+            let (height, witness_coinbase) =
+                Chain::mine(&node, &tdp, &template, &prev_hash, &mined, fingerprint).await;
+            let block_hash: String = node
+                .rpc_call("getblockhash", serde_json::json!([height]))
+                .await
+                .expect("getblockhash")
+                .as_str()
+                .expect("hash string")
+                .to_string();
+            let block_hex: String = node
+                .rpc_call("getblock", serde_json::json!([block_hash, 0]))
+                .await
+                .expect("getblock")
+                .as_str()
+                .expect("hex string")
+                .to_string();
+            let coinbase_tx =
+                bitcoin::Transaction::consensus_decode(&mut witness_coinbase.as_slice())
+                    .expect("submitted coinbase must decode");
+            let actual =
+                bp_coinbase_snapshot::ActualCoinbase::from_coinbase(&coinbase_tx, Network::Regtest);
+            assert_eq!(actual.total_value_sats, reward_sats);
+
+            Some(Self {
+                node,
+                tdp,
+                pplns,
+                group_solo,
+                gate,
+                pg,
+                redis,
+                group_id,
+                members,
+                fee_addr,
+                fingerprint,
+                intended,
+                height,
+                block_hash,
+                block_hex,
+                coinbase_tx,
+                actual,
+            })
+        }
+
+        fn sink(&self) -> TdpBlockSubmissionSink {
+            TdpBlockSubmissionSink::new(self.tdp.clone())
+                .with_network(Network::Regtest)
+                .with_fanout(
+                    self.gate.clone(),
+                    Some(self.pplns.clone()),
+                    self.group_solo.clone(),
+                    None,
+                    self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
+                )
+                .with_pool(self.pg.clone())
+                .with_redis(self.redis.clone())
+        }
+
+        async fn book(
+            &self,
+            actual: Option<bp_coinbase_snapshot::ActualCoinbase>,
+            block_hash: &str,
+        ) -> bool {
+            self.sink()
+                .book_declared_block_found(
+                    self.members[0].clone(),
+                    "b1c2d3e4".to_string(),
+                    self.actual.total_value_sats,
+                    block_hash.to_string(),
+                    self.block_hex.clone(),
+                    self.fingerprint,
+                    actual,
+                )
+                .await
+        }
+
+        async fn reconcile_once(&self) {
+            let mut last_unbookable = None;
+            super::reconcile(
+                &self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
+                &self.redis,
+                Some(&self.pplns),
+                Some(&self.group_solo),
+                DEPTH,
+                None,
+                &mut last_unbookable,
+            )
+            .await;
+        }
+
+        /// Scoped to THIS group, for the same reason the PPLNS reader is scoped
+        /// to its miners: every test starts its own chain at the same height.
+        async fn history_rows(&self) -> Vec<(String, i64)> {
+            sqlx::query_as(
+                r#"SELECT address, "paidSats" FROM pplns_group_block_history
+                   WHERE "groupId" = $1 AND "blockHeight" = $2 AND "rowType" = 'coinbase'
+                   ORDER BY address"#,
+            )
+            .bind(self.group_id)
+            .bind(self.height as i32)
+            .fetch_all(&self.pg)
+            .await
+            .expect("read group history rows")
+        }
+
+        fn amount_of(&self, rows: &[(String, i64)], member: &str) -> u64 {
+            rows.iter()
+                .find(|(a, _)| a == member)
+                .map(|(_, s)| *s as u64)
+                .unwrap_or_else(|| panic!("no history row for {member} in {rows:?}"))
+        }
+
+        fn intended_of(&self, member: &str) -> u64 {
+            self.intended
+                .iter()
+                .find(|p| p.address == *member)
+                .map(|p| p.sats)
+                .expect("member in the distribution")
+        }
+
+        /// Group-Solo keeps NO ledger — that is the invariant, not an accident.
+        /// Asserted in every test so a future change that starts writing
+        /// balances has to come past it.
+        async fn assert_no_ledger_rows(&self) {
+            for m in &self.members {
+                let balances: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM pplns_balance WHERE address = $1")
+                        .bind(m)
+                        .fetch_one(&self.pg)
+                        .await
+                        .expect("count balances");
+                assert_eq!(
+                    balances, 0,
+                    "Group-Solo must write no PPLNS balance row ({m})"
+                );
+            }
+        }
+
+        async fn purge(pg: &sqlx::PgPool, group_id: uuid::Uuid, members: &[String; 3]) {
+            // ON DELETE CASCADE takes the member and history rows with it.
+            let _ = sqlx::query("DELETE FROM pplns_group WHERE id = $1")
+                .bind(group_id)
+                .execute(pg)
+                .await;
+            for m in members {
+                // A membership left behind by a panicked run would collide with
+                // the UNIQUE on `address` at seed time.
+                let _ = sqlx::query("DELETE FROM pplns_group_member WHERE address = $1")
+                    .bind(m)
+                    .execute(pg)
+                    .await;
+                let _ = sqlx::query(r#"DELETE FROM blocks_entity WHERE "minerAddress" = $1"#)
+                    .bind(m)
+                    .execute(pg)
+                    .await;
+            }
+        }
+
+        async fn teardown(self) {
+            Self::purge(&self.pg, self.group_id, &self.members).await;
+            self.pplns.shutdown();
+            self.group_solo.shutdown();
+            self.tdp.shutdown().expect("TDP clean shutdown");
+            self.node.shutdown().await.expect("regtest clean shutdown");
+        }
+    }
+
+    /// The chain's own coinbase decides the Group-Solo booking too — not the
+    /// list the pool intended to pay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_declared_group_block_books_exactly_what_its_coinbase_paid() {
+        let Some(c) = GroupChain::setup(DB_GROUP_BOOKS_THE_COINBASE).await else {
+            return;
+        };
+
+        assert!(
+            c.book(Some(c.actual.clone()), &c.block_hash).await,
+            "book_declared_block_found must report the booking reached the fan-out"
+        );
+        assert!(
+            c.history_rows().await.is_empty(),
+            "with Redis wired the apply MUST wait for confirmations"
+        );
+
+        c.node
+            .generate_to_self(DEPTH)
+            .await
+            .expect("bury to confirmation depth");
+        c.reconcile_once().await;
+
+        let rows = c.history_rows().await;
+        assert_eq!(
+            rows.len(),
+            3,
+            "one coinbase row per seeded member, got {rows:?}"
+        );
+        // THE claim: member[1] was paid SHIFT_SATS LESS on-chain than intended,
+        // member[2] that much more. The booked rows must say so.
+        assert_eq!(
+            c.amount_of(&rows, &c.members[1]),
+            c.intended_of(&c.members[1]) - SHIFT_SATS,
+            "must book what the COINBASE paid, not what the distribution intended"
+        );
+        assert_eq!(
+            c.amount_of(&rows, &c.members[2]),
+            c.intended_of(&c.members[2]) + SHIFT_SATS,
+            "must book what the COINBASE paid, not what the distribution intended"
+        );
+        for (address, paid_sats) in &rows {
+            assert!(*paid_sats > 0, "a 0-sat row proves no payout: {address}");
+            let script = bp_mining_job::address_to_script(Network::Regtest, address)
+                .expect("history-row address must be payable");
+            assert!(
+                c.coinbase_tx.output.iter().any(|o| {
+                    o.script_pubkey.as_bytes() == script.as_bytes()
+                        && o.value.to_sat() == *paid_sats as u64
+                }),
+                "every booked row must correspond to a real coinbase output: {address}"
+            );
+        }
+
+        // The pool's own output is paid ON-CHAIN but books no history row —
+        // that is what makes 3 the right count and not 4. Asserted from both
+        // sides so a booking that started crediting the fee address, or one
+        // that stopped paying it, is caught here rather than by the bare count.
+        let fee_script = bp_mining_job::address_to_script(Network::Regtest, &c.fee_addr)
+            .expect("fee address must be payable");
+        assert!(
+            c.coinbase_tx
+                .output
+                .iter()
+                .any(|o| o.script_pubkey.as_bytes() == fee_script.as_bytes()),
+            "the coinbase must actually pay the pool output"
+        );
+        assert!(
+            !rows.iter().any(|(a, _)| *a == c.fee_addr),
+            "the pool output must book no member history row"
+        );
+        c.assert_no_ledger_rows().await;
+
+        c.teardown().await;
+    }
+
+    /// Replay safety — and it is NOT the guard it looks like.
+    ///
+    /// PPLNS proves this with an absolute balance write: a second apply would
+    /// move a number, so an unchanged balance is evidence. Group-Solo writes no
+    /// balance at all, so the assertion had to be re-invented, and doing that
+    /// honestly meant finding out what actually holds the line.
+    ///
+    /// The obvious candidate is `bulk_insert_pplns_group_block_history`'s
+    /// `ON CONFLICT ("groupId", "blockHeight", address) DO NOTHING`. **It is
+    /// not what protects this path.** Turning that clause into an upsert (tried,
+    /// 2026-08-10) leaves this test passing, because the replay never reaches
+    /// the insert.
+    ///
+    /// What stops it is the SNAPSHOT LIFECYCLE: Group-Solo consumes its weight
+    /// snapshot at apply, where PPLNS explicitly does not ("The weight snapshot
+    /// is NOT consumed" — settlement there is a delta from the real coinbase
+    /// and legitimately serves every block of its distribution). So the second
+    /// attempt finds no settlement inputs and is refused with "needs an
+    /// operator reprocess" before any row is written.
+    ///
+    /// This test therefore guards the OUTCOME — a replay never moves a booked
+    /// row — and not one named mechanism. It carries a genuinely different
+    /// coinbase so that an overwrite would be visible if one ever happened; two
+    /// independent things would have to break at once for it to stay silent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_apply_of_the_same_group_block_cannot_overwrite_it() {
+        let Some(c) = GroupChain::setup(DB_GROUP_NO_OVERWRITE).await else {
+            return;
+        };
+
+        assert!(c.book(Some(c.actual.clone()), &c.block_hash).await);
+        c.node
+            .generate_to_self(DEPTH)
+            .await
+            .expect("bury to confirmation depth");
+        c.reconcile_once().await;
+
+        let first = c.history_rows().await;
+        assert_eq!(first.len(), 3, "precondition: the first apply booked");
+
+        // A second coinbase for the same block, shifted the OTHER way, so a
+        // missing replay guard shows up as moved amounts and not merely as
+        // extra rows.
+        let mut divergent = c.actual.clone();
+        let m1 = c.members[1].clone();
+        let m2 = c.members[2].clone();
+        if let Some(v) = divergent.paid_by_address.get_mut(&m1) {
+            *v += SHIFT_SATS;
+        }
+        if let Some(v) = divergent.paid_by_address.get_mut(&m2) {
+            *v -= SHIFT_SATS;
+        }
+        assert_ne!(
+            divergent.paid_by_address.get(&m1),
+            c.actual.paid_by_address.get(&m1),
+            "the replay must carry a genuinely different coinbase, or it proves nothing"
+        );
+
+        assert!(c.book(Some(divergent), &c.block_hash).await);
+        c.reconcile_once().await;
+
+        let second = c.history_rows().await;
+        assert_eq!(
+            second, first,
+            "a replay must not add, remove or move a single booked row"
+        );
+        c.assert_no_ledger_rows().await;
+
+        c.teardown().await;
+    }
+
+    /// Without a parsed coinbase there is nothing to settle against, and the
+    /// booking must REFUSE rather than fall back to what the pool intended —
+    /// the same rule as PPLNS, on the mode that keeps no ledger to correct it
+    /// later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_group_block_without_a_parsed_coinbase_is_refused_not_booked_from_intent() {
+        let Some(c) = GroupChain::setup(DB_GROUP_REFUSES_WITHOUT_COINBASE).await else {
+            return;
+        };
+
+        assert!(c.book(None, &c.block_hash).await);
+        c.node
+            .generate_to_self(DEPTH)
+            .await
+            .expect("bury to confirmation depth");
+        c.reconcile_once().await;
+
+        assert!(
+            c.history_rows().await.is_empty(),
+            "a block whose coinbase could not be parsed must book NOTHING — \
+             booking from the intended distribution would pay out what the \
+             chain never paid"
+        );
+        c.assert_no_ledger_rows().await;
 
         c.teardown().await;
     }
