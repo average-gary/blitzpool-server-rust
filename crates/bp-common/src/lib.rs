@@ -163,6 +163,57 @@ impl AddressId {
     }
 }
 
+/// Normalize a BTC address for storage / equality comparison.
+///
+/// **The one implementation of this rule.** It lived in three places
+/// (`bp_mining_job::address`, and a hand copy in each of the group-mgmt and
+/// blockparty engines) because `bp-mining-job` is only a dev-dependency of the
+/// engines, so they could not import it. Two of the three carried a doc comment
+/// requiring byte-for-byte agreement with the first — an invariant nothing
+/// checked. The blockparty copy records what the last drift cost: an
+/// unconditional `to_ascii_lowercase` corrupted Base58 case, so a
+/// signature-verified legacy address never matched the case-preserved row the
+/// verify path wrote, and any Base58 coinbase output was built from a mangled
+/// address. It lives here because `bp-common` already owns [`AddressId`], every
+/// one of those crates already depends on it, and the rule is pure string
+/// manipulation — no `bitcoin` dependency needed.
+///
+/// Bech32 / bech32m (BIP-173 / BIP-350) are case-insensitive by spec — wallets
+/// may present them uppercase (QR-code optimization) but the canonical wire form
+/// is lowercase. Legacy P2PKH / P2SH (base58) IS case-sensitive — different
+/// cases are different addresses with different checksums — and is left
+/// untouched.
+///
+/// Whitespace is trimmed. Empty input maps to empty output; callers that need
+/// empty rejected get that from [`AddressId::new`], which returns
+/// [`InvalidAddressError::Empty`].
+pub fn normalize_btc_address(address: &str) -> String {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("bc1")
+        || lower.starts_with("tb1")
+        || lower.starts_with("bcrt1")
+        || lower.starts_with("sb1")
+    {
+        lower
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// [`normalize_btc_address`] followed by [`AddressId::new`] — normalize, then
+/// shape-validate.
+///
+/// The two-step composition the engines and the API layer all perform. Exposed
+/// so a caller cannot normalize and forget to validate, or validate a
+/// non-normalized string; the engines map the error into their own type.
+pub fn normalized_address_id(raw: &str) -> Result<AddressId, InvalidAddressError> {
+    AddressId::new(normalize_btc_address(raw))
+}
+
 fn validate_address_shape(s: &str) -> Result<(), InvalidAddressError> {
     if s.is_empty() {
         return Err(InvalidAddressError::Empty);
@@ -425,6 +476,217 @@ pub use tracing;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- normalize_btc_address ----
+
+    /// The shared vector table for the normalizer agreement test.
+    ///
+    /// Covers what the three pre-unification implementations disagreed about or
+    /// could have: mixed-case Base58 (the case a past unconditional lowercase
+    /// corrupted), uppercase bech32 across all four HRPs (`bc1`/`tb1`/`bcrt1`/
+    /// `sb1`), whitespace, and empty input.
+    fn normalizer_vectors() -> Vec<&'static str> {
+        vec![
+            // mixed-case Base58 — MUST be preserved verbatim
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+            "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn",
+            "2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc",
+            // uppercase bech32, all four HRPs — MUST be lowercased
+            "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+            "TB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KXPJZSX",
+            "BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080",
+            "SB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+            // already-lowercase bech32 — unchanged
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            // mixed-case bech32
+            "Bc1QW508d6qejxtdg4y5r3zarvary0c5XW7Kv8f3t4",
+            // taproot (mainnet 62 chars, regtest 64 — see the P2TR/62-char note)
+            "BC1PW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KW508D6QEJXTDG4Y5R3ZARVARY0C5XW7K0YLH7D",
+            // whitespace
+            "  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  ",
+            "  1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2  ",
+            "\t1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\n",
+            // empty / whitespace-only
+            "",
+            "   ",
+            // prefix-adjacent strings that must NOT be treated as bech32
+            "bc2qsomething",
+            "BC2QSOMETHING",
+            "sb2qsomething",
+            "notanaddress",
+            "NOTANADDRESS",
+        ]
+    }
+
+    /// The rule as it stood at `crates/bp-mining-job/src/address.rs:18`
+    /// (`normalize_btc_address`), copied VERBATIM.
+    fn old_mining_job_impl(address: &str) -> String {
+        let trimmed = address.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("bc1")
+            || lower.starts_with("tb1")
+            || lower.starts_with("bcrt1")
+            || lower.starts_with("sb1")
+        {
+            lower
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// The rule as it stood in BOTH engine hand copies
+    /// (`bp-group-mgmt-engine/src/util.rs:22`,
+    /// `bp-blockparty-engine/src/util.rs:22`), copied VERBATIM. The two were
+    /// byte-identical apart from the error type they mapped into, so one copy
+    /// here represents both; `Err` stands for "rejected", which is what both
+    /// `InvalidAddress` variants meant.
+    fn old_engine_impl(raw: &str) -> Result<String, ()> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(());
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let normalized = if lower.starts_with("bc1")
+            || lower.starts_with("tb1")
+            || lower.starts_with("bcrt1")
+            || lower.starts_with("sb1")
+        {
+            lower
+        } else {
+            trimmed.to_string()
+        };
+        AddressId::new(normalized)
+            .map(|a| a.into_inner())
+            .map_err(|_| ())
+    }
+
+    /// **The Phase 0 gate.** The new single implementation must agree
+    /// byte-for-byte with all three it replaces, over the shared vector table.
+    ///
+    /// Run against the three old implementations while they still existed, so
+    /// the deletion that follows is evidenced rather than assumed. The old
+    /// bodies are inlined above rather than imported because two of the three
+    /// were `pub(crate)` in crates that (still) cannot depend on the third —
+    /// which is the whole reason the duplication existed.
+    #[test]
+    fn new_normalizer_agrees_byte_for_byte_with_all_three_it_replaced() {
+        for raw in normalizer_vectors() {
+            let new = normalize_btc_address(raw);
+
+            // 1. bp-mining-job's `normalize_btc_address` — same signature, so
+            //    the comparison is direct and total (empty in → empty out).
+            assert_eq!(
+                new,
+                old_mining_job_impl(raw),
+                "disagreed with the bp-mining-job normalizer on {raw:?}"
+            );
+
+            // 2/3. The engine copies additionally ran `AddressId::new`, so they
+            //      are compared through the same composition
+            //      (`normalized_address_id`). Both directions are asserted: an
+            //      input the old one rejected must still be rejected, and one it
+            //      accepted must normalize to the same bytes — otherwise this
+            //      test would pass on everything being rejected.
+            match old_engine_impl(raw) {
+                Ok(old) => {
+                    let got = normalized_address_id(raw)
+                        .unwrap_or_else(|e| panic!("{raw:?} was accepted before, now {e}"));
+                    assert_eq!(
+                        got.as_str(),
+                        old,
+                        "disagreed with the engine normalizer on {raw:?}"
+                    );
+                    // and it agrees with the bare string rule too
+                    assert_eq!(got.as_str(), new, "composition drifted from the rule");
+                }
+                Err(()) => assert!(
+                    normalized_address_id(raw).is_err(),
+                    "{raw:?} was rejected before but is accepted now"
+                ),
+            }
+        }
+    }
+
+    /// Negative control for the agreement test: the vector table must actually
+    /// contain inputs that distinguish the rule from the two ways of getting it
+    /// wrong. Without this, the test above would pass against an
+    /// unconditional-lowercase implementation (the money bug the blockparty
+    /// copy documents) or against a no-op one.
+    #[test]
+    fn the_vector_table_would_catch_both_historical_mistakes() {
+        let vectors = normalizer_vectors();
+
+        // A. unconditional lowercase — the Base58-corrupting bug.
+        assert!(
+            vectors.iter().any(|raw| {
+                let wrong = raw.trim().to_ascii_lowercase();
+                !raw.trim().is_empty() && wrong != normalize_btc_address(raw)
+            }),
+            "no vector distinguishes the rule from unconditional lowercase"
+        );
+
+        // B. no-op (never lowercase bech32).
+        assert!(
+            vectors.iter().any(|raw| {
+                let wrong = raw.trim().to_string();
+                !raw.trim().is_empty() && wrong != normalize_btc_address(raw)
+            }),
+            "no vector distinguishes the rule from a no-op"
+        );
+    }
+
+    #[test]
+    fn normalize_btc_address_lowercases_every_bech32_hrp() {
+        assert_eq!(
+            normalize_btc_address("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4"),
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
+        assert_eq!(
+            normalize_btc_address("TB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KXPJZSX"),
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+        );
+        assert_eq!(
+            normalize_btc_address("BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080"),
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+        );
+        assert_eq!(normalize_btc_address("SB1QFOO"), "sb1qfoo");
+    }
+
+    #[test]
+    fn normalize_btc_address_preserves_base58_case() {
+        for a in [
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+        ] {
+            assert_eq!(normalize_btc_address(a), a);
+        }
+    }
+
+    #[test]
+    fn normalize_btc_address_trims_and_maps_empty_to_empty() {
+        assert_eq!(normalize_btc_address("  bc1qfoo  "), "bc1qfoo");
+        assert_eq!(normalize_btc_address(""), "");
+        assert_eq!(normalize_btc_address("   "), "");
+    }
+
+    #[test]
+    fn normalized_address_id_rejects_what_address_id_rejects() {
+        // empty → Empty, not an Ok("") — the engines relied on this rejection.
+        assert_eq!(
+            normalized_address_id("   "),
+            Err(InvalidAddressError::Empty)
+        );
+        // over the 62-char cap → TooLong. A 111-char xpub lands here.
+        let xpub = "x".repeat(111);
+        assert_eq!(
+            normalized_address_id(&xpub),
+            Err(InvalidAddressError::TooLong(111))
+        );
+    }
 
     // ---- StreamKind ----
 

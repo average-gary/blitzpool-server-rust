@@ -51,8 +51,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bp_common::AddressId;
-use bp_mining_job::normalize_btc_address;
+use bp_common::{normalize_btc_address, AddressId};
 
 use crate::extensions::{RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS};
 use crate::tokens::{Token, TokenAllocError, TokenStore};

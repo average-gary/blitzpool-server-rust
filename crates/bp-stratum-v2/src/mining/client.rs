@@ -46,10 +46,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bitcoin::Network;
-use bp_common::{AddressId, StreamKind};
+use bp_common::{normalize_btc_address, AddressId, StreamKind};
 use bp_mining_job::{
-    address_to_script, merkle_root_from_coinbase, normalize_btc_address, MiningJob, MiningJobCache,
-    MiningJobError, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+    address_to_script, merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError,
+    PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
 use bp_share::{
     clamp_difficulty_to_max_target, difficulty_to_target, hash_rate_to_difficulty, sha256d,
@@ -126,7 +126,7 @@ pub const ERR_PROTOCOL_VERSION_MISMATCH: &str = "protocol-version-mismatch";
 pub const ERR_UNSUPPORTED_PROTOCOL: &str = "unsupported-protocol";
 
 /// `unknown-user` — the address parsed out of `user_identity` failed
-/// `bp_mining_job::normalize_btc_address` validation.
+/// `bp_common::normalize_btc_address` validation.
 pub const ERR_UNKNOWN_USER: &str = "unknown-user";
 
 /// `max-target-out-of-range` — miner's declared `max_target` is below
@@ -3336,7 +3336,7 @@ pub(crate) mod tests {
         }
     }
 
-    // Regtest bech32 address — passes bp_mining_job::normalize_btc_address.
+    // Regtest bech32 address — passes bp_common::normalize_btc_address.
     const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
     // ── SetupConnection ────────────────────────────────────────────
