@@ -21,6 +21,12 @@ use serde::{Deserialize, Serialize};
 pub mod extranonce;
 pub use extranonce::{ExtranonceAllocator, ExtranonceError};
 
+pub mod payout_identity;
+pub use payout_identity::{
+    parse_payout_identity, split_identity_and_worker, IdentityParseError, PayoutIdentity,
+    RotatingDescriptor,
+};
+
 #[cfg(feature = "sqlx")]
 mod sqlx_impls;
 

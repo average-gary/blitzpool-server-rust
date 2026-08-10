@@ -78,7 +78,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
-use bp_common::{AddressId, Sats, StreamKind};
+use bp_common::{AddressId, PayoutIdentity, Sats, StreamKind};
 use bp_stratum_v2::jdp::client::{parse_user_identifier_as_address, AllocateTokenContext};
 use bp_stratum_v2::jdp::dynamic_outputs::{
     encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
@@ -354,7 +354,22 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             // the designated output, so the pool's only enforcement is
             // "some sats went to that script" — which is enough precisely
             // because shorting it shorts the miner itself.
-            [only] if only.address == miner_address.as_str() => only.address.clone(),
+            // `payout_id()` for the "is this me?" test — that is an identity
+            // comparison against what the JDC authenticated as, and it is
+            // height-invariant. What gets DESIGNATED is a different question and
+            // is answered by the `match` below, not by this string.
+            [only] if only.payout_id() == miner_address.as_str() => match &only.identity {
+                PayoutIdentity::Static { address } => address.clone(),
+                // §6.4.3 designates ONE locking script, once, at allocate time —
+                // before any template exists, so there is no height to derive at
+                // and no way to change it per block. A rotating identity
+                // therefore cannot be served on the base protocol: designating
+                // its ledger key's script would silently pin every future block
+                // to one derivation index, which is rotation in name only.
+                // Unreachable by construction today; `absurd()` is what makes
+                // Phase 3 come back here instead of inheriting a wrong answer.
+                PayoutIdentity::Rotating { descriptor, .. } => descriptor.clone().absurd(),
+            },
             // A single payee who is SOMEBODY ELSE. The resolver routing the
             // block away from the miner is a guard — today the pending
             // Blockparty route, which sends 100 % to the pool fee address so
@@ -368,7 +383,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             [only] => {
                 warn!(
                     user_identifier,
-                    routed_to = %only.address,
+                    routed_to = only.payout_id(),
                     "JDP allocate: this miner's block is routed to another payee, which the base \
                      protocol cannot enforce (the JDC would satisfy the designated output with \
                      1 sat) — refusing the token; use ext 0x0003"
@@ -1555,10 +1570,7 @@ mod base_allocate_tests {
         let payouts = Arc::new(FixedPayouts {
             entries: entries
                 .iter()
-                .map(|(a, s)| PayoutEntry {
-                    address: a.to_string(),
-                    sats: *s,
-                })
+                .map(|(a, s)| PayoutEntry::static_address(a.to_string(), *s))
                 .collect(),
             asked_at: StdMutex::new(Vec::new()),
             stream,

@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bitcoin::Network;
-use bp_common::{normalize_btc_address, AddressId, StreamKind};
+use bp_common::{parse_payout_identity, AddressId, PayoutIdentity, StreamKind};
 use bp_mining_job::{
     address_to_script, merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError,
     PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
@@ -125,8 +125,9 @@ pub const ERR_PROTOCOL_VERSION_MISMATCH: &str = "protocol-version-mismatch";
 /// Used for `protocol = 2` (TDP-only) until that path is wired.
 pub const ERR_UNSUPPORTED_PROTOCOL: &str = "unsupported-protocol";
 
-/// `unknown-user` — the address parsed out of `user_identity` failed
-/// `bp_common::normalize_btc_address` validation.
+/// `unknown-user` — the payout part of `user_identity` failed
+/// `bp_common::parse_payout_identity` or, for a literal address, did not parse
+/// on the configured network.
 pub const ERR_UNKNOWN_USER: &str = "unknown-user";
 
 /// `max-target-out-of-range` — miner's declared `max_target` is below
@@ -1251,26 +1252,31 @@ fn resolve_open_context<C: Clock>(
         error_code: code.to_string(),
     };
 
-    // Parse `user_identity` → (address, worker). Format is
-    // `address.worker_name` (single dot split). Multiple dots: worker_name
-    // keeps the rest (split only on first dot).
-    let (address_part, worker_part) = match user_identity.find('.') {
-        Some(idx) => (&user_identity[..idx], &user_identity[idx + 1..]),
-        None => (user_identity, ""),
-    };
-    if address_part.is_empty() {
-        return Err(err(ERR_UNKNOWN_USER));
-    }
+    // Parse `user_identity` → (payout identity, worker). The split, the
+    // normalization and the shape check are one shared function
+    // (`bp_common::parse_payout_identity`) rather than this site's own three
+    // steps — see its docs for the four places that each spelled the rule
+    // differently.
+    let (identity, worker_part) =
+        parse_payout_identity(user_identity).map_err(|_| err(ERR_UNKNOWN_USER))?;
 
-    // `normalize_btc_address` is a whitespace/casing-only normalizer.
-    // We then call `address_to_script` to actually verify the address
-    // parses and matches the configured network.
-    let normalized = normalize_btc_address(address_part);
-    if normalized.is_empty() {
-        return Err(err(ERR_UNKNOWN_USER));
+    // Then the real check, which is stronger than the shape check and stays
+    // here: does the address actually parse, and on THIS network? The identity
+    // decides what is being validated.
+    //
+    // `match` and not `if`: a rotating identity has no single script to probe —
+    // its scripts are derived per height and there is no height at channel-open
+    // — so the check that replaces this one is a descriptor check, not an
+    // address one. `absurd()` makes that a compile error to skip rather than a
+    // channel that opens unvalidated.
+    match &identity {
+        PayoutIdentity::Static { address } => {
+            address_to_script(state.network, address).map_err(|_| err(ERR_UNKNOWN_USER))?;
+        }
+        PayoutIdentity::Rotating { descriptor, .. } => descriptor.clone().absurd(),
     }
-    address_to_script(state.network, &normalized).map_err(|_| err(ERR_UNKNOWN_USER))?;
-    let address = AddressId::new(normalized).map_err(|_| err(ERR_UNKNOWN_USER))?;
+    let address =
+        AddressId::new(identity.payout_id().to_string()).map_err(|_| err(ERR_UNKNOWN_USER))?;
 
     // Multi-channel address-lock check: subsequent channels MUST resolve
     // to the same address as the first one ("address-locked").
@@ -1280,10 +1286,13 @@ fn resolve_open_context<C: Clock>(
         }
     }
 
-    let worker = if worker_part.is_empty() {
-        "default".to_string()
-    } else {
-        worker_part.to_string()
+    // SV2's own default, kept verbatim: no dot AND an empty worker after a dot
+    // both become `"default"` here. `parse_payout_identity` distinguishes the
+    // two (SV1 does not default them the same way) and this site collapses them,
+    // which is what it did before.
+    let worker = match worker_part {
+        Some(w) if !w.is_empty() => w.to_string(),
+        _ => "default".to_string(),
     };
 
     // Initial difficulty. A positive `nominal_hash_rate` is the miner
@@ -4733,10 +4742,10 @@ pub(crate) mod tests {
     use bp_mining_job::PayoutEntry;
 
     fn payouts() -> Vec<PayoutEntry> {
-        vec![PayoutEntry {
-            address: REGTEST_ADDR.to_string(),
-            sats: 5_000_000_000,
-        }]
+        vec![PayoutEntry::static_address(
+            REGTEST_ADDR.to_string(),
+            5_000_000_000,
+        )]
     }
 
     /// `MiningJobInputs` fixture for the SV2 apply_template_broadcast

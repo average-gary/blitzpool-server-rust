@@ -1306,10 +1306,10 @@ mod tests {
             coinbase_tx_outputs_count: 1,
             coinbase_tx_locktime: 0,
         };
-        let payouts = vec![PayoutEntry {
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            sats: 5_000_000_000,
-        }];
+        let payouts = vec![PayoutEntry::static_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            5_000_000_000,
+        )];
         build_mining_job_from_tdp(
             Network::Regtest,
             &payouts,
@@ -1538,10 +1538,10 @@ mod tests {
             coinbase_tx_outputs_count: active.coinbase_tx_outputs_count,
             coinbase_tx_locktime: active.coinbase_tx_locktime,
         };
-        let payouts = vec![PayoutEntry {
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            sats: 5_000_000_000,
-        }];
+        let payouts = vec![PayoutEntry::static_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            5_000_000_000,
+        )];
         let mining_job = build_mining_job_from_tdp(
             Network::Regtest,
             &payouts,

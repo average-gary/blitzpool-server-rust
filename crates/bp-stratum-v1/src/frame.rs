@@ -505,10 +505,18 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 });
             }
             let raw_username = arr[0].as_str().unwrap().to_string();
-            let (address, worker) = match raw_username.split_once('.') {
-                Some((a, w)) => (a.to_string(), w.to_string()),
-                None => (raw_username.clone(), "worker".to_string()),
-            };
+            // The shared split — one implementation across the four protocol
+            // paths that read a `user_identity` (see
+            // `bp_common::split_identity_and_worker`). SV1's own convention, that
+            // a missing dot means worker `"worker"` while a trailing dot leaves it
+            // empty, stays here: it is SV1's default, not part of the rule, which
+            // is why the shared function returns `Option` instead of a defaulted
+            // string.
+            let (address, worker) = bp_common::split_identity_and_worker(&raw_username);
+            let (address, worker) = (
+                address.to_string(),
+                worker.map_or_else(|| "worker".to_string(), str::to_string),
+            );
             let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
             Ok(SV1Request::Authorize(AuthorizeRequest {
                 id,

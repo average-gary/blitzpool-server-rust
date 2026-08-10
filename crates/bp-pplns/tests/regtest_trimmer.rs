@@ -345,10 +345,7 @@ async fn run_trim_scenario(
 
     let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|(a, s)| PayoutEntry {
-            address: a.as_str().to_string(),
-            sats: *s,
-        })
+        .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
         .collect();
 
     // ── Build MiningJob ─────────────────────────────────────────────────

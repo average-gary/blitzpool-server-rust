@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use bitcoin::Network;
-use bp_common::normalize_btc_address;
+use bp_common::{parse_payout_identity, PayoutIdentity};
 use bp_mining_job::{
     address_to_script, MiningJobCache, ResolvedPayouts, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
@@ -487,19 +487,40 @@ pub fn handle_authorize<C: Clock>(
         return out;
     }
 
-    // Normalise (trim + bech32-lowercase). Critical for downstream cache
-    // / PPLNS-window keys.
-    request.address = normalize_btc_address(&request.address);
-
-    // Validate via `address_to_script` — covers parse failure AND
-    // network mismatch.
-    // bitcoin-address-validation; our `Address::from_str` +
-    // `require_network` covers the same shape.
-    if address_to_script(state.network, &request.address).is_err() {
+    // Parse the payout part into an identity — the shared
+    // `bp_common::parse_payout_identity`, which normalises (trim +
+    // bech32-lowercase, critical for downstream cache / PPLNS-window keys) and
+    // shape-checks in one step. `frame.rs` already split off the worker, so the
+    // payout part is passed in on its own.
+    let Ok((identity, _)) = parse_payout_identity(&request.address) else {
         out.push_frame(write_error(&id, ERR_OTHER_UNKNOWN, REJECT_INVALID_ADDR));
         out.push_event(SessionEvent::Disconnect);
         return out;
+    };
+
+    // Then the stronger check: does the address parse, and on THIS network?
+    //
+    // `match` and not `if`: a rotating identity has no single script to probe at
+    // authorize time (its scripts are derived per height, and there is no height
+    // here), so what replaces this is a descriptor check. `absurd()` is what
+    // makes that a compile error to skip rather than a session that authorizes
+    // unvalidated.
+    match &identity {
+        PayoutIdentity::Static { address } => {
+            if address_to_script(state.network, address).is_err() {
+                out.push_frame(write_error(&id, ERR_OTHER_UNKNOWN, REJECT_INVALID_ADDR));
+                out.push_event(SessionEvent::Disconnect);
+                return out;
+            }
+        }
+        PayoutIdentity::Rotating { descriptor, .. } => descriptor.clone().absurd(),
     }
+
+    // `AuthorizeRequest.address` is the session's payout id: it is what
+    // `SessionEvent::Authorized` carries, what the mode gate is keyed on, and
+    // what `no_fee` compares a resolved payee against. Height-invariant, so
+    // `payout_id()`.
+    request.address = identity.payout_id().to_string();
 
     state.authorization = Some(request.clone());
     out.push_frame(write_authorize_response(&id));
@@ -824,11 +845,15 @@ fn build_and_register_notify<C: Clock>(
         return None;
     }
 
+    // `payout_id()`, not the payout script: the question is "is this miner the
+    // sole payee", which is an identity comparison against what it authorized
+    // with. A rotating identity's script differs every block while its payout id
+    // does not, so reading the script here would report a fee on every block.
     state.no_fee = payouts.entries.len() == 1
         && state
             .authorization
             .as_ref()
-            .is_some_and(|a| payouts.entries[0].address == a.address);
+            .is_some_and(|a| payouts.entries[0].payout_id() == a.address);
 
     let tdp_template = TdpCoinbaseTemplate {
         coinbase_prefix: &template.coinbase_prefix,
@@ -983,10 +1008,10 @@ mod tests {
             &empty_registry(),
             &cache,
             &template,
-            &ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-                address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-                sats: 5_000_000_000,
-            }]),
+            &ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+                "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+                5_000_000_000,
+            )]),
             true,
             0,
         );
@@ -1083,10 +1108,10 @@ mod tests {
     /// supplies it (the IO-layer connection loop async-resolves via
     /// [`crate::hooks::PayoutResolver`]).
     fn solo_payouts_fixture(addr: &str) -> ResolvedPayouts {
-        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: addr.to_string(),
-            sats: 5_000_000_000,
-        }])
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+            addr.to_string(),
+            5_000_000_000,
+        )])
     }
 
     // ── 3 destroy spec cases ────────────────────────────────────────

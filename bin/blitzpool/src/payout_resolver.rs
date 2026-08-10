@@ -379,13 +379,7 @@ impl ProductionPayoutResolver {
                 match result.distribution.payout_entries_at(reward_sats) {
                     Ok(entries) => (
                         ResolvedPayouts {
-                            entries: entries
-                                .into_iter()
-                                .map(|(address, sats)| PayoutEntry {
-                                    address: address.into_inner(),
-                                    sats,
-                                })
-                                .collect(),
+                            entries: weight_entries_to_payouts(entries),
                             payouts_fingerprint: result.payouts_fingerprint(),
                         },
                         result.snapshot_written,
@@ -421,10 +415,10 @@ impl ProductionPayoutResolver {
         // exact sats. The coinbase builder's remainder guard tops up any
         // sub-1-sat floor loss on this sole output.
         let sats = ((route.percent as f64 / 100.0) * reward_sats as f64).floor() as u64;
-        Some(vec![PayoutEntry {
-            address: route.fee_address.into_inner(),
+        Some(vec![PayoutEntry::static_address(
+            route.fee_address.into_inner(),
             sats,
-        }])
+        )])
     }
 
     async fn blockparty_payouts(
@@ -517,13 +511,7 @@ impl ProductionPayoutResolver {
                 match result.distribution.payout_entries_at(reward_sats) {
                     Ok(entries) => (
                         ResolvedPayouts {
-                            entries: entries
-                                .into_iter()
-                                .map(|(address, sats)| PayoutEntry {
-                                    address: address.into_inner(),
-                                    sats,
-                                })
-                                .collect(),
+                            entries: weight_entries_to_payouts(entries),
                             payouts_fingerprint: result.payouts_fingerprint(),
                         },
                         result.snapshot_written,
@@ -811,7 +799,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                 let entries: Vec<(String, u64)> =
                     solo_payouts(miner_address.as_str(), &self.resolver.solo_fee, t_ref)
                         .into_iter()
-                        .map(|p| (p.address, p.sats))
+                        .map(|p| (p.payout_id().to_string(), p.sats))
                         .collect();
                 // The dev-fee output doubles as pool_payout when set;
                 // otherwise the configured pool fee address anchors
@@ -903,14 +891,35 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
 fn entries_to_payouts(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutEntry> {
     entries
         .iter()
-        .map(|e| PayoutEntry {
-            address: e.address.as_str().to_string(),
-            // `Sats` is a signed i64; a coinbase output can only ever be a
-            // non-negative amount. Clamp defensively so a (should-be-impossible)
-            // negative distributor value can't wrap to ~1.8e19 via `as u64` and
-            // blow up the coinbase as bad-cb-amount.
-            sats: e.sats.0.max(0) as u64,
+        .map(|e| {
+            PayoutEntry::static_address(
+                e.address.as_str(),
+                // `Sats` is a signed i64; a coinbase output can only ever be a
+                // non-negative amount. Clamp defensively so a
+                // (should-be-impossible) negative distributor value can't wrap
+                // to ~1.8e19 via `as u64` and blow up the coinbase as
+                // bad-cb-amount.
+                e.sats.0.max(0) as u64,
+            )
         })
+        .collect()
+}
+
+/// Translate a §4 weight-model evaluation (`payout_entries_at`) into coinbase
+/// payout entries.
+///
+/// **PPLNS and Group-Solo both resolve through here**, which is the point: this
+/// was the same three-line closure written twice, once per mode, and
+/// `CLAUDE.md`'s opening line is about exactly that shape. It is also where the
+/// two modes stop paying a literal address once identities can rotate — one
+/// edit, both modes, instead of the "fixed twice in two PRs a day apart" entry.
+///
+/// `static_address` and not a parse: `AddressId` is already normalized and
+/// shape-checked, and the coinbase seam takes it verbatim today.
+fn weight_entries_to_payouts(entries: Vec<(AddressId, u64)>) -> Vec<PayoutEntry> {
+    entries
+        .into_iter()
+        .map(|(address, sats)| PayoutEntry::static_address(address.into_inner(), sats))
         .collect()
 }
 
@@ -1084,7 +1093,7 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qabc");
+        assert_eq!(r[0].payout_id(), "bc1qabc");
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
@@ -1099,9 +1108,9 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0].address, "bc1qdev");
+        assert_eq!(r[0].payout_id(), "bc1qdev");
         assert_eq!(r[0].sats, 75_000_000); // floor(1.5% × 5e9)
-        assert_eq!(r[1].address, "bc1qminer");
+        assert_eq!(r[1].payout_id(), "bc1qminer");
         assert_eq!(r[1].sats, TEST_REWARD - 75_000_000); // miner takes the remainder
                                                          // The two outputs sum to exactly the reward.
         assert_eq!(r[0].sats + r[1].sats, TEST_REWARD);
@@ -1119,7 +1128,7 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qminer");
+        assert_eq!(r[0].payout_id(), "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
@@ -1134,7 +1143,7 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qminer");
+        assert_eq!(r[0].payout_id(), "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
@@ -1152,7 +1161,7 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 1, "no zero-value dev output");
-        assert_eq!(r[0].address, "bc1qminer");
+        assert_eq!(r[0].payout_id(), "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
@@ -1173,9 +1182,9 @@ mod tests {
         ];
         let payouts = entries_to_payouts(&entries);
         assert_eq!(payouts.len(), 2);
-        assert_eq!(payouts[0].address, "bc1qa");
+        assert_eq!(payouts[0].payout_id(), "bc1qa");
         assert_eq!(payouts[0].sats, 60_000_000);
-        assert_eq!(payouts[1].address, "bc1qb");
+        assert_eq!(payouts[1].payout_id(), "bc1qb");
         assert_eq!(payouts[1].sats, 40_000_000);
     }
 }

@@ -545,7 +545,7 @@ where
                                 } else {
                                     (p.sats as f64) * 100.0 / (reward_sats as f64)
                                 },
-                                address: p.address,
+                                address: p.payout_id().to_string(),
                                 sats: p.sats,
                             })
                             .collect()
@@ -616,12 +616,16 @@ fn assemble_block_preview(
     let mut witness_commitment = [0u8; 32];
     witness_commitment.copy_from_slice(&dwc_bytes[6..6 + 32]);
 
+    // Round-trip through the display type: `PayoutInfoEntry` carries an address
+    // string, so a `PayoutIdentity` cannot survive it — a rotating identity would
+    // come back out as a `Static` entry paying its ledger key rather than its
+    // derived script, i.e. a preview that does not match the coinbase. Harmless
+    // today (only `Static` exists) and it is the same shape the preview had
+    // before, but it is the reason the preview must take `ResolvedPayouts`
+    // directly once identities can rotate, not a `Vec<PayoutInfoEntry>`.
     let payout_entries: Vec<PayoutEntry> = payouts
         .iter()
-        .map(|p| PayoutEntry {
-            address: p.address.clone(),
-            sats: p.sats,
-        })
+        .map(|p| PayoutEntry::static_address(p.address.clone(), p.sats))
         .collect();
     let cb_template = CoinbaseTemplate {
         block_height,

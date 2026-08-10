@@ -4,6 +4,7 @@
 //! encoding, BIP-141 witness commitment, and stateless extranonce splicing.
 
 use bitcoin::Network;
+use bp_common::PayoutIdentity;
 use bp_share::sha256d_from_parts;
 use tracing::warn;
 
@@ -29,23 +30,54 @@ const COINBASE_NONFINAL_SEQUENCE: u32 = 0xffff_fffe;
 /// coinbase builder must place those sats verbatim. Deriving amounts from a
 /// float percentage here would re-floor each output and silently drop up to a
 /// sat per output (e.g. a 50 000 000-sat finder bonus rounding to 49 999 999).
+///
+/// The payout target is a [`PayoutIdentity`] rather than a `String` so that
+/// "which address is this" and "which script does this block pay" can be
+/// different questions. They are the same answer for every identity that exists
+/// today ([`PayoutIdentity::Static`]); they stop being the same answer for a
+/// rotating identity, and the type is what forces each reader to say which one
+/// it meant.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PayoutEntry {
-    pub address: String,
+    /// Where this output pays.
+    pub identity: PayoutIdentity,
     /// Exact output amount in satoshis.
     pub sats: u64,
 }
 
 impl PayoutEntry {
+    /// A literal address, taken **verbatim**, with exact sats.
+    ///
+    /// Verbatim and not normalized: that is what this seam did before the
+    /// identity type existed, and normalizing here would be a behaviour change
+    /// smuggled into a refactor. The wire paths normalize at intake, which is
+    /// where the miner's bytes actually arrive.
+    pub fn static_address(address: impl Into<String>, sats: u64) -> Self {
+        Self {
+            identity: PayoutIdentity::static_address_verbatim(address),
+            sats,
+        }
+    }
+
     /// Percentage-based convenience: floor `percent`% of `reward_sats` to an
     /// exact output. For the Solo split (dev-fee / 100%-to-miner) and the
     /// percentage-oriented tests. The PPLNS / Group-Solo / Blockparty
     /// distributors bypass this — they carry exact per-output sats already.
     pub fn from_percent(address: impl Into<String>, percent: f64, reward_sats: u64) -> Self {
-        Self {
-            address: address.into(),
-            sats: ((percent / 100.0) * reward_sats as f64).floor() as u64,
-        }
+        Self::static_address(
+            address,
+            ((percent / 100.0) * reward_sats as f64).floor() as u64,
+        )
+    }
+
+    /// The ledger key / mode key for this entry — **height-invariant**.
+    ///
+    /// NOT the payout script. For a `Static` entry the two coincide, which is
+    /// why one `String` sufficed; for a rotating one they do not, and reading
+    /// this where a script was meant is the mistake [`PayoutIdentity`] exists to
+    /// make unwriteable. Scripts come from `payout_script` only.
+    pub fn payout_id(&self) -> &str {
+        self.identity.payout_id()
     }
 }
 
@@ -235,6 +267,16 @@ pub enum MiningJobError {
     InvalidAddress(#[from] address::AddressError),
     #[error("at least one payout entry is required")]
     NoPayouts,
+    /// A rotating identity needs the block height to derive its script, and the
+    /// template's `coinbase_prefix` carried no decodable BIP-34 push.
+    ///
+    /// Unreachable today — no rotating identity can be constructed. It exists so
+    /// that when one can be, the failure is a refused job rather than a coinbase
+    /// built at a fabricated height, which would pay a script the miner cannot
+    /// spend. `ResolvedPayouts::none()` documents the same choice for a
+    /// distribution that could not be built: serve no job rather than guess.
+    #[error("template carried no decodable BIP-34 height and a payout identity needs one")]
+    MissingBlockHeight,
 }
 
 /// Build a `MiningJob` for the given template + payouts.
@@ -300,6 +342,7 @@ pub fn build_mining_job(
         payouts,
         template.coinbase_value_sats,
         &template.witness_commitment,
+        template.block_height,
     )?;
 
     // BIP-54: nLockTime = block_height - 1, non-final nSequence. Serialize the
@@ -365,6 +408,36 @@ pub struct TdpCoinbaseTemplate<'a> {
     pub coinbase_tx_locktime: u32,
 }
 
+impl TdpCoinbaseTemplate<'_> {
+    /// The block height this template builds on, decoded from
+    /// `coinbase_prefix`.
+    ///
+    /// **There is no height field, on this struct or on any production
+    /// template**, and adding one would be the wrong fix. Checked at `f070414`:
+    /// neither `NewTemplate` (`bp-template-distribution`), `ActiveSV1Template`
+    /// (`bp-stratum-v1/src/notify.rs`), nor `ActiveSV2Template` carries a height
+    /// — only the RPC-path [`CoinbaseTemplate`] does. Threading one down from
+    /// Core would mean widening an IPC message and three template structs to
+    /// carry a value that is *already in the bytes*.
+    ///
+    /// Core pre-encodes the BIP-34 height push at the start of
+    /// `coinbase_prefix` — it must, for the block to be valid — so the height is
+    /// recoverable locally with [`crate::decode_bip34_height`], which already
+    /// exists and is already exercised against a real Core template
+    /// (`tests/regtest_bip54.rs`). No IPC or RPC change, and no new field that
+    /// could disagree with the bytes actually being mined.
+    ///
+    /// `None` when the prefix does not begin with a 1..=4-byte push: hand-built
+    /// test templates with an empty or synthetic prefix. A `Static` payout does
+    /// not care, which is why this returns `Option` instead of erroring — a
+    /// missing height must not fail a job that never needed one. A rotating
+    /// payout does care, and the caller
+    /// ([`build_mining_job_from_tdp`]) is where that becomes an error.
+    pub fn block_height(&self) -> Option<u32> {
+        crate::bip54::decode_bip34_height(self.coinbase_prefix)
+    }
+}
+
 /// Build a `MiningJob` from a TDP `NewTemplate`'s coinbase fields plus
 /// the pool's per-job payout split.
 ///
@@ -397,7 +470,17 @@ pub fn build_mining_job_from_tdp(
         return Err(MiningJobError::NoPayouts);
     }
 
-    // Scriptsig FIRST, outputs second — keeps the error precedence
+    // Height first, and before the scriptsig check — not for its own sake but
+    // because [`crate::cache::MiningJobCache`] has no choice: the height is part
+    // of the outputs cache key, which it consults before it ever runs the
+    // scriptsig check inside the build closure. The cache's contract is "same
+    // errors in the same precedence" as this function, so the order is settled
+    // there and copied here. Unobservable today (`MissingBlockHeight` is
+    // unreachable while no identity rotates); the point is that it stays
+    // unobservable when one does.
+    let block_height = payout_height(template, payouts)?;
+
+    // Scriptsig SECOND, outputs third — keeps the error precedence
     // (NoPayouts → ScriptSigTooLong → InvalidAddress) identical to the
     // pre-split function so callers matching/logging the variant see
     // the same failure cause for the same inputs.
@@ -407,8 +490,12 @@ pub fn build_mining_job_from_tdp(
         extranonce_slot_size,
     )?;
 
-    let payout_outputs =
-        build_payout_outputs(network, payouts, template.coinbase_tx_value_remaining)?;
+    let payout_outputs = build_payout_outputs(
+        network,
+        payouts,
+        template.coinbase_tx_value_remaining,
+        block_height,
+    )?;
 
     Ok(assemble_tdp_job(
         script_sig,
@@ -563,10 +650,78 @@ fn build_scriptsig(height_encoded: &[u8], identifier: &[u8], padding: &[u8]) -> 
     s
 }
 
+/// The `scriptPubKey` this entry is paid at `block_height`.
+///
+/// **The one place an identity becomes coinbase bytes.** Every other
+/// `address_to_script` call in the repo is a test, an authorize-time validation
+/// probe, or a weight estimate.
+///
+/// `block_height` is what makes rotation expressible: a rotating identity's
+/// script is a function of it, a static one's is not. The `Static` arm ignores
+/// it, and the type says so rather than a comment hoping for it.
+pub(crate) fn payout_script(
+    network: Network,
+    identity: &PayoutIdentity,
+    block_height: u32,
+) -> Result<Vec<u8>, MiningJobError> {
+    match identity {
+        // Verbatim today's behaviour: `address_to_script` on the literal string,
+        // height unused.
+        PayoutIdentity::Static { address } => {
+            let _ = block_height;
+            Ok(address::address_to_script(network, address)?.into_bytes())
+        }
+        // Unreachable by construction, and certified so by the compiler rather
+        // than by `unreachable!()` — `RotatingDescriptor` is uninhabited. When
+        // intake gives it values this line stops compiling, which is precisely
+        // how the next phase finds this site.
+        PayoutIdentity::Rotating { descriptor, .. } => descriptor.clone().absurd(),
+    }
+}
+
+/// The height [`payout_script`] must derive at, for a TDP template.
+///
+/// **The one implementation of this rule**, called by
+/// [`build_mining_job_from_tdp`] and by [`crate::cache::MiningJobCache`]. Two
+/// copies would be two answers to "which height was this output set derived
+/// at?", and the cache keys its parsed outputs on that answer — a disagreement
+/// is a coinbase paying scripts derived for another block, which is precisely
+/// the class of bug `CLAUDE.md` opens with.
+///
+/// The height comes from Core's pre-encoded BIP-34 push (see
+/// [`TdpCoinbaseTemplate::block_height`]). A prefix without a decodable push
+/// means a hand-built test template; every identity that exists today is
+/// `Static` and ignores the height, so `0` is a faithful stand-in rather than a
+/// guess that could pay the wrong script. The moment an identity's script
+/// depends on the height, `payout_script` must not be reachable with a
+/// fabricated one — which is what [`MiningJobError::MissingBlockHeight`] is for.
+///
+/// The guard is `!rotates()` over every entry rather than a `match` because the
+/// question is a property of the whole slice, not of one identity: `all` over a
+/// per-variant `match` is the exhaustive form of it. `rotates()` is itself a
+/// `match`, so adding a variant forces a decision there.
+pub(crate) fn payout_height(
+    template: &TdpCoinbaseTemplate<'_>,
+    payouts: &[PayoutEntry],
+) -> Result<u32, MiningJobError> {
+    match template.block_height() {
+        Some(h) => Ok(h),
+        None if payouts.iter().all(|p| !p.identity.rotates()) => Ok(0),
+        None => Err(MiningJobError::MissingBlockHeight),
+    }
+}
+
+/// Build the payout outputs for a coinbase at `block_height`.
+///
+/// `block_height` is threaded in for [`payout_script`] — see there for why. It
+/// is NOT used for the BIP-34 scriptsig push, which the two builders handle
+/// separately (the RPC path encodes it from `CoinbaseTemplate::block_height`,
+/// the TDP path takes Core's pre-encoded `coinbase_prefix` verbatim).
 pub(crate) fn build_payout_outputs(
     network: Network,
     payouts: &[PayoutEntry],
     reward_sats: u64,
+    block_height: u32,
 ) -> Result<Vec<(u64, Vec<u8>)>, MiningJobError> {
     let mut outputs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(payouts.len());
     let mut total_paid: u64 = 0;
@@ -576,7 +731,7 @@ pub(crate) fn build_payout_outputs(
         // — the distribution already summed to `reward_sats` precisely.
         let amount = p.sats;
         total_paid = total_paid.saturating_add(amount);
-        let script = address::address_to_script(network, &p.address)?.into_bytes();
+        let script = payout_script(network, &p.identity, block_height)?;
         outputs.push((amount, script));
     }
 
@@ -621,8 +776,9 @@ fn build_outputs(
     payouts: &[PayoutEntry],
     reward_sats: u64,
     witness_commitment: &[u8; 32],
+    block_height: u32,
 ) -> Result<Vec<(u64, Vec<u8>)>, MiningJobError> {
-    let mut outputs = build_payout_outputs(network, payouts, reward_sats)?;
+    let mut outputs = build_payout_outputs(network, payouts, reward_sats, block_height)?;
 
     // Witness commitment OP_RETURN: OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed || commit
     let mut commit_data = [0u8; 36];
@@ -715,12 +871,7 @@ pub fn solo_payouts(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let percent = fee.dev_fee_percent;
-    let full_to_miner = || {
-        vec![PayoutEntry {
-            address: miner_address.to_string(),
-            sats: reward_sats,
-        }]
-    };
+    let full_to_miner = || vec![PayoutEntry::static_address(miner_address, reward_sats)];
     match (miner_address.is_empty(), dev_addr) {
         (true, _) => vec![],
         (false, None) => full_to_miner(),
@@ -743,13 +894,7 @@ pub fn solo_payouts(
         (false, Some(dev)) => {
             let dev = PayoutEntry::from_percent(dev, percent, reward_sats);
             let miner_sats = reward_sats.saturating_sub(dev.sats);
-            vec![
-                dev,
-                PayoutEntry {
-                    address: miner_address.to_string(),
-                    sats: miner_sats,
-                },
-            ]
+            vec![dev, PayoutEntry::static_address(miner_address, miner_sats)]
         }
     }
 }
@@ -770,10 +915,7 @@ mod tests {
     fn single_payout(addr: &str) -> Vec<PayoutEntry> {
         // Single output → the builder's remainder guard tops it up to the full
         // reward regardless of the exact value seeded here.
-        vec![PayoutEntry {
-            address: addr.to_string(),
-            sats: 5_000_000_000,
-        }]
+        vec![PayoutEntry::static_address(addr.to_string(), 5_000_000_000)]
     }
 
     // ---- encode_block_height_minimal ----
@@ -948,20 +1090,15 @@ mod tests {
         // 49 999 999). Mirrors a real Group-Solo block-template payout set.
         let reward = 316_672_616;
         let payouts = vec![
-            PayoutEntry {
-                address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".into(),
-                sats: 4_750_092,
-            },
-            PayoutEntry {
-                address: "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2".into(),
-                sats: 50_000_000, // finder bonus — must stay EXACT
-            },
-            PayoutEntry {
-                address: "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy".into(),
-                sats: reward - 4_750_092 - 50_000_000,
-            },
+            PayoutEntry::static_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", 4_750_092),
+            // finder bonus — must stay EXACT
+            PayoutEntry::static_address("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", 50_000_000),
+            PayoutEntry::static_address(
+                "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+                reward - 4_750_092 - 50_000_000,
+            ),
         ];
-        let outs = build_payout_outputs(Network::Bitcoin, &payouts, reward).unwrap();
+        let outs = build_payout_outputs(Network::Bitcoin, &payouts, reward, 800_000).unwrap();
         assert_eq!(outs[0].0, 4_750_092);
         assert_eq!(
             outs[1].0, 50_000_000,
@@ -1175,15 +1312,14 @@ mod tests {
         // Two payouts so the output loop + the count varint are exercised, and
         // a non-default sequence / locktime so those fields can't silently drift.
         let payouts = vec![
-            PayoutEntry {
-                address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                sats: 3_000_000_000,
-            },
-            PayoutEntry {
-                address: "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
-                    .to_string(),
-                sats: 2_000_000_000,
-            },
+            PayoutEntry::static_address(
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                3_000_000_000,
+            ),
+            PayoutEntry::static_address(
+                "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3".to_string(),
+                2_000_000_000,
+            ),
         ];
         let slot = EXTRANONCE_SLOT_LEN;
         let template = TdpCoinbaseTemplate {
@@ -1205,6 +1341,7 @@ mod tests {
             Network::Bitcoin,
             &payouts,
             template.coinbase_tx_value_remaining,
+            payout_height(&template, &payouts).unwrap(),
         )
         .unwrap();
         let total_output_count =
@@ -1632,7 +1769,7 @@ mod solo_split_tests {
     fn without_a_dev_fee_the_solo_split_is_a_single_output() {
         let out = solo_payouts("bc1qminer", &fee(None, 0.0), REWARD);
         assert_eq!(out.len(), 1, "no second output: {out:?}");
-        assert_eq!(out[0].address, "bc1qminer");
+        assert_eq!(out[0].payout_id(), "bc1qminer");
         assert_eq!(out[0].sats, REWARD);
     }
 
@@ -1652,8 +1789,8 @@ mod solo_split_tests {
     fn a_configured_dev_fee_splits_and_conserves_every_satoshi() {
         let out = solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 1.0), REWARD);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].address, "bc1qdev");
-        assert_eq!(out[1].address, "bc1qminer");
+        assert_eq!(out[0].payout_id(), "bc1qdev");
+        assert_eq!(out[1].payout_id(), "bc1qminer");
         assert_eq!(
             out[0].sats + out[1].sats,
             REWARD,

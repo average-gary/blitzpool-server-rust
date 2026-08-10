@@ -277,10 +277,10 @@ impl DeviceStatusSink for NoOpHooks {
 #[async_trait]
 impl PayoutResolver for NoOpHooks {
     async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.to_string(),
-            sats: reward_sats,
-        }])
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+            miner_address.to_string(),
+            reward_sats,
+        )])
     }
 }
 
@@ -407,10 +407,10 @@ pub(crate) mod test_support {
     #[async_trait]
     impl PayoutResolver for RecordingHooks {
         async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-            ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-                address: miner_address.to_string(),
-                sats: reward_sats,
-            }])
+            ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+                miner_address.to_string(),
+                reward_sats,
+            )])
         }
     }
 

@@ -255,10 +255,10 @@ impl PayoutResolver for NoOpHooks {
         miner_address: &AddressId,
         reward_sats: u64,
     ) -> ResolvedPayouts {
-        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.as_str().to_string(),
-            sats: reward_sats,
-        }])
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+            miner_address.as_str().to_string(),
+            reward_sats,
+        )])
     }
 }
 
@@ -400,10 +400,10 @@ pub mod test_support {
             if let Some(ref custom) = *self.payouts_override.lock().expect("poisoned") {
                 return ResolvedPayouts::unsnapshotted(custom.clone());
             }
-            ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-                address: miner_address.as_str().to_string(),
-                sats: reward_sats,
-            }])
+            ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+                miner_address.as_str().to_string(),
+                reward_sats,
+            )])
         }
     }
 
@@ -639,17 +639,11 @@ mod tests {
     #[tokio::test]
     async fn recording_hooks_payout_override_replaces_default() {
         let hooks = RecordingHooks::new().with_payouts(vec![
-            PayoutEntry {
-                address: "p1".to_string(),
-                sats: 1_500_000_000,
-            },
-            PayoutEntry {
-                address: "p2".to_string(),
-                sats: 3_500_000_000,
-            },
+            PayoutEntry::static_address("p1".to_string(), 1_500_000_000),
+            PayoutEntry::static_address("p2".to_string(), 3_500_000_000),
         ]);
         let payouts = hooks.resolve_payouts(&make_addr(), 5_000_000_000).await;
         assert_eq!(payouts.entries.len(), 2);
-        assert_eq!(payouts.entries[0].address, "p1");
+        assert_eq!(payouts.entries[0].payout_id(), "p1");
     }
 }
