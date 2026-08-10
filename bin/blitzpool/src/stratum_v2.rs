@@ -376,8 +376,8 @@ fn build_port_hooks(
 mod tests {
     use super::*;
     use bp_config::{
-        ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PplnsConfig, RedisConfig,
-        StratumConfig, Sv2Config, TdpConfig as TomlTdpConfig,
+        ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PayoutIdentityConfig, PplnsConfig,
+        RedisConfig, StratumConfig, Sv2Config, TdpConfig as TomlTdpConfig,
     };
     use std::path::PathBuf;
 
@@ -388,6 +388,9 @@ mod tests {
             pool_base_url: None,
             api_secure: false,
             roles: Vec::new(),
+            // Default: rotating identities off — these tests assert SV2's
+            // existing static-address behaviour.
+            payout_identity: PayoutIdentityConfig::default(),
             bitcoin_rpc: BitcoinRpcConfig {
                 url: "http://127.0.0.1".into(),
                 user: "u".into(),

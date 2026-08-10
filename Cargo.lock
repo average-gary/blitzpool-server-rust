@@ -856,6 +856,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bp-payout-descriptor"
+version = "2.3.0"
+dependencies = [
+ "bitcoin",
+ "bp-common",
+ "bp-pplns",
+ "miniscript",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "bp-pplns"
 version = "2.3.1"
 dependencies = [

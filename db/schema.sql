@@ -1648,6 +1648,41 @@ CREATE INDEX redis_state_backup_captured_at_idx ON public.redis_state_backup USI
 
 
 --
+-- Name: miner_identity; Type: TABLE; Schema: public; Owner: -
+--
+-- Payout identity: one row per miner, either a fixed address ('static') or a
+-- rotating xpub-derived descriptor ('rotating'). The database half of
+-- `bp_common::PayoutIdentity`. See crates/bp-db/migrations/0010_add_miner_identity.sql
+-- for the full reasoning, including why there is no `addr(<address>)` sentinel
+-- and why the ledger key is base58 (hex would not fit varchar(62)).
+--
+
+CREATE TABLE public.miner_identity (
+    "payoutId" character varying(62) NOT NULL,
+    kind character varying(16) NOT NULL,
+    address character varying(62),
+    descriptor text,
+    "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    CONSTRAINT miner_identity_pkey PRIMARY KEY ("payoutId"),
+    -- The sum type, as a constraint: exactly one of address/descriptor is
+    -- populated, so a half-populated identity is unrepresentable in the
+    -- database and not merely unconstructed by this process.
+    CONSTRAINT "CHK_miner_identity_kind_populated" CHECK (
+        (kind = 'static'   AND address    IS NOT NULL AND descriptor IS NULL)
+        OR
+        (kind = 'rotating' AND descriptor IS NOT NULL AND address    IS NULL)
+    )
+);
+
+CREATE INDEX "IDX_miner_identity_descriptor"
+    ON public.miner_identity (descriptor)
+ WHERE descriptor IS NOT NULL;
+
+CREATE INDEX "IDX_miner_identity_kind" ON public.miner_identity (kind);
+
+
+--
 -- PostgreSQL database dump complete
 --
 

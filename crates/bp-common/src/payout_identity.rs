@@ -48,10 +48,18 @@ enum Never {}
 /// "what is the script for a rotating identity?" has to write the arm now, and
 /// the arm it writes now is `unreachable`-by-construction rather than a guess.
 ///
-/// The field becomes `Box<miniscript::Descriptor<DescriptorPublicKey>>` when
-/// intake lands. At that point this type gains values and every arm written
-/// against it starts running — which is why those arms must be written to be
-/// *correct*, not merely to compile.
+/// The field becomes `Box<miniscript::Descriptor<DescriptorPublicKey>>` when a
+/// mode is ready to *pay* one. At that point this type gains values and every
+/// arm written against it starts running — which is why those arms must be
+/// written to be *correct*, not merely to compile.
+///
+/// **Intake landing is not that moment**, and the distinction is the whole
+/// reason the phases are separate. `bp_payout_descriptor::RotatingPayout` now
+/// exists and validates a real xpub, but nothing converts one into this variant:
+/// the conversion is what makes `absurd()` unwritable, and the compile errors it
+/// produces have to be answered with a real derivation at the coinbase seam, not
+/// with a stub. So intake can validate and store a rotating identity while the
+/// payout path still provably cannot see one.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RotatingDescriptor {
     _not_yet: Never,

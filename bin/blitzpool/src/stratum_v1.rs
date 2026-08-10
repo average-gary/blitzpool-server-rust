@@ -543,8 +543,8 @@ fn mode_from_port(m: MiningMode) -> MiningModeResult {
 mod tests {
     use super::*;
     use bp_config::{
-        ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PplnsConfig, RedisConfig,
-        StratumConfig, TdpConfig as TomlTdpConfig,
+        ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PayoutIdentityConfig, PplnsConfig,
+        RedisConfig, StratumConfig, TdpConfig as TomlTdpConfig,
     };
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
@@ -557,6 +557,9 @@ mod tests {
             pool_base_url: None,
             api_secure: false,
             roles: Vec::new(),
+            // Default: rotating identities off, which is what these tests want —
+            // they assert SV1's existing static-address behaviour.
+            payout_identity: PayoutIdentityConfig::default(),
             bitcoin_rpc: BitcoinRpcConfig {
                 url: "http://127.0.0.1".into(),
                 user: "u".into(),
