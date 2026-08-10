@@ -46,3 +46,6 @@ full-setup/*.sh
 DESIGN-*.md
 DEFERRED.md
 CHECKLIST.md
+
+# Local agent instructions — never publish
+CLAUDE.md
