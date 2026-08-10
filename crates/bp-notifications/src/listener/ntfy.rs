@@ -96,9 +96,13 @@ pub fn spawn_ntfy_listener(
                 tokio::time::sleep(Duration::from_secs(config.reconnect_backoff_seconds)).await;
                 continue;
             }
+            let path_len: usize =
+                topics.iter().map(|t| t.len()).sum::<usize>() + topics.len().saturating_sub(1);
             info!(
                 target: "bp_notifications::listener::ntfy",
                 topic_count = topics.len(),
+                path_len,
+                chunks = chunk_topics(&topics, MAX_TOPIC_PATH_LEN).len(),
                 "SSE stream connecting"
             );
 
@@ -112,7 +116,7 @@ pub fn spawn_ntfy_listener(
                     // backoff; this is an intentional, immediate refresh).
                     info!(target: "bp_notifications::listener::ntfy", "reconnect signal — refreshing topics");
                 }
-                _ = stream_until_break(&client, &config, &topics, &handler) => {
+                _ = stream_all_chunks(&client, &config, &topics, &handler) => {
                     warn!(target: "bp_notifications::listener::ntfy", "SSE stream ended, reconnecting");
                     tokio::time::sleep(Duration::from_secs(config.reconnect_backoff_seconds)).await;
                 }
@@ -121,6 +125,80 @@ pub fn spawn_ntfy_listener(
         info!(target: "bp_notifications::listener::ntfy", "listener stopped");
     });
     shutdown_tx
+}
+
+/// Longest comma-joined topic path we will put in one SSE URL.
+///
+/// ntfy answers **HTTP 400** once the path gets long enough, and the pool
+/// speaks HTTP/1.1 so it sees the 400 rather than a stream that never opens.
+/// Measured against the production server on 2026-08-06: a 14 830-character
+/// path returned 200, a 15 980-character one returned 400. The exact ceiling
+/// sits between those, so this budget is set at roughly half the last known
+/// good value — the topic list grows with the miner count, and a limit that
+/// only just fits is the situation this constant exists to end.
+///
+/// It bounds the PATH, not the topic count, because addresses differ in length
+/// (42 characters for a bech32 v0, 62 for the longest seen) and a count-based
+/// split would drift with the address mix.
+const MAX_TOPIC_PATH_LEN: usize = 8_000;
+
+/// Split `topics` so each chunk's comma-joined path stays within
+/// `max_path_len`. Order is preserved; no topic is dropped or duplicated.
+///
+/// A single topic longer than the budget still gets its own chunk — dropping
+/// it would silently stop serving that miner, and one oversized path is a
+/// visible failure rather than an invisible omission. ntfy's own topic grammar
+/// (`[-_A-Za-z0-9]{1,64}`) makes it unreachable in practice.
+fn chunk_topics(topics: &[String], max_path_len: usize) -> Vec<Vec<String>> {
+    let mut chunks: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_len = 0usize;
+    for topic in topics {
+        // +1 for the comma this topic needs once it is not the first.
+        let added = if current.is_empty() {
+            topic.len()
+        } else {
+            topic.len() + 1
+        };
+        if !current.is_empty() && current_len + added > max_path_len {
+            chunks.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        current_len += if current.is_empty() {
+            topic.len()
+        } else {
+            topic.len() + 1
+        };
+        current.push(topic.clone());
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Hold one SSE connection per chunk and return as soon as ANY of them ends.
+///
+/// Returning on the first break — rather than restarting only that chunk —
+/// keeps the caller's state machine exactly as it was with a single stream: a
+/// break re-reads the topic list and rebuilds everything. With a handful of
+/// chunks that is cheap, and it means there is still only one place that
+/// decides when the topic set is refreshed.
+async fn stream_all_chunks(
+    client: &Client,
+    config: &NtfyListenerConfig,
+    topics: &[String],
+    handler: &CommandHandler,
+) {
+    let chunks = chunk_topics(topics, MAX_TOPIC_PATH_LEN);
+    let streams: Vec<_> = chunks
+        .iter()
+        .map(|chunk| Box::pin(stream_until_break(client, config, chunk, handler)))
+        .collect();
+    if streams.is_empty() {
+        return;
+    }
+    let (_, _, _remaining) = futures::future::select_all(streams).await;
 }
 
 async fn stream_until_break(
@@ -231,7 +309,7 @@ struct NtfyEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::sse_data_field;
+    use super::{chunk_topics, sse_data_field, MAX_TOPIC_PATH_LEN};
 
     /// Only `data:` lines carry the ntfy message JSON; the SSE framing
     /// (`event:` / `id:` / comments / blanks) must be skipped, and the one
@@ -254,5 +332,114 @@ mod tests {
         // A leading space belongs to data content only after the first space is
         // consumed — a second space is preserved.
         assert_eq!(sse_data_field("data:  x"), Some(" x"));
+    }
+
+    // ── Topic chunking ───────────────────────────────────────────────
+    //
+    // The bug this guards: every topic went into ONE comma-joined path, and
+    // ntfy answers 400 once that path is long enough. Measured against the
+    // production server 2026-08-06 — 14 830 characters returned 200, 15 980
+    // returned 400 — and on 2026-08-10 prod stood at 358 topics / 15 193
+    // characters with 5 804 SSE failures in 24 h. The return channel
+    // (user → pool commands) was down roughly two thirds of the time.
+
+    /// A realistic topic: the longest address shape seen on prod is 62 chars.
+    fn topic(i: usize, len: usize) -> String {
+        let seed = format!("bc1q{i:0>8}");
+        let mut t = seed.clone();
+        while t.len() < len {
+            t.push('x');
+        }
+        t.truncate(len);
+        t
+    }
+
+    fn path_len(chunk: &[String]) -> usize {
+        chunk.iter().map(|t| t.len()).sum::<usize>() + chunk.len().saturating_sub(1)
+    }
+
+    /// ⚠️ 372 and not 349: the memory of this bug records that a test at 349
+    /// topics passes by ACCIDENT — that count sits just under the server's
+    /// threshold, so it would hold with the chunking removed and prove
+    /// nothing. Every count here is above the observed failure point.
+    #[test]
+    fn every_chunk_stays_within_the_path_budget() {
+        for count in [372usize, 500, 1_000] {
+            let topics: Vec<String> = (0..count).map(|i| topic(i, 62)).collect();
+            let unsplit = path_len(&topics);
+            assert!(
+                unsplit > 15_980,
+                "precondition: {count} topics must exceed the length that returned 400 \
+                 on the real server, got {unsplit}"
+            );
+
+            let chunks = chunk_topics(&topics, MAX_TOPIC_PATH_LEN);
+            assert!(chunks.len() > 1, "{count} topics must be split at all");
+            for chunk in &chunks {
+                assert!(
+                    path_len(chunk) <= MAX_TOPIC_PATH_LEN,
+                    "{count} topics: a chunk of {} chars exceeds the {MAX_TOPIC_PATH_LEN} budget",
+                    path_len(chunk)
+                );
+            }
+        }
+    }
+
+    /// Splitting must not lose or duplicate a topic: a dropped one is a miner
+    /// whose commands silently stop arriving, which is the failure this whole
+    /// change exists to end — just quieter.
+    #[test]
+    fn chunking_preserves_every_topic_exactly_once() {
+        let topics: Vec<String> = (0..500).map(|i| topic(i, 62)).collect();
+        let flattened: Vec<String> = chunk_topics(&topics, MAX_TOPIC_PATH_LEN)
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(flattened, topics, "order and membership must both survive");
+    }
+
+    /// Mixed lengths, because a count-based split would drift with the address
+    /// mix: bech32 v0 is 42 characters, the longest seen on prod is 62.
+    #[test]
+    fn a_mixed_address_length_list_still_respects_the_budget() {
+        let topics: Vec<String> = (0..600)
+            .map(|i| topic(i, if i % 3 == 0 { 42 } else { 62 }))
+            .collect();
+        for chunk in chunk_topics(&topics, MAX_TOPIC_PATH_LEN) {
+            assert!(path_len(&chunk) <= MAX_TOPIC_PATH_LEN);
+        }
+    }
+
+    /// Below the budget nothing changes — one chunk, one connection, exactly
+    /// as before. A fix that split a small pool into several streams would be
+    /// paying connection overhead for nothing.
+    #[test]
+    fn a_short_list_is_left_as_one_chunk() {
+        let topics: Vec<String> = (0..50).map(|i| topic(i, 62)).collect();
+        assert_eq!(chunk_topics(&topics, MAX_TOPIC_PATH_LEN).len(), 1);
+        assert!(chunk_topics(&[], MAX_TOPIC_PATH_LEN).is_empty());
+    }
+
+    /// A single topic wider than the budget gets its own chunk rather than
+    /// being dropped. Unreachable under ntfy's own grammar
+    /// (`[-_A-Za-z0-9]{1,64}`), asserted so the loop cannot silently discard.
+    #[test]
+    fn an_oversized_single_topic_is_kept_not_dropped() {
+        let huge = topic(1, 200);
+        let chunks = chunk_topics(std::slice::from_ref(&huge), 100);
+        assert_eq!(chunks, vec![vec![huge]]);
+    }
+
+    /// The production numbers, as a regression pin: 358 topics of the longest
+    /// observed shape exceed what the server accepted, and must come out as
+    /// more than one chunk.
+    #[test]
+    fn the_measured_production_list_gets_split() {
+        let topics: Vec<String> = (0..358).map(|i| topic(i, 62)).collect();
+        assert!(
+            path_len(&topics) > 14_830,
+            "precondition: past the last known-good path"
+        );
+        assert!(chunk_topics(&topics, MAX_TOPIC_PATH_LEN).len() >= 3);
     }
 }
