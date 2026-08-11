@@ -24,6 +24,76 @@ use tokio::sync::broadcast;
 pub const REDIS_DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 pub const PG_DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
+/// Set this to turn every Redis/Postgres skip into a **failure**.
+///
+/// The skip default is right for CI-without-services and for a contributor
+/// who has not started the containers. It is wrong for the run you intend
+/// to believe, because a skipped test passes: `$?` cannot tell a suite that
+/// exercised Postgres from one that never reached it.
+///
+/// Measured 2026-08-10, which is why this exists. The Docker daemon died
+/// part-way through a full-suite run. Every Redis/Postgres test after that
+/// point skipped, and the totals came out **identical** to the healthy run
+/// — 2104 passed either way. Nothing in the exit code, the failure count or
+/// the passed-count distinguished them; only `grep -c skipping` did, and
+/// only because the run happened to use `--nocapture`. Checking the
+/// containers before the run does not help either: they were up at the
+/// start.
+///
+/// With this set, that outage is a red suite at the moment it happens,
+/// naming the service and the URL.
+pub const REQUIRE_SERVICES_ENV: &str = "BP_REQUIRE_TEST_SERVICES";
+
+/// Whether an unreachable service must fail rather than skip.
+fn services_required() -> bool {
+    value_requires_services(std::env::var(REQUIRE_SERVICES_ENV).ok().as_deref())
+}
+
+/// Does this [`REQUIRE_SERVICES_ENV`] value ask for failures?
+///
+/// Split from the env read so the rule is testable: the workspace sets
+/// `unsafe_code = "deny"` and Rust 1.85 made `set_var` unsafe, so a test
+/// cannot mutate the environment to reach it (same constraint as
+/// `bp_regtest_harness::config`).
+///
+/// Any value other than empty or `0` counts, so `=1` and `=true` both work
+/// while `=0` stays an explicit opt-out — a half-set variable must not read
+/// as "required" and then quietly fail a contributor's whole suite.
+fn value_requires_services(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty() && v != "0")
+}
+
+/// Report an unreachable service: skip by default, panic under
+/// [`REQUIRE_SERVICES_ENV`].
+///
+/// Returns `None` so callers stay a one-line `?`/`else` at the top of a
+/// test; it only ever returns in the skip case.
+fn skip_or_fail<T>(reason: String) -> Option<T> {
+    if let Some(line) = skip_decision(services_required(), reason) {
+        eprintln!("{line}");
+    }
+    None
+}
+
+/// [`skip_or_fail`] with the decision passed in, so both branches can be
+/// exercised without mutating the environment.
+///
+/// Returns the skip line rather than printing it. The verification protocol
+/// counts `grep -c skipping` over the whole run and expects **0** on a
+/// healthy one, so a unit test that reached an `eprintln!("… skipping")`
+/// would put a permanent 3 in that count and quietly destroy the only
+/// measurement that distinguishes a real run from a skipped one. Printing
+/// stays in [`skip_or_fail`], which no test calls.
+fn skip_decision(required: bool, reason: String) -> Option<String> {
+    assert!(
+        !required,
+        "{reason}\n{REQUIRE_SERVICES_ENV} is set, so an unreachable service is a failure \
+         rather than a skip. Start the services (`docker start bp-test-pg bp-test-redis`) \
+         or unset it."
+    );
+    Some(format!("{reason} — skipping"))
+}
+
 /// Deterministic regtest P2WPKH address from a 32-byte secret-key seed —
 /// a valid bech32 string with a correct checksum, no live `getnewaddress`.
 pub fn deterministic_p2wpkh_regtest(seed: [u8; 32]) -> String {
@@ -144,6 +214,42 @@ pub async fn wait_for_any_paired_template(
     res.expect("TDP must emit a paired NewTemplate + SetNewPrevHash before the timeout")
 }
 
+/// Clear every trace of a Blockparty admin address, so a test that owns
+/// `addrs` can re-create its group from scratch.
+///
+/// Deletes from `blockparty_group` by admin address, NOT from
+/// `blockparty_member` — `blockparty_member` has
+/// `ON DELETE CASCADE` from `blockparty_group`, so removing the parent is
+/// strictly more thorough than removing the child, and removing only the
+/// child leaves the parent behind.
+///
+/// That difference was a permanent, cross-branch failure. Measured
+/// 2026-08-10: the two blockparty regtests pick a **fixed** admin address
+/// (`deterministic_p2wpkh_regtest([0xa1; 32])` /  `[0xc1; 32]`) and
+/// `blockparty_group` has `UQ_blockparty_group_admin_address`, so one
+/// interrupted run left an orphaned group row and every later run — on any
+/// branch, including unmodified `main` — failed `create_group` with
+/// `AdminAddressTaken` forever after. Cleaning by member address could not
+/// help: the row holding the constraint was the one it did not touch.
+///
+/// The member address is still worth passing: a non-admin address may hold
+/// `UQ_blockparty_member_address` under a group whose own admin is not in
+/// `addrs`, which no `blockparty_group` delete would reach.
+pub async fn cleanup_blockparty_rows(pool: &PgPool, addrs: &[&str]) {
+    for a in addrs {
+        // Parent first — cascades to blockparty_member, _invitation,
+        // _join_link and _block_history for that group.
+        let _ = sqlx::query(r#"DELETE FROM blockparty_group WHERE "adminAddress" = $1"#)
+            .bind(*a)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+            .bind(*a)
+            .execute(pool)
+            .await;
+    }
+}
+
 /// Per-test-binary logical-DB ranges.
 ///
 /// `connect_redis_or_skip` **flushes** the DB it opens, so two tests
@@ -256,36 +362,21 @@ pub async fn connect_redis_or_skip(test_db: u8) -> Option<ConnectionManager> {
 async fn connect_redis_or_skip_raw(test_db: u16) -> Option<ConnectionManager> {
     let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_DEFAULT_URL.to_string());
     let url = format!("{base}/{test_db}");
-    let client = Client::open(url.clone())
-        .map_err(|e| eprintln!("redis client open {url}: {e} — skipping"))
-        .ok()?;
+    let client = match Client::open(url.clone()) {
+        Ok(c) => c,
+        Err(e) => return skip_or_fail(format!("redis client open {url}: {e}")),
+    };
     let mut conn =
         match tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client)).await {
             Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                eprintln!("redis connect {url}: {e} — skipping");
-                return None;
-            }
-            Err(_) => {
-                eprintln!("redis connect timed out at {url} — skipping");
-                return None;
-            }
+            Ok(Err(e)) => return skip_or_fail(format!("redis connect {url}: {e}")),
+            Err(_) => return skip_or_fail(format!("redis connect timed out at {url}")),
         };
-    if redis::cmd("PING")
-        .query_async::<String>(&mut conn)
-        .await
-        .is_err()
-    {
-        eprintln!("redis PING {url} failed — skipping");
-        return None;
+    if let Err(e) = redis::cmd("PING").query_async::<String>(&mut conn).await {
+        return skip_or_fail(format!("redis PING {url} failed: {e}"));
     }
-    if redis::cmd("FLUSHDB")
-        .query_async::<()>(&mut conn)
-        .await
-        .is_err()
-    {
-        eprintln!("redis FLUSHDB {url} failed — skipping");
-        return None;
+    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
+        return skip_or_fail(format!("redis FLUSHDB {url} failed: {e}"));
     }
     Some(conn)
 }
@@ -304,13 +395,61 @@ pub async fn connect_pg_or_skip() -> Option<PgPool> {
     .await
     {
         Ok(Ok(p)) => Some(p),
-        Ok(Err(e)) => {
-            eprintln!("PG connect {url}: {e} — skipping");
-            None
+        Ok(Err(e)) => skip_or_fail(format!("PG connect {url}: {e}")),
+        Err(_) => skip_or_fail(format!("PG connect timed out at {url}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The skip path must stay the default, or a contributor without the
+    /// containers gets a wall of failures instead of skips.
+    #[test]
+    fn an_unset_or_zero_value_still_skips() {
+        for value in [None, Some(""), Some("0")] {
+            assert!(
+                !value_requires_services(value),
+                "{value:?} must not demand services"
+            );
+            let line = skip_decision(value_requires_services(value), "PG down".to_string());
+            assert_eq!(
+                line.as_deref(),
+                Some("PG down — skipping"),
+                "{value:?} must skip (and say so), not panic"
+            );
         }
-        Err(_) => {
-            eprintln!("PG connect timed out at {url} — skipping");
-            None
+    }
+
+    /// The point of the knob: with it set, an unreachable service is a
+    /// FAILURE. Asserted through `skip_decision` rather than by re-deriving
+    /// the rule, because the bug it guards against is a decision function
+    /// that returns a skip no matter what — which no test of
+    /// `value_requires_services` alone would catch.
+    #[test]
+    #[should_panic(expected = "BP_REQUIRE_TEST_SERVICES")]
+    fn a_set_value_turns_an_unreachable_service_into_a_failure() {
+        assert!(
+            value_requires_services(Some("1")),
+            "precondition: `1` must demand services, else the panic below proves nothing"
+        );
+        let _ = skip_decision(
+            value_requires_services(Some("1")),
+            "PG connect refused".to_string(),
+        );
+    }
+
+    /// `=true` has to work too — nobody reads the docs for which truthy
+    /// spelling was chosen, and a value that silently means "skip" would
+    /// reinstate the exact failure this knob exists to catch.
+    #[test]
+    fn truthy_spellings_other_than_one_also_count() {
+        for value in ["true", "yes", "always"] {
+            assert!(
+                value_requires_services(Some(value)),
+                "`{value}` must demand services"
+            );
         }
     }
 }

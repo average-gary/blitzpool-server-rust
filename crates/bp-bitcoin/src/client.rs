@@ -357,9 +357,8 @@ mod tests {
 
     #[test]
     fn cookie_auth_reads_well_formed_file() {
-        let mut file = tempfile_in_default();
+        let (mut file, path) = tempfile_in_default();
         file.write_all(b"__cookie__:abcdef1234567890\n").unwrap();
-        let path = file_path(&file);
         let cfg = BitcoinRpcConfig {
             url: "http://127.0.0.1:18443".to_string(),
             auth: RpcAuth::Cookie(path),
@@ -373,9 +372,8 @@ mod tests {
 
     #[test]
     fn cookie_auth_rejects_malformed_file() {
-        let mut file = tempfile_in_default();
+        let (mut file, path) = tempfile_in_default();
         file.write_all(b"no-colon-anywhere").unwrap();
-        let path = file_path(&file);
         let cfg = BitcoinRpcConfig {
             url: "http://127.0.0.1:18443".to_string(),
             auth: RpcAuth::Cookie(path),
@@ -399,22 +397,67 @@ mod tests {
     }
 
     // Tiny helpers — keep tests independent of `tempfile` crate.
-    fn tempfile_in_default() -> std::fs::File {
+    //
+    // The path is returned alongside the handle rather than recovered from
+    // the fd. It used to come back via `read_link("/proc/self/fd/<fd>")`,
+    // which does not exist on macOS — so both callers failed there, on a
+    // helper, with nothing wrong in the code under test. The path was known
+    // at create time all along; carrying it is shorter as well as portable.
+    fn tempfile_in_default() -> (std::fs::File, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("bp-bitcoin-test-cookie-{}", rand_suffix()));
-        std::fs::File::create(path).unwrap()
+        let file = std::fs::File::create(&path).unwrap();
+        (file, path)
     }
-    fn file_path(file: &std::fs::File) -> std::path::PathBuf {
-        // Recover the path by re-opening via the fd's procfs entry on
-        // Linux; non-portable but fine for our test env.
-        use std::os::fd::AsRawFd;
-        let fd = file.as_raw_fd();
-        std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap()
-    }
+    /// Unique per call, even between two `#[test]` threads in the same
+    /// microsecond.
+    ///
+    /// A bare nanosecond timestamp is NOT unique on macOS: measured
+    /// 2026-08-10, 200 successive `SystemTime::now()` reads yielded 8
+    /// distinct values, because the clock advances in 1µs steps and simply
+    /// pads three zero digits. Two threads racing collided on 89/2000 runs,
+    /// which is what made `cookie_auth_reads_well_formed_file` read the
+    /// *other* test's `no-colon-anywhere` and fail — only under the full
+    /// suite, never when run alone. An atomic counter breaks the tie
+    /// regardless of clock resolution.
     fn rand_suffix() -> String {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-            .to_string()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    /// The suffix must be unique across threads, or the two cookie tests
+    /// above silently overwrite each other's file.
+    ///
+    /// Pinned as its own test because the failure it guards against is
+    /// timing-dependent: the collision showed up only in a full-suite run
+    /// and passed 8/8 when the cookie tests ran alone, so nothing else here
+    /// would catch a regression to a bare timestamp.
+    #[test]
+    fn rand_suffix_is_unique_under_thread_contention() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..64).map(|_| rand_suffix()).collect::<Vec<_>>()))
+            .collect();
+        let all: Vec<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("suffix thread"))
+            .collect();
+        let mut unique: Vec<&String> = all.iter().collect();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "rand_suffix collided: {} of {} values were distinct",
+            unique.len(),
+            all.len()
+        );
     }
 }
