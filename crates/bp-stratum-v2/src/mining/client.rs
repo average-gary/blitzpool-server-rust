@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bitcoin::Network;
-use bp_common::{parse_payout_identity, AddressId, PayoutIdentity, StreamKind};
+use bp_common::{parse_payout_identity_with, AddressId, PayoutIdentity, StreamKind};
 use bp_mining_job::{
     address_to_script, merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError,
     PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
@@ -677,6 +677,22 @@ pub struct MiningSessionState<C: Clock> {
     /// gates the `🎯 Extended share difficulty` trace in the submit
     /// validator. Defaults to `false`.
     pub share_logs: bool,
+
+    /// The pool's rotating-identity intake, or `None` when the deployment has
+    /// none wired. Set by the I/O layer after construction, exactly like
+    /// [`Self::share_logs`] above — this crate cannot build one, because it needs
+    /// `miniscript`.
+    ///
+    /// Read once, at channel open. `None` is not "the feature is off": the
+    /// operator flag lives inside the implementation, so with an intake
+    /// installed and the flag off an xpub is *refused with a reason* rather than
+    /// reported as an unknown user. `None` is the standalone-crate case.
+    ///
+    /// The SV1 field of the same name is the same field for the same reason, and
+    /// both read it through the one shared `parse_payout_identity_with`. Two
+    /// protocols asking one question once is the point — see
+    /// [`bp_common::RotatingIntake`].
+    pub rotating_intake: Option<Arc<dyn bp_common::RotatingIntake>>,
 }
 
 /// Per-port config slice passed at construction. The full
@@ -740,6 +756,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             vardiff_silence_easing: port.vardiff_silence_easing,
             last_difficulty_check_ms: 0,
             share_logs: false,
+            rotating_intake: None,
         }
     }
 
@@ -1253,12 +1270,18 @@ fn resolve_open_context<C: Clock>(
     };
 
     // Parse `user_identity` → (payout identity, worker). The split, the
-    // normalization and the shape check are one shared function
-    // (`bp_common::parse_payout_identity`) rather than this site's own three
-    // steps — see its docs for the four places that each spelled the rule
-    // differently.
+    // normalization, the shape check and the pool's rotating intake are one
+    // shared function (`bp_common::parse_payout_identity_with`) rather than this
+    // site's own steps — see its docs for the four places that each spelled the
+    // rule differently.
+    //
+    // A refused rotating identity lands in the same `ERR_UNKNOWN_USER` as a bad
+    // address, because that is the only error SV2 channel-open has to offer. The
+    // reason is logged inside the intake implementation, which is the only thing
+    // that knows it — `IdentityRefused` deliberately carries no detail.
     let (identity, worker_part) =
-        parse_payout_identity(user_identity).map_err(|_| err(ERR_UNKNOWN_USER))?;
+        parse_payout_identity_with(user_identity, state.rotating_intake.as_deref())
+            .map_err(|_| err(ERR_UNKNOWN_USER))?;
 
     // Then the real check, which is stronger than the shape check and stays
     // here: does the address actually parse, and on THIS network? The identity
@@ -1266,14 +1289,24 @@ fn resolve_open_context<C: Clock>(
     //
     // `match` and not `if`: a rotating identity has no single script to probe —
     // its scripts are derived per height and there is no height at channel-open
-    // — so the check that replaces this one is a descriptor check, not an
-    // address one. `absurd()` makes that a compile error to skip rather than a
-    // channel that opens unvalidated.
+    // — so what it gets is a derivability probe, not an address parse.
     match &identity {
         PayoutIdentity::Static { address } => {
             address_to_script(state.network, address).map_err(|_| err(ERR_UNKNOWN_USER))?;
         }
-        PayoutIdentity::Rotating { descriptor, .. } => descriptor.clone().absurd(),
+        // Refuse the channel now if this descriptor cannot produce a script,
+        // rather than at coinbase assembly for a block. `state.network` is not
+        // consulted and that is correct, not an omission: a derived
+        // `scriptPubKey` is network-agnostic, so there is no network to
+        // mismatch. (A miner who pastes a `tpub` at a mainnet pool is paid to a
+        // script derived from the same key material they hold, so it is
+        // spendable — the network prefix is a serialization detail of the xpub,
+        // not of the output.)
+        PayoutIdentity::Rotating { .. } => {
+            identity
+                .probe_payable()
+                .map_err(|_| err(ERR_UNKNOWN_USER))?;
+        }
     }
     let address =
         AddressId::new(identity.payout_id().to_string()).map_err(|_| err(ERR_UNKNOWN_USER))?;

@@ -73,11 +73,14 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use bitcoin::bip32::Xpub;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::{Address, Network, ScriptBuf};
-use bp_common::AddressId;
+use bp_common::{
+    AddressId, PayoutIdentity, RotatingDescriptor, RotatingScriptSource, RotationError,
+};
 use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
 use miniscript::ForEachKey;
 
@@ -291,6 +294,56 @@ impl fmt::Display for RotatingPayout {
     /// miner's whole wallet-watching capability; the id is an opaque key.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.payout_id.as_str())
+    }
+}
+
+/// **The one implementation**, and the reason
+/// [`bp_common::PayoutIdentity`] can live in a `bitcoin`-free crate.
+///
+/// See [`RotatingScriptSource`]'s docs for why the trait exists at all. What
+/// matters here is that this is the only `impl` of it in the workspace: a second
+/// one would be a second answer to "which script does this miner get at height
+/// H", which is the shape of the 2026-07-25/26 entry in `CLAUDE.md` (the same
+/// fix landing in two PRs a day apart).
+impl RotatingScriptSource for RotatingPayout {
+    /// `Vec<u8>` and not `ScriptBuf` because the trait is `bitcoin`-free —
+    /// `bp-common` cannot name `ScriptBuf`. Raw bytes are what the coinbase seam
+    /// wants anyway; its static arm produces them the same way
+    /// (`address_to_script(...).into_bytes()`).
+    ///
+    /// The error is flattened to [`RotationError::NotDerivable`], dropping which
+    /// [`IntakeError`] it was. Nothing is lost that a caller could use: by the
+    /// time an identity exists, [`assert_derivable`] has already run, so every
+    /// failure here means the invariant was established somewhere other than
+    /// intake — and the only safe response to that is to fail the coinbase,
+    /// regardless of which variant it was.
+    fn script_at(&self, height: u32) -> Result<Vec<u8>, RotationError> {
+        RotatingPayout::script_at(self, height)
+            .map(|s| s.into_bytes())
+            .map_err(|_| RotationError::NotDerivable)
+    }
+
+    fn canonical_descriptor(&self) -> &str {
+        RotatingPayout::canonical_descriptor(self)
+    }
+}
+
+impl RotatingPayout {
+    /// This rotating payout as a [`PayoutIdentity`] — **the only route from
+    /// intake into the payout path.**
+    ///
+    /// `PayoutIdentity::rotating` is `pub` and could be called with any
+    /// `RotatingScriptSource`, but this crate is the only place that has one,
+    /// and this method is the only place that wraps it. So "every rotating
+    /// identity in the pool passed the three intake assertions" is a property of
+    /// one function rather than of a convention.
+    ///
+    /// Consumes `self`: the descriptor moves into the `Arc` the payout path
+    /// clones, so there is no second copy that could drift from the `payout_id`
+    /// hashed off it.
+    pub fn into_payout_identity(self) -> PayoutIdentity {
+        let payout_id = self.payout_id.clone();
+        PayoutIdentity::rotating(RotatingDescriptor::new(Arc::new(self)), payout_id)
     }
 }
 

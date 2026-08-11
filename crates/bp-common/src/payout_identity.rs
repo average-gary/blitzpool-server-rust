@@ -18,70 +18,175 @@
 //! `address_to_script` where the only coinbase-path script derivation already
 //! lives.
 //!
-//! **`Rotating` cannot be constructed.** Not by convention — see
-//! [`RotatingDescriptor`]. That is what makes introducing this type a refactor
-//! with a compiler-checked no-op guarantee instead of a feature behind a flag:
-//! no behaviour can differ if the second variant cannot exist, while every
-//! `match` on it still enumerates the sites the next phase has to fill in.
+//! **`Rotating` is now constructible, and the derivation is a trait object.**
+//! [`RotatingScriptSource`] is how those two facts coexist: the *type* every
+//! crate touches stays here, while the one implementation lives in
+//! `bp-payout-descriptor` with the `miniscript` dependency. The trait's
+//! signature is `bitcoin`-free on purpose — script **bytes**, not a `ScriptBuf`
+//! — which is the same shape the coinbase seam already produces.
+
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use crate::{normalize_btc_address, AddressId, InvalidAddressError};
 
-/// An uninhabited type. No value of it exists, so nothing containing one by
-/// value can be constructed.
+/// The height [`PayoutIdentity::probe_payable`] derives at.
 ///
-/// `!` would say this directly but is not stable in field position.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Never {}
+/// An arbitrary in-range index — see that method for why it is not 0. Any real
+/// block height works; this one is a round number well inside the range a
+/// wildcard descriptor accepts (`0..=2^31-1` for a non-hardened step).
+const PROBE_HEIGHT: u32 = 1_000_000;
 
-/// The descriptor a [`PayoutIdentity::Rotating`] derives its per-block script
-/// from — **not yet representable**.
+/// Why a rotating identity could not produce a script.
 ///
-/// The field is [`Never`], which is uninhabited, so this struct cannot be built
-/// *anywhere*, including inside this module. That is deliberate and it is
-/// stronger than omitting a public constructor: "we did not write a way to make
-/// one" is a claim about the code as it stands, and the next person to add a
-/// helper breaks it silently. "The type has no values" is checked by the
-/// compiler on every build.
-///
-/// Rust still requires a `match` arm for an uninhabited variant on stable, so
-/// the exhaustiveness this buys is real: every site that will have to answer
-/// "what is the script for a rotating identity?" has to write the arm now, and
-/// the arm it writes now is `unreachable`-by-construction rather than a guess.
-///
-/// The field becomes `Box<miniscript::Descriptor<DescriptorPublicKey>>` when a
-/// mode is ready to *pay* one. At that point this type gains values and every
-/// arm written against it starts running — which is why those arms must be
-/// written to be *correct*, not merely to compile.
-///
-/// **Intake landing is not that moment**, and the distinction is the whole
-/// reason the phases are separate. `bp_payout_descriptor::RotatingPayout` now
-/// exists and validates a real xpub, but nothing converts one into this variant:
-/// the conversion is what makes `absurd()` unwritable, and the compile errors it
-/// produces have to be answered with a real derivation at the coinbase seam, not
-/// with a stub. So intake can validate and store a rotating identity while the
-/// payout path still provably cannot see one.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RotatingDescriptor {
-    _not_yet: Never,
+/// **No payload, deliberately** — the same rule
+/// `bp_payout_descriptor::IntakeError` is built on. A descriptor is a
+/// wallet-watching capability and a parser's error text can contain key
+/// material, so there is nowhere here to put one. Every variant is a fixed
+/// string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RotationError {
+    /// Derivation at this height failed. Unreachable for an identity built
+    /// through `bp_payout_descriptor`'s intake, which asserts derivability at
+    /// construction — so this variant means the invariant was established
+    /// somewhere else, and the coinbase must fail rather than guess a script.
+    #[error("rotating payout identity could not derive a script at this height")]
+    NotDerivable,
 }
 
+/// What a [`PayoutIdentity::Rotating`] asks for its per-block script.
+///
+/// **This trait is why `PayoutIdentity` can stay in `bp-common`.** Deriving a
+/// script needs `miniscript`, and `bp-common` is depended on by 19 crates, 11 of
+/// which take no `bitcoin` dependency at all — so the derivation cannot live
+/// here. The trait's signature is deliberately `bitcoin`-free (`Vec<u8>` of
+/// script bytes, not a `ScriptBuf`), which is exactly what the coinbase seam
+/// already produces: `address_to_script(...).into_bytes()`.
+///
+/// The one implementation is `bp_payout_descriptor::RotatingPayout`, and one is
+/// the point. `CLAUDE.md`'s opening line is about the same concept implemented
+/// twice; a second impl of this trait would be a second answer to "which script
+/// does this miner get at height H", which is the shape of the 2026-07-25/26
+/// entry (the same fix landed in two PRs a day apart).
+///
+/// `Send + Sync` because a resolved identity is carried across the async payout
+/// path. Measured 2026-08-10: `Descriptor<DescriptorPublicKey>` **is**
+/// `Send + Sync + 'static` in `miniscript 13.1.0`, so the one implementation can
+/// satisfy this without storing a canonical string and re-parsing per use.
+pub trait RotatingScriptSource: fmt::Debug + Send + Sync {
+    /// The `scriptPubKey` this identity is paid at `height`, as raw bytes.
+    ///
+    /// Must be a pure function of `(self, height)`: re-deriving at the same
+    /// height must give the same script, or an orphan reconvergence pays a
+    /// different address on the replacement block. Pinned on the one
+    /// implementation by `derivation_is_idempotent_at_a_fixed_height`.
+    fn script_at(&self, height: u32) -> Result<Vec<u8>, RotationError>;
+
+    /// The canonical descriptor, for a miner to verify a payout against
+    /// `bitcoin-cli deriveaddresses` and for the `miner_identity` row.
+    ///
+    /// **A credential for logging purposes** — it is a wallet-watching
+    /// capability over every address the pool will ever pay this miner. It must
+    /// not reach a log line or an unauthenticated endpoint, which is why
+    /// [`RotatingDescriptor`]'s `Debug` redacts it rather than delegating here.
+    fn canonical_descriptor(&self) -> &str;
+}
+
+/// The descriptor a [`PayoutIdentity::Rotating`] derives its per-block script
+/// from.
+///
+/// A newtype over `Arc<dyn RotatingScriptSource>` rather than the trait object
+/// bare, so `PayoutIdentity` keeps `Clone` (the payout path clones entries
+/// freely) and so the `Debug` redaction below cannot be bypassed by a caller
+/// that happens to hold the `Arc`.
+///
+/// # What this replaced, and why the replacement is the load-bearing part
+///
+/// Through Phase 2 this struct held an uninhabited field, so it could not be
+/// constructed *anywhere* — including inside this module — and every site that
+/// would one day need a rotating script wrote an `absurd()` arm the compiler
+/// certified as dead. That was not a stylistic choice: it made Phase 1 a
+/// refactor with a compiler-checked no-op guarantee, and it made the list of
+/// sites to change something the compiler produced rather than something a human
+/// grepped for.
+///
+/// Giving it values is what cashed that in. All four `absurd()` calls became
+/// compile errors in one build — `bp_mining_job::coinbase::payout_script`,
+/// `bp_stratum_v1`'s authorize probe, `bp_stratum_v2`'s channel-open probe, and
+/// the JDP resolver's tailored-Solo route in `bin/blitzpool/src/jdp_hooks.rs` —
+/// and each had to be answered with a real derivation, a real check, or an
+/// explicit refusal. None of them could be answered with a stub, because there
+/// is no longer an uninhabited value to discharge.
+///
+/// The fourth is the one worth naming: nobody enumerating "where does a payout
+/// script get built" by hand would have listed the JDP hook, because it does not
+/// build one — it decides whether a declared job *can* be tailored. The compiler
+/// listed it.
+#[derive(Clone)]
+pub struct RotatingDescriptor(Arc<dyn RotatingScriptSource>);
+
 impl RotatingDescriptor {
-    /// Discharge a `Rotating` arm that cannot be reached.
+    /// Wrap the one implementation. Called by `bp-payout-descriptor` after its
+    /// three intake assertions have run — see
+    /// `bp_payout_descriptor::assert_derivable`, which is what makes
+    /// [`Self::script_at`] unable to panic.
+    pub fn new(source: Arc<dyn RotatingScriptSource>) -> Self {
+        Self(source)
+    }
+
+    /// The script this identity is paid at `height`.
+    pub fn script_at(&self, height: u32) -> Result<Vec<u8>, RotationError> {
+        self.0.script_at(height)
+    }
+
+    /// The canonical descriptor. **Do not log it** — see
+    /// [`RotatingScriptSource::canonical_descriptor`]. This exists for the
+    /// `miner_identity` write and for a miner-authenticated read, and nothing
+    /// else.
+    pub fn canonical_descriptor(&self) -> &str {
+        self.0.canonical_descriptor()
+    }
+}
+
+impl fmt::Debug for RotatingDescriptor {
+    /// **Redacted, not delegated.** `PayoutIdentity` derives nothing and this
+    /// type is inside it; a `#[derive(Debug)]` here would put the descriptor
+    /// into every `?identity` and `?payouts` field in the codebase, and there
+    /// are several on the payout path. A descriptor in a log is the miner's
+    /// whole wallet-watching capability.
     ///
-    /// Returns `!` by matching an uninhabited value with zero arms, so the
-    /// *compiler* certifies the arm is dead. Use this instead of
-    /// `unreachable!()`: a panic macro is a promise a human made, and it stays
-    /// compiling — and silently becomes reachable — the moment this type gains
-    /// values.
-    ///
-    /// **This method is the Phase-2/3 worklist.** When `_not_yet` becomes a real
-    /// descriptor, `absurd` can no longer be written, and every
-    /// `descriptor.absurd()` in the workspace turns into a compile error that
-    /// has to be replaced with the real derivation. That is the whole reason to
-    /// land the type before the feature: the list of sites is produced by the
-    /// compiler, now, rather than by grepping during the feature.
-    pub fn absurd(self) -> ! {
-        match self._not_yet {}
+    /// The `payout_id` is the greppable handle, and it is already in
+    /// `PayoutIdentity`'s own `Debug` beside this.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RotatingDescriptor(<redacted>)")
+    }
+}
+
+/// Two rotating descriptors are equal when they are the **same descriptor**, not
+/// when they are the same allocation.
+///
+/// Hand-written because a trait object cannot derive it, and the definition is a
+/// money question rather than a formality: `payout_id` is a hash of the
+/// canonical descriptor (`bp_payout_descriptor::payout_id_for`), so comparing
+/// canonical strings here agrees with comparing ledger keys. `Arc::ptr_eq` would
+/// not — the same xpub parsed twice is two allocations and one identity, and a
+/// pointer comparison would report a miner as two miners in anything that
+/// deduplicates payout entries.
+impl PartialEq for RotatingDescriptor {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_descriptor() == other.canonical_descriptor()
+    }
+}
+
+impl Eq for RotatingDescriptor {}
+
+/// Consistent with [`PartialEq`] — same canonical descriptor, same hash. Both
+/// must key on the same field or a `HashMap<PayoutIdentity, _>` silently loses
+/// entries.
+impl Hash for RotatingDescriptor {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.canonical_descriptor().hash(state);
     }
 }
 
@@ -132,8 +237,6 @@ pub enum PayoutIdentity {
         address: String,
     },
     /// An extended public key the pool derives a fresh script from per block.
-    ///
-    /// **Unconstructible** — see [`RotatingDescriptor`].
     Rotating {
         /// The descriptor to derive from.
         descriptor: RotatingDescriptor,
@@ -185,6 +288,81 @@ impl PayoutIdentity {
         match self {
             PayoutIdentity::Static { address } => address,
             PayoutIdentity::Rotating { payout_id, .. } => payout_id.as_str(),
+        }
+    }
+
+    /// A rotating identity from its validated descriptor and ledger key.
+    ///
+    /// Called only by `bp_payout_descriptor`, which runs the three intake
+    /// assertions first. Nothing here re-checks them — this module has no
+    /// `miniscript` to check them with, which is the whole reason the
+    /// derivation is a trait object.
+    pub fn rotating(descriptor: RotatingDescriptor, payout_id: AddressId) -> Self {
+        PayoutIdentity::Rotating {
+            descriptor,
+            payout_id,
+        }
+    }
+
+    /// **The payout script at `height`, as raw bytes — role 3.**
+    ///
+    /// Not `payout_id()`. For a `Static` identity the two coincide, which is why
+    /// one `String` sufficed before this type existed; for a `Rotating` one they
+    /// are different values, and confusing them is the mistake this sum type
+    /// exists to make unwriteable.
+    ///
+    /// The `Static` arm returns `None` rather than a script: this module cannot
+    /// parse an address (no `bitcoin` dependency), so the caller keeps doing what
+    /// it does today. `None` means *"not my answer, use `address_to_script` on
+    /// `payout_id()`"*, and the coinbase seam's `match` is what makes that
+    /// explicit rather than implied — see `bp_mining_job::coinbase::payout_script`.
+    ///
+    /// Returning `Option<Result<…>>` and not flattening: a `Static` identity has
+    /// no derivation to fail, and collapsing "nothing to derive" into an error
+    /// would make the coinbase seam treat every static payout as a failure it
+    /// then has to recover from.
+    pub fn script_at(&self, height: u32) -> Option<Result<Vec<u8>, RotationError>> {
+        match self {
+            PayoutIdentity::Static { .. } => None,
+            PayoutIdentity::Rotating { descriptor, .. } => Some(descriptor.script_at(height)),
+        }
+    }
+
+    /// **Can this identity be paid at all?** The authorize / channel-open probe.
+    ///
+    /// One implementation for both protocols. SV1's `mining.authorize` and SV2's
+    /// `OpenMiningChannel` both have to answer it, they are in different crates,
+    /// and `CLAUDE.md`'s opening line is about exactly the shape where two copies
+    /// of one rule drift apart. The `Static` half stays at the call sites because
+    /// it needs `address_to_script` (network-checked, `bitcoin`-dependent, and
+    /// already there); this is the half that is the same in both.
+    ///
+    /// `Static` is `Ok(())` and does **not** silently pass: the caller's `match`
+    /// is what routes a static identity to `address_to_script`, and this method
+    /// returning `Ok` for it would be wrong only if a caller used this *instead*
+    /// of that check. That is why the arms are explicit at both call sites rather
+    /// than this being a single call covering both.
+    ///
+    /// # What this probe does and does not prove
+    ///
+    /// It derives at one height, so it proves that height. The real guarantee —
+    /// that *every* height derives — comes from `bp_payout_descriptor`'s three
+    /// intake assertions, which run before a `Rotating` identity can exist.
+    /// This is defence in depth: it catches an identity that reached the payout
+    /// path without going through intake, at connection time, instead of at
+    /// coinbase assembly for a found block.
+    ///
+    /// The probe height is deliberately not 0. A wildcard descriptor derives at
+    /// index 0 as readily as anywhere, but 0 is also the stand-in
+    /// `payout_height` uses for a template with no decodable BIP-34 push, and a
+    /// probe that only ever exercised the one height a fabricated template
+    /// produces would be the weakest possible choice.
+    pub fn probe_payable(&self) -> Result<(), RotationError> {
+        match self {
+            PayoutIdentity::Static { .. } => Ok(()),
+            PayoutIdentity::Rotating { descriptor, .. } => {
+                descriptor.script_at(PROBE_HEIGHT).map(|_| ())
+            }
         }
     }
 
@@ -241,12 +419,63 @@ pub fn split_identity_and_worker(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The pool's rotating-identity intake, as seen from a protocol crate.
+///
+/// **Why this is a trait and not a function.** Turning a wire string into a
+/// rotating identity needs `miniscript` (three intake assertions and a
+/// descriptor parse), and `bp-common` is depended on by 19 crates, 11 of which
+/// take no `bitcoin` dependency at all. So the *decision* lives here and the
+/// *implementation* lives in `bin/blitzpool` on top of `bp-payout-descriptor` —
+/// the same split, for the same reason, as [`RotatingScriptSource`].
+///
+/// It is also the local idiom: a capability a protocol crate needs but cannot
+/// itself provide arrives as an injected hook (`ServerHooks`, `PayoutResolver`,
+/// `BlockSubmissionSink`). This is one more of those.
+///
+/// **One implementation, and that is the point.** SV1's `mining.authorize` and
+/// SV2's `OpenMiningChannel` both have to answer "is this an xpub, and may this
+/// pool accept it?", they are in different crates, and `CLAUDE.md`'s opening
+/// line is about exactly the shape where two copies of one rule drift apart.
+pub trait RotatingIntake: Send + Sync {
+    /// Intake `payout_part` (the wire identity with any `.worker` suffix
+    /// already removed).
+    ///
+    /// - `Ok(None)` — not an extended-key attempt. The caller's existing static
+    ///   address path handles it, byte for byte as before.
+    /// - `Ok(Some(_))` — a validated rotating identity.
+    /// - `Err(_)` — it *was* an extended-key attempt and this pool refuses it:
+    ///   an invalid key, a descriptor that cannot rotate, or the operator flag
+    ///   being off. Deliberately not `Ok(None)`: falling through to the address
+    ///   path would refuse the same connection with a length-related message and
+    ///   leave the miner debugging the wrong thing.
+    fn intake(&self, payout_part: &str) -> Result<Option<PayoutIdentity>, IdentityRefused>;
+}
+
+/// The pool refused this payout identity. **Carries no detail, deliberately.**
+///
+/// Two reasons, and both are load-bearing:
+///
+/// 1. **The credential rule.** A descriptor parser's error text can contain a
+///    private key — measured, `Descriptor::from_str` on a bare `xprv` returns a
+///    131-character error containing the whole key. `Copy` is what makes the
+///    variant a leak would need (one holding the parser's `String`) a compile
+///    error, the same guard `bp_payout_descriptor::IntakeError` is built on.
+/// 2. **The informative log already happened.** The implementation of
+///    [`RotatingIntake`] is the only thing that knows *which* refusal this was,
+///    and it is where the operator-facing line is written. Both protocol sites
+///    have exactly one rejection code to offer a miner
+///    (`REJECT_INVALID_ADDR` / `ERR_UNKNOWN_USER`), so a detail carried up here
+///    would have nowhere to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the pool refused this payout identity")]
+pub struct IdentityRefused;
+
 /// Why a wire identity could not become a [`PayoutIdentity`].
 ///
 /// Deliberately narrow, and deliberately carrying no borrowed text from a
-/// parser. When descriptor intake lands, the error text is a hazard rather than
-/// a convenience: `Descriptor::from_str` on a bare `xprv` returns a 131-char
-/// error that **contains the whole private key**. The local idiom next door
+/// parser. The error text is a hazard rather than a convenience:
+/// `Descriptor::from_str` on a bare `xprv` returns a 131-char error that
+/// **contains the whole private key**. The local idiom next door
 /// (`Address::from_str(a).map_err(|e| AddressError::Parse(e.to_string()))`) is
 /// correct for a public address and would write a spendable key into the pool's
 /// logs if copied here.
@@ -258,15 +487,18 @@ pub enum IdentityParseError {
     /// The payout part is not a usable address shape.
     #[error("identity payout part is not a valid address: {0}")]
     InvalidAddress(InvalidAddressError),
+    /// The payout part was an extended-key attempt and the pool refused it.
+    /// See [`IdentityRefused`] for why nothing more is said here.
+    #[error("identity payout part was refused: {0}")]
+    Refused(IdentityRefused),
 }
 
 /// Parse a wire identity (`<payout>` or `<payout>.<worker>`) into a
-/// [`PayoutIdentity`] plus the raw worker part.
+/// [`PayoutIdentity`] plus the raw worker part, with **no** rotating intake.
 ///
-/// **Only ever returns `Static`.** The grammar for a rotating identity is not
-/// implemented here yet, on purpose: the point of landing this function now is
-/// that when it is, it is one place rather than four, and the four call sites
-/// need no further change.
+/// Always `Static`, and that is right for the callers that keep using it: the
+/// JDP `user_identifier` helper and the Worker-ID TLV, neither of which is a
+/// place a miner presents a payout identity for the first time.
 ///
 /// Shape-validates through [`AddressId`], which is what the sites that call
 /// this already do. It does NOT parse the address or check the network — that is
@@ -275,7 +507,49 @@ pub enum IdentityParseError {
 pub fn parse_payout_identity(
     raw: &str,
 ) -> Result<(PayoutIdentity, Option<&str>), IdentityParseError> {
+    parse_payout_identity_with(raw, None)
+}
+
+/// [`parse_payout_identity`], plus the pool's rotating intake when one is
+/// installed.
+///
+/// **The one implementation of the whole rule**, and the short form above
+/// delegates to it rather than repeating the static half. That matters more than
+/// it looks: the static half is four steps (split, normalize, shape-check, keep
+/// the un-narrowed `String`) and each of those was once spelled differently at
+/// each of four call sites.
+///
+/// Order of operations, all three of which are decisions:
+///
+/// 1. **Split off the worker first.** A bare xpub contains no dot, but
+///    `<xpub>.<worker>` does, and intake must see the key without the suffix.
+/// 2. **Intake before normalization.** [`normalize_btc_address`] lowercases
+///    bech32; base58 is case-sensitive and an extended key is base58, so
+///    lowercasing one would corrupt it. (It does not today — an xpub matches
+///    none of the bech32 prefixes — but relying on that is relying on a
+///    coincidence in another function.)
+/// 3. **A refusal is an error, not a fall-through.** See
+///    [`RotatingIntake::intake`].
+///
+/// `rotating: None` means no intake is installed, which is *not* the same as
+/// "the feature is off": the operator flag lives inside the implementation, so
+/// flag-off still refuses an xpub with a reason rather than reporting it as a
+/// malformed address. `None` is for the call sites that have no intake to
+/// consult at all.
+pub fn parse_payout_identity_with<'a>(
+    raw: &'a str,
+    rotating: Option<&dyn RotatingIntake>,
+) -> Result<(PayoutIdentity, Option<&'a str>), IdentityParseError> {
     let (payout_part, worker) = split_identity_and_worker(raw);
+    if let Some(intake) = rotating {
+        match intake.intake(payout_part) {
+            Ok(Some(identity)) => return Ok((identity, worker)),
+            Err(refused) => return Err(IdentityParseError::Refused(refused)),
+            // Not an extended-key attempt — fall through to the static path
+            // below, unchanged.
+            Ok(None) => {}
+        }
+    }
     let normalized = normalize_btc_address(payout_part);
     if normalized.is_empty() {
         return Err(IdentityParseError::Empty);

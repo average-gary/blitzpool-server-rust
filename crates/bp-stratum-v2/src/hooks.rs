@@ -221,6 +221,18 @@ pub struct MiningServerHooks {
     pub rejected_sink: Arc<dyn RejectedShareSink>,
     pub session_persistence: Arc<dyn SessionPersistence>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
+    /// The pool's rotating-identity intake, consulted once per
+    /// `OpenMiningChannel`. **The same `Arc` SV1's
+    /// `ServerHooks::rotating_intake` carries** — see that field for why an
+    /// injected capability rather than something this crate builds, and
+    /// [`crate::mining::client::MiningSessionState::rotating_intake`] for the
+    /// session-side copy the channel-open handler reads.
+    ///
+    /// One implementation across both protocols is the point: an xpub that SV1
+    /// admits and SV2 refuses (or vice versa) would be two answers to one
+    /// question, and the miner's ledger key would depend on which port it
+    /// connected to.
+    pub rotating_intake: Option<Arc<dyn bp_common::RotatingIntake>>,
 }
 
 impl MiningServerHooks {
@@ -236,6 +248,9 @@ impl MiningServerHooks {
             rejected_sink: no_op.clone(),
             session_persistence: no_op.clone(),
             device_status_sink: no_op,
+            // See SV1's `no_op`: no intake means the static path, unchanged,
+            // and `NoOpHooks` gets no stub impl of the trait.
+            rotating_intake: None,
         }
     }
 }
@@ -386,6 +401,7 @@ pub mod test_support {
                 rejected_sink: arc.clone(),
                 session_persistence: arc.clone(),
                 device_status_sink: arc,
+                rotating_intake: None,
             }
         }
     }

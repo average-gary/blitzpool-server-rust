@@ -64,6 +64,7 @@ use crate::block_sink::TdpBlockSubmissionSink;
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::group_service::SharedGroupService;
+use crate::payout_identities::PayoutIdentityDirectory;
 
 /// Per-port SV1 server bundle. One entry per `[stratum]`/`[pplns]`
 /// port the operator enabled. Consumed by [`crate::stratum::spawn`]
@@ -102,6 +103,10 @@ pub(crate) fn build_per_port_servers(
     engines: &EngineHandles,
     group_service: &SharedGroupService,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
+    // The pool's one rotating-identity intake, built in `crate::stratum` and
+    // shared with SV2. Every port gets the same `Arc` — the verdict on an xpub
+    // cannot depend on which port a miner connected to.
+    rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
@@ -188,9 +193,11 @@ pub(crate) fn build_per_port_servers(
             port_config.payout_mode,
             block_sink.clone(),
             payout_resolver.clone(),
+            rotating_intake.clone(),
             engines,
             lookup.clone(),
             engines.mode_gate.clone(),
+            engines.payout_identities.clone(),
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
         );
@@ -325,9 +332,11 @@ fn build_port_hooks(
     port_payout_mode: MiningMode,
     block_sink: Arc<dyn bp_stratum_v1::BlockSubmissionSink>,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
+    rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
     mode_gate: Arc<BlitzpoolModeGate>,
+    payout_identities: Arc<PayoutIdentityDirectory>,
     device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> ServerHooks {
@@ -354,6 +363,7 @@ fn build_port_hooks(
         Arc::new(ModeGatePopulatingPersistence::new(
             port_payout_mode,
             mode_gate,
+            payout_identities,
             group_lookup,
             blockparty_lookup,
             live_sessions,
@@ -367,6 +377,7 @@ fn build_port_hooks(
         session_persistence: Arc::new(session),
         payout_resolver,
         device_status_sink,
+        rotating_intake: Some(rotating_intake),
     }
 }
 
@@ -435,9 +446,19 @@ impl BlockpartyAdminLookup for BlockpartyApiAdminLookup {
 /// `Mutex<HashMap<SessionId, String>>` populated on register so the
 /// deregister path can resolve the address back and call
 /// `mode_gate.clear_mode` correctly under refcounting.
+///
+/// **It also releases the payout-identity directory entry**, from the same
+/// resolved address and under the same refcount. That is deliberate rather than
+/// convenient: this is the one place both protocols' disconnects converge, and it
+/// is already the thing that knows which `payout_id` the ending session held. A
+/// second release site — one per protocol, say — would be two chances for a
+/// rotating miner's descriptor to outlive its connections or to be dropped while
+/// a sibling rig is still mining on it.
 pub(crate) struct ModeGatePopulatingPersistence {
     port_payout_mode: MiningMode,
     mode_gate: Arc<BlitzpoolModeGate>,
+    /// Released in lockstep with the mode gate — see the struct doc.
+    payout_identities: Arc<PayoutIdentityDirectory>,
     group_lookup: Arc<dyn GroupLookup>,
     /// Blockparty admin-lookup. `None` when the `[blockparty]` feature
     /// isn't configured — then Blockparty mode is never resolved here.
@@ -450,6 +471,7 @@ impl ModeGatePopulatingPersistence {
     pub(crate) fn new(
         port_payout_mode: MiningMode,
         mode_gate: Arc<BlitzpoolModeGate>,
+        payout_identities: Arc<PayoutIdentityDirectory>,
         group_lookup: Arc<dyn GroupLookup>,
         blockparty: Option<Arc<dyn BlockpartyAdminLookup>>,
         inner: Arc<dyn SharedSessionPersistence>,
@@ -457,6 +479,7 @@ impl ModeGatePopulatingPersistence {
         Self {
             port_payout_mode,
             mode_gate,
+            payout_identities,
             group_lookup,
             blockparty,
             inner,
@@ -519,6 +542,11 @@ impl SharedSessionPersistence for ModeGatePopulatingPersistence {
         };
         if let Some(address) = address {
             self.mode_gate.clear_mode(&address);
+            // Same key, same refcount, same moment. `address` here is the
+            // session's `payout_id` (authorize replaced the wire string with it),
+            // which is what the directory is keyed on; for a static miner this is
+            // a no-op, because nothing static was ever published.
+            self.payout_identities.release(&address);
         }
         self.inner.deregister_session(session_id).await;
     }
@@ -802,6 +830,7 @@ mod tests {
         let wrapper = ModeGatePopulatingPersistence::new(
             MiningMode::Pplns,
             gate.clone(),
+            Arc::new(PayoutIdentityDirectory::new()),
             lookup,
             None,
             inner.clone(),
@@ -827,6 +856,7 @@ mod tests {
         let wrapper = ModeGatePopulatingPersistence::new(
             MiningMode::Solo,
             gate.clone(),
+            Arc::new(PayoutIdentityDirectory::new()),
             lookup,
             None,
             inner.clone(),
@@ -850,6 +880,7 @@ mod tests {
         let wrapper = ModeGatePopulatingPersistence::new(
             MiningMode::Solo,
             gate.clone(),
+            Arc::new(PayoutIdentityDirectory::new()),
             lookup,
             Some(bp),
             inner.clone(),
@@ -873,6 +904,7 @@ mod tests {
         let wrapper = ModeGatePopulatingPersistence::new(
             MiningMode::Pplns,
             gate.clone(),
+            Arc::new(PayoutIdentityDirectory::new()),
             lookup,
             None,
             inner.clone(),
@@ -901,6 +933,7 @@ mod tests {
         let wrapper = ModeGatePopulatingPersistence::new(
             MiningMode::Pplns,
             gate.clone(),
+            Arc::new(PayoutIdentityDirectory::new()),
             lookup,
             None,
             inner.clone(),

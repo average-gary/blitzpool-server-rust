@@ -537,7 +537,21 @@ where
                         // This used to be a second implementation reading the
                         // PPLNS fee config, so a solo miner saw a fee output
                         // that its real coinbase never carried.
-                        bp_mining_job::solo_payouts(addr.as_str(), &s.solo_fee, reward_sats)
+                        //
+                        // `static_address_verbatim` and not a directory lookup:
+                        // this route's input is a path segment, not a live
+                        // session, and bp-api has no rotating-identity directory
+                        // to resolve one against. `verbatim` because that is
+                        // byte-for-byte what this call passed before — the
+                        // `AddressId` is already shape-validated. A rotating
+                        // miner asking for its own preview gets its `payout_id`
+                        // previewed as an address, which is the same limitation
+                        // `assemble_block_preview` documents below and is fixed
+                        // in the same place: by the preview taking
+                        // `ResolvedPayouts` instead of display entries.
+                        let miner =
+                            bp_common::PayoutIdentity::static_address_verbatim(addr.as_str());
+                        bp_mining_job::solo_payouts(&miner, &s.solo_fee, reward_sats)
                             .into_iter()
                             .map(|p| PayoutInfoEntry {
                                 percent: if reward_sats == 0 {

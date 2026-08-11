@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty_engine::BlockpartyApi;
-use bp_common::{AddressId, MiningMode, Sats};
+use bp_common::{AddressId, MiningMode, PayoutIdentity, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 /// Re-exported so the wiring keeps one import path for the solo split.
 pub(crate) use bp_mining_job::SoloFeeConfig;
@@ -60,6 +60,7 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::engines::BlitzpoolModeGate;
+use crate::payout_identities::PayoutIdentityDirectory;
 
 /// The single production [`PayoutResolver`] impl. Holds clones of the
 /// engines + the mode gate; cheap to clone (each field is internally
@@ -75,6 +76,10 @@ pub(crate) struct ProductionPayoutResolver {
     /// payouts — i.e. a deployment without the Blockparty feature wired
     /// behaves exactly as before.
     blockparty: Option<Arc<dyn BlockpartyApi>>,
+    /// `payout_id → PayoutIdentity` for the rotating identities of currently
+    /// connected miners. See [`PayoutIdentityDirectory`] for why the descriptor
+    /// arrives this way and not down the connection.
+    identities: Arc<PayoutIdentityDirectory>,
 }
 
 impl ProductionPayoutResolver {
@@ -84,6 +89,7 @@ impl ProductionPayoutResolver {
         group_solo: GroupSoloEngine,
         solo_fee: SoloFeeConfig,
         blockparty: Option<Arc<dyn BlockpartyApi>>,
+        identities: Arc<PayoutIdentityDirectory>,
     ) -> Self {
         Self {
             mode_gate,
@@ -91,7 +97,37 @@ impl ProductionPayoutResolver {
             group_solo,
             solo_fee,
             blockparty,
+            identities,
         }
+    }
+
+    /// **How this pool pays a `payout_id`** — one lookup, one place.
+    ///
+    /// Every mode's payout builder goes through here for a miner-supplied
+    /// identity, so "rotating miners are paid a derived script" is a property of
+    /// one function rather than of four arms agreeing. Pool-side addresses (the
+    /// Solo dev fee, the Blockparty pending-fee route, a group's operator-entered
+    /// member addresses) deliberately do NOT: they are `Static` at their
+    /// construction site, which is what keeps the pool-fee address unrotatable.
+    fn identity_of(&self, payout_id: &str) -> PayoutIdentity {
+        self.identities.identity_for(payout_id)
+    }
+
+    /// Solo's payout list for `miner_address`.
+    ///
+    /// Exists because the Solo split is reached from six places — the Solo arm
+    /// and five Blockparty fallbacks — and every one of them has to resolve the
+    /// identity the same way. Five of them spelling
+    /// `solo_payouts(miner_address, …)` and one spelling
+    /// `solo_payouts(&self.identity_of(miner_address), …)` is precisely how a
+    /// rotating miner ends up paid a hash on the fallback path only, which is
+    /// the shape of `CLAUDE.md`'s 2026-08-03 entry.
+    fn solo_split(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
+        solo_payouts(
+            &self.identity_of(miner_address),
+            &self.solo_fee,
+            reward_sats,
+        )
     }
 
     /// Resolution core — used by both the SV1 + SV2 trait impls.
@@ -127,11 +163,7 @@ impl ProductionPayoutResolver {
                     return (ResolvedPayouts::unsnapshotted(route), vouchable);
                 }
                 (
-                    ResolvedPayouts::unsnapshotted(solo_payouts(
-                        miner_address,
-                        &self.solo_fee,
-                        reward_sats,
-                    )),
+                    ResolvedPayouts::unsnapshotted(self.solo_split(miner_address, reward_sats)),
                     vouchable,
                 )
             }
@@ -432,21 +464,21 @@ impl ProductionPayoutResolver {
                 miner_address,
                 "Blockparty mode in gate but service handle not wired; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
+            return self.solo_split(miner_address, reward_sats);
         };
         let Some(gid_str) = group_id_str else {
             warn!(
                 miner_address,
                 "Blockparty mode published WITHOUT a group_id; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
+            return self.solo_split(miner_address, reward_sats);
         };
         let Ok(group_id) = Uuid::parse_str(gid_str) else {
             warn!(
                 miner_address,
                 gid_str, "Blockparty group_id failed to parse as UUID; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
+            return self.solo_split(miner_address, reward_sats);
         };
         match svc.build_payouts(group_id, Sats(reward_sats as i64)).await {
             Ok(Some(result)) => entries_to_payouts(&result.payouts),
@@ -456,7 +488,7 @@ impl ProductionPayoutResolver {
                     %group_id,
                     "Blockparty group not found; falling back to solo"
                 );
-                solo_payouts(miner_address, &self.solo_fee, reward_sats)
+                self.solo_split(miner_address, reward_sats)
             }
             Err(err) => {
                 warn!(
@@ -465,7 +497,7 @@ impl ProductionPayoutResolver {
                     %group_id,
                     "Blockparty distribution build failed; falling back to solo"
                 );
-                solo_payouts(miner_address, &self.solo_fee, reward_sats)
+                self.solo_split(miner_address, reward_sats)
             }
         }
     }
@@ -796,8 +828,39 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                 }
             }
             TailoredMode::Solo => {
+                let identity = self.resolver.identity_of(miner_address.as_str());
+                // **A REFUSAL, not a fallback** — the idiom `jdp_distribution_for`
+                // established for Blockparty, and the same answer the
+                // base-protocol allocate path gives (`jdp_hooks.rs`).
+                //
+                // A published ext 0x0003 distribution is a list of FIXED
+                // `script_pubkey` bytes under a distribution id, and a JDC reuses
+                // it across blocks. There is no height here and no way to change
+                // it per block, so a rotating identity has no expressible form:
+                // lowering one would pin every future block to a script derived
+                // at whatever index this build happened to pick — rotation in
+                // name only, and a miner who configured an xpub would never see
+                // its second address.
+                //
+                // `Unavailable` costs this JDC its tailored distribution and pays
+                // it correctly through the mining path instead. `match` and not
+                // `if identity.rotates()`: this arm chooses what to *do* with an
+                // identity, which is the exhaustive question.
+                match &identity {
+                    PayoutIdentity::Rotating { payout_id, .. } => {
+                        warn!(
+                            miner = miner_address.as_str(),
+                            payout_id = payout_id.as_str(),
+                            "jdp distribution source: this miner's payout identity rotates per \
+                             block, which a published distribution's fixed scripts cannot \
+                             express — no tailored distribution"
+                        );
+                        return TailoredDistribution::Unavailable;
+                    }
+                    PayoutIdentity::Static { .. } => {}
+                }
                 let entries: Vec<(String, u64)> =
-                    solo_payouts(miner_address.as_str(), &self.resolver.solo_fee, t_ref)
+                    solo_payouts(&identity, &self.resolver.solo_fee, t_ref)
                         .into_iter()
                         .map(|p| (p.payout_id().to_string(), p.sats))
                         .collect();
@@ -928,6 +991,14 @@ mod tests {
     use super::*;
 
     const TEST_REWARD: u64 = 5_000_000_000;
+
+    /// The miner argument to [`solo_payouts`]. These cases are about the dev-fee
+    /// split, which is the same arithmetic for either identity variant; the
+    /// rotating side of the Solo path is covered where it is observable — the
+    /// derived-script regtest gate — not here, where nothing renders a script.
+    fn miner(address: &str) -> PayoutIdentity {
+        PayoutIdentity::static_address_verbatim(address)
+    }
 
     /// The promise this flag carries gates the whole block-found emission, not
     /// just a snapshot lookup: without it nothing is emitted, so the durable
@@ -1078,14 +1149,14 @@ mod tests {
 
     #[test]
     fn solo_payouts_empty_address_yields_empty() {
-        let r = solo_payouts("", &SoloFeeConfig::default(), TEST_REWARD);
+        let r = solo_payouts(&miner(""), &SoloFeeConfig::default(), TEST_REWARD);
         assert!(r.is_empty());
     }
 
     #[test]
     fn solo_payouts_no_dev_fee_yields_single_100_pct() {
         let r = solo_payouts(
-            "bc1qabc",
+            &miner("bc1qabc"),
             &SoloFeeConfig {
                 dev_fee_address: None,
                 dev_fee_percent: 0.0,
@@ -1100,7 +1171,7 @@ mod tests {
     #[test]
     fn solo_payouts_with_dev_fee_splits() {
         let r = solo_payouts(
-            "bc1qminer",
+            &miner("bc1qminer"),
             &SoloFeeConfig {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 1.5,
@@ -1120,7 +1191,7 @@ mod tests {
     fn solo_payouts_with_dev_fee_empty_address_is_ignored() {
         // Trim treats whitespace-only as empty.
         let r = solo_payouts(
-            "bc1qminer",
+            &miner("bc1qminer"),
             &SoloFeeConfig {
                 dev_fee_address: Some("   ".into()),
                 dev_fee_percent: 1.5,
@@ -1135,7 +1206,7 @@ mod tests {
     #[test]
     fn solo_payouts_rejects_out_of_range_fee_percent() {
         let r = solo_payouts(
-            "bc1qminer",
+            &miner("bc1qminer"),
             &SoloFeeConfig {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 150.0,
@@ -1153,7 +1224,7 @@ mod tests {
         // (operator forgot `dev_fee_percent`). Must NOT emit a zero-value dev
         // output — collapse to a single 100 %-to-miner payout.
         let r = solo_payouts(
-            "bc1qminer",
+            &miner("bc1qminer"),
             &SoloFeeConfig {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 0.0,

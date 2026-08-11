@@ -23,8 +23,9 @@ pub use extranonce::{ExtranonceAllocator, ExtranonceError};
 
 pub mod payout_identity;
 pub use payout_identity::{
-    parse_payout_identity, split_identity_and_worker, IdentityParseError, PayoutIdentity,
-    RotatingDescriptor,
+    parse_payout_identity, parse_payout_identity_with, split_identity_and_worker,
+    IdentityParseError, IdentityRefused, PayoutIdentity, RotatingDescriptor, RotatingIntake,
+    RotatingScriptSource, RotationError,
 };
 
 #[cfg(feature = "sqlx")]

@@ -66,6 +66,7 @@ use tracing::{info, warn};
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::group_service::SharedGroupService;
+use crate::payout_identities::PayoutIdentityDirectory;
 use crate::stratum_v1::{
     self, BlockpartyAdminLookup, BlockpartyApiAdminLookup, GroupLookup,
     ModeGatePopulatingPersistence,
@@ -176,6 +177,9 @@ pub(crate) fn build_per_port_servers(
     noise_config: NoiseConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
+    // The pool's one rotating-identity intake — the same `Arc` SV1 gets, built
+    // in `crate::stratum`. See SV1's `build_per_port_servers`.
+    rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
@@ -248,10 +252,12 @@ pub(crate) fn build_per_port_servers(
         let hooks = build_port_hooks(
             sv1_port_config.payout_mode,
             payout_resolver.clone(),
+            rotating_intake.clone(),
             block_sink.clone(),
             engines,
             lookup.clone(),
             mode_gate.clone(),
+            engines.payout_identities.clone(),
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
         );
@@ -325,10 +331,12 @@ pub(crate) fn build_per_port_servers(
 fn build_port_hooks(
     port_payout_mode: MiningMode,
     payout_resolver: Arc<dyn PayoutResolver>,
+    rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     block_sink: Arc<dyn Sv2BlockSink>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
     mode_gate: Arc<BlitzpoolModeGate>,
+    payout_identities: Arc<PayoutIdentityDirectory>,
     device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> MiningServerHooks {
@@ -355,6 +363,7 @@ fn build_port_hooks(
         Arc::new(ModeGatePopulatingPersistence::new(
             port_payout_mode,
             mode_gate,
+            payout_identities,
             group_lookup,
             blockparty_lookup,
             live_sessions,
@@ -369,6 +378,7 @@ fn build_port_hooks(
         rejected_sink: rejected,
         session_persistence: session,
         device_status_sink,
+        rotating_intake: Some(rotating_intake),
     }
 }
 

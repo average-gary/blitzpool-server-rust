@@ -363,12 +363,30 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
                 // §6.4.3 designates ONE locking script, once, at allocate time —
                 // before any template exists, so there is no height to derive at
                 // and no way to change it per block. A rotating identity
-                // therefore cannot be served on the base protocol: designating
-                // its ledger key's script would silently pin every future block
-                // to one derivation index, which is rotation in name only.
-                // Unreachable by construction today; `absurd()` is what makes
-                // Phase 3 come back here instead of inheriting a wrong answer.
-                PayoutIdentity::Rotating { descriptor, .. } => descriptor.clone().absurd(),
+                // therefore cannot be served on the base protocol.
+                //
+                // **A REFUSAL, not a fallback**, in the sense `jdp_distribution_for`
+                // established for Blockparty. The two answers available here are
+                // both wrong: designating a script derived at some chosen index
+                // pins every future block to that one index — rotation in name
+                // only, and a miner who configured an xpub would never see the
+                // second address — while designating the `payout_id`'s script is
+                // not a script at all (a `payout_id` is a hash, not an address).
+                // Refusing the token costs this JDC its custom job selection and
+                // pays it correctly through ext 0x0003 or the mining path
+                // instead; guessing costs it the rotation it asked for, silently.
+                PayoutIdentity::Rotating { .. } => {
+                    warn!(
+                        user_identifier,
+                        payout_id = only.payout_id(),
+                        "JDP allocate: this miner's payout identity rotates per block, which \
+                         §6.4.3's single designated output cannot express — refusing the token; \
+                         use ext 0x0003"
+                    );
+                    return AllocateOutcome::Refused {
+                        reason: "base-protocol JDP cannot express a rotating payout identity",
+                    };
+                }
             },
             // A single payee who is SOMEBODY ELSE. The resolver routing the
             // block away from the miner is a guard — today the pending

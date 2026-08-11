@@ -60,6 +60,7 @@ mod listeners;
 mod live_mode_marker;
 mod live_sessions;
 mod network_difficulty;
+mod payout_identities;
 mod payout_resolver;
 mod pending_blocks;
 mod redis_backup;
@@ -963,6 +964,12 @@ async fn main() -> ExitCode {
                             dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
                         },
                         engines.blockparty.clone(),
+                        // The SAME directory the Stratum resolver reads, not a
+                        // fresh one: a JDC's declared job pays the identities
+                        // Stratum's authorize published, so a second directory
+                        // here would resolve every rotating miner to its
+                        // `payout_id` as an address and fail the coinbase.
+                        engines.payout_identities.clone(),
                     ));
                 // Spawn the JDP template-tx cache when the pool needs the txs
                 // (`jdp_orphan_submitblock` → reconstruct the full block +

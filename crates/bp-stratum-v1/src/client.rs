@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use bitcoin::Network;
-use bp_common::{parse_payout_identity, PayoutIdentity};
+use bp_common::{parse_payout_identity_with, PayoutIdentity};
 use bp_mining_job::{
     address_to_script, MiningJobCache, ResolvedPayouts, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
@@ -104,6 +104,19 @@ pub struct SessionState<C: Clock> {
     /// construction; gates the `🎯 Share difficulty` + `✅ Share
     /// accepted` traces in [`validate_submit`].
     pub share_logs: bool,
+
+    /// The pool's rotating-identity intake, or `None` when the deployment has
+    /// none wired. Set by the I/O layer after construction (the
+    /// [`Self::share_logs`] idiom next door), because this crate cannot build
+    /// one: it needs `miniscript`.
+    ///
+    /// Read once, at `mining.authorize`. `None` is not "the feature is off" —
+    /// the operator flag lives inside the implementation, so with an intake
+    /// installed and the flag off an xpub is *refused with a reason* rather than
+    /// reported as a malformed address. `None` is the standalone-crate case, and
+    /// it makes this crate's own tests exercise the same static path they always
+    /// have.
+    pub rotating_intake: Option<Arc<dyn bp_common::RotatingIntake>>,
 }
 
 impl<C: Clock> SessionState<C> {
@@ -167,6 +180,7 @@ impl<C: Clock> SessionState<C> {
             extranonce_subscribed: false,
             stream: bp_common::StreamKind::Pplns,
             share_logs: server_config.share_logs,
+            rotating_intake: None,
         }
     }
 
@@ -488,11 +502,20 @@ pub fn handle_authorize<C: Clock>(
     }
 
     // Parse the payout part into an identity — the shared
-    // `bp_common::parse_payout_identity`, which normalises (trim +
-    // bech32-lowercase, critical for downstream cache / PPLNS-window keys) and
-    // shape-checks in one step. `frame.rs` already split off the worker, so the
-    // payout part is passed in on its own.
-    let Ok((identity, _)) = parse_payout_identity(&request.address) else {
+    // `bp_common::parse_payout_identity_with`, which normalises (trim +
+    // bech32-lowercase, critical for downstream cache / PPLNS-window keys),
+    // shape-checks, and consults the pool's rotating intake, in one step.
+    // `frame.rs` already split off the worker, so the payout part is passed in on
+    // its own.
+    //
+    // Both refusal shapes land in the same rejection here, and that is not a
+    // shortcut: SV1 has exactly one error to offer (`REJECT_INVALID_ADDR`), the
+    // informative operator-facing line is written inside the intake
+    // implementation, and `IdentityRefused` carries no detail on purpose (a
+    // descriptor parser's error text can contain a private key).
+    let Ok((identity, _)) =
+        parse_payout_identity_with(&request.address, state.rotating_intake.as_deref())
+    else {
         out.push_frame(write_error(&id, ERR_OTHER_UNKNOWN, REJECT_INVALID_ADDR));
         out.push_event(SessionEvent::Disconnect);
         return out;
@@ -502,18 +525,19 @@ pub fn handle_authorize<C: Clock>(
     //
     // `match` and not `if`: a rotating identity has no single script to probe at
     // authorize time (its scripts are derived per height, and there is no height
-    // here), so what replaces this is a descriptor check. `absurd()` is what
-    // makes that a compile error to skip rather than a session that authorizes
-    // unvalidated.
-    match &identity {
-        PayoutIdentity::Static { address } => {
-            if address_to_script(state.network, address).is_err() {
-                out.push_frame(write_error(&id, ERR_OTHER_UNKNOWN, REJECT_INVALID_ADDR));
-                out.push_event(SessionEvent::Disconnect);
-                return out;
-            }
-        }
-        PayoutIdentity::Rotating { descriptor, .. } => descriptor.clone().absurd(),
+    // here), so what it gets is a derivability probe instead —
+    // `probe_payable()`, which is the same implementation SV2's channel-open
+    // uses. The `Static` arm stays here because it needs `address_to_script`,
+    // which is network-checked; the rotating half is identical on both protocols
+    // and therefore lives in one place.
+    let payable = match &identity {
+        PayoutIdentity::Static { address } => address_to_script(state.network, address).is_ok(),
+        PayoutIdentity::Rotating { .. } => identity.probe_payable().is_ok(),
+    };
+    if !payable {
+        out.push_frame(write_error(&id, ERR_OTHER_UNKNOWN, REJECT_INVALID_ADDR));
+        out.push_event(SessionEvent::Disconnect);
+        return out;
     }
 
     // `AuthorizeRequest.address` is the session's payout id: it is what

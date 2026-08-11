@@ -83,6 +83,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::boot::FoundationHandles;
+use crate::payout_identities::PayoutIdentityDirectory;
 
 /// Long-lived engine + sink aggregate. Phase 7.4 + 7.5 thread this
 /// into the Stratum servers + cron schedules.
@@ -92,6 +93,18 @@ pub(crate) struct EngineHandles {
     pub(crate) stats: ShareStatsEngineHandle,
     pub(crate) session_persistence: SessionPersistenceEngineHandle,
     pub(crate) mode_gate: Arc<BlitzpoolModeGate>,
+    /// `payout_id → PayoutIdentity` for the rotating identities of currently
+    /// connected miners. Sits beside [`Self::mode_gate`] because it is the same
+    /// kind of thing about the same key: a per-connection fact the payout path
+    /// has to read by `payout_id`, published at authorize and refcounted to
+    /// disconnect. See [`crate::payout_identities`] for why the descriptor
+    /// travels this way and not down the connection.
+    ///
+    /// Built unconditionally, on every role. It is an empty `HashMap` on a
+    /// process with no Stratum listeners, and the alternative — an `Option`
+    /// keyed on the front role — would make every reader ask "is this a front?"
+    /// to answer "how do I pay this miner".
+    pub(crate) payout_identities: Arc<PayoutIdentityDirectory>,
     /// The front's producing Stratum fan-out sinks — built only on the front,
     /// where Stratum feeds them; they stamp each share and publish it onto the
     /// Redis stream. `None` on the satellite: it has no Stratum listeners; its
@@ -164,6 +177,7 @@ pub(crate) async fn spawn(
     // them full (with crons).
     let read_only = !cfg.has_role(Role::Payout);
     let mode_gate = Arc::new(BlitzpoolModeGate::new());
+    let payout_identities = Arc::new(PayoutIdentityDirectory::new());
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
     let stats = spawn_stats(cfg, handles).await?;
@@ -201,6 +215,7 @@ pub(crate) async fn spawn(
         stats,
         session_persistence,
         mode_gate,
+        payout_identities,
         accepted_sink,
         rejected_sink,
         session_persistence_hook,

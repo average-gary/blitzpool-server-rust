@@ -270,13 +270,28 @@ pub enum MiningJobError {
     /// A rotating identity needs the block height to derive its script, and the
     /// template's `coinbase_prefix` carried no decodable BIP-34 push.
     ///
-    /// Unreachable today — no rotating identity can be constructed. It exists so
-    /// that when one can be, the failure is a refused job rather than a coinbase
-    /// built at a fabricated height, which would pay a script the miner cannot
-    /// spend. `ResolvedPayouts::none()` documents the same choice for a
-    /// distribution that could not be built: serve no job rather than guess.
+    /// **Reachable as of Phase 3.** It exists so the failure is a refused job
+    /// rather than a coinbase built at a fabricated height, which would pay a
+    /// script the miner cannot spend. `ResolvedPayouts::none()` documents the
+    /// same choice for a distribution that could not be built: serve no job
+    /// rather than guess.
     #[error("template carried no decodable BIP-34 height and a payout identity needs one")]
     MissingBlockHeight,
+    /// A rotating identity's descriptor would not derive at this height.
+    ///
+    /// Should be unreachable: `bp_payout_descriptor`'s intake asserts
+    /// derivability at construction and `RotatingPayout` has no other
+    /// constructor, so every rotating identity that exists derives at every
+    /// height. Kept as a refused job rather than an `expect`, because the
+    /// alternative on this path is a panic **inside coinbase assembly** — which
+    /// is the exact failure the hardened-step assertion exists to prevent, and
+    /// re-introducing it here would undo that at the last step.
+    ///
+    /// Carries no detail on purpose: the parser's text can contain key material
+    /// (see `bp_payout_descriptor`'s credential rule), and this error is
+    /// formatted into logs.
+    #[error("a rotating payout identity failed to derive its script at this height")]
+    RotationFailed,
 }
 
 /// Build a `MiningJob` for the given template + payouts.
@@ -671,11 +686,25 @@ pub(crate) fn payout_script(
             let _ = block_height;
             Ok(address::address_to_script(network, address)?.into_bytes())
         }
-        // Unreachable by construction, and certified so by the compiler rather
-        // than by `unreachable!()` — `RotatingDescriptor` is uninhabited. When
-        // intake gives it values this line stops compiling, which is precisely
-        // how the next phase finds this site.
-        PayoutIdentity::Rotating { descriptor, .. } => descriptor.clone().absurd(),
+        // Derived at THIS block's height. `network` is unused: a descriptor
+        // carries its own key material and derives a `scriptPubKey` directly,
+        // and a script is network-agnostic — the network only ever mattered for
+        // *rendering* an address, which is what the `Static` arm parses. That is
+        // also the property that makes the regtest gate meaningful: the same
+        // descriptor at the same height gives the same script on regtest as on
+        // mainnet, so `bitcoin-cli deriveaddresses` is an independent check and
+        // not a second copy of this code.
+        //
+        // The error path is real but should be unreachable: intake's
+        // `assert_derivable` ran before this identity could exist. Failing the
+        // build is the only safe answer — a coinbase that cannot derive one
+        // miner's script must not be published paying somebody else.
+        PayoutIdentity::Rotating { descriptor, .. } => {
+            let _ = network;
+            descriptor
+                .script_at(block_height)
+                .map_err(|_| MiningJobError::RotationFailed)
+        }
     }
 }
 
@@ -860,8 +889,26 @@ impl Default for SoloFeeConfig {
 /// 100%-to-miner, or `dev_fee_percent` to dev + remainder to miner. Amounts are
 /// exact sats — the dev fee floors, the miner takes the remainder so both
 /// outputs sum to exactly `reward_sats`.
+///
+/// # Why the miner is a [`PayoutIdentity`] and the dev fee is not
+///
+/// The miner's target is whatever it presented on the wire, which may rotate.
+/// The dev-fee address is **the pool's own**, read from operator config, and it
+/// is `Static` here by construction rather than by convention.
+///
+/// That is deliberate and it is the thing to preserve. The plan is explicit:
+/// *"The `match` must not accidentally make the pool-fee address rotatable."*
+/// Taking one identity and one `&str` is how this function cannot do that — not
+/// a rule a reader has to check, but the only shape the signature allows. The
+/// same applies to the sibling pool-side route,
+/// `blockparty_pending_fee_route`, which builds a `Static` entry from a
+/// `fee_address` for the same reason.
+///
+/// It also means the caller has to have resolved an identity, which is what
+/// keeps a `payout_id` from being passed off as an address: hand this the string
+/// and the compiler asks which one you meant.
 pub fn solo_payouts(
-    miner_address: &str,
+    miner: &PayoutIdentity,
     fee: &SoloFeeConfig,
     reward_sats: u64,
 ) -> Vec<PayoutEntry> {
@@ -871,8 +918,18 @@ pub fn solo_payouts(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let percent = fee.dev_fee_percent;
-    let full_to_miner = || vec![PayoutEntry::static_address(miner_address, reward_sats)];
-    match (miner_address.is_empty(), dev_addr) {
+    let full_to_miner = || {
+        vec![PayoutEntry {
+            identity: miner.clone(),
+            sats: reward_sats,
+        }]
+    };
+    // The empty-identity case is `payout_id().is_empty()` and not a `match` on
+    // the variant: it asks "did the caller hand us nothing", which is a property
+    // of the ledger key both variants have. A rotating identity's `payout_id` is
+    // a 47-char hash and can never be empty, so this is the static case as it
+    // always was.
+    match (miner.payout_id().is_empty(), dev_addr) {
         (true, _) => vec![],
         (false, None) => full_to_miner(),
         (false, Some(_dev)) if !(0.0..=100.0).contains(&percent) => {
@@ -892,9 +949,17 @@ pub fn solo_payouts(
             full_to_miner()
         }
         (false, Some(dev)) => {
+            // `from_percent` builds a `Static` entry, and that is the pool's own
+            // fee address — see this function's docs.
             let dev = PayoutEntry::from_percent(dev, percent, reward_sats);
             let miner_sats = reward_sats.saturating_sub(dev.sats);
-            vec![dev, PayoutEntry::static_address(miner_address, miner_sats)]
+            vec![
+                dev,
+                PayoutEntry {
+                    identity: miner.clone(),
+                    sats: miner_sats,
+                },
+            ]
         }
     }
 }
@@ -1760,6 +1825,13 @@ mod solo_split_tests {
         }
     }
 
+    /// The miner argument. A helper and not an inline constructor at each of the
+    /// eight call sites below, so that "what kind of identity is the miner" is
+    /// one line to change when a rotating variant of these cases is added.
+    fn miner(address: &str) -> PayoutIdentity {
+        PayoutIdentity::static_address_verbatim(address)
+    }
+
     /// The reported bug: a solo miner's `/block-template` preview showed a
     /// fee output its real `mining.notify` did not carry, because the
     /// preview read the PPLNS fee config. With no solo dev fee configured
@@ -1767,7 +1839,7 @@ mod solo_split_tests {
     /// from here.
     #[test]
     fn without_a_dev_fee_the_solo_split_is_a_single_output() {
-        let out = solo_payouts("bc1qminer", &fee(None, 0.0), REWARD);
+        let out = solo_payouts(&miner("bc1qminer"), &fee(None, 0.0), REWARD);
         assert_eq!(out.len(), 1, "no second output: {out:?}");
         assert_eq!(out[0].payout_id(), "bc1qminer");
         assert_eq!(out[0].sats, REWARD);
@@ -1778,7 +1850,7 @@ mod solo_split_tests {
     /// dropping the fee.
     #[test]
     fn a_zero_percent_dev_fee_is_not_an_output() {
-        let out = solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 0.0), REWARD);
+        let out = solo_payouts(&miner("bc1qminer"), &fee(Some("bc1qdev"), 0.0), REWARD);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].sats, REWARD);
     }
@@ -1787,7 +1859,7 @@ mod solo_split_tests {
     /// reward — the coinbase must not lose or invent a satoshi.
     #[test]
     fn a_configured_dev_fee_splits_and_conserves_every_satoshi() {
-        let out = solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 1.0), REWARD);
+        let out = solo_payouts(&miner("bc1qminer"), &fee(Some("bc1qdev"), 1.0), REWARD);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].payout_id(), "bc1qdev");
         assert_eq!(out[1].payout_id(), "bc1qminer");
@@ -1801,11 +1873,11 @@ mod solo_split_tests {
     #[test]
     fn an_empty_or_whitespace_dev_address_is_ignored() {
         assert_eq!(
-            solo_payouts("bc1qminer", &fee(Some(""), 1.0), REWARD).len(),
+            solo_payouts(&miner("bc1qminer"), &fee(Some(""), 1.0), REWARD).len(),
             1
         );
         assert_eq!(
-            solo_payouts("bc1qminer", &fee(Some("   "), 1.0), REWARD).len(),
+            solo_payouts(&miner("bc1qminer"), &fee(Some("   "), 1.0), REWARD).len(),
             1
         );
     }
@@ -1813,17 +1885,17 @@ mod solo_split_tests {
     #[test]
     fn an_out_of_range_percent_falls_back_to_the_miner() {
         assert_eq!(
-            solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 101.0), REWARD).len(),
+            solo_payouts(&miner("bc1qminer"), &fee(Some("bc1qdev"), 101.0), REWARD).len(),
             1
         );
         assert_eq!(
-            solo_payouts("bc1qminer", &fee(Some("bc1qdev"), -1.0), REWARD).len(),
+            solo_payouts(&miner("bc1qminer"), &fee(Some("bc1qdev"), -1.0), REWARD).len(),
             1
         );
     }
 
     #[test]
     fn an_empty_miner_address_yields_nothing() {
-        assert!(solo_payouts("", &fee(None, 0.0), REWARD).is_empty());
+        assert!(solo_payouts(&miner(""), &fee(None, 0.0), REWARD).is_empty());
     }
 }
