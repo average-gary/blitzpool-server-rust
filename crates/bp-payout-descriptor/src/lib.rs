@@ -190,6 +190,17 @@ pub enum IntakeError {
     /// rotating identities (`[payout_identity] allow_rotating`, default false).
     #[error("rotating payout identities are not enabled on this pool")]
     FeatureDisabled,
+    /// A stored `miner_identity.descriptor` will not parse or will not derive.
+    /// Distinct from [`Self::PoolDescriptorInvalid`] because the input is a
+    /// database row rather than this module's own template — the operator needs
+    /// to know which one to go and look at.
+    #[error("a stored payout descriptor is unusable")]
+    StoredIdentityUnusable,
+    /// A stored descriptor parses and derives but does **not** hash to the
+    /// `payoutId` it was fetched under. The ledger has been crediting one wallet
+    /// and the row would pay another; see [`rehydrate_stored_identity`].
+    #[error("a stored payout descriptor does not match its payout id")]
+    StoredIdentityMismatch,
 }
 
 /// A validated rotating payout identity: the pool's descriptor around a miner's
@@ -408,6 +419,54 @@ pub fn intake_wire_identity(
         return Err(IntakeError::FeatureDisabled);
     }
     RotatingPayout::from_xpub_str(raw).map(Some)
+}
+
+/// Rebuild a stored rotating identity, and prove it is the one its key names.
+///
+/// The settlement half of intake. A block found at height `H` is booked ~100
+/// blocks later, by which time the in-memory directory may not hold the miner at
+/// all — it is refcounted to *connection* lifetime — so the descriptor comes back
+/// out of `miner_identity` instead. That row is the only place it survives a
+/// restart, and this is the one function that turns it back into something
+/// payable.
+///
+/// **The integrity check is the point, not the parse.** `payout_id` is
+/// `"xpb" + base58(sha256(canonical descriptor))`, so the mapping is
+/// content-addressed and 1:1: a row whose descriptor does not re-hash to the key
+/// it was fetched under is corrupt, and the alternative to noticing is deriving a
+/// payout script for a *different* wallet than the one the ledger has been
+/// crediting. Both halves live here, together, so a caller cannot do the parse
+/// and forget the comparison — which is why this takes the stored key rather than
+/// returning a [`RotatingPayout`] for the caller to check.
+///
+/// It also re-runs [`assert_derivable`]. A stored row predates any change to
+/// those assertions, so a descriptor that was acceptable when it was written is
+/// re-judged by today's rules rather than trusted for having once passed.
+///
+/// The credential rule applies unchanged: no parser text escapes, and an `xprv`
+/// cannot get through — `Descriptor<DescriptorPublicKey>` has nowhere to put a
+/// private key, so `wpkh(xprv…/0/*)` fails the parse rather than being stored and
+/// re-derived. [`IntakeError`] is still `Copy`, which is what keeps a
+/// well-meaning `#[error("… {descriptor}")]` from compiling.
+pub fn rehydrate_stored_identity(
+    payout_id: &str,
+    descriptor: &str,
+) -> Result<RotatingPayout, IntakeError> {
+    // Not `e.to_string()`, for the same reason as everywhere else in this module.
+    let parsed = Descriptor::<DescriptorPublicKey>::from_str(descriptor.trim())
+        .map_err(|_| IntakeError::StoredIdentityUnusable)?;
+    assert_derivable(&parsed)?;
+
+    let canonical = parsed.to_string();
+    let rebuilt = payout_id_for(&canonical);
+    if rebuilt.as_str() != payout_id {
+        return Err(IntakeError::StoredIdentityMismatch);
+    }
+    Ok(RotatingPayout {
+        descriptor: parsed,
+        canonical,
+        payout_id: rebuilt,
+    })
 }
 
 /// The three assertions, in one function, applied to anything derivable.
@@ -905,5 +964,129 @@ mod tests {
             "the descriptor's external chain + wildcard must match {POOL_DERIVATION_PATH_BIP32}"
         );
         assert!(POOL_DERIVATION_PATH_BIP32.ends_with("/0/H"));
+    }
+
+    // ── Rehydration from `miner_identity` (plan Phase 4a) ──────────────
+
+    /// A stored row round-trips to the identity that wrote it, and derives the
+    /// same script.
+    ///
+    /// The script assertion is the one that matters. Comparing `payout_id`s only
+    /// proves the hash agrees with itself; comparing the derived script at a
+    /// height proves the *rehydrated descriptor pays where the coinbase paid*,
+    /// which is the only thing settlement needs from this function.
+    #[test]
+    fn a_stored_identity_rehydrates_to_the_same_payouts() {
+        let original = RotatingPayout::from_xpub_str(XPUB).expect("intake");
+        let rebuilt = rehydrate_stored_identity(
+            original.payout_id().as_str(),
+            original.canonical_descriptor(),
+        )
+        .expect("rehydrate");
+
+        assert_eq!(rebuilt.payout_id(), original.payout_id());
+        assert_eq!(
+            rebuilt.canonical_descriptor(),
+            original.canonical_descriptor()
+        );
+        for height in [0u32, 1, 840_000, 2_099_999] {
+            assert_eq!(
+                rebuilt.script_at(height).expect("rebuilt derives"),
+                original.script_at(height).expect("original derives"),
+                "rehydrated identity must pay the same script at {height}"
+            );
+        }
+    }
+
+    /// **The negative control for the integrity check**, and the reason
+    /// [`rehydrate_stored_identity`] takes the key instead of returning the
+    /// identity for the caller to compare.
+    ///
+    /// A row that pairs one miner's `payoutId` with another miner's descriptor is
+    /// exactly the corruption that would pay wallet B while the ledger credits
+    /// wallet A. Both descriptors here are individually valid and individually
+    /// derivable, so nothing but the hash comparison can tell them apart —
+    /// delete that comparison and this test is the only thing in the workspace
+    /// that fails.
+    #[test]
+    fn a_stored_descriptor_paired_with_another_miners_key_is_refused() {
+        let mine = RotatingPayout::from_xpub_str(XPUB).expect("intake");
+        // A second, real, distinct xpub — the same one `payout_identities.rs`
+        // uses as `XPUB_B`. Fabricating one does not work: base58 is checksummed,
+        // so an invented string is refused as `NotAnXpub` and the test would
+        // "pass" on the wrong refusal.
+        let theirs = RotatingPayout::from_xpub_str(
+            "xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB",
+        )
+        .expect("a second valid xpub");
+        assert_ne!(
+            mine.payout_id(),
+            theirs.payout_id(),
+            "precondition: the two identities must differ"
+        );
+
+        let err =
+            rehydrate_stored_identity(mine.payout_id().as_str(), theirs.canonical_descriptor())
+                .expect_err("a mismatched pair must be refused");
+        assert_eq!(err, IntakeError::StoredIdentityMismatch);
+    }
+
+    /// The assertions are re-run on the way back in, not assumed from the fact
+    /// that the row exists.
+    ///
+    /// A hardened descriptor is the one that *panics* at derivation
+    /// (`a_hardened_descriptor_panics_at_derivation`), so a stored row is the one
+    /// place it could reach coinbase assembly without passing intake — a direct
+    /// `INSERT`, or a row written before the assertion existed.
+    #[test]
+    fn a_stored_descriptor_is_re_judged_by_todays_assertions() {
+        let hardened = spell(XPUB).replace("/0/*", "/0h/*");
+        let parsed =
+            Descriptor::<DescriptorPublicKey>::from_str(&hardened).expect("hardened parses");
+        let key = payout_id_for(&parsed.to_string());
+
+        // Precondition: the pairing is internally consistent, so ONLY the
+        // assertion can refuse it.
+        let err = rehydrate_stored_identity(key.as_str(), &hardened)
+            .expect_err("a hardened stored descriptor must be refused");
+        assert_eq!(err, IntakeError::HardenedStepRejected);
+    }
+
+    /// An `xprv` cannot survive a round-trip through the store, and the refusal
+    /// still says nothing about it.
+    ///
+    /// `Descriptor<DescriptorPublicKey>` has nowhere to put a private key, so
+    /// this is refused by the type rather than by a check someone could delete.
+    /// Asserted anyway: the guarantee is worth a test that fails loudly if a
+    /// future `Descriptor<DescriptorSecretKey>` ever becomes the parse target.
+    #[test]
+    fn a_stored_xprv_descriptor_is_refused_without_describing_it() {
+        let leaky = spell(XPRV);
+        let err = rehydrate_stored_identity("xpbwhatever", &leaky)
+            .expect_err("an xprv descriptor must be refused");
+        assert_eq!(err, IntakeError::StoredIdentityUnusable);
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(XPRV) && !rendered.contains(&XPRV[..16]),
+            "the refusal must not echo the key: {rendered}"
+        );
+    }
+
+    /// Garbage in the column is refused as `StoredIdentityUnusable`, distinctly
+    /// from the pool's own template being broken.
+    ///
+    /// The distinction is operational: `PoolDescriptorInvalid` means go and look
+    /// at [`POOL_DESCRIPTOR_TEMPLATE`], this means go and look at a row.
+    #[test]
+    fn stored_garbage_is_refused_as_a_row_problem() {
+        for raw in ["", "   ", "wpkh(", "not-a-descriptor", XPUB] {
+            let err =
+                rehydrate_stored_identity("xpbwhatever", raw).expect_err("{raw:?} must be refused");
+            assert_eq!(
+                err,
+                IntakeError::StoredIdentityUnusable,
+                "{raw:?} must be refused as a row problem"
+            );
+        }
     }
 }

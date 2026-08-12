@@ -203,6 +203,48 @@ pub(crate) async fn spawn(
     };
     let session_persistence_hook = session_persistence.session_persistence_hook();
 
+    // **Settlement attribution, installed once, for every mode that settles.**
+    //
+    // Built here because this is the only place holding all three inputs a
+    // settlement needs: the network (rendering `bcrt1…` vs `bc1…`), the identity
+    // sources (the directory above + the Postgres pool), and — via the engine
+    // that calls it — the found block's height.
+    //
+    // All four modes, since `CLAUDE.md` asks for the other two whenever one is
+    // touched:
+    //
+    // - **PPLNS** and **Group-Solo** settle a distribution against the block's
+    //   own coinbase, so both must map a ledger key to the address that coinbase
+    //   actually paid. They get the SAME resolver instance — two would be two
+    //   answers to one question, and the `payout_id`-keyed history rows they
+    //   write are read together.
+    // - **Solo** keeps no ledger: the coinbase pays the finder directly and there
+    //   is no per-address settlement to attribute.
+    // - **Blockparty** identities are operator-entered addresses that never
+    //   rotate, and its resolver refuses a rotating one outright rather than
+    //   acquiring an opinion about it (see `payout_resolver::entries_to_payouts`).
+    //
+    // Installed unconditionally rather than under `has_role(Payout)`: a
+    // read-only engine never reaches settlement, so the install is inert there,
+    // whereas gating it would make "can this process attribute a payout" a
+    // second, role-shaped answer to the question above.
+    let paid_addresses: Arc<dyn bp_coinbase_snapshot::PaidAddressResolver> =
+        Arc::new(crate::payout_identities::PoolPaidAddresses::new(
+            payout_identities.clone(),
+            handles.db.pool().clone(),
+            crate::stratum_v2::config_network_to_bitcoin(cfg.network),
+        ));
+    if let Some(engine) = pplns.as_ref() {
+        // False only if something installed one first, which nothing does — the
+        // engines are constructed above and handed out below.
+        if !engine.install_paid_address_resolver(paid_addresses.clone()) {
+            warn!("pplns: a paid-address resolver was already installed; keeping the first");
+        }
+    }
+    if !group_solo.install_paid_address_resolver(paid_addresses) {
+        warn!("group-solo: a paid-address resolver was already installed; keeping the first");
+    }
+
     info!(
         pplns_enabled = pplns.is_some(),
         read_only,

@@ -19,6 +19,7 @@ pub mod actual;
 pub mod budget;
 pub mod build;
 pub mod ledger;
+pub mod paid_at_height;
 pub mod snapshot;
 
 use std::collections::HashMap;
@@ -30,6 +31,9 @@ pub use actual::ActualCoinbase;
 pub use budget::{read_coinbase_budget, write_coinbase_budget};
 pub use build::{build_and_snapshot, BuildRequest, BuiltDistribution};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
+pub use paid_at_height::{
+    PaidAddressResolver, PaidAtHeight, PaidAtHeightError, StaticPaidAddresses,
+};
 pub use snapshot::{
     delete_snapshot, read_weight_snapshot, read_weight_snapshot_with_retry,
     resolve_snapshot_for_block_found, write_weight_snapshot, StoredWeightSnapshot,

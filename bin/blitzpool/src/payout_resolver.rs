@@ -481,7 +481,7 @@ impl ProductionPayoutResolver {
             return self.solo_split(miner_address, reward_sats);
         };
         match svc.build_payouts(group_id, Sats(reward_sats as i64)).await {
-            Ok(Some(result)) => entries_to_payouts(&result.payouts),
+            Ok(Some(result)) => entries_to_payouts(&result.payouts, &self.identities),
             Ok(None) => {
                 warn!(
                     miner_address,
@@ -951,11 +951,33 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
 /// Carries the EXACT per-output sats the distributor computed (largest-remainder
 /// residuum, fixed finder bonus, solvency cap) — the coinbase builder places
 /// them verbatim, never re-deriving from a percentage.
-fn entries_to_payouts(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutEntry> {
-    entries
-        .iter()
-        .map(|e| {
-            PayoutEntry::static_address(
+///
+/// **Blockparty only, and it REFUSES a rotating identity.** Not an omission — a
+/// decision, and the same one `jdp_distribution_for` writes as an explicit
+/// `Nothing` arm rather than a fall-through. A Blockparty group is a rental: its
+/// members are enrolled by an admin into `blockparty_member`, out of band, and
+/// the hashing device never presents an identity for them. There is no
+/// channel-open at which a member could supply a descriptor, so a `Rotating` here
+/// means a member address collided with a published `payout_id` — a bug, not a
+/// miner to pay.
+///
+/// The refusal is an empty list, which is `ResolvedPayouts::none()` — the pool's
+/// existing "serve no job" answer. Deliberately NOT a fall-through to
+/// `solo_split`: that pays this block's whole reward to the connecting miner and
+/// nothing to the group, which is the wrong money rather than no money. And
+/// deliberately not "skip that one entry": the remaining percentages would no
+/// longer sum to the group's split, so the coinbase would silently pay a
+/// distribution no admin ever configured.
+fn entries_to_payouts(
+    entries: &[CoinbaseDistributionEntry],
+    identities: &PayoutIdentityDirectory,
+) -> Vec<PayoutEntry> {
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        // `match`, not `is_some()` on a descriptor: the refusal has to be an arm
+        // the compiler can see, per `CLAUDE.md`.
+        match identities.identity_for(e.address.as_str()) {
+            PayoutIdentity::Static { .. } => out.push(PayoutEntry::static_address(
                 e.address.as_str(),
                 // `Sats` is a signed i64; a coinbase output can only ever be a
                 // non-negative amount. Clamp defensively so a
@@ -963,9 +985,20 @@ fn entries_to_payouts(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutEntry>
                 // to ~1.8e19 via `as u64` and blow up the coinbase as
                 // bad-cb-amount.
                 e.sats.0.max(0) as u64,
-            )
-        })
-        .collect()
+            )),
+            PayoutIdentity::Rotating { .. } => {
+                error!(
+                    payout_id = e.address.as_str(),
+                    entries = entries.len(),
+                    "Blockparty distribution contains a ROTATING identity; Blockparty members are \
+                     operator-entered addresses and this mode does not derive scripts — refusing \
+                     the whole distribution and serving NO JOB"
+                );
+                return Vec::new();
+            }
+        }
+    }
+    out
 }
 
 /// Translate a §4 weight-model evaluation (`payout_entries_at`) into coinbase
@@ -1236,12 +1269,16 @@ mod tests {
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
-    #[test]
-    fn entries_to_payouts_carries_exact_sats() {
+    /// A BIP-32 test-vector xpub — a real key with a real checksum, because
+    /// `RotatingPayout::from_xpub_str` refuses anything else and the refusal test
+    /// below would then be asserting against an empty directory.
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+
+    fn blockparty_entries(first: &str) -> Vec<CoinbaseDistributionEntry> {
         use bp_common::Sats;
-        let entries = vec![
+        vec![
             CoinbaseDistributionEntry {
-                address: AddressId::new("bc1qa".to_string()).unwrap(),
+                address: AddressId::new(first.to_string()).unwrap(),
                 percent: 60.0,
                 sats: Sats(60_000_000),
             },
@@ -1250,12 +1287,54 @@ mod tests {
                 percent: 40.0,
                 sats: Sats(40_000_000),
             },
-        ];
-        let payouts = entries_to_payouts(&entries);
+        ]
+    }
+
+    #[test]
+    fn entries_to_payouts_carries_exact_sats() {
+        let entries = blockparty_entries("bc1qa");
+        let payouts = entries_to_payouts(&entries, &PayoutIdentityDirectory::new());
         assert_eq!(payouts.len(), 2);
         assert_eq!(payouts[0].payout_id(), "bc1qa");
         assert_eq!(payouts[0].sats, 60_000_000);
         assert_eq!(payouts[1].payout_id(), "bc1qb");
         assert_eq!(payouts[1].sats, 40_000_000);
+    }
+
+    /// **Blockparty's refusal, and its shape.** A rotating identity among the
+    /// members is a bug — they are operator-entered addresses — so the whole
+    /// distribution is refused rather than the entry skipped: skipping leaves the
+    /// other members' percentages no longer summing to the group's split, which
+    /// pays out a distribution no admin configured.
+    ///
+    /// The test above is this one's negative control, on the same entries: with an
+    /// empty directory the identical list yields both outputs, so the emptiness
+    /// here is the refusal and not a broken fixture.
+    #[test]
+    fn entries_to_payouts_refuses_a_rotating_member_entirely() {
+        let identity = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB)
+            .expect("a BIP-32 vector is a valid xpub")
+            .into_payout_identity();
+        let payout_id = identity.payout_id().to_string();
+        let directory = PayoutIdentityDirectory::new();
+        directory.publish_for_test(identity);
+
+        let entries = blockparty_entries(&payout_id);
+        assert_eq!(
+            entries.len(),
+            2,
+            "the precondition: one rotating member AND one static one"
+        );
+
+        let payouts = entries_to_payouts(&entries, &directory);
+        assert!(
+            payouts.is_empty(),
+            "the static member must go down with it — a partial Blockparty split \
+             is worse than no job: {payouts:?}"
+        );
+        assert!(
+            ResolvedPayouts::unsnapshotted(payouts).is_none(),
+            "and an empty list is exactly the pool's existing serve-no-job answer"
+        );
     }
 }

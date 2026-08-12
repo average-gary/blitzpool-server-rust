@@ -169,11 +169,14 @@ pub(crate) async fn spawn(
     // SV2 hook builders both need it. Two instances would be two verdicts on
     // "is this xpub admissible", and the miner's ledger key would depend on
     // which protocol it spoke. Both write into `engines.payout_identities`, which
-    // is the same directory the resolver reads.
+    // is the same directory the resolver reads — and, through the pool below,
+    // into `miner_identity`, which is what settlement reads ~100 blocks later
+    // when this connection no longer exists.
     let rotating_intake: Arc<dyn bp_common::RotatingIntake> =
         Arc::new(crate::payout_identities::PoolRotatingIntake::new(
             engines.payout_identities.clone(),
             cfg.payout_identity.allow_rotating,
+            foundation.db.pool().clone(),
         ));
 
     // ONE pool-wide MiningJob cache shared across every SV1 AND SV2
