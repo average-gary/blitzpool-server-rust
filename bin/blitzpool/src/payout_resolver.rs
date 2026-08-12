@@ -246,6 +246,24 @@ fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
     }
 }
 
+/// Which accounting a tailored build belongs to.
+///
+/// The kind travels with the build because the caller cannot re-derive it:
+/// Solo and Group-Solo produce different payout vectors for the same one
+/// address, so an owner address alone cannot tell the two apart later.
+///
+/// A named function and not an inline `match`, because it is the second half
+/// of the mode→answer table [`jdp_distribution_for`] starts, and the JDP loop
+/// compares its result against `StreamKind::for_mode` to decide whether an
+/// address's mode moved. A test that restates this mapping instead of calling
+/// it proves nothing about the pair actually agreeing.
+fn accounting_for(tailored: TailoredMode, miner: &AddressId) -> DistributionAccounting {
+    match tailored {
+        TailoredMode::Solo => DistributionAccounting::Solo(miner.clone()),
+        TailoredMode::GroupSolo => DistributionAccounting::GroupSolo(miner.clone()),
+    }
+}
+
 /// Did the build fail because NOTHING in the window holds a share?
 ///
 /// Matched as its own condition because it is the one build failure that
@@ -825,18 +843,26 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
             // different payout vectors for the same address, and the mining
             // side cannot tell them apart from the owner alone.
             Some(b) => TailoredDistribution::Built {
-                accounting: match tailored {
-                    TailoredMode::Solo => DistributionAccounting::Solo(miner_address.clone()),
-                    TailoredMode::GroupSolo => {
-                        DistributionAccounting::GroupSolo(miner_address.clone())
-                    }
-                },
+                accounting: accounting_for(tailored, miner_address),
                 built: Box::new(b),
             },
             // `lower_*` failed (unusable address / weight overflow).
             // Still not the pool-wide distribution's problem.
             None => TailoredDistribution::Unavailable,
         }
+    }
+
+    async fn current_mode(&self, miner_address: &AddressId) -> Option<bp_common::StreamKind> {
+        // The same `lookup_known` [`Self::build_for_miner`] decides from, so
+        // the JDP loop cannot conclude "the mode moved" from a gate reading
+        // the builder would disagree with. `lookup_known` and not
+        // `lookup_mode`: an address with no mining session is undecided, not
+        // Solo, and here that difference is the difference between leaving a
+        // session's plan alone and tearing it up every time a rig blips.
+        bp_stratum_v2::hooks::PayoutResolver::resolve_stream_known(
+            self.resolver.as_ref(),
+            miner_address,
+        )
     }
 
     async fn next_distribution_id(&self) -> Option<u64> {
@@ -978,6 +1004,56 @@ mod tests {
             jdp_distribution_for(Some(MiningMode::Solo)),
             "unknown and Solo must stay distinct answers — collapsing them IS the bug"
         );
+    }
+
+    /// What a mode gets BUILT and what the mode probe REPORTS have to agree,
+    /// for every mode.
+    ///
+    /// Two mappings off the same `MiningMode` reach the JDP loop: the plan
+    /// comes from [`jdp_distribution_for`], the probe answer from
+    /// `StreamKind::for_mode` (via `resolve_stream_known`), and the loop
+    /// compares them through `accounting_matches_stream` to decide whether the
+    /// mode moved. Let those two disagree for any mode and a session correctly
+    /// served would conclude "moved" on every single frame — rebuilding its
+    /// plan, burning a distribution id and pushing a frame, per frame, forever.
+    ///
+    /// So it is pinned here rather than left to the fact that today they
+    /// happen to line up.
+    #[test]
+    fn what_a_mode_is_built_and_what_it_probes_as_are_the_same_answer() {
+        use bp_stratum_v2::bridge::{accounting_matches_stream, DistributionAccounting as Acct};
+        let miner = AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string())
+            .expect("address");
+        for mode in [
+            MiningMode::Pplns,
+            MiningMode::Solo,
+            MiningMode::GroupSolo,
+            MiningMode::Blockparty,
+        ] {
+            let probed = bp_common::StreamKind::for_mode(mode);
+            // The accounting `build_for_miner` stamps onto the entry for this
+            // mode, by calling the same two functions it calls — not by
+            // restating them. Swap the arms inside `accounting_for` and this
+            // test goes red; a restated copy would stay green while every
+            // Group-Solo JDP session got a plan the mining side then refuses.
+            let built = match jdp_distribution_for(Some(mode)) {
+                JdpDistributionFor::PoolWide => Some(Acct::PoolWide),
+                JdpDistributionFor::Tailored(kind) => Some(accounting_for(kind, &miner)),
+                // Nothing is built, so there is nothing for the probe to
+                // disagree with: the session lands in the refused state, whose
+                // retry is time-throttled and never asks about the mode.
+                JdpDistributionFor::Nothing => None,
+                JdpDistributionFor::ModeUnknown => {
+                    panic!("{mode:?} is a known mode; only `None` may answer ModeUnknown")
+                }
+            };
+            let Some(built) = built else { continue };
+            assert!(
+                accounting_matches_stream(&built, probed),
+                "{mode:?} is built as {built:?} but probes as {probed:?} — a session on this \
+                 mode would rebuild its plan on every frame"
+            );
+        }
     }
 
     /// The two tailored modes must not be swapped: each names the builder

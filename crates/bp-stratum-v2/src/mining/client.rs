@@ -2768,14 +2768,16 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // a since-superseded or settlement-invalidated distribution is rejected
     // here exactly as a stale TLV would be.
     //
-    // Inheritance is deliberately narrow — off Solo, and only where §2 lets
-    // this connection use the extension at all. `resolve_distribution_reference`
-    // owns both guards, and the IO layer resolved the acceptance above through
-    // the same call, so the id validated here is the id that was resolved.
+    // Inheritance is narrow in exactly one way — §2 must let this connection
+    // use the extension at all. `resolve_distribution_reference` owns that
+    // guard, and the IO layer resolved the acceptance above through the same
+    // call with the same arguments, so the id validated here is the id that
+    // was resolved. It takes no stream, which is what makes "the same
+    // arguments" something the compiler can hold up: the operand the two
+    // callers used to disagree about no longer exists.
     let distribution_ref = crate::bridge::resolve_distribution_reference(
         input.distribution_id,
         bridge_job,
-        state.stream,
         state
             .negotiated_extensions
             .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
@@ -3033,28 +3035,16 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // both are questions about a mode and neither is checkable on its
             // own. A guard like `if state.stream == Pplns` would be an
             // `if mode ==` in disguise: a stream added later would slip
-            // through it silently. As a pair the match is exhaustive over
-            // `StreamKind`, so a new stream has to be classified rather than
-            // default into being served.
-            //
-            // The entry carries the accounting it was BUILT for, so this is a
-            // direct comparison and not an inference from the owner address.
-            // That distinction is the whole point: a Solo plan and a
-            // Group-Solo plan are both tailored to the same one address, and
-            // an owner check waves the wrong one through — a Solo plan mined
-            // on a Group-Solo stream pays the finder alone instead of
-            // splitting across the group.
+            // through it silently — see `accounting_matches_stream`, which
+            // owns the pair and is shared with the JDP declare path.
             //
             // Reachable, and not exotically. The JDP side picks which plan to
             // build from the mode gate at ALLOCATE time, and a JDC allocates
             // before its mining channel exists (measured: ~8 s, in both JDP
-            // modes), so the gate is empty and answers Solo. Whatever the
-            // address really is, it gets a Solo plan. This match is where that
-            // guess is caught, because the mining side is the one place the
-            // mode is certain — the port has already spoken.
-            //
-            // Every pair is spelled out. A new stream or a new accounting kind
-            // then fails to compile instead of landing in a catch-all.
+            // modes), so the gate may not know the mode yet. This check is
+            // where a plan built against the wrong one is caught, because the
+            // mining side is a place the mode is certain — the port has
+            // already spoken.
             //
             // Against `accounting_stream`, the mode gate's answer for THIS
             // frame, not the template stream frozen at OpenChannel. The JDP
@@ -3062,39 +3052,33 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // against the frozen one, a mode that changed mid-connection
             // would make the pool reject its OWN correct plan — and every
             // code but `stale-chain-tip` sends an SRI jd-client off the pool.
-            use crate::bridge::DistributionAccounting as Acct;
-            match (&entry.accounting, state.accounting_stream) {
-                // The plan and the stream agree: only the address is left.
-                (Acct::Solo(owner), StreamKind::Solo)
-                | (Acct::GroupSolo(owner), StreamKind::GroupSolo) => {
+            if !crate::bridge::accounting_matches_stream(&entry.accounting, state.accounting_stream)
+            {
+                tracing::warn!(
+                    channel_id = input.channel_id,
+                    stream = ?state.accounting_stream,
+                    accounting = ?entry.accounting,
+                    "sv2: custom job references a distribution built for different \
+                     accounting than this connection's — published against a stale or \
+                     unresolved mode; rejecting rather than paying the wrong set of miners"
+                );
+                return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+            }
+            // The accounting fits this connection; only the address is left,
+            // and only a tailored plan names one. A `match` and not
+            // `owner()`-plus-`if`: which accountings name an owner is the
+            // same question `accounting_matches_stream` answers over the
+            // pair, and an `is_some()` on the owner reads like a mode test
+            // while answering a different one.
+            match &entry.accounting {
+                crate::bridge::DistributionAccounting::Solo(owner)
+                | crate::bridge::DistributionAccounting::GroupSolo(owner) => {
                     if channel_addr != owner.as_str() {
                         return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
                     }
                 }
-                // Pool-wide is the PPLNS window's. Without this a Group-Solo
-                // connection could point at it: its blocks would pay the PPLNS
-                // window while its shares kept earning a cut of the group's.
-                (Acct::PoolWide, StreamKind::Pplns) => {}
-
-                (Acct::PoolWide, StreamKind::Solo)
-                | (Acct::PoolWide, StreamKind::GroupSolo)
-                | (Acct::PoolWide, StreamKind::Blockparty)
-                | (Acct::Solo(_), StreamKind::Pplns)
-                | (Acct::Solo(_), StreamKind::GroupSolo)
-                | (Acct::Solo(_), StreamKind::Blockparty)
-                | (Acct::GroupSolo(_), StreamKind::Pplns)
-                | (Acct::GroupSolo(_), StreamKind::Solo)
-                | (Acct::GroupSolo(_), StreamKind::Blockparty) => {
-                    tracing::warn!(
-                        channel_id = input.channel_id,
-                        stream = ?state.accounting_stream,
-                        accounting = ?entry.accounting,
-                        "sv2: custom job references a distribution built for different \
-                         accounting than this connection's — published against a stale or \
-                         unresolved mode; rejecting rather than paying the wrong set of miners"
-                    );
-                    return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
-                }
+                // Pool-wide names nobody — every PPLNS connection shares it.
+                crate::bridge::DistributionAccounting::PoolWide => {}
             }
             let declared: Vec<bitcoin::TxOut> =
                 match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
@@ -7185,19 +7169,32 @@ pub(crate) mod tests {
     /// the test pass for a declaration the JDP path would have classified
     /// `BaseProtocol` and recorded nowhere.
     ///
-    /// Both streams, because they are the two answers
-    /// `resolve_distribution_reference` gives and only one of them used to
-    /// reach this flag: off Solo it inherits the declaration's reference,
-    /// on Solo it deliberately does not. The JDP side makes no such
-    /// distinction, so reading its answer instead of the declaration's own
-    /// field wrote the `blocks_entity` row twice for every Solo JDC.
+    /// Both streams, because the flag must not come out of whichever answer
+    /// `resolve_distribution_reference` happened to give: reading its answer
+    /// instead of the declaration's own field wrote the `blocks_entity` row
+    /// twice for every Solo JDC, back when Solo inherited nothing.
+    ///
+    /// Each stream is given the accounting it is actually on. Pairing a
+    /// pool-wide plan with a Solo connection would be the money case the
+    /// accounting check exists to refuse, not a fixture for this one.
     #[test]
     fn a_declared_distribution_job_is_left_to_the_jdp_path() {
-        for stream in [StreamKind::Pplns, StreamKind::Solo] {
+        for (stream, accounting) in [
+            (
+                StreamKind::Pplns,
+                crate::bridge::DistributionAccounting::PoolWide,
+            ),
+            (
+                StreamKind::Solo,
+                crate::bridge::DistributionAccounting::Solo(
+                    AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
+                ),
+            ),
+        ] {
             let mut s = negotiated_session_with_extended_channel();
             s.set_stream(stream);
             let cid = s.primary_channel.unwrap();
-            let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
+            let entry = distribution_entry(accounting);
             // Declared WITH the conformant coinbase, so the declaration
             // binding and §7.1 both pass and the only variable left is the
             // declaration itself.
@@ -7818,6 +7815,111 @@ pub(crate) mod tests {
         }
     }
 
+    /// The same flip, on a Full-Template job — where the §6 TLV rides on
+    /// `DeclareMiningJob` and the reference is INHERITED from the declaration
+    /// rather than read off this frame.
+    ///
+    /// A separate test because the case above cannot reach this code at all:
+    /// its `distribution_id` is a frame TLV, and `resolve_distribution_
+    /// reference` returns on that before it ever looks at a stream. So the
+    /// operand it is given went unexercised, and the two callers of that
+    /// function drifted apart unnoticed — the IO layer resolving the
+    /// acceptance from `accounting_stream`, the handler judging it by the
+    /// frozen `stream`.
+    ///
+    /// Both directions, because each produced a different wrong answer:
+    /// `custom-jobs-require-solo` for a correct Group-Solo plan (the handler
+    /// saw Solo, inherited nothing, and fell into the base-protocol gate),
+    /// and `stale-payout-distribution` the other way (the handler inherited a
+    /// reference the IO layer had resolved no acceptance for). Both are fatal
+    /// for an SRI jd-client.
+    #[test]
+    fn a_full_template_job_inherits_against_the_live_mode_not_the_frozen_stream() {
+        use crate::bridge::DistributionAccounting as Acct;
+        let me = || AddressId::new(REGTEST_ADDR.to_string()).unwrap();
+
+        // Opened Solo, joined a group. The JDP side has published the
+        // Group-Solo plan the new mode calls for; the template stream is
+        // frozen at Solo and must not be what decides.
+        let mut s = negotiated_session_with_extended_channel();
+        s.set_stream(StreamKind::Solo);
+        s.accounting_stream = StreamKind::GroupSolo;
+        let cid = s.primary_channel.unwrap();
+        let entry = distribution_entry(Acct::GroupSolo(me()));
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let declared = declared_under_distribution(
+            bridge_entry_declaring(
+                Token([1u8; 16]),
+                REGTEST_ADDR,
+                42,
+                &FIXTURE_SCRIPT_SIG_PREFIX,
+                &blob,
+            ),
+            9,
+        );
+        let acc = accepted(entry);
+        let input = custom_job_matching(cid, &declared);
+        assert_eq!(
+            input.distribution_id, None,
+            "a Full-Template JDC puts the TLV on the declare, not here — without that this \
+             test would take the frame-TLV path and prove nothing"
+        );
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&declared)),
+            None,
+            Some(&acc),
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "the pool must not refuse the plan it published for this miner's own mode, got {:?}",
+            out.outbound[0]
+        );
+
+        // The other way: left the group, so the accounting is Solo again while
+        // the template stream is frozen at GroupSolo. The Solo plan its own
+        // mode calls for must be mineable — judged by the frozen stream this
+        // is the pair (Solo, GroupSolo) and refused.
+        let mut s = negotiated_session_with_extended_channel();
+        s.set_stream(StreamKind::GroupSolo);
+        s.accounting_stream = StreamKind::Solo;
+        let cid = s.primary_channel.unwrap();
+        let entry = distribution_entry(Acct::Solo(me()));
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let declared = declared_under_distribution(
+            bridge_entry_declaring(
+                Token([2u8; 16]),
+                REGTEST_ADDR,
+                43,
+                &FIXTURE_SCRIPT_SIG_PREFIX,
+                &blob,
+            ),
+            9,
+        );
+        let acc = accepted(entry);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &custom_job_matching(cid, &declared),
+            Some(&job_ref_for(&declared)),
+            None,
+            Some(&acc),
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "the pool must not refuse the Solo plan of a miner that left its group, got {:?}",
+            out.outbound[0]
+        );
+    }
+
     /// The base-protocol Solo gate reads the same live mode. A JDC on the base
     /// protocol is only served because §6.4.3's one designated output pays the
     /// miner itself, so a self-chosen split can only shortchange itself. The
@@ -8165,27 +8267,34 @@ pub(crate) mod tests {
         }
     }
 
-    /// A Solo stream has always been served a reference-less custom job, and
-    /// this commit must not change that. The inherited reference would drag it
-    /// into the §7.2/§10 acceptance window for the first time — so a pool
-    /// block settling between `DeclareMiningJobSuccess` and this frame, or any
-    /// supersession, would answer `stale-payout-distribution` where the job
-    /// used to be served. Fatal for an SRI jd-client.
+    /// A Solo job that never consulted a payout window must not start failing
+    /// on one — the property the Solo carve-out was reaching for, expressed by
+    /// what the job actually is rather than by which stream it arrived on.
     ///
-    /// The unresolvable acceptance is the point: it is what a settled or
-    /// superseded distribution looks like here.
+    /// "Never consulted" means its DECLARATION referenced nothing
+    /// (`distribution_id: None`, the base-protocol shape). Such a job is
+    /// judged as it always was: the §6.4.3 designated output on the
+    /// allocation, the declaration binding here, and no acceptance window.
+    ///
+    /// The carve-out used to be phrased as "a Solo stream inherits nothing",
+    /// and its fixture declared under a POOL-WIDE plan — which is not a Solo
+    /// job's own plan at all, but the money case in disguise: a connection
+    /// whose accounting flipped to Solo while holding a declaration bound to
+    /// the PPLNS window. See
+    /// `a_flipped_solo_accounting_may_not_mine_a_pool_wide_declaration`.
     #[test]
-    fn a_solo_stream_is_untouched_by_its_declarations_distribution() {
+    fn a_solo_job_that_referenced_nothing_is_untouched_by_the_acceptance_window() {
         let mut s = solo_session_with_extended_channel();
         s.negotiated_extensions
             .push(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
-        let blob = conformant_outputs(&entry, 312_500_000);
-        let declared = declared_under_distribution(
-            bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
-            9,
+        // Declared WITHOUT a distribution reference.
+        let declared =
+            bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &[0x00]);
+        assert_eq!(
+            declared.declared_job.distribution_id, None,
+            "the subject is a declaration that referenced nothing"
         );
         let mut input = custom_job_matching(cid, &declared);
         input.distribution_id = None;
@@ -8205,6 +8314,66 @@ pub(crate) mod tests {
             "a Solo job must not start failing on a window it never consulted, got {:?}",
             out.outbound[0]
         );
+    }
+
+    /// The case the old Solo carve-out let through, and the reason it is gone.
+    ///
+    /// A JDC declares a Full-Template job under the pool-wide (PPLNS) plan —
+    /// its coinbase pays the window. Its address then flips to Solo in the
+    /// mode gate (a second session on the solo port), so `accounting_stream`
+    /// re-resolves to Solo on the next `SetCustomMiningJob`. Dropping the
+    /// inherited reference there sent the job to the base-protocol arm, which
+    /// serves a Solo connection with NO acceptance check and NO §7.1
+    /// recompute: the block pays the PPLNS window on-chain while the booking
+    /// resolves Solo and writes nothing, so the window's claims survive and
+    /// the pool pays them a second time.
+    ///
+    /// Both a live and a withdrawn plan, because only the pair check catches
+    /// the live one — an acceptance test alone would wave it through.
+    #[test]
+    fn a_flipped_solo_accounting_may_not_mine_a_pool_wide_declaration() {
+        for live in [true, false] {
+            let mut s = negotiated_session_with_extended_channel();
+            s.set_stream(StreamKind::Pplns);
+            s.accounting_stream = StreamKind::Solo;
+            let cid = s.primary_channel.unwrap();
+            let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
+            let blob = conformant_outputs(&entry, 312_500_000);
+            let declared = declared_under_distribution(
+                bridge_entry_declaring(
+                    Token([1u8; 16]),
+                    REGTEST_ADDR,
+                    42,
+                    &FIXTURE_SCRIPT_SIG_PREFIX,
+                    &blob,
+                ),
+                9,
+            );
+            let acc = accepted(entry);
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &custom_job_matching(cid, &declared),
+                Some(&job_ref_for(&declared)),
+                None,
+                live.then_some(&acc),
+                1_000,
+            );
+            match &out.outbound[0] {
+                OutboundFrame::SetCustomMiningJobError { error_code, .. } => assert_eq!(
+                    error_code,
+                    if live {
+                        ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH
+                    } else {
+                        ERR_STALE_PAYOUT_DISTRIBUTION
+                    },
+                    "live={live}"
+                ),
+                other => panic!(
+                    "live={live}: a coinbase paying the PPLNS window must not be mined by a \
+                     Solo accounting, got {other:?}"
+                ),
+            }
+        }
     }
 
     /// The mirror of the Solo carve-out: a stream whose shares DO enter shared
