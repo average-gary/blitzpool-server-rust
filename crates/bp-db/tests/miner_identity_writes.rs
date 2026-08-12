@@ -140,15 +140,19 @@ async fn a_rotating_identity_round_trips_with_no_address() {
         "a rotating identity has no fixed address — that is the whole point"
     );
     // The descriptor is 130+ chars and lives in TEXT; only the ledger key is
-    // bound by the 62-char identity shape.
+    // bound by the identity shape. Both widths are read from
+    // `bp_common::MAX_ADDRESS_LEN` rather than written as a literal, because the
+    // number moved once already (62 → 90, `0011_widen_identity_columns.sql`) and
+    // a literal here would have gone on claiming the old one.
     assert!(
-        DESCRIPTOR.len() > 62,
+        DESCRIPTOR.len() > bp_common::MAX_ADDRESS_LEN,
         "precondition: the descriptor must exceed the identity-column width, or \
          this test is not exercising the TEXT column"
     );
     assert!(
-        ROTATING_ID.len() <= 62,
-        "the ledger key must fit varchar(62)"
+        ROTATING_ID.len() <= bp_common::MAX_ADDRESS_LEN,
+        "the ledger key must fit varchar({})",
+        bp_common::MAX_ADDRESS_LEN
     );
 
     let all = find_rotating_identities(&pool).await.expect("bulk read");

@@ -92,15 +92,23 @@ use miniscript::ForEachKey;
 /// `importdescriptors` and `deriveaddresses` want. Both spellings are the same
 /// path and both belong in the miner-facing documentation.
 ///
-/// **P2WPKH and not P2TR, deliberately.** Measured 2026-08-10: a regtest P2TR
-/// address (`bcrt1p…`) is **64 characters** against the 62-character cap in
-/// `bp_common`'s `validate_address_shape` and in all 27 `character varying(62)`
-/// identity columns; mainnet P2TR is exactly 62 with zero spare. P2WPKH is
-/// 42 on mainnet/testnet/signet and 44 on regtest. Choosing P2TR would mean
-/// widening the identity columns first, as its own migration with its own
-/// rollback story — and per `CLAUDE.md` that must not ride along inside a
-/// feature diff. P2WPKH also buys ~39% more outputs from the same weight
-/// budget (124 WU vs 172).
+/// **P2WPKH and not P2TR, deliberately — and one of the two reasons is now
+/// spent.** It was chosen for both:
+///
+/// 1. *Width.* Measured 2026-08-10: a regtest P2TR address (`bcrt1p…`) is 64
+///    characters against what was then a 62-character cap in `bp_common` and in
+///    every identity column. **This reason is gone as of 2026-08-12** —
+///    `bp_common::MAX_ADDRESS_LEN` is 90 and migration
+///    `0011_widen_identity_columns.sql` widened the columns, as its own change
+///    with its own rollback story, exactly as `CLAUDE.md` requires.
+/// 2. *Weight.* A P2WPKH output is 124 WU against P2TR's 172, so the same
+///    coinbase weight budget pays ~39 % more miners. **This reason stands**, and
+///    it is now the whole of the argument.
+///
+/// So P2TR has become *possible* here, not *advisable*: it would cost ~39 % of
+/// the pool's payout capacity per block. And switching is not a config tweak —
+/// see the paragraph below, which applies to a script-type change as much as to
+/// an edit of the derivation path.
 ///
 /// Changing this constant re-homes every future rotating payout. It does NOT
 /// re-home past ones: a `payout_id` is a hash of the descriptor built from this
@@ -125,32 +133,39 @@ pub const POOL_SCRIPT_TYPE: &str = "p2wpkh";
 /// per-output weight and `CLAUDE.md` records that going wrong once.
 pub const POOL_OUTPUT_WEIGHT_WU: usize = 124;
 
-/// Why `payout_id` is base58 and not hex.
+/// Why `payout_id` is base58 and not hex — **and why that is now frozen rather
+/// than merely chosen.**
 ///
 /// A rotating identity needs a stable, height-invariant key for the ledger
 /// (`pplns_balance`, `pplns_payout_history`, `worker_shares_entity`,
-/// `blockparty_member`). Those are 27 `character varying(62)` columns, and
-/// `bp_common`'s `validate_address_shape` caps at 62 characters.
+/// `blockparty_member`). Measured 2026-08-10 over the canonical descriptor
+/// string, against the 62-character cap those columns had at the time:
 ///
-/// Measured 2026-08-10 over the canonical descriptor string:
+/// | encoding            | `payout_id` width | fit 62 | fit 90 |
+/// |---------------------|-------------------|--------|--------|
+/// | sha256 **base58**   | 47                | yes    | yes    |
+/// | ripemd160 base58    | 31                | yes    | yes    |
+/// | sha256 **hex**      | 67                | **no** | yes    |
+/// | ripemd160 hex       | 43                | yes    | yes    |
 ///
-/// | encoding            | width | fits 62 |
-/// |---------------------|-------|---------|
-/// | sha256 **base58**   | 44    | yes     |
-/// | ripemd160 base58    | 28    | yes     |
-/// | sha256 **hex**      | 64    | **no**  |
-/// | ripemd160 hex       | 40    | yes     |
+/// The original reason was the fourth column not existing: hex would have forced
+/// a 29-column migration and base58 would not. **That reason is spent** — the
+/// columns are `varchar(90)` since 2026-08-12
+/// (`0011_widen_identity_columns.sql`), so hex would fit now. The tripwire that
+/// said so was the control assertion in
+/// `payout_id_is_base58_and_fits_the_identity_columns`, and it fired as designed.
 ///
-/// **sha256 + base58 = 44 characters**, so no identity-column migration is
-/// needed. sha256 hex is 64 and would force one across all 27 columns. That is
-/// the entire reason for the encoding: a two-character decision standing between
-/// "no migration" and "migrate 27 columns", and it is written here rather than
-/// only in a commit message because the next person to touch this will be
-/// reaching for `to_string()` on the hash — which is hex.
+/// What replaces it is stronger than the width argument ever was: **a
+/// `payout_id` is content-addressed, so the encoding IS the identity.** Every
+/// ledger row already written names a miner by this spelling. Switching to hex
+/// would not reformat those keys, it would mint different ones and orphan the
+/// balances they hold — the same hazard as editing
+/// [`POOL_DESCRIPTOR_TEMPLATE`], and treated the same way: a migration, never a
+/// cleanup. `payout_id_is_the_documented_spelling` pins the exact string for a
+/// known xpub so a change of encoding, prefix or hash cannot pass quietly.
 ///
-/// sha256 over ripemd160 because 28 characters of ripemd160 buys nothing that
-/// 44 does not: both fit, and the wider hash has no collision story to tell.
-/// Pinned by `payout_id_is_base58_and_fits_the_identity_columns`.
+/// sha256 over ripemd160 was, and remains, that the shorter hash buys nothing:
+/// both fit, and only one has a collision story worth telling.
 const PAYOUT_ID_PREFIX: &str = "xpb";
 
 /// Everything intake can refuse, with **no borrowed input in any variant**.
@@ -259,8 +274,10 @@ impl RotatingPayout {
         })
     }
 
-    /// The height-invariant ledger key. Safe to store in any of the 27
-    /// `character varying(62)` identity columns — see [`PAYOUT_ID_PREFIX`].
+    /// The height-invariant ledger key. Safe to store in any identity column —
+    /// they are `character varying(90)` since
+    /// `0011_widen_identity_columns.sql`, and a `payout_id` is 47 characters.
+    /// See [`PAYOUT_ID_PREFIX`].
     ///
     /// This is **not** a payout script and cannot be spent to. The
     /// `PayoutIdentity` sum type is what keeps that confusion inexpressible:
@@ -365,8 +382,9 @@ impl RotatingPayout {
 /// "this is an address" (the existing static path, unchanged). Getting that
 /// wrong in the permissive direction would turn a typo'd address into a
 /// confusing descriptor error; in the strict direction it would silently send a
-/// real xpub down the address path, where it fails the 62-char shape check with
-/// a message about length.
+/// real xpub down the address path, where it fails the shape check with a message
+/// about length (111 characters against `bp_common::MAX_ADDRESS_LEN`, which is 90
+/// since 2026-08-12 and still nowhere near admitting a key).
 ///
 /// The four prefixes are the mainnet/testnet spellings of a BIP-32 extended
 /// **public** key and the BIP-49/84 variants (`ypub`/`zpub` and their testnet
@@ -512,11 +530,12 @@ pub fn assert_derivable(d: &Descriptor<DescriptorPublicKey>) -> Result<(), Intak
 fn payout_id_for(canonical: &str) -> AddressId {
     let digest = sha256::Hash::hash(canonical.as_bytes());
     let encoded = bitcoin::base58::encode(digest.as_byte_array());
-    // 3 + 43..=44 chars, comfortably inside the 62-char shape; `expect` is the
-    // honest form here because a failure would mean the arithmetic above is
-    // wrong, which `payout_id_is_base58_and_fits_the_identity_columns` pins.
+    // 3 + 43..=44 chars, comfortably inside `bp_common::MAX_ADDRESS_LEN`;
+    // `expect` is the honest form here because a failure would mean the
+    // arithmetic above is wrong, which
+    // `payout_id_is_base58_and_fits_the_identity_columns` pins.
     AddressId::new(format!("{PAYOUT_ID_PREFIX}{encoded}"))
-        .expect("a base58 sha256 digest with a 3-char prefix fits the 62-char identity shape")
+        .expect("a base58 sha256 digest with a 3-char prefix fits the identity shape")
 }
 
 #[cfg(test)]
@@ -725,12 +744,18 @@ mod tests {
 
     // ── payout_id ──────────────────────────────────────────────────────
 
-    /// The encoding decision, pinned: base58 fits the identity columns and hex
-    /// does not.
+    /// The `payout_id` fits every identity column, with room to spare.
     ///
-    /// The hex assertion is the control. Without it this test passes for any
-    /// encoding at all, and the whole point of the decision is that ONE of the
-    /// two choices needs a 27-column migration and the other does not.
+    /// This test used to carry a control asserting that the **hex** spelling of
+    /// the same digest did NOT fit, because that was the entire reason base58 was
+    /// chosen, and it said in as many words: *"if it does, the 62-char cap moved
+    /// and this decision needs revisiting"*. The cap moved on 2026-08-12
+    /// (`0011_widen_identity_columns.sql`), the control fired, and the revisiting
+    /// is recorded at [`PAYOUT_ID_PREFIX`]: the decision stands, on the ground
+    /// that the encoding is now the identity rather than because hex is too wide.
+    ///
+    /// So the width claim keeps only the assertions that are still true, and
+    /// `payout_id_is_the_documented_spelling` carries what the control used to.
     #[test]
     fn payout_id_is_base58_and_fits_the_identity_columns() {
         let p = RotatingPayout::from_xpub_str(XPUB).unwrap();
@@ -738,22 +763,43 @@ mod tests {
 
         assert!(id.starts_with(PAYOUT_ID_PREFIX), "{id} must be greppable");
         assert!(
-            id.len() <= 62,
-            "payout_id is {} chars and the identity columns are varchar(62)",
-            id.len()
+            id.len() <= bp_common::MAX_ADDRESS_LEN,
+            "payout_id is {} chars and the identity columns are varchar({})",
+            id.len(),
+            bp_common::MAX_ADDRESS_LEN
         );
         // It round-trips through the shape gate every ledger column is behind.
         assert!(AddressId::new(id).is_ok());
+    }
 
-        // Control: the hex spelling of the same digest does NOT fit, which is
-        // the entire reason base58 was chosen. `to_string()` on a
-        // `sha256::Hash` is hex, so this is the one keystroke away.
+    /// **The exact spelling of a `payout_id`, for a known xpub.** A golden value,
+    /// because the id is content-addressed: a change of hash, encoding or prefix
+    /// does not reformat the ledger keys already written, it mints different ones
+    /// and orphans the balances the old ones hold.
+    ///
+    /// It replaces the width control that `varchar(90)` retired — same job, and
+    /// it does not depend on any column being narrow. The hex assertion below is
+    /// what makes it bite in the direction that is actually tempting:
+    /// `to_string()` on a `sha256::Hash` is hex, one keystroke from
+    /// `bitcoin::base58::encode`.
+    #[test]
+    fn payout_id_is_the_documented_spelling() {
+        let p = RotatingPayout::from_xpub_str(XPUB).unwrap();
+        assert_eq!(
+            p.payout_id().as_str(),
+            "xpbDvdXsU17hMXJncLySBtpKYsBPNZVX1AZmUcG8ccuQZz9",
+            "the ledger key for the BIP-32 test vector must not move — see \
+             PAYOUT_ID_PREFIX"
+        );
+
         let hex = sha256::Hash::hash(p.canonical_descriptor().as_bytes()).to_string();
-        assert_eq!(hex.len(), 64);
-        assert!(
-            AddressId::new(&hex).is_err(),
-            "precondition: sha256 hex must NOT fit — if it does, the 62-char cap \
-             moved and this decision needs revisiting"
+        assert_eq!(hex.len(), 64, "sha256 hex is 64 chars");
+        assert_ne!(
+            format!("{PAYOUT_ID_PREFIX}{hex}"),
+            p.payout_id().as_str(),
+            "the hex spelling is a DIFFERENT identity for the same wallet, and it \
+             fits the widened columns now — so nothing but this test stops the \
+             switch"
         );
     }
 
@@ -824,12 +870,19 @@ mod tests {
         );
     }
 
-    /// Derived addresses fit the 62-char identity shape on every network — the
-    /// reason the pool path is P2WPKH.
+    /// Derived addresses fit the identity shape on every network.
     ///
-    /// The P2TR control is deliberate: it documents a **pre-existing, latent**
-    /// break (regtest `bcrt1p…` is 64 chars) that this feature must not fix and
-    /// must not walk into. See `POOL_DESCRIPTOR_TEMPLATE`.
+    /// The P2TR block below **used to be the control**: it asserted that the same
+    /// derivation as taproot produces a 64-character `bcrt1p…` against a
+    /// 62-character cap, documenting a pre-existing latent break that this feature
+    /// was not allowed to fix. Phase 5 fixed it separately
+    /// (`0011_widen_identity_columns.sql`, `MAX_ADDRESS_LEN = 90`), so the same
+    /// address is now asserted to *pass* — the break is closed, and this is the
+    /// test that says so rather than a comment claiming it.
+    ///
+    /// Which leaves the pool path on P2WPKH for weight alone — 124 WU against
+    /// P2TR's 172 — pinned by `a_derived_output_weighs_the_documented_wu`, not
+    /// here.
     #[test]
     fn derived_addresses_fit_the_identity_shape_on_every_network() {
         let p = RotatingPayout::from_xpub_str(XPUB).unwrap();
@@ -841,13 +894,15 @@ mod tests {
         ] {
             let a = p.address_at(network, 800_000).unwrap().to_string();
             assert!(
-                a.len() <= 62 && AddressId::new(&a).is_ok(),
+                a.len() <= bp_common::MAX_ADDRESS_LEN && AddressId::new(&a).is_ok(),
                 "{network:?} derived address is {} chars: {a}",
                 a.len()
             );
         }
 
-        // Control: the same path as P2TR would NOT fit on regtest.
+        // The widest address this repo can produce, and the one that did not fit
+        // before Phase 5. Kept as a live assertion because it is the only place a
+        // regtest P2TR address is constructed at all.
         let tr = Descriptor::<DescriptorPublicKey>::from_str(&format!("tr({XPUB}/0/*)")).unwrap();
         let tr_addr = tr
             .at_derivation_index(800_000)
@@ -855,11 +910,12 @@ mod tests {
             .address(Network::Regtest)
             .unwrap()
             .to_string();
-        assert_eq!(
-            tr_addr.len(),
-            64,
-            "precondition: a regtest P2TR address is 64 chars against a 62-char \
-             cap — the latent break that keeps this pool path on P2WPKH"
+        assert_eq!(tr_addr.len(), 64, "a regtest P2TR address is 64 chars");
+        assert!(
+            AddressId::new(&tr_addr).is_ok(),
+            "a regtest P2TR address must fit the identity shape now — it did not \
+             until MAX_ADDRESS_LEN moved to {}",
+            bp_common::MAX_ADDRESS_LEN
         );
     }
 
@@ -926,8 +982,8 @@ mod tests {
 
     /// The look-like test decides which *reporter* an identity gets, so its two
     /// failure directions are both bugs: a real xpub falling through to the
-    /// address path (rejected for its length, 62-char shape), or a typo'd
-    /// address being answered with a descriptor error.
+    /// address path (rejected for its length — 111 chars against the identity
+    /// shape), or a typo'd address being answered with a descriptor error.
     #[test]
     fn looks_like_extended_key_separates_keys_from_addresses() {
         for key in [XPUB, XPRV, &format!("  {XPUB}  ")] {

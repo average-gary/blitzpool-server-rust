@@ -220,20 +220,24 @@ impl Hash for RotatingDescriptor {
 pub enum PayoutIdentity {
     /// A literal Bitcoin address, paid verbatim at every height.
     Static {
-        /// **Not an [`AddressId`], and that is load-bearing.**
+        /// **Not an [`AddressId`], and the reason changed on 2026-08-12.**
         ///
-        /// This is the same unconstrained `String` the coinbase seam carries
-        /// today. Narrowing it to `AddressId` would impose that type's 62-char
-        /// cap here, and a **regtest P2TR address is 64 characters**
-        /// (`bcrt1p` + 1 + 52 + 6; the same formula gives 44 for `bcrt1q`,
-        /// which matches what the node hands the regtests). Several regtests
-        /// pay one today and pass. So the cap is not a latent break at this
-        /// seam — it is a live one, and importing it here would fail passing
-        /// tests inside a refactor that is supposed to change no behaviour.
+        /// It used to be the length: `AddressId` capped at 62 characters, a
+        /// **regtest P2TR address is 64** (`bcrt1p` + 1 + 52 + 6; the same
+        /// formula gives 44 for `bcrt1q`, which is what the node hands the
+        /// regtests), so narrowing this would have failed passing tests. That
+        /// break is fixed — [`crate::MAX_ADDRESS_LEN`] is 90 and migration
+        /// `0011_widen_identity_columns.sql` widened the columns behind it.
         ///
-        /// Widening `AddressId` and the 27 `varchar(62)` columns behind it is
-        /// its own change with its own migration and rollback story. It does
-        /// not ride along in a payout-identity diff.
+        /// What survives is the weaker but still sufficient reason: this is the
+        /// same unconstrained `String` the coinbase seam carries, and
+        /// [`static_address_verbatim`](PayoutIdentity::static_address_verbatim)
+        /// exists to preserve a caller's bytes exactly — the pool's own fee
+        /// address out of config, and the weight-entry lowering, which passes
+        /// through strings that were already validated upstream. Narrowing this
+        /// to `AddressId` would move shape validation onto a seam that
+        /// deliberately does not validate, so it is a separate decision with its
+        /// own argument, not a leftover of the width fix.
         address: String,
     },
     /// An extended public key the pool derives a fresh script from per block.
@@ -281,9 +285,9 @@ impl PayoutIdentity {
     /// `Rotating` those are different values, which is the entire reason this
     /// type is a sum type.
     ///
-    /// Returns `&str` rather than `&AddressId` because the `Static` arm cannot
-    /// hold an `AddressId` — see [`PayoutIdentity::Static::address`]. Narrowing
-    /// it belongs with the 62-char column widening, not here.
+    /// Returns `&str` rather than `&AddressId` because the `Static` arm does not
+    /// hold an `AddressId` — see [`PayoutIdentity::Static::address`] for why
+    /// that is still true now that the 62-char cap is gone.
     pub fn payout_id(&self) -> &str {
         match self {
             PayoutIdentity::Static { address } => address,
@@ -662,13 +666,16 @@ mod tests {
         );
     }
 
-    /// The 62-char cap is a **live** break at this seam, not a latent one.
+    /// A regtest P2TR address is 64 characters and now goes **everywhere**: the
+    /// seam, `AddressId`, and the identity columns behind it.
     ///
-    /// `Static` holds a `String` specifically so this works. If someone
-    /// narrows it to `AddressId`, this test fails and points at the reason
-    /// rather than at four regtests that suddenly stop paying.
+    /// This pair of assertions used to read the other way round — `AddressId`
+    /// rejecting it with `TooLong(64)` as a "negative control" for why `Static`
+    /// holds a `String`. That was the latent break; migration
+    /// `0011_widen_identity_columns.sql` and [`crate::MAX_ADDRESS_LEN`] fixed it,
+    /// and this is the test that would have failed before them.
     #[test]
-    fn a_regtest_p2tr_address_is_64_chars_and_static_carries_it() {
+    fn a_regtest_p2tr_address_is_64_chars_and_fits_everywhere_now() {
         // A real bech32m P2TR on regtest: `bcrt1p` + 52 data + 6 checksum.
         let regtest_p2tr = "bcrt1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusgm2jyk";
         assert_eq!(
@@ -676,31 +683,46 @@ mod tests {
             64,
             "regtest P2TR must be 64 chars for this test to mean anything"
         );
-
-        // The cap this seam must NOT inherit.
-        assert_eq!(
-            AddressId::new(regtest_p2tr),
-            Err(InvalidAddressError::TooLong(64)),
-            "negative control: AddressId rejects it, so carrying one here would break payouts"
+        assert!(
+            regtest_p2tr.len() > 62,
+            "and longer than the old cap, or it proves nothing about the widening"
         );
 
-        // ... and `Static` carries it unharmed.
+        // The cap that used to reject it.
+        assert!(
+            AddressId::new(regtest_p2tr).is_ok(),
+            "the identity columns are varchar(90) and this is the address that \
+             made them move"
+        );
+
+        // ... and `Static` carries it, as it always did.
         let identity = PayoutIdentity::static_address(regtest_p2tr);
         assert_eq!(identity.payout_id(), regtest_p2tr);
     }
 
-    /// `parse_payout_identity` DOES apply the cap, because the sites it
-    /// replaces do. Pinning it so the difference from the seam is deliberate
-    /// and visible rather than an accident of which function was called.
+    /// `parse_payout_identity` applies the cap, and the cap is now 90.
+    ///
+    /// Both directions in one test: the address that used to be refused is
+    /// accepted, and one character past [`crate::MAX_ADDRESS_LEN`] is still
+    /// refused — so this cannot pass by the cap having been removed rather than
+    /// widened.
     #[test]
-    fn parse_applies_the_cap_that_the_coinbase_seam_does_not() {
+    fn parse_applies_the_widened_cap() {
         let regtest_p2tr = "bcrt1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusgm2jyk";
         assert_eq!(
-            parse_payout_identity(regtest_p2tr),
+            parse_payout_identity(regtest_p2tr)
+                .map(|(id, worker)| (id.payout_id().to_string(), worker)),
+            Ok((regtest_p2tr.to_string(), None)),
+            "a regtest taproot payout address parses now"
+        );
+
+        let too_long = "a".repeat(crate::MAX_ADDRESS_LEN + 1);
+        assert_eq!(
+            parse_payout_identity(&too_long),
             Err(IdentityParseError::InvalidAddress(
-                InvalidAddressError::TooLong(64)
+                InvalidAddressError::TooLong(crate::MAX_ADDRESS_LEN + 1)
             )),
-            "intake keeps today's cap; only the coinbase seam is uncapped"
+            "the cap moved; it did not disappear"
         );
     }
 }

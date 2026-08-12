@@ -31,7 +31,7 @@ CREATE TABLE public.address_settings_entity (
     "deletedAt" bigint,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     shares double precision DEFAULT '0'::double precision NOT NULL,
     "bestDifficulty" double precision DEFAULT '0'::real NOT NULL,
     "miscCoinbaseScriptData" character varying,
@@ -47,7 +47,7 @@ CREATE TABLE public.best_difficulty_tracker_entity (
     "deletedAt" bigint,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "bestDifficulty" double precision NOT NULL,
     "lastCheckedAt" bigint NOT NULL
 );
@@ -63,7 +63,7 @@ CREATE TABLE public.blocks_entity (
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     id integer NOT NULL,
     height bigint NOT NULL,
-    "minerAddress" character varying(62) NOT NULL,
+    "minerAddress" character varying(90) NOT NULL,
     worker character varying NOT NULL,
     "sessionId" character varying(8) NOT NULL,
     "blockData" character varying NOT NULL
@@ -99,7 +99,7 @@ CREATE TABLE public.client_difficulty_statistics_entity (
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     id integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "clientName" character varying(64),
     "slotTime" bigint NOT NULL,
     "maxDifficulty" real DEFAULT '0'::real NOT NULL
@@ -134,7 +134,7 @@ CREATE TABLE public.client_entity (
     "deletedAt" bigint,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "clientName" character varying(64) NOT NULL,
     "sessionId" character varying(8) NOT NULL,
     "userAgent" character varying(128),
@@ -156,7 +156,7 @@ CREATE TABLE public.client_rejected_statistics_entity (
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     id integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "time" bigint NOT NULL,
     reason character varying NOT NULL,
     count real DEFAULT '0'::real NOT NULL,
@@ -193,7 +193,7 @@ CREATE TABLE public.client_statistics_entity (
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     id integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "clientName" character varying NOT NULL,
     "sessionId" character varying(8) NOT NULL,
     "time" bigint NOT NULL,
@@ -238,7 +238,7 @@ CREATE TABLE public.external_shares_entity (
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     id integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "clientName" character varying NOT NULL,
     "time" bigint NOT NULL,
     difficulty real NOT NULL,
@@ -325,7 +325,7 @@ CREATE TABLE public.ntfy_subscriptions_entity (
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     id integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     language character varying DEFAULT 'de'::character varying NOT NULL,
     "bestDiffNotificationsEnabled" boolean DEFAULT true NOT NULL,
     "deviceNotificationsEnabled" boolean DEFAULT false NOT NULL,
@@ -461,7 +461,7 @@ ALTER SEQUENCE public.pool_share_statistics_entity_id_seq OWNED BY public.pool_s
 --
 
 CREATE TABLE public.pplns_address_email (
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     email character varying(320) NOT NULL,
     "verifiedAt" bigint,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
@@ -474,7 +474,7 @@ CREATE TABLE public.pplns_address_email (
 --
 
 CREATE TABLE public.pplns_balance (
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "balanceSats" bigint DEFAULT 0 CONSTRAINT "pplns_balance_pendingSats_not_null" NOT NULL,
     "totalPaidSats" bigint DEFAULT 0 NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
@@ -488,7 +488,7 @@ CREATE TABLE public.pplns_balance (
 
 CREATE TABLE public.pplns_email_verification (
     token character varying(64) NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     email character varying(320) NOT NULL,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "expiresAt" bigint NOT NULL
@@ -500,7 +500,7 @@ CREATE TABLE public.pplns_email_verification (
 --
 
 CREATE TABLE public.pplns_ownership_challenge (
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     message text NOT NULL,
     "createdAt" bigint NOT NULL,
     "expiresAt" bigint NOT NULL,
@@ -513,7 +513,7 @@ CREATE TABLE public.pplns_ownership_challenge (
 --
 
 CREATE TABLE public.pplns_address_ownership (
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     method character varying(16) NOT NULL,
     "scriptType" character varying(16) NOT NULL,
     "verifiedAt" bigint NOT NULL,
@@ -533,7 +533,7 @@ CREATE INDEX IF NOT EXISTS "IDX_pplns_ownership_challenge_expiresAt"
 CREATE TABLE public.pplns_group (
     id uuid NOT NULL,
     name character varying(64) NOT NULL,
-    "creatorAddress" character varying(62) NOT NULL,
+    "creatorAddress" character varying(90) NOT NULL,
     "adminTokenHash" character varying(255) NOT NULL,
     active boolean DEFAULT false NOT NULL,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
@@ -558,7 +558,7 @@ CREATE TABLE public.pplns_group (
 --
 
 CREATE TABLE public.pplns_group_balance (
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "groupId" uuid NOT NULL,
     "pendingSats" bigint DEFAULT 0 NOT NULL,
     "totalPaidSats" bigint DEFAULT 0 NOT NULL,
@@ -575,7 +575,7 @@ CREATE TABLE public.pplns_group_block_history (
     id integer NOT NULL,
     "groupId" uuid NOT NULL,
     "blockHeight" integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "paidSats" bigint DEFAULT 0 NOT NULL,
     percent real DEFAULT 0 NOT NULL,
     "sharesInRound" bigint DEFAULT 0 NOT NULL,
@@ -612,7 +612,7 @@ ALTER SEQUENCE public.pplns_group_block_history_id_seq OWNED BY public.pplns_gro
 CREATE TABLE public.pplns_group_invitation (
     token character varying(64) NOT NULL,
     "groupId" uuid NOT NULL,
-    address character varying(62),
+    address character varying(90),
     email character varying(320),
     status character varying(16) DEFAULT 'pending'::character varying NOT NULL,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
@@ -630,7 +630,7 @@ CREATE TABLE public.pplns_group_invitation (
 CREATE TABLE public.pplns_group_join_request (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     "groupId" uuid NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     email character varying(320) NOT NULL,
     message text,
     status character varying(16) DEFAULT 'pending'::character varying NOT NULL,
@@ -647,7 +647,7 @@ CREATE TABLE public.pplns_group_join_request (
 CREATE TABLE public.pplns_group_member (
     id integer NOT NULL,
     "groupId" uuid NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     role character varying(16) DEFAULT 'member'::character varying NOT NULL,
     "joinedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL
 );
@@ -680,7 +680,7 @@ ALTER SEQUENCE public.pplns_group_member_id_seq OWNED BY public.pplns_group_memb
 CREATE TABLE public.pplns_payout_history (
     id integer NOT NULL,
     "blockHeight" integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "paidSats" bigint DEFAULT 0 NOT NULL,
     percent real DEFAULT 0 NOT NULL,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
@@ -717,7 +717,7 @@ CREATE TABLE public.push_subscription_entity (
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     id integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     endpoint text NOT NULL,
     platform character varying DEFAULT 'unknown'::character varying NOT NULL,
     "lastNotificationAt" bigint,
@@ -769,7 +769,7 @@ CREATE TABLE public.telegram_subscriptions_entity (
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     id integer NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "telegramChatId" bigint NOT NULL,
     "bestDiffNotificationsEnabled" boolean DEFAULT true CONSTRAINT "telegram_subscriptions_enti_bestDiffNotificationsEnabl_not_null" NOT NULL,
     "isDefault" boolean DEFAULT false NOT NULL,
@@ -804,7 +804,7 @@ ALTER SEQUENCE public.telegram_subscriptions_entity_id_seq OWNED BY public.teleg
 --
 
 CREATE TABLE public.worker_shares_entity (
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     "clientName" character varying NOT NULL,
     shares double precision DEFAULT 0 NOT NULL,
     "rejectedShares" double precision DEFAULT 0 NOT NULL
@@ -1504,7 +1504,7 @@ ALTER TABLE ONLY public.pplns_group_invitation
 CREATE TABLE public.blockparty_group (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     name character varying(64) NOT NULL,
-    "adminAddress" character varying(62) NOT NULL,
+    "adminAddress" character varying(90) NOT NULL,
     "adminTokenHash" character varying(64) NOT NULL,
     status character varying(16) DEFAULT 'draft'::character varying NOT NULL,
     "lastShareAt" bigint,
@@ -1517,7 +1517,7 @@ CREATE TABLE public.blockparty_group (
 CREATE TABLE public.blockparty_member (
     id bigint NOT NULL,
     "groupId" uuid NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     email character varying(320) NOT NULL,
     "percentBp" integer NOT NULL,
     role character varying(16) DEFAULT 'member'::character varying NOT NULL,
@@ -1540,7 +1540,7 @@ ALTER TABLE ONLY public.blockparty_member ALTER COLUMN id SET DEFAULT nextval('p
 CREATE TABLE public.blockparty_invitation (
     token character varying(64) NOT NULL,
     "groupId" uuid NOT NULL,
-    address character varying(62) NOT NULL,
+    address character varying(90) NOT NULL,
     email character varying(320) NOT NULL,
     status character varying(16) DEFAULT 'pending'::character varying NOT NULL,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
@@ -1653,14 +1653,18 @@ CREATE INDEX redis_state_backup_captured_at_idx ON public.redis_state_backup USI
 -- Payout identity: one row per miner, either a fixed address ('static') or a
 -- rotating xpub-derived descriptor ('rotating'). The database half of
 -- `bp_common::PayoutIdentity`. See crates/bp-db/migrations/0010_add_miner_identity.sql
--- for the full reasoning, including why there is no `addr(<address>)` sentinel
--- and why the ledger key is base58 (hex would not fit varchar(62)).
+-- for the full reasoning, including why there is no `addr(<address>)` sentinel.
+-- The ledger key is base58: hex would not have fit the varchar(62) these columns
+-- were when 0010 was written, and it is frozen there now for a better reason —
+-- a payout_id is content-addressed, so changing the encoding orphans every
+-- balance already keyed by it. 0011_widen_identity_columns.sql took every
+-- identity column to varchar(90); see it for why 90.
 --
 
 CREATE TABLE public.miner_identity (
-    "payoutId" character varying(62) NOT NULL,
+    "payoutId" character varying(90) NOT NULL,
     kind character varying(16) NOT NULL,
-    address character varying(62),
+    address character varying(90),
     descriptor text,
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,

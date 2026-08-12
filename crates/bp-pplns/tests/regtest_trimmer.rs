@@ -87,7 +87,11 @@ const BUDGET: u32 = 50_000;
 /// budget.
 ///
 /// **Mainnet HRP** (not regtest): regtest P2TR addresses are 64 chars
-/// long, which exceeds `AddressId`'s 62-char DB-column limit. P2WPKH +
+/// long, which exceeded `AddressId`'s DB-column limit when this was written.
+/// That limit is 90 since `0011_widen_identity_columns.sql`, so a regtest HRP
+/// would work here now — the mainnet spelling is kept because switching it
+/// would change the scripts this test's expectations were measured against, and
+/// it buys nothing. P2WPKH +
 /// P2TR scripts are network-independent (`OP_0 <hash>` / `OP_1 <xonly>`,
 /// no hrp encoded in the script bytes), so bitcoin-core regtest
 /// validates them identically to mainnet scripts. The mining-job
