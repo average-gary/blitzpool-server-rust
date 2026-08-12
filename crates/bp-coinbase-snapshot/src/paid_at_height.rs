@@ -58,8 +58,9 @@
 //! payout under `bp_payout_descriptor::POOL_DESCRIPTOR_TEMPLATE` is P2WPKH and
 //! always renders. This is declined rather than overlooked — see the plan.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 use bitcoin::{Address, Network, Script};
 use bp_common::PayoutIdentity;
@@ -331,7 +332,17 @@ impl PaidAtHeight {
     }
 }
 
-/// Turns a distribution's ledger keys into the addresses this block paid them.
+/// **Who is behind a ledger key** — asked twice per block, from the two ends of
+/// the split, through one trait.
+///
+/// | Asked | By | When | An unanswerable key |
+/// |---|---|---|---|
+/// | [`Self::paid_at_height`] | settlement | ~100 blocks after the block was found | is an **error**: booking the rest credits that miner its whole claim on top of what the coinbase already paid it |
+/// | [`Self::derived_payout_keys`] | the distribution build, before the coinbase | seconds before a template goes out | is **absent from the answer**, so the row is dropped as it is today |
+///
+/// The two differ on purpose and the reason is the retry: a settlement is
+/// re-attempted every tick until it succeeds, and a job is not. See
+/// [`Self::derived_payout_keys`].
 ///
 /// **Why this is injected rather than passed in.** Both engines read their own
 /// weight snapshot when the block-found event did not carry one — the
@@ -343,9 +354,11 @@ impl PaidAtHeight {
 ///
 /// One trait, one production implementation, used by PPLNS and Group-Solo alike
 /// — the seam doc at `payout_resolver.rs` exists because this translation was
-/// written twice before.
+/// written twice before. Both questions live on it for the same reason: two
+/// traits would be two answers to "is this key a rotating identity", and the
+/// filter that drops a row and the settlement that books it must not disagree.
 #[async_trait::async_trait]
-pub trait PaidAddressResolver: fmt::Debug + Send + Sync {
+pub trait PayoutIdentityResolver: fmt::Debug + Send + Sync {
     /// Resolve every one of `ledger_keys` for the block at `height`.
     ///
     /// Must be **total**: the returned map has to answer for every key it was
@@ -357,6 +370,37 @@ pub trait PaidAddressResolver: fmt::Debug + Send + Sync {
         ledger_keys: &[String],
         height: u32,
     ) -> Result<PaidAtHeight, PaidAtHeightError>;
+
+    /// Which of `ledger_keys` are paid by a **derived** script rather than by
+    /// being an address — and, by returning them, that the coinbase can pay them.
+    ///
+    /// The distribution build gates on this (plan Decision 8 part 2, Amendment
+    /// 2). It is a set of keys rather than a map of identities because the crate
+    /// that consumes it is `bp-pplns`, the ~2 000-line weight model, which must
+    /// not learn what an xpub is: from there a key in this set means *"payable,
+    /// and its output is a P2WPKH"*, which is everything the filter and the
+    /// weight estimate need.
+    ///
+    /// # Why this cannot fail
+    ///
+    /// There is no `Result`, and that is the decision, not an omission. This runs
+    /// on the job path: the caller is building the template that goes out in the
+    /// next `mining.notify`, and one unpayable entry does not fail one miner — it
+    /// fails `build_payout_outputs`, which fails
+    /// `MiningJobCache::get_or_build(…).ok()?`, which sends **no job to any
+    /// connection sharing this payout set**. For PPLNS that is every miner in the
+    /// pool, on every template, with no log line. So a key this cannot resolve is
+    /// left out and its row is dropped — costing that one miner its share of one
+    /// template — and the implementation logs why. Settlement makes the opposite
+    /// choice ([`PaidAtHeightError::is_terminal`]) because a settlement gets
+    /// another tick and a template does not.
+    ///
+    /// Keys that are already payable addresses do not need to be in here, and
+    /// returning them would not be wrong — the consumer's predicate is
+    /// `is_valid_payout_address(key) || derived.contains(key)`, which fails safe:
+    /// an implementation that answers with an empty set degrades to exactly the
+    /// behaviour this pool had before rotating identities existed.
+    async fn derived_payout_keys(&self, ledger_keys: &[String]) -> HashSet<String>;
 }
 
 /// The resolver for a pool with no rotating identities: every ledger key is the
@@ -377,7 +421,7 @@ pub trait PaidAddressResolver: fmt::Debug + Send + Sync {
 pub struct StaticPaidAddresses;
 
 #[async_trait::async_trait]
-impl PaidAddressResolver for StaticPaidAddresses {
+impl PayoutIdentityResolver for StaticPaidAddresses {
     async fn paid_at_height(
         &self,
         ledger_keys: &[String],
@@ -400,6 +444,84 @@ impl PaidAddressResolver for StaticPaidAddresses {
         // rendered — so any value produces the same map. Passing the real one
         // would mean plumbing it in for nothing.
         PaidAtHeight::resolve(identities.iter(), Network::Bitcoin, height)
+    }
+
+    /// None. This resolver is the "no rotating identities here" answer, so every
+    /// key it is asked about is either an address the distribution build already
+    /// accepts or a key it already drops — which is this pool's behaviour on
+    /// every release before rotation existed, and the behaviour a deployment that
+    /// has not installed the real resolver must keep having.
+    ///
+    /// Note the asymmetry with [`Self::paid_at_height`], which *refuses* a key it
+    /// cannot resolve rather than falling back: there, silence would book a
+    /// rotating miner's claim a second time; here, silence is the status quo.
+    async fn derived_payout_keys(&self, _ledger_keys: &[String]) -> HashSet<String> {
+        HashSet::new()
+    }
+}
+
+/// The one resolver an engine uses — installed once at startup, read from two
+/// places.
+///
+/// # Why this is a type and not two `OnceLock` fields
+///
+/// It already existed twice: both engines held
+/// `OnceLock<Arc<dyn PayoutIdentityResolver>>` and both spelled out the same
+/// default (`match …get() { Some(r) => r.clone(), None => Arc::new(StaticPaidAddresses) }`).
+/// Amendment 2 needs a **third** reader — the distribution builder, which asks
+/// [`PayoutIdentityResolver::derived_payout_keys`] on the job path — and adding
+/// it as another `OnceLock` would have made four copies of "unset means
+/// static-only". That is the drift `CLAUDE.md` opens with, so the rule lives here
+/// once instead.
+///
+/// # Why the two readers must share the handle and not just the rule
+///
+/// The filter that decides a rotating miner's row survives into the coinbase and
+/// the settlement that books what that coinbase paid are answering the same
+/// question about the same key. If the builder read one resolver and settlement
+/// another, a row could be paid by a resolver that knows it and then booked by one
+/// that does not — which is exactly the double-credit
+/// [`PaidAtHeightError::Unresolvable`] exists to refuse. `Clone` here is an
+/// `Arc` clone of the *cell*, so an `install` after the clone is visible to both.
+#[derive(Clone, Default)]
+pub struct InstalledResolver {
+    cell: Arc<OnceLock<Arc<dyn PayoutIdentityResolver>>>,
+}
+
+impl InstalledResolver {
+    /// Install the descriptor-aware resolver. Idempotent-by-refusal: returns
+    /// `false` if one was already installed, and keeps the first.
+    ///
+    /// Refusing rather than replacing is deliberate — a second install would mean
+    /// two answers to "who is behind this ledger key" existed in one process, and
+    /// whichever arrived later would silently win for every future block.
+    pub fn install(&self, resolver: Arc<dyn PayoutIdentityResolver>) -> bool {
+        self.cell.set(resolver).is_ok()
+    }
+
+    /// The installed resolver, or [`StaticPaidAddresses`].
+    ///
+    /// The default is the safe one in both directions: it refuses a `payout_id`
+    /// at settlement (rather than booking a full-claim credit on top of what the
+    /// coinbase paid) and returns no derived keys on the job path (which is
+    /// this pool's behaviour on every release before rotation existed).
+    pub fn get(&self) -> Arc<dyn PayoutIdentityResolver> {
+        match self.cell.get() {
+            Some(resolver) => resolver.clone(),
+            None => Arc::new(StaticPaidAddresses),
+        }
+    }
+}
+
+impl fmt::Debug for InstalledResolver {
+    /// Reports *whether* one is installed, not what it is. The production
+    /// resolver holds the identity directory and hand-writes its own `Debug` so a
+    /// `{:?}` cannot print descriptors; not forwarding here means this type does
+    /// not depend on every future implementation having remembered to.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InstalledResolver")
+            .field("installed", &self.cell.get().is_some())
+            .finish()
     }
 }
 
@@ -614,6 +736,84 @@ mod tests {
             !rendered.contains("wpkh") && !rendered.contains("xpub"),
             "a refusal must not carry descriptor material: {rendered}"
         );
+    }
+
+    /// A resolver that claims every key it is asked about is derived, so an
+    /// installed answer is distinguishable from the default's empty set.
+    #[derive(Debug)]
+    struct EverythingIsDerived;
+
+    #[async_trait::async_trait]
+    impl PayoutIdentityResolver for EverythingIsDerived {
+        async fn paid_at_height(
+            &self,
+            _ledger_keys: &[String],
+            height: u32,
+        ) -> Result<PaidAtHeight, PaidAtHeightError> {
+            Ok(PaidAtHeight::static_only(height))
+        }
+
+        async fn derived_payout_keys(&self, ledger_keys: &[String]) -> HashSet<String> {
+            ledger_keys.iter().cloned().collect()
+        }
+    }
+
+    /// **The load-bearing property of [`InstalledResolver`]:** a clone taken
+    /// *before* the install sees the installed resolver.
+    ///
+    /// This is what lets the distribution builder (job path) and the engine
+    /// (settlement) hold the same handle when the builder is constructed in
+    /// `spawn`, minutes before `bin/blitzpool` installs the real resolver. Both
+    /// directions are asserted in one test: the clone answers the default's empty
+    /// set before, and the installed resolver's full set after, so it cannot pass
+    /// because neither side was ever wired.
+    #[tokio::test]
+    async fn a_clone_taken_before_the_install_sees_it() {
+        let handle = InstalledResolver::default();
+        let taken_early = handle.clone();
+        let keys = vec!["xpbwhoever".to_string()];
+
+        assert!(
+            taken_early
+                .get()
+                .derived_payout_keys(&keys)
+                .await
+                .is_empty(),
+            "before the install, the default answers with no derived keys"
+        );
+
+        assert!(handle.install(Arc::new(EverythingIsDerived)));
+        assert_eq!(
+            taken_early.get().derived_payout_keys(&keys).await.len(),
+            1,
+            "the clone taken before the install must see it"
+        );
+
+        // Idempotent-by-refusal: the second install is rejected and the first kept.
+        assert!(!handle.install(Arc::new(StaticPaidAddresses)));
+        assert_eq!(
+            handle.get().derived_payout_keys(&keys).await.len(),
+            1,
+            "a second install must not replace the first"
+        );
+    }
+
+    /// The default refuses a `payout_id` at settlement — the same guard
+    /// [`StaticPaidAddresses`] carries, reached through the handle, so an engine
+    /// that never had a resolver installed cannot misbook one.
+    #[tokio::test]
+    async fn the_uninstalled_handle_is_the_static_only_refusal() {
+        let payout_id = RotatingPayout::from_xpub_str(XPUB_A)
+            .expect("intake")
+            .payout_id()
+            .as_str()
+            .to_string();
+        let err = InstalledResolver::default()
+            .get()
+            .paid_at_height(std::slice::from_ref(&payout_id), 40)
+            .await
+            .expect_err("an uninstalled handle must refuse a payout_id");
+        assert_eq!(err, PaidAtHeightError::Unresolvable { payout_id });
     }
 
     /// A coinbase paying `script` — behind a pool output, because

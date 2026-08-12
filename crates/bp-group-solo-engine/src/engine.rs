@@ -23,7 +23,7 @@
 //! - `shutdown` — flips the cancel watch so background tasks exit.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use bp_common::{AddressId, InvalidAddressError, Sats};
@@ -173,14 +173,22 @@ struct Inner {
     /// real wall-clock, so this only bounds Redis between reads, never affects
     /// correctness. (An out-of-order older share never lowers the watermark.)
     window_trim_watermark: StdMutex<HashMap<Uuid, i64>>,
-    /// How a distribution's ledger keys become the addresses a block paid them.
+    /// Who is behind a ledger key — read twice per block, from the two ends of
+    /// the split, through **one** handle.
+    ///
+    /// The distribution builder holds a clone of this same
+    /// [`bp_coinbase_snapshot::InstalledResolver`] and asks it which keys are
+    /// rotating before it filters them into the coinbase; settlement asks it which
+    /// address each key was paid under ~100 blocks later. Sharing the handle
+    /// rather than the rule is load-bearing: a row paid by a resolver that knows
+    /// it and then booked by one that does not is a double credit.
     ///
     /// Unset means [`bp_coinbase_snapshot::StaticPaidAddresses`] — correct for a
     /// pool with no rotating identities, and a refusal for any key that is not a
     /// payable address, so leaving it unset can never misbook a `payout_id`.
     /// `bin/blitzpool` installs the descriptor-aware one at startup, the same one
     /// it installs on the PPLNS engine: one resolver, both modes.
-    paid_addresses: OnceLock<Arc<dyn bp_coinbase_snapshot::PaidAddressResolver>>,
+    identity_resolver: bp_coinbase_snapshot::InstalledResolver,
 }
 
 /// Cached payout mode + window length for one group. `window_ms` is 0 for
@@ -293,7 +301,11 @@ impl GroupSoloEngine {
         let config = config.try_new()?;
         let round = GroupRoundStore::new(redis);
         let dist_cfg = DistributionConfig::from_engine_config(&config);
-        let distribution_builder = DistributionBuilder::new(pool.clone(), round.clone(), dist_cfg);
+        // One handle, two readers — the builder's job-path filter and this
+        // engine's settlement. See `Inner::identity_resolver`.
+        let identity_resolver = bp_coinbase_snapshot::InstalledResolver::default();
+        let distribution_builder = DistributionBuilder::new(pool.clone(), round.clone(), dist_cfg)
+            .with_identities(identity_resolver.clone());
         let clock = Arc::new(SystemClock);
         let reset_runner = GroupResetRunner::new(pool.clone(), round.clone(), clock.clone());
 
@@ -331,7 +343,7 @@ impl GroupSoloEngine {
                 cancel_tx,
                 reset_tasks: StdMutex::new(reset_tasks),
                 block_found_in_progress: TokioMutex::new(HashSet::new()),
-                paid_addresses: OnceLock::new(),
+                identity_resolver,
                 mode_cache: StdMutex::new(HashMap::new()),
                 window_trim_watermark: StdMutex::new(HashMap::new()),
             }),
@@ -620,27 +632,29 @@ impl GroupSoloEngine {
         })
     }
 
-    /// Install the descriptor-aware paid-address resolver. Idempotent-by-refusal:
-    /// returns `false` if one was already installed, and keeps the first.
+    /// Install the descriptor-aware payout-identity resolver.
+    /// Idempotent-by-refusal: returns `false` if one was already installed, and
+    /// keeps the first.
     ///
     /// Only `bin/blitzpool` calls this, once, at startup, with the SAME resolver
     /// it installs on the PPLNS engine. Until it does, settlement uses
     /// [`bp_coinbase_snapshot::StaticPaidAddresses`], which refuses a ledger key
     /// that is not a payable address rather than writing a history row against
     /// the wrong one.
-    pub fn install_paid_address_resolver(
+    ///
+    /// This also reaches the **distribution builder**, which shares the handle:
+    /// installing here is what makes a rotating member's row survive into the
+    /// coinbase in the first place. There is nothing to install twice.
+    pub fn install_payout_identity_resolver(
         &self,
-        resolver: Arc<dyn bp_coinbase_snapshot::PaidAddressResolver>,
+        resolver: Arc<dyn bp_coinbase_snapshot::PayoutIdentityResolver>,
     ) -> bool {
-        self.inner.paid_addresses.set(resolver).is_ok()
+        self.inner.identity_resolver.install(resolver)
     }
 
     /// The installed resolver, or the static-only default.
-    fn paid_addresses(&self) -> Arc<dyn bp_coinbase_snapshot::PaidAddressResolver> {
-        match self.inner.paid_addresses.get() {
-            Some(resolver) => resolver.clone(),
-            None => Arc::new(bp_coinbase_snapshot::StaticPaidAddresses),
-        }
+    fn identity_resolver(&self) -> Arc<dyn bp_coinbase_snapshot::PayoutIdentityResolver> {
+        self.inner.identity_resolver.get()
     }
 
     /// Apply a Group-Solo found block: write its payout history from the
@@ -766,7 +780,7 @@ impl GroupSoloEngine {
         let derivation_height = u32::try_from(block_height).unwrap_or(0);
         let ledger_keys: Vec<String> = snapshot.entries.iter().map(|e| e.address.clone()).collect();
         let paid_at = self
-            .paid_addresses()
+            .identity_resolver()
             .paid_at_height(&ledger_keys, derivation_height)
             .await?;
         paid_at.require_height(block_height)?;

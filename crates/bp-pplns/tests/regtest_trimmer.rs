@@ -255,6 +255,8 @@ async fn run_trim_scenario(
         finder_address: None,
         reference_revenue_sats: REGTEST_BLOCK_REWARD_SATS,
         withheld_value: WithheldValue::ToOtherMiners,
+        // Every miner here is a literal regtest address: nothing derived.
+        derived_payout_keys: &std::collections::HashSet::new(),
     })
     .expect("build_weight_distribution");
 

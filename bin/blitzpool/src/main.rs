@@ -970,6 +970,7 @@ async fn main() -> ExitCode {
                         // here would resolve every rotating miner to its
                         // `payout_id` as an address and fail the coinbase.
                         engines.payout_identities.clone(),
+                        crate::stratum_v2::config_network_to_bitcoin(cfg.network),
                     ));
                 // Spawn the JDP template-tx cache when the pool needs the txs
                 // (`jdp_orphan_submitblock` → reconstruct the full block +

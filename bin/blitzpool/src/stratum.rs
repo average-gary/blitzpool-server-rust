@@ -160,6 +160,9 @@ pub(crate) async fn spawn(
         },
         engines.blockparty.clone(),
         engines.payout_identities.clone(),
+        // The renderer's network, so the resolver can ask the renderer's own
+        // payability question before it hands a coinbase a key it cannot pay.
+        crate::stratum_v2::config_network_to_bitcoin(cfg.network),
     ));
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();
     let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = production_resolver;

@@ -422,6 +422,17 @@ pub mod redis_db {
     pub const RT_SPLIT_E2E: u16 = 12 * RANGE;
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
     pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
+    /// `bp-pplns-engine`'s `regtest_rotating_pplns_block` — a rotating miner
+    /// through the whole PPLNS path, twice, so it owns its own range rather
+    /// than sharing a window with a sibling that flushes.
+    ///
+    /// **15 is the last usable base.** `redis_db_in_range` is
+    /// `(base + test_db) % redis_database_count()`, so with `RANGE = 32` a
+    /// sixteenth base would be `16 * 32 = 512`, which folds straight back onto
+    /// `BLITZPOOL_BIN = 0` even on the 512-database container. A new binary
+    /// past this one needs `RANGE` reduced or the container widened — not the
+    /// next multiple.
+    pub const RT_ROTATING_PPLNS_BLOCK: u16 = 15 * RANGE;
 }
 
 /// How many logical databases this Redis actually has.

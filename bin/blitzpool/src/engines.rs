@@ -228,7 +228,7 @@ pub(crate) async fn spawn(
     // read-only engine never reaches settlement, so the install is inert there,
     // whereas gating it would make "can this process attribute a payout" a
     // second, role-shaped answer to the question above.
-    let paid_addresses: Arc<dyn bp_coinbase_snapshot::PaidAddressResolver> =
+    let identity_resolver: Arc<dyn bp_coinbase_snapshot::PayoutIdentityResolver> =
         Arc::new(crate::payout_identities::PoolPaidAddresses::new(
             payout_identities.clone(),
             handles.db.pool().clone(),
@@ -237,11 +237,11 @@ pub(crate) async fn spawn(
     if let Some(engine) = pplns.as_ref() {
         // False only if something installed one first, which nothing does — the
         // engines are constructed above and handed out below.
-        if !engine.install_paid_address_resolver(paid_addresses.clone()) {
+        if !engine.install_payout_identity_resolver(identity_resolver.clone()) {
             warn!("pplns: a paid-address resolver was already installed; keeping the first");
         }
     }
-    if !group_solo.install_paid_address_resolver(paid_addresses) {
+    if !group_solo.install_payout_identity_resolver(identity_resolver) {
         warn!("group-solo: a paid-address resolver was already installed; keeping the first");
     }
 

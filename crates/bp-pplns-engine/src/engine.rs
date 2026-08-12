@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bp_common::{AddressId, InvalidAddressError, Sats};
@@ -62,7 +62,7 @@ use crate::ledger::{
 use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SystemClock};
 use crate::window::{snapshot::StoredWeightSnapshot, NetworkDifficulty, WindowError, WindowStore};
 use bp_coinbase_snapshot::{
-    ActualCoinbase, PaidAddressResolver, PaidAtHeight, PaidAtHeightError, StaticPaidAddresses,
+    ActualCoinbase, InstalledResolver, PaidAtHeight, PaidAtHeightError, PayoutIdentityResolver,
 };
 use bp_share::{block_subsidy_sats, claim_sats};
 
@@ -174,18 +174,27 @@ struct Inner {
     config: PplnsEngineConfig,
     cancel_tx: watch::Sender<bool>,
     block_found_in_progress: AtomicBool,
-    /// How a distribution's ledger keys become the addresses a block paid them.
+    /// Who is behind a ledger key — read twice per block, from the two ends of
+    /// the split, through **one** handle.
     ///
-    /// Unset means [`StaticPaidAddresses`] — correct for a pool with no rotating
+    /// The distribution builder above holds a clone of this same
+    /// [`InstalledResolver`] and asks it which keys are rotating before it filters
+    /// them into the coinbase; settlement asks it which address each key was paid
+    /// under ~100 blocks later. Sharing the handle rather than the rule is
+    /// load-bearing: a row paid by a resolver that knows it and then booked by one
+    /// that does not is the double credit
+    /// [`PaidAtHeightError::Unresolvable`] exists to refuse.
+    ///
+    /// Unset means [`bp_coinbase_snapshot::StaticPaidAddresses`] — correct for a pool with no rotating
     /// identities, and a refusal for any key that is not a payable address, so
     /// leaving it unset can never misbook a `payout_id`. `bin/blitzpool` installs
     /// the descriptor-aware one at startup
-    /// ([`PplnsEngine::install_paid_address_resolver`]).
+    /// ([`PplnsEngine::install_payout_identity_resolver`]).
     ///
-    /// A `OnceLock` rather than a constructor argument because `Inner` lives
+    /// Installed rather than passed to the constructor because `Inner` lives
     /// behind an `Arc` shared by every clone of the handle, and because the
     /// resolver needs the identity directory, which is built after the engines.
-    paid_addresses: OnceLock<Arc<dyn PaidAddressResolver>>,
+    identity_resolver: InstalledResolver,
 }
 
 impl PplnsEngine {
@@ -236,7 +245,11 @@ impl PplnsEngine {
         // is kept current incrementally; there is no periodic full recalc.
         window.bootstrap_window_if_needed().await?;
         let dist_cfg = DistributionConfig::from_engine_config(&config);
-        let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg);
+        // One handle, two readers — the builder's job-path filter and this
+        // engine's settlement. See `Inner::identity_resolver`.
+        let identity_resolver = InstalledResolver::default();
+        let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg)
+            .with_identities(identity_resolver.clone());
         let touch_buffer = Arc::new(TouchBuffer::new());
         let clock = Arc::new(SystemClock);
         let sweep_runner = DustSweepRunner::new(pool.clone(), clock, config.abandoned_balance_days);
@@ -285,7 +298,7 @@ impl PplnsEngine {
                 config,
                 cancel_tx,
                 block_found_in_progress: AtomicBool::new(false),
-                paid_addresses: OnceLock::new(),
+                identity_resolver,
             }),
         })
     }
@@ -409,23 +422,28 @@ impl PplnsEngine {
         .ok_or(EngineError::SnapshotMissingForPayouts)
     }
 
-    /// Install the descriptor-aware paid-address resolver. Idempotent-by-refusal:
-    /// returns `false` if one was already installed, and keeps the first.
+    /// Install the descriptor-aware payout-identity resolver.
+    /// Idempotent-by-refusal: returns `false` if one was already installed, and
+    /// keeps the first.
     ///
     /// Only `bin/blitzpool` calls this, once, at startup — it is the only place
     /// that has the identity directory and the Postgres pool together. Until it
-    /// does, settlement uses [`StaticPaidAddresses`], which refuses any ledger key
+    /// does, settlement uses [`bp_coinbase_snapshot::StaticPaidAddresses`], which refuses any ledger key
     /// that is not a payable address rather than settling one wrongly.
-    pub fn install_paid_address_resolver(&self, resolver: Arc<dyn PaidAddressResolver>) -> bool {
-        self.inner.paid_addresses.set(resolver).is_ok()
+    ///
+    /// This also reaches the **distribution builder**, which shares the handle:
+    /// installing here is what makes a rotating miner's row survive into the
+    /// coinbase in the first place. There is nothing to install twice.
+    pub fn install_payout_identity_resolver(
+        &self,
+        resolver: Arc<dyn PayoutIdentityResolver>,
+    ) -> bool {
+        self.inner.identity_resolver.install(resolver)
     }
 
     /// The installed resolver, or the static-only default.
-    fn paid_addresses(&self) -> Arc<dyn PaidAddressResolver> {
-        match self.inner.paid_addresses.get() {
-            Some(resolver) => resolver.clone(),
-            None => Arc::new(StaticPaidAddresses),
-        }
+    fn identity_resolver(&self) -> Arc<dyn PayoutIdentityResolver> {
+        self.inner.identity_resolver.get()
     }
 
     /// Apply a found block: settle `claim(T_actual) − paid` per address
@@ -537,7 +555,7 @@ impl PplnsEngine {
         // it on the next line rather than letting it settle as height 0.
         let derivation_height = u32::try_from(block_height).unwrap_or(0);
         let paid_at = self
-            .paid_addresses()
+            .identity_resolver()
             .paid_at_height(&Self::ledger_keys(&snapshot), derivation_height)
             .await?;
         paid_at.require_height(block_height)?;

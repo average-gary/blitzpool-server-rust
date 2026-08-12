@@ -708,6 +708,53 @@ pub(crate) fn payout_script(
     }
 }
 
+/// **Can a coinbase pay this identity at all?**
+///
+/// The same question [`payout_script`] answers by succeeding, asked where there
+/// is no height yet: the distribution build, which decides *whose* rows survive
+/// into a snapshot that is height-invariant by construction (Decision 8).
+///
+/// It lives here, three lines from the renderer, because the only failure mode
+/// this predicate has is disagreeing with it — and a disagreement is not a
+/// cosmetic drift:
+///
+/// - says yes, renderer says no ⇒ `build_payout_outputs` fails the whole
+///   coinbase, and `MiningJobCache::get_or_build(…).ok()?` in the SV1 client
+///   turns that into **no `mining.notify` for every connection sharing this
+///   payout set** — all of PPLNS, silently.
+/// - says no, renderer would have said yes ⇒ a miner's row is dropped from the
+///   distribution before the score total is taken, so the other miners are paid
+///   its share. Under PPLNS the dropped miner keeps its ledger balance and the
+///   pool then owes more than the block paid; under Group-Solo there is no
+///   ledger and the loss is permanent.
+///
+/// `a_payable_identity_is_exactly_one_the_renderer_can_render` pins the two
+/// together.
+///
+/// # Why it takes the network and `is_valid_payout_address` does not
+///
+/// `bp_pplns::is_valid_payout_address` is `Address::from_str(…).is_ok()` —
+/// network-agnostic, and its doc says so, on the grounds that a wrong-network
+/// address cannot arrive from the share path. This is the predicate *paired with
+/// the renderer*, and the renderer is `address_to_script(network, …)`, so it has
+/// to ask the same thing the renderer asks or the pin test above is vacuous.
+/// The two therefore differ for exactly one input class — a well-formed address
+/// on another network — and this one is the stricter: it drops that row rather
+/// than letting it abort a block.
+pub fn is_payable_identity(network: Network, identity: &PayoutIdentity) -> bool {
+    match identity {
+        // The renderer's own call, so "payable" cannot mean something else here.
+        PayoutIdentity::Static { address } => address::address_to_script(network, address).is_ok(),
+        // Payability was settled at intake: `bp_payout_descriptor` derives the
+        // descriptor once (`assert_derivable`) before a `RotatingPayout` can
+        // exist, and the wildcard index space it derives over is every height a
+        // block can have. There is no height here to ask about, and inventing one
+        // would make this predicate answer for a block other than the one being
+        // built.
+        PayoutIdentity::Rotating { .. } => true,
+    }
+}
+
 /// The height [`payout_script`] must derive at, for a TDP template.
 ///
 /// **The one implementation of this rule**, called by
@@ -1809,6 +1856,133 @@ mod tests {
             tx.output[2].script_pubkey.to_bytes(),
             vec![0x6a, 0x03, b'P', b'O', b'L']
         );
+    }
+}
+
+#[cfg(test)]
+mod payability_tests {
+    use super::*;
+    use bp_payout_descriptor::RotatingPayout;
+
+    /// A BIP-32 test-vector master public key — published, no funds. A made-up
+    /// string fails `Xpub::from_str`, and every assertion below would then be
+    /// made about an identity that could not be built.
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    /// A real regtest P2WPKH address, per `CLAUDE.md`: `format!("{p}aaa")` would
+    /// make the payable case unpayable and the test would pass on the wrong arm.
+    const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    /// Well-formed, and on the wrong network. The one input class where
+    /// [`is_payable_identity`] and `bp_pplns::is_valid_payout_address` differ.
+    const MAINNET_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+
+    /// Height classes, not a sample: the genesis edge, a halving, a plausible
+    /// current height, and the top of the BIP-32 unhardened index space, which is
+    /// where derivation stops (see
+    /// `the_top_of_the_derivation_range_is_where_the_pair_stops_agreeing`).
+    const HEIGHTS: [u32; 5] = [0, 1, 840_000, 1 << 30, (1 << 31) - 1];
+
+    fn rotating() -> PayoutIdentity {
+        RotatingPayout::from_xpub_str(XPUB)
+            .expect("a BIP-32 vector is a valid xpub")
+            .into_payout_identity()
+    }
+
+    /// **The pin.** `is_payable_identity` is asked at distribution-build time,
+    /// where there is no height; `payout_script` is asked per block. They must
+    /// answer the same question, or the pool either drops a payable miner's row
+    /// or publishes a distribution whose coinbase cannot be built — and the
+    /// second one blanks `mining.notify` for every miner sharing the payout set,
+    /// silently (`MiningJobCache::get_or_build(…).ok()?`).
+    ///
+    /// *Mutation that must fail this:* flip either arm of either `match`.
+    #[test]
+    fn a_payable_identity_is_exactly_one_the_renderer_can_render() {
+        let network = Network::Regtest;
+        let payout_id = RotatingPayout::from_xpub_str(XPUB)
+            .expect("vector")
+            .payout_id()
+            .as_str()
+            .to_string();
+
+        let cases: Vec<(&str, PayoutIdentity)> = vec![
+            (
+                "a literal regtest address",
+                PayoutIdentity::static_address_verbatim(REGTEST_ADDR),
+            ),
+            ("a rotating identity", rotating()),
+            // The Amendment 2 case: a ledger key that reached the coinbase
+            // builder as an address because nothing could resolve it.
+            (
+                "a payout_id in an address field",
+                PayoutIdentity::static_address_verbatim(payout_id),
+            ),
+            (
+                "a mainnet address on regtest",
+                PayoutIdentity::static_address_verbatim(MAINNET_ADDR),
+            ),
+            (
+                "an empty address",
+                PayoutIdentity::static_address_verbatim(""),
+            ),
+            (
+                "a fabricated address",
+                PayoutIdentity::static_address_verbatim("bcrt1qaaa"),
+            ),
+        ];
+
+        let mut payable = 0usize;
+        for (what, identity) in &cases {
+            let predicate = is_payable_identity(network, identity);
+            payable += usize::from(predicate);
+            for height in HEIGHTS {
+                assert_eq!(
+                    predicate,
+                    payout_script(network, identity, height).is_ok(),
+                    "the predicate and the renderer disagree about {what} at height {height}"
+                );
+            }
+        }
+        // The control: without it, `fn is_payable_identity(..) -> bool { false }`
+        // paired with a renderer that always failed would pass the loop above.
+        assert_eq!(
+            payable,
+            2,
+            "exactly the literal address and the rotating identity are payable; \
+             a different count means a case changed arms: {:?}",
+            cases
+                .iter()
+                .map(|(w, i)| (*w, is_payable_identity(network, i)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The one place the pair above is knowingly not equal, recorded rather than
+    /// left for someone to discover: BIP-32 unhardened derivation covers
+    /// `0..2^31`, so a *rotating* identity is payable at every height a chain can
+    /// reach and unrenderable above that. `2^31` blocks is ~40 000 years of
+    /// 10-minute blocks, and `payout_height` cannot produce one — Core's BIP-34
+    /// push is the only source, and a block that high is not a block.
+    ///
+    /// This test exists so the divergence is a *measured* boundary. If a future
+    /// descriptor template derives past it, this fails and the doc on
+    /// `is_payable_identity` gets corrected instead of quietly becoming false.
+    #[test]
+    fn the_top_of_the_derivation_range_is_where_the_pair_stops_agreeing() {
+        let identity = rotating();
+        assert!(is_payable_identity(Network::Regtest, &identity));
+        assert!(
+            payout_script(Network::Regtest, &identity, (1 << 31) - 1).is_ok(),
+            "the whole unhardened range must derive"
+        );
+        assert!(
+            payout_script(Network::Regtest, &identity, 1 << 31).is_err(),
+            "hardened indices are not derivable from an xpub; if this ever \
+             succeeds, is_payable_identity's Rotating arm is no longer bounded \
+             by anything and its doc must say what it is bounded by instead"
+        );
+        // A static identity has no such boundary: the height is unused.
+        let literal = PayoutIdentity::static_address_verbatim(REGTEST_ADDR);
+        assert!(payout_script(Network::Regtest, &literal, u32::MAX).is_ok());
     }
 }
 
