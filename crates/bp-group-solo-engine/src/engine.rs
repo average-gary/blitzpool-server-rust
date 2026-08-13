@@ -119,12 +119,19 @@ impl EngineError {
             | EngineError::SnapshotMissingForPayouts { .. }
             | EngineError::RevenueBelowSubsidy { .. }
             | EngineError::Address(_) => true,
+            // A ledger error is usually infrastructure, but exactly one of
+            // them is a verdict, and `LedgerError` owns that distinction
+            // itself — "kept here rather than in each engine's `is_terminal`
+            // so the two cannot disagree about it", in its own words. So ask
+            // it rather than restating the answer: a height that already
+            // carries a DIFFERENT block's payout rows still carries them on
+            // the next tick.
+            EngineError::Ledger(e) => e.is_terminal(),
             // Infrastructure, and the per-group in-flight guard — all
             // of these clear on their own.
             EngineError::Redis(_)
             | EngineError::Round(_)
             | EngineError::Db(_)
-            | EngineError::Ledger(_)
             | EngineError::Reset(_)
             | EngineError::Distribution(_)
             | EngineError::BlockFoundInProgress { .. } => false,
@@ -986,12 +993,55 @@ mod tests {
         fn _from_round(e: RoundError) -> EngineError {
             EngineError::from(e)
         }
-        fn _from_ledger(e: LedgerError) -> EngineError {
-            EngineError::from(e)
-        }
+        // `_from_ledger` used to sit here and no longer does: the test below
+        // builds `EngineError::from(LedgerError::…)` twice, for real, and
+        // asserts on the result. A never-called inner `fn` was the only
+        // witness available while nothing exercised that conversion at
+        // runtime; next to a test that does, keeping it would read as coverage
+        // while asserting nothing.
         fn _from_reset(e: ResetError) -> EngineError {
             EngineError::from(e)
         }
+    }
+
+    /// The one verdict inside `LedgerError` has to reach the confirmation
+    /// watcher through THIS engine too.
+    ///
+    /// `LedgerError::is_terminal` says in its own doc that it lives in
+    /// `bp-coinbase-snapshot`, rather than in either engine, "so the two cannot
+    /// disagree about it". PPLNS delegates to it; this engine folded
+    /// `Ledger(_)` in with Redis/Round/Db/Reset and answered `false`.
+    ///
+    /// Nothing bounds a `false`. The pending-block hash is written without a
+    /// TTL and the confirmation watcher keeps no attempt count — its only exit
+    /// is `Err(err) if err.is_terminal()`. So the block is re-applied every
+    /// tick forever behind a repeating warning, instead of being parked in the
+    /// unbookable store where an operator reprocess can reach it, which is what
+    /// the variant's own doc asks for.
+    ///
+    /// The `Sqlx` half is the negative control, and pairing them is the point:
+    /// `assert!(terminal)` alone would pass just as happily against an
+    /// `is_terminal` that answered `true` for every ledger error — and that one
+    /// parks a block, and stops paying it, over a transient closed pool.
+    #[test]
+    fn a_height_booked_by_another_block_is_terminal_but_a_db_blip_is_not() {
+        let booked = EngineError::from(LedgerError::HeightBookedByAnotherBlock {
+            block_height: 912_345,
+            booked_rows: 4,
+            incoming_rows: 3,
+        });
+        assert!(
+            booked.is_terminal(),
+            "the rows already booked at that height will not change on the next tick, so this \
+             must park rather than retry: {booked}"
+        );
+
+        let blip = EngineError::from(LedgerError::Sqlx(sqlx::Error::PoolClosed));
+        assert!(
+            !blip.is_terminal(),
+            "a transport failure clears on its own — parking here would strand a block whose \
+             coinbase already paid: {blip}"
+        );
     }
 
     #[test]
