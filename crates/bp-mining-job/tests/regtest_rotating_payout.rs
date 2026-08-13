@@ -148,9 +148,8 @@ async fn a_rotating_identity_is_paid_the_script_core_derives_and_the_block_is_ac
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping rotating-payout regtest — bitcoin-node not found at {} (set \
-             BITCOIN_NODE_PATH to override)",
-            cfg.bitcoin_node_path.display()
+            "skipping rotating-payout regtest — {}",
+            cfg.unavailable_reason()
         );
         return;
     }
@@ -329,9 +328,8 @@ async fn re_mining_a_height_after_an_orphan_pays_the_same_derived_script() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping rotating-payout orphan regtest — bitcoin-node not found at {} (set \
-             BITCOIN_NODE_PATH to override)",
-            cfg.bitcoin_node_path.display()
+            "skipping rotating-payout orphan regtest — {}",
+            cfg.unavailable_reason()
         );
         return;
     }

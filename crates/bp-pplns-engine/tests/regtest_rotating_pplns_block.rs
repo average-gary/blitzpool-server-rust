@@ -145,18 +145,16 @@ async fn a_rotating_pplns_miner_is_paid_the_script_core_derives_and_books_one_le
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
         eprintln!(
-            "skipping rotating-PPLNS regtest — bitcoin-node not found at {} (set \
-             BITCOIN_NODE_PATH to override)",
-            regtest_cfg.bitcoin_node_path.display()
+            "skipping rotating-PPLNS regtest — {}",
+            regtest_cfg.unavailable_reason()
         );
         return;
     }
-    let Some(redis_conn) =
-        connect_redis_in_range_or_skip(
-            bp_test_support::redis_db::RT_ROTATING_PPLNS_BLOCK,
-            REDIS_TEST_DB,
-        )
-            .await
+    let Some(redis_conn) = connect_redis_in_range_or_skip(
+        bp_test_support::redis_db::RT_ROTATING_PPLNS_BLOCK,
+        REDIS_TEST_DB,
+    )
+    .await
     else {
         return;
     };
@@ -704,6 +702,15 @@ fn test_engine_config(fee_addr: &str) -> PplnsEngineConfig {
         fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr valid")),
         fee_percent: 1.5,
         min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
+        // Regtest halves every 150 blocks. The default is the mainnet interval,
+        // under which the engine expects 50 BTC where regtest pays 25 and its
+        // "coinbase pays less than the subsidy" guard REFUSES to book a healthy
+        // block. This fixture books at height ~102 so it passes either way —
+        // which is exactly why it is pinned rather than left to be rediscovered:
+        // upstream 0d93a15 pinned every other booking fixture with the note
+        // "Set here so the next one cannot inherit the trap", and this is the
+        // next one.
+        subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
         ..PplnsEngineConfig::default()
     }
 }
