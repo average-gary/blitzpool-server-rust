@@ -126,12 +126,24 @@ impl EngineError {
             // verdict — one of them (an identity row that has not arrived
             // yet) is deliberately retryable.
             EngineError::PaymentAttribution(e) => e.is_terminal(),
+            // Same shape, same reason: a ledger error is usually
+            // infrastructure, but one of them is a verdict — a height that
+            // already carries a DIFFERENT block's payout rows still carries
+            // them next tick. `LedgerError` owns that distinction precisely
+            // so this engine and PPLNS cannot disagree about it — and they
+            // disagreed anyway for ten days: the commit that hoisted the type
+            // (2026-08-03) wired PPLNS to it and left `Ledger(_)` here in the
+            // infrastructure arm below, answering `false`. Nothing bounds a
+            // `false`: the pending-block hash has no TTL and the watcher keeps
+            // no attempt count, so it is a re-apply every tick forever behind
+            // a repeating warning instead of the park in the unbookable store
+            // the variant's own doc asks for.
+            EngineError::Ledger(e) => e.is_terminal(),
             // Infrastructure, and the per-group in-flight guard — all
             // of these clear on their own.
             EngineError::Redis(_)
             | EngineError::Round(_)
             | EngineError::Db(_)
-            | EngineError::Ledger(_)
             | EngineError::Reset(_)
             | EngineError::Distribution(_)
             | EngineError::BlockFoundInProgress { .. } => false,
@@ -1067,6 +1079,14 @@ const _SHUTDOWN_HOOK_DOC: Duration = Duration::from_secs(0);
 mod tests {
     use super::*;
 
+    /// Compile-only witnesses that each `From` impl exists.
+    ///
+    /// `_from_ledger` used to sit here too and no longer does: the terminal-
+    /// classification test below constructs `EngineError::from(LedgerError::…)`
+    /// twice, for real, and asserts on the result. A never-called inner `fn` was
+    /// the only witness available while nothing exercised that conversion at
+    /// runtime; keeping it now would read as coverage while asserting nothing.
+    /// The other three still have no runtime witness, so they stay.
     #[test]
     fn engine_error_carries_source_variants() {
         fn _from_db(e: DbError) -> EngineError {
@@ -1075,12 +1095,47 @@ mod tests {
         fn _from_round(e: RoundError) -> EngineError {
             EngineError::from(e)
         }
-        fn _from_ledger(e: LedgerError) -> EngineError {
-            EngineError::from(e)
-        }
         fn _from_reset(e: ResetError) -> EngineError {
             EngineError::from(e)
         }
+    }
+
+    /// The one verdict inside `LedgerError` has to reach the confirmation
+    /// watcher through THIS engine too.
+    ///
+    /// `LedgerError::is_terminal` says in its own doc comment that it lives
+    /// there "so the two cannot disagree about it" — and from 2026-08-03, the
+    /// commit that hoisted it, until 2026-08-13 they disagreed anyway: PPLNS
+    /// delegated to it, Group-Solo folded `Ledger(_)` in with the
+    /// infrastructure arm and answered `false`. Nothing bounds a `false`: the
+    /// pending-block hash carries no TTL and the watcher keeps no attempt
+    /// count, so it is a re-apply every tick forever behind a repeating
+    /// warning, never the park in the unbookable store the variant's own doc
+    /// asks for.
+    ///
+    /// The `Sqlx` half is the negative control, and pairing them is the whole
+    /// point: `assert!(terminal)` alone would pass just as happily on an
+    /// `is_terminal` that answered `true` for every ledger error, which parks
+    /// a block — and stops paying it out — over a closed pool.
+    #[test]
+    fn a_height_booked_by_another_block_is_terminal_but_a_db_blip_is_not() {
+        let booked = EngineError::from(LedgerError::HeightBookedByAnotherBlock {
+            block_height: 912_345,
+            booked_rows: 4,
+            incoming_rows: 3,
+        });
+        assert!(
+            booked.is_terminal(),
+            "the rows already booked at that height will not change on the next tick, so this \
+             must park rather than retry: {booked}"
+        );
+
+        let blip = EngineError::from(LedgerError::Sqlx(sqlx::Error::PoolClosed));
+        assert!(
+            !blip.is_terminal(),
+            "a transport failure clears on its own — parking here would strand a block whose \
+             coinbase already paid: {blip}"
+        );
     }
 
     #[test]
