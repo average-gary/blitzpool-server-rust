@@ -13,7 +13,16 @@
 //! are a record of what happened, never an obligation. That is also why
 //! the writer can be plainly idempotent instead of accumulating: a
 //! redelivered block-found must leave the history exactly as the first
-//! delivery did, and the UNIQUE index is enough to guarantee it.
+//! delivery did.
+//!
+//! This used to add "and the UNIQUE index is enough to guarantee it". It is
+//! not, and the reason is in the key: `(groupId, blockHeight, address)` does
+//! not name a block, so the index cannot distinguish a redelivery of the same
+//! block from a different block at the same height, and `ON CONFLICT DO
+//! NOTHING` absorbs both without a word. Idempotency for the first is
+//! genuinely all the index owes; refusing the second is a question about
+//! block identity that no per-row constraint on these columns can answer. See
+//! [`apply_distribution`].
 
 use bp_common::{AddressId, Sats};
 use bp_db::{bulk_insert_pplns_group_block_history, GroupPayoutHistoryInsert};
@@ -26,7 +35,8 @@ use uuid::Uuid;
 // `sharesInRound` fields (see [`AuditRow`]) but the discriminator
 // itself is identical, so we alias the shared enum.
 pub use bp_coinbase_snapshot::{
-    ApplyDistributionResult, LedgerError, PayoutRowType as GroupPayoutRowType,
+    classify_booked_height, ApplyDistributionResult, BookedHeightVerdict, LedgerError,
+    PayoutRowType as GroupPayoutRowType,
 };
 
 /// One row in the payout history. Group-Solo's `sharesInRound` +
@@ -59,9 +69,45 @@ pub fn coinbase_row(
 }
 
 /// Write one block's payout history for one group inside a single PG
-/// transaction. Idempotent on replay via the
-/// `(groupId, blockHeight, address)` UNIQUE constraint: a redelivered
-/// block-found inserts nothing and reports `history_inserted == 0`.
+/// transaction.
+///
+/// Atomically:
+/// 1. Refuse outright if this `(group, height)` already carries a DIFFERENT
+///    block's payout rows — see below.
+/// 2. Insert the audit rows into `pplns_group_block_history`.
+///
+/// **Why step 1 exists, when the UNIQUE constraint already gates replays.**
+/// It gates them per ROW, and the row key is `(groupId, blockHeight, address)`
+/// with no `blockHash` in it. So `ON CONFLICT DO NOTHING` cannot tell a
+/// redelivery of the same block from a second, different block at the same
+/// height, and it absorbs both — reporting `Ok`. For the second case that is
+/// the wrong answer twice over: the addresses the two blocks share keep the
+/// FIRST block's amounts, while any member only the new block pays is inserted
+/// alongside them, so the height ends up holding a row set that reconciles to
+/// neither block. And `history_inserted` is then greater than zero, so it reads
+/// as a successful booking. `LedgerError::HeightBookedByAnotherBlock`'s own doc
+/// describes that shape as the bug it was added to prevent — the confirmation
+/// watcher takes the `Ok`, fires the settlement, logs "payout history applied"
+/// and drops the parked block, and the record of a block whose coinbase really
+/// paid those miners goes with it.
+///
+/// No satoshi is misdirected by this: Group-Solo pays in the coinbase and keeps
+/// no balance table, so unlike PPLNS there is no absolute credit here to
+/// double-apply. What is lost is the record — which is what the members' payout
+/// history is rendered from, and what `bp_db::payout_recorded_at_height` reads
+/// to decide a found block was not missed.
+///
+/// The danger is SEQUENTIAL redelivery, which is what the confirmation watcher
+/// produces when its post-apply `remove_pending_block` fails (its error is
+/// deliberately ignored) or the process dies in that window. Concurrent
+/// duplicates are serialized a level up by `GroupSoloEngine`'s per-group
+/// in-flight guard, which is an in-process `Mutex` — so two processes booking
+/// the same group at once are outside what either that guard or the read below
+/// closes, exactly as for PPLNS.
+///
+/// A replay of the SAME block still passes silently and still reports
+/// `history_inserted == 0`, so callers and tests that relied on plain
+/// idempotency see no change.
 pub async fn apply_distribution(
     pool: &PgPool,
     group_id: Uuid,
@@ -70,6 +116,33 @@ pub async fn apply_distribution(
     now_ms: i64,
 ) -> Result<ApplyDistributionResult, LedgerError> {
     let mut tx = pool.begin().await?;
+
+    // Read inside the transaction that writes, so the gate and the insert
+    // cannot be split by a commit in between.
+    let booked =
+        bp_db::pplns_group_booked_value_rows_at_height(&mut *tx, group_id, block_height).await?;
+    match classify_booked_height(
+        booked,
+        rows.iter().map(|r| (r.address.as_str(), r.paid_sats.0)),
+    ) {
+        BookedHeightVerdict::Fresh => {}
+        BookedHeightVerdict::Replay => {
+            return Ok(ApplyDistributionResult {
+                history_inserted: 0,
+                balances_affected: 0,
+            });
+        }
+        BookedHeightVerdict::Conflict {
+            booked_rows,
+            incoming_rows,
+        } => {
+            return Err(LedgerError::HeightBookedByAnotherBlock {
+                block_height,
+                booked_rows,
+                incoming_rows,
+            });
+        }
+    }
 
     let history_rows: Vec<GroupPayoutHistoryInsert> = rows
         .iter()

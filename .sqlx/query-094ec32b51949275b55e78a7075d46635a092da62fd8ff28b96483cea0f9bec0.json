@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address, \"paidSats\" AS paid_sats\n             FROM pplns_group_block_history\n            WHERE \"groupId\" = $1 AND \"blockHeight\" = $2 AND \"paidSats\" <> 0",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "paid_sats",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "094ec32b51949275b55e78a7075d46635a092da62fd8ff28b96483cea0f9bec0"
+}

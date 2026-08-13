@@ -487,3 +487,211 @@ async fn competing_update(pool: &PgPool, address: &str) -> bool {
     let _ = other.rollback().await;
     got
 }
+
+// ── A DIFFERENT block at an already-booked height ────────────────────
+//
+// `pplns_payout_history` has no `blockHash` column and is UNIQUE on
+// `(blockHeight, address)`, so "this height has rows" conflates a harmless
+// redelivery with a reorg that replaced the booked block. `ON CONFLICT DO
+// NOTHING` cannot tell them apart on its own: it would keep the first block's
+// amounts for every shared address and insert any address only the new block
+// pays, leaving the height holding a set that reconciles to neither — and here,
+// unlike Group-Solo, that is not only a damaged record. PPLNS keeps balances,
+// so the accompanying upsert applies `totalPaidSats` a second time.
+//
+// Both directions are asserted in each test below. A gate that refuses too
+// little books the wrong thing; a gate that refuses too much parks the ordinary
+// redelivery the confirmation watcher produces whenever its post-apply
+// `remove_pending_block` fails, and a real block is then never recorded.
+
+/// Real P2WPKH regtest addresses, checksums verified. Nothing here parses them,
+/// but a fixture that could not survive the renderer has quietly stopped
+/// matching production.
+///
+/// One pair per test, never shared. `pplns_balance` is keyed by address alone —
+/// no height, no block — so two tests in this file that name the same address
+/// are writing to the same row and deleting it out from under each other on
+/// cleanup, whatever heights they use. That is a flake, and it is the reason
+/// the rest of the file partitions by address prefix.
+const COLLIDE_A: &str = "bcrt1qgph8hukx60a8hezl94k25nd4wn85hecek785v7";
+const COLLIDE_B: &str = "bcrt1qlx5arkhdegeuzjjartdc428nur5g49yn4j40ut";
+const LATE_ARRIVER_PAID: &str = "bcrt1qjrum4cf6m8jm0gdtk6dv35xy3q493e5t8qlcsa";
+const LATE_ARRIVER_PENDING: &str = "bcrt1qawrzh064ju8kupx429v5xkkdxny8xcw9ldjjxn";
+
+/// Unlike `apply_in_tx`, this hands the error back instead of unwrapping, and
+/// rolls the transaction back — which is what the engine does, and what makes
+/// the "nothing reached the table" assertions below mean anything.
+async fn try_apply_in_tx(
+    pool: &PgPool,
+    block_height: i32,
+    rows: &[AuditRow],
+    balances: &[BalanceWrite],
+    now_ms: i64,
+) -> Result<ApplyDistributionResult, bp_pplns_engine::ledger::LedgerError> {
+    let mut tx = pool.begin().await.expect("begin");
+    match apply_distribution(&mut tx, block_height, rows, balances, now_ms).await {
+        Ok(out) => {
+            tx.commit().await.expect("commit");
+            Ok(out)
+        }
+        Err(e) => {
+            tx.rollback().await.expect("rollback");
+            Err(e)
+        }
+    }
+}
+
+fn cb(address: &str, sats: i64, percent: f32) -> AuditRow {
+    AuditRow {
+        address: AddressId::new(address).expect("valid address"),
+        paid_sats: Sats(sats),
+        percent,
+        row_type: PayoutRowType::Coinbase,
+    }
+}
+
+fn credit(address: &str, total_paid: i64) -> BalanceWrite {
+    BalanceWrite {
+        address: AddressId::new(address).expect("valid address"),
+        balance_sats: Sats(0),
+        total_paid_sats: Sats(total_paid),
+    }
+}
+
+async fn cleanup_addresses(pool: &PgPool, block_heights: &[i32], addresses: &[&str]) {
+    let owned: Vec<String> = addresses.iter().map(|a| (*a).to_string()).collect();
+    let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = ANY($1)"#)
+        .bind(block_heights)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = ANY($1)")
+        .bind(&owned)
+        .execute(pool)
+        .await;
+}
+
+#[tokio::test]
+async fn a_different_block_at_a_booked_height_is_refused_and_the_balance_is_untouched() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let block_height = 9_998_005;
+    let addrs = [COLLIDE_A, COLLIDE_B];
+    cleanup_addresses(&pool, &[block_height], &addrs).await;
+
+    let block_a = [cb(COLLIDE_A, 300_000, 60.0), cb(COLLIDE_B, 200_000, 40.0)];
+    let bal_a = [credit(COLLIDE_A, 300_000), credit(COLLIDE_B, 200_000)];
+    let first = try_apply_in_tx(&pool, block_height, &block_a, &bal_a, 1)
+        .await
+        .expect("the first apply at a fresh height must succeed");
+    assert_eq!(
+        first.history_inserted, 2,
+        "precondition: block A really booked both rows, or nothing below is \
+         about a booked height"
+    );
+
+    // Direction 1 — ordinary idempotency is untouched.
+    let replay = try_apply_in_tx(&pool, block_height, &block_a, &bal_a, 2)
+        .await
+        .expect("a redelivery of the SAME block must still be Ok, not a conflict");
+    assert_eq!(replay.history_inserted, 0);
+    assert_eq!(
+        replay.balances_affected, 0,
+        "and it must not re-apply the balance"
+    );
+
+    // Direction 2 — a different coinbase at the same height.
+    let block_b = [cb(COLLIDE_A, 250_000, 50.0), cb(COLLIDE_B, 250_000, 50.0)];
+    let bal_b = [credit(COLLIDE_A, 250_000), credit(COLLIDE_B, 250_000)];
+    let err = try_apply_in_tx(&pool, block_height, &block_b, &bal_b, 3)
+        .await
+        .expect_err("a DIFFERENT block at a booked height must be refused, not absorbed");
+    match err {
+        bp_pplns_engine::ledger::LedgerError::HeightBookedByAnotherBlock {
+            block_height: h,
+            booked_rows,
+            incoming_rows,
+        } => {
+            assert_eq!(h, block_height);
+            assert_eq!(booked_rows, 2);
+            assert_eq!(incoming_rows, 2);
+        }
+        other => panic!("wrong error: {other}"),
+    }
+    // The booked rows do not change on a retry, so the refusal has to park the
+    // block rather than make the confirmation watcher — whose only exit for a
+    // failing apply is `is_terminal()` — spin on it every tick.
+    let again = try_apply_in_tx(&pool, block_height, &block_b, &bal_b, 4)
+        .await
+        .expect_err("still refused");
+    assert!(again.is_terminal(), "must park, not retry forever: {again}");
+
+    // Block A's booking is the record, and its credit was applied once.
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT address, "paidSats" FROM pplns_payout_history
+            WHERE "blockHeight" = $1 ORDER BY address"#,
+    )
+    .bind(block_height)
+    .fetch_all(&pool)
+    .await
+    .expect("read history");
+    assert_eq!(
+        rows,
+        vec![
+            (COLLIDE_A.to_string(), 300_000),
+            (COLLIDE_B.to_string(), 200_000)
+        ],
+        "a refused apply must roll back entirely"
+    );
+    let total_paid: (i64,) =
+        sqlx::query_as(r#"SELECT "totalPaidSats" FROM pplns_balance WHERE address = $1"#)
+            .bind(COLLIDE_A)
+            .fetch_one(&pool)
+            .await
+            .expect("read balance");
+    assert_eq!(
+        total_paid.0, 300_000,
+        "the second block must not have added its own credit on top of the \
+         first block's — that is the double-apply this gate prevents"
+    );
+
+    cleanup_addresses(&pool, &[block_height], &addrs).await;
+}
+
+/// A 0-sat `pending` row must not turn a redelivery into a conflict.
+///
+/// PPLNS appends one per address live in the window but absent from the
+/// distribution, and the window moves between delivery attempts — so a single
+/// miner arriving in that gap would otherwise park an ordinary replay and the
+/// block would never be booked. This is why the comparison looks only at
+/// value-bearing rows.
+#[tokio::test]
+async fn a_late_arriver_pending_row_does_not_turn_a_redelivery_into_a_conflict() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let block_height = 9_998_006;
+    let addrs = [LATE_ARRIVER_PAID, LATE_ARRIVER_PENDING];
+    cleanup_addresses(&pool, &[block_height], &addrs).await;
+
+    let first_delivery = [cb(LATE_ARRIVER_PAID, 400_000, 100.0)];
+    let bal = [credit(LATE_ARRIVER_PAID, 400_000)];
+    let first = try_apply_in_tx(&pool, block_height, &first_delivery, &bal, 1)
+        .await
+        .expect("first apply");
+    assert_eq!(first.history_inserted, 1, "precondition");
+
+    let redelivery = [
+        cb(LATE_ARRIVER_PAID, 400_000, 100.0),
+        pending_row(
+            AddressId::new(LATE_ARRIVER_PENDING).expect("valid address"),
+            Sats(0),
+        ),
+    ];
+    let replay = try_apply_in_tx(&pool, block_height, &redelivery, &bal, 2)
+        .await
+        .expect("a row that moves no value cannot make this a different block");
+    assert_eq!(replay.history_inserted, 0);
+
+    cleanup_addresses(&pool, &[block_height], &addrs).await;
+}

@@ -264,6 +264,42 @@ pub async fn find_recent_group_block_history(
 // transaction. There is no balance table behind it — Group-Solo pays
 // what the coinbase pays and owes nothing afterwards.
 
+/// The value-bearing history rows already recorded for one group at one
+/// height, as `(address, paidSats)` — the Group-Solo counterpart of
+/// [`crate::pplns_booked_value_rows_at_height`].
+///
+/// `pplns_group_block_history` has no `blockHash` column and is UNIQUE on
+/// `(groupId, blockHeight, address)`, so a booked block's only identity here is
+/// its height. That makes "does this height already have rows" ambiguous
+/// between a harmless redelivery and a different block, and the two are told
+/// apart by comparing what was booked against what the apply would write — see
+/// `bp_coinbase_snapshot::classify_booked_height`, which both modes call.
+///
+/// `"paidSats" <> 0` because a row is not an accounting: rows that moved no
+/// value must not make one booking look like another. The ordering the
+/// comparison needs is applied in Rust by the classifier rather than requested
+/// here, so the result does not depend on the column's database collation.
+pub async fn pplns_group_booked_value_rows_at_height<'e, E>(
+    executor: E,
+    group_id: Uuid,
+    block_height: i32,
+) -> Result<Vec<(String, i64)>, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let rows = sqlx::query!(
+        r#"SELECT address, "paidSats" AS paid_sats
+             FROM pplns_group_block_history
+            WHERE "groupId" = $1 AND "blockHeight" = $2 AND "paidSats" <> 0"#,
+        group_id,
+        block_height,
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows.into_iter().map(|r| (r.address, r.paid_sats)).collect())
+}
+
 /// Bulk-insert block-history rows for one block-found. `ON CONFLICT
 /// ("groupId", "blockHeight", address) DO NOTHING` gates replays.
 /// `rowType` is the discriminator: `"coinbase"` / `"pending"` /

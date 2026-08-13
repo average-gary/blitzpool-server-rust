@@ -31,7 +31,10 @@ use bp_pplns::CoinbaseDistributionEntry;
 pub use bp_db::TouchUpdate;
 // Shared with Group-Solo — one source of truth for the rowType wire
 // strings + apply-distribution result / error shapes.
-pub use bp_coinbase_snapshot::{ApplyDistributionResult, LedgerError, PayoutRowType};
+pub use bp_coinbase_snapshot::{
+    classify_booked_height, ApplyDistributionResult, BookedHeightVerdict, LedgerError,
+    PayoutRowType,
+};
 
 /// One row in the apply-distribution audit log.
 ///
@@ -143,15 +146,17 @@ pub async fn apply_distribution(
     // replaying moves nothing either way — even for a genuinely different
     // block, because two blocks that pay the same coinbase settle the same
     // deltas and booking them twice would double-apply them.
+    // The comparison itself is `bp_coinbase_snapshot::classify_booked_height`,
+    // which Group-Solo's `apply_distribution` also calls — its history table has
+    // the same height-only identity and needs the same answer, and this used to
+    // be the only copy of it.
     let booked = bp_db::pplns_booked_value_rows_at_height(&mut *tx, block_height).await?;
-    if !booked.is_empty() {
-        let mut want: Vec<(String, i64)> = rows
-            .iter()
-            .filter(|r| r.paid_sats.0 != 0)
-            .map(|r| (r.address.as_str().to_string(), r.paid_sats.0))
-            .collect();
-        want.sort();
-        if booked == want {
+    match classify_booked_height(
+        booked,
+        rows.iter().map(|r| (r.address.as_str(), r.paid_sats.0)),
+    ) {
+        BookedHeightVerdict::Fresh => {}
+        BookedHeightVerdict::Replay => {
             // The ordinary replay: the confirmation watcher's post-apply
             // `remove_pending_block` failed, or the process died in that
             // window. Nothing to do.
@@ -160,11 +165,16 @@ pub async fn apply_distribution(
                 balances_affected: 0,
             });
         }
-        return Err(LedgerError::HeightBookedByAnotherBlock {
-            block_height,
-            booked_rows: booked.len(),
-            incoming_rows: want.len(),
-        });
+        BookedHeightVerdict::Conflict {
+            booked_rows,
+            incoming_rows,
+        } => {
+            return Err(LedgerError::HeightBookedByAnotherBlock {
+                block_height,
+                booked_rows,
+                incoming_rows,
+            });
+        }
     }
 
     let history_rows: Vec<PayoutHistoryInsert> = rows
