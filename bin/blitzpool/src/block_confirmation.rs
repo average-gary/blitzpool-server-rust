@@ -448,6 +448,8 @@ mod declared_block_booking_regtest {
     const DB_GROUP_BOOKS_THE_COINBASE: u8 = 21;
     const DB_GROUP_NO_OVERWRITE: u8 = 22;
     const DB_GROUP_REFUSES_WITHOUT_COINBASE: u8 = 23;
+    const DB_BONUS_BOOKS_THE_COINBASE: u8 = 24;
+    const DB_BONUS_POOL_WIDE: u8 = 25;
 
     /// The production default of `[pplns] confirmation_depth`.
     const DEPTH: u32 = 3;
@@ -457,8 +459,37 @@ mod declared_block_booking_regtest {
     /// ledger against that same coinbase would be a tautology.
     const SHIFT_SATS: u64 = 1_000;
 
+    /// Finder bonus for the two fixtures that run with it on: 20 %.
+    ///
+    /// Not a round number picked for looks — it is the smallest convenient
+    /// value that makes the fixtures' precondition unsatisfiable without the
+    /// bonus. Both name `miners[0]` as finder, and it holds 100 of the 600
+    /// seeded share weight against `miners[1]`'s 200, i.e. 1/6 against 1/3. The
+    /// boost is `S·f/(1−f)`, which lands in the denominator too, so the finder
+    /// ends at `f + (1−f)/6` of the miner pot and the peer at `(1−f)/3`. The
+    /// finder overtakes only for `f > 1/7 ≈ 14.3 %`, so at the 10 % this was
+    /// first written with, "the finder outweighs a miner with twice its shares"
+    /// would have been FALSE with a perfectly working bonus. At 20 % it is
+    /// 33.3 % against 26.7 % — a margin four orders of magnitude clear of the
+    /// couple of sats two floored divisions cost.
+    const BONUS_PPM: u32 = 200_000;
+
+    /// Sats of slack allowed between a recomputed claim and what the coinbase
+    /// paid for the same weight.
+    ///
+    /// They are the same quantity reached two ways — `w·pot/S` at settlement
+    /// against `w·T/W` in the §4 coinbase — so the gap is only the flooring in
+    /// each, plus the floor inside `weight_p`. Measured at 0 sats on this
+    /// fixture; the allowance is for the arithmetic, not for a policy.
+    const LEDGER_ROUNDING_SATS: i64 = 64;
+
     fn engine_config(fee_addr: &str) -> PplnsEngineConfig {
+        engine_config_with_bonus(fee_addr, 0)
+    }
+
+    fn engine_config_with_bonus(fee_addr: &str, finder_bonus_ppm: u32) -> PplnsEngineConfig {
         PplnsEngineConfig {
+            finder_bonus_ppm,
             dust_sweep_enabled: false,
             touch_flush_interval_secs: 3_600,
             fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr")),
@@ -514,6 +545,21 @@ mod declared_block_booking_regtest {
     impl Chain {
         /// `None` ⇒ the caller must return (bitcoin-node / Redis / PG missing).
         async fn setup(redis_db: u8) -> Option<Self> {
+            Self::setup_with_bonus(redis_db, 0).await
+        }
+
+        /// As [`Self::setup`], with a finder bonus configured on the engine and
+        /// the block's finder named to the build.
+        ///
+        /// `finder_bonus_ppm` is threaded to BOTH the engine config and the
+        /// `build_distribution` call, because either alone proves nothing: a
+        /// configured bonus with an unnamed finder builds bonus-free (that is
+        /// `build_pool_wide`'s contract), and a named finder with no bonus
+        /// configured builds identically to `None`. `finder` is the address the
+        /// bonus should land on — `miners[0]`, which is also who `book` credits
+        /// as the block's finder, so the settlement path sees one consistent
+        /// story.
+        async fn setup_with_bonus(redis_db: u8, finder_bonus_ppm: u32) -> Option<Self> {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter("blitzpool=debug,bp_pplns_engine=debug")
                 .with_test_writer()
@@ -554,7 +600,7 @@ mod declared_block_booking_regtest {
             Self::purge(&pg, &miners, &fee_addr).await;
 
             let pplns = PplnsEngine::spawn(
-                engine_config(&fee_addr),
+                engine_config_with_bonus(&fee_addr, finder_bonus_ppm),
                 redis.clone(),
                 pg.clone(),
                 NetworkDifficulty::new(1_000.0),
@@ -630,8 +676,14 @@ mod declared_block_booking_regtest {
             let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
 
             let reward_sats = template.coinbase_tx_value_remaining;
+            // With a bonus configured this is the per-finder build the JDP
+            // tailored path serves; `None` is the pool-wide one. `miners[0]` is
+            // the finder `book` credits below, so the coinbase, the snapshot and
+            // the block-found event all name the same address.
+            let finder = (finder_bonus_ppm > 0)
+                .then(|| AddressId::new(miners[0].clone()).expect("finder addr"));
             let dist = pplns
-                .build_distribution(reward_sats, None)
+                .build_distribution(reward_sats, finder.as_ref())
                 .await
                 .expect("build_distribution");
             let fingerprint = dist.payouts_fingerprint();
@@ -797,6 +849,28 @@ mod declared_block_booking_regtest {
                 .with_redis(self.redis.clone())
         }
 
+        /// The real ext 0x0003 publisher source, over this chain's live TDP —
+        /// the same struct `jdp.rs` builds at boot, with the same engines.
+        fn distribution_source(&self) -> crate::payout_resolver::ProductionDistributionSource {
+            crate::payout_resolver::ProductionDistributionSource {
+                resolver: Arc::new(crate::payout_resolver::ProductionPayoutResolver::new(
+                    self.gate.clone(),
+                    Some(self.pplns.clone()),
+                    self.group_solo.clone(),
+                    Default::default(),
+                    None,
+                )),
+                // The live TDP as the `ChainView` seam, not a stub: this is the
+                // one implementation every other production JDP hook resolves
+                // its reward against, so the revenue the published
+                // distribution is built at is the revenue a job would carry.
+                chain: Arc::new(self.tdp.clone()),
+                redis: Some(self.redis.clone()),
+                network: Network::Regtest,
+                fee_address: Some(AddressId::new(self.fee_addr.clone()).expect("fee addr")),
+            }
+        }
+
         /// Book through the JDP door. `actual = None` models a block whose
         /// coinbase could not be parsed.
         async fn book(
@@ -858,6 +932,33 @@ mod declared_block_booking_regtest {
                 .find(|(a, _)| a == miner)
                 .map(|(_, s)| *s as u64)
                 .unwrap_or_else(|| panic!("no booked row for {miner} — {rows:?}"))
+        }
+
+        /// The signed ledger after settlement — `claim − paid`, per address.
+        ///
+        /// This is the side of the booking that `coinbase_rows` cannot see:
+        /// `paidSats` is transcribed from the coinbase, while `balanceSats` is
+        /// the delta against a claim RECOMPUTED from the stored snapshot.
+        async fn balances(&self) -> Vec<(String, i64)> {
+            sqlx::query_as(
+                r#"SELECT address, "balanceSats" FROM pplns_balance
+                   WHERE address = ANY($1) ORDER BY address"#,
+            )
+            .bind(&self.miners[..])
+            .fetch_all(&self.pg)
+            .await
+            .expect("read balances")
+        }
+
+        /// Absent means "settlement wrote no row", which is not the same claim
+        /// as a zero balance — panic rather than let a missing write read as a
+        /// settled one.
+        fn balance_of(&self, balances: &[(String, i64)], miner: &str) -> i64 {
+            balances
+                .iter()
+                .find(|(a, _)| a == miner)
+                .map(|(_, s)| *s)
+                .unwrap_or_else(|| panic!("no balance row for {miner} — {balances:?}"))
         }
 
         fn intended_of(&self, miner: &str) -> u64 {
@@ -974,6 +1075,304 @@ mod declared_block_booking_regtest {
                  coinbase has no such output"
             );
         }
+
+        c.teardown().await;
+    }
+
+    /// The same booking, with a finder bonus configured — the money path this
+    /// feature adds, end to end on a real chain.
+    ///
+    /// The commit that added the bonus argues settlement needs no changes:
+    /// `bp_share::claim_sats` has no bonus term, because the boost is already
+    /// inside `score_weight`, so the snapshot the ledger recomputes from carries
+    /// it for free. That is an argument about code that was never run with the
+    /// knob on — every other regtest here settles at the `0` default, so a
+    /// settlement that silently dropped the bonus would have passed all of them.
+    ///
+    /// What must hold is a conjunction, and no half of it is provable alone.
+    ///
+    /// The load-bearing half is the BALANCE, not the audit row. `paidSats` is
+    /// copied from the coinbase, so asserting the finder's row exceeds a peer's
+    /// only re-reads the coinbase this fixture built — true of any bonus that
+    /// reached the *build* and silent about whether settlement kept it. What
+    /// settlement actually computes is `balance += claim − paid`, and `claim`
+    /// comes from the SNAPSHOT: `claim_sats(score_weight, score_total, …)`, with
+    /// the boost inside `score_weight` and also inside `score_total`. So the two
+    /// sides have to agree to within rounding, and the balance must be ~0 for
+    /// the finder despite it having been paid a third of the pot on 1/6 of the
+    /// shares. A settlement that dropped the bonus computes the finder's claim
+    /// from 100/600 of the pot, sees it was paid 1/3, and books a large NEGATIVE
+    /// balance — the finder appearing to owe the pool for its own bonus. That is
+    /// the failure this test exists to catch, and it is invisible in `paidSats`.
+    ///
+    /// Then the direction, and the money invariant:
+    ///
+    /// - The finder outweighs `miners[1]`, which holds TWICE its shares. At
+    ///   `BONUS_PPM` this is unsatisfiable without a working bonus (see there).
+    /// - Every booked row is an output the accepted coinbase really carries, so
+    ///   a bonus cannot be credited out of value nobody paid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_block_found_with_the_bonus_on_books_the_boosted_claim() {
+        let Some(c) = Chain::setup_with_bonus(DB_BONUS_BOOKS_THE_COINBASE, BONUS_PPM).await else {
+            return;
+        };
+
+        // Precondition, not decoration: `setup_with_bonus` only names a finder
+        // when the ppm is non-zero, and `build_weight_distribution` silently
+        // drops an unparseable address. Both failures would leave a build that
+        // looks fine and carries no bonus, and every assertion below would then
+        // be measuring the plain window.
+        assert!(
+            c.pplns.finder_bonus_active(),
+            "the engine must have the bonus ON, or this test re-runs the \
+             zero-bonus fixture under a new name"
+        );
+        let finder_intended = c.intended_of(&c.miners[0]);
+        let peer_intended = c.intended_of(&c.miners[1]);
+        assert!(
+            finder_intended > peer_intended,
+            "the INTENDED distribution must already boost the finder past the \
+             miner holding twice its shares ({finder_intended} vs \
+             {peer_intended}) — otherwise the bonus never entered the build and \
+             the ledger assertions below cannot distinguish it from a plain window"
+        );
+
+        assert!(
+            c.book(Some(c.actual.clone()), &c.block_hash).await,
+            "book_declared_block_found must report the booking reached the fan-out"
+        );
+        assert!(
+            c.coinbase_rows().await.is_empty(),
+            "with Redis wired the apply MUST wait for confirmations"
+        );
+
+        c.node
+            .generate_to_self(DEPTH)
+            .await
+            .expect("bury to confirmation depth");
+        c.reconcile_once().await;
+
+        let rows = c.coinbase_rows().await;
+        assert_eq!(
+            rows.len(),
+            3,
+            "one coinbase row per seeded miner, got {rows:?}"
+        );
+        let finder_booked = c.amount_of(&rows, &c.miners[0]);
+        let peer_booked = c.amount_of(&rows, &c.miners[1]);
+        assert!(
+            finder_booked > peer_booked,
+            "the finder booked {finder_booked} sat and the miner with TWICE its \
+             shares booked {peer_booked} — the bonus never reached the coinbase"
+        );
+
+        // THE claim: settlement recomputed the BOOSTED claim from the snapshot.
+        //
+        // The finder was paid a third of the pot on a sixth of the shares. If
+        // `claim_sats` recomputes it from the plain share weight the delta is a
+        // large debt; the balance landing at ~0 says the score weight it read
+        // back carried the boost. `miners[1]` and `miners[2]` anchor it: they
+        // were paid the same way from the same snapshot and must also settle
+        // flat, so a uniformly-zero table (e.g. nothing written) cannot pass —
+        // the finder's own `paid` is what makes its 0 informative.
+        let balances = c.balances().await;
+        let finder_balance = c.balance_of(&balances, &c.miners[0]);
+        assert!(
+            finder_balance.abs() <= LEDGER_ROUNDING_SATS,
+            "the finder was paid {finder_booked} sat and settled to a balance of \
+             {finder_balance} — a claim recomputed WITHOUT the bonus (a sixth of \
+             the pot against a third paid) is exactly this debt, so the boost did \
+             not survive the snapshot → recompute → book round trip"
+        );
+        // The shift is the one legitimate non-zero: miners[1] was paid
+        // SHIFT_SATS less than its claim and miners[2] that much more, and
+        // settlement books precisely that difference. Asserted exactly, so a
+        // settlement that booked "whatever was paid" as the claim — which would
+        // also zero the finder — fails here.
+        assert!(
+            (c.balance_of(&balances, &c.miners[1]) - SHIFT_SATS as i64).abs()
+                <= LEDGER_ROUNDING_SATS,
+            "miners[1] was underpaid exactly SHIFT_SATS on-chain, so it must be \
+             owed that — got {}",
+            c.balance_of(&balances, &c.miners[1])
+        );
+        assert!(
+            (c.balance_of(&balances, &c.miners[2]) + SHIFT_SATS as i64).abs()
+                <= LEDGER_ROUNDING_SATS,
+            "miners[2] was overpaid exactly SHIFT_SATS on-chain, so it must owe \
+             that — got {}",
+            c.balance_of(&balances, &c.miners[2])
+        );
+
+        // And it was paid by the block, not conjured: every booked row must be
+        // an output the accepted coinbase really carries. This is what separates
+        // "the finder was credited more" from "the pool credited value nobody
+        // paid" — the invariant the whole non-custodial model rests on.
+        for (address, paid_sats) in &rows {
+            assert!(*paid_sats > 0, "a 0-sat row proves no payout: {address}");
+            let script = bp_mining_job::address_to_script(Network::Regtest, address)
+                .expect("audit-row address must be payable");
+            assert!(
+                c.coinbase_tx.output.iter().any(|o| {
+                    o.script_pubkey.as_bytes() == script.as_bytes()
+                        && o.value.to_sat() == *paid_sats as u64
+                }),
+                "ledger claims {address} was paid {paid_sats} sat, but the accepted \
+                 coinbase has no such output — a bonus paid out of nothing"
+            );
+        }
+
+        c.teardown().await;
+    }
+
+    /// A configured finder bonus must not empty the pool-wide slot — asserted
+    /// on the PRODUCTION `PayoutDistributionSource`, not on the pure classifier.
+    ///
+    /// `jdp_distribution_for` is unit-tested for every mode at both values of
+    /// the flag, but it only decides where a *session* is served. The pool-wide
+    /// slot is a different question, answered by `build_pool_wide`, and it is
+    /// the load-bearing one: it fills what `current_pool_wide()` returns, which
+    /// is the only thing that makes `distribution_available` true, which is the
+    /// only thing that lets ext 0x0003 be negotiated — for every mode, on every
+    /// session. An early `return None` there because a bonus is configured takes
+    /// non-custodial payout enforcement down pool-wide, carries Solo and
+    /// Group-Solo with it, and strands the per-finder path the bonus exists for,
+    /// because `build_for_miner` is only reached after that negotiation. The
+    /// publisher's `else { continue }` logs nothing, so it fails silently.
+    ///
+    /// Not hypothetical: `110038b`, this feature's first commit, opened
+    /// `build_pool_wide` with `if pplns.finder_bonus_active() { return None }`.
+    /// Measured 2026-08-13 with that line restored, over `blitzpool` plus
+    /// `bp-stratum-v2` (the two packages that own the JDP path): 484 tests
+    /// passed and this one failed. It was the whole coverage.
+    ///
+    /// The two other `PayoutDistributionSource` impls in the workspace are why:
+    /// `jdp_push_distribution_e2e`'s `FixedSource` hardcodes `Some(..)` and
+    /// `NoOpJdpHooks` hardcodes `None`, so neither can observe the config at
+    /// all, and `grep -c bonus` over both is 0.
+    ///
+    /// Both directions, so it cannot pass on a bonus that quietly never applied:
+    /// the pool-wide build must SUCCEED and be bonus-free, while the tailored
+    /// build for the same finder on the same engine must carry the boost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_configured_bonus_still_publishes_a_pool_wide_distribution() {
+        let Some(c) = Chain::setup_with_bonus(DB_BONUS_POOL_WIDE, BONUS_PPM).await else {
+            return;
+        };
+        assert!(
+            c.pplns.finder_bonus_active(),
+            "the engine must have the bonus ON, or this asserts nothing about it"
+        );
+
+        let source = c.distribution_source();
+        let built = {
+            use bp_stratum_v2::jdp_server::PayoutDistributionSource as _;
+            source.build_pool_wide().await
+        };
+        let built = built.expect(
+            "a configured finder bonus must NOT empty the pool-wide slot — \
+             returning None here never negotiates ext 0x0003, so no mode gets \
+             non-custodial payouts and the per-finder path is never reached",
+        );
+
+        // Bonus-free, pinned on the whole SHAPE and not on one pair.
+        //
+        // `miners[0] < miners[1]` alone would hold with the boost landing on
+        // miners[2]: `b = S·f/(1−f)` enters `score_total`, so it dilutes every
+        // other entry by the same `(1−f)` and preserves their ORDER. What a
+        // bonus cannot leave intact is the PROPORTION — the seeded 100/200/300,
+        // which a build naming nobody publishes as 1:2:3.
+        //
+        // This is what makes the fallback safe rather than a misdirection: an
+        // arbitrary finder boosted here would be paid the bonus on every other
+        // client's block, and it need not be the address this test happens to
+        // read.
+        let weight_of = |addr: &str| -> u64 {
+            let script = bp_mining_job::address_to_script(Network::Regtest, addr)
+                .expect("payable address")
+                .to_bytes();
+            built
+                .payouts
+                .iter()
+                .find(|o| o.script_pubkey == script)
+                .map(|o| o.weight)
+                .unwrap_or_else(|| panic!("{addr} absent from the pool-wide distribution"))
+        };
+        // Score-weight units, and the published weight IS the score weight
+        // here: `purge` cleared these addresses' balances and nothing has
+        // settled yet, so `extras_total` is 0 for them and the sats→weight
+        // projection adds nothing.
+        //
+        // The slack is for `round(share/Σshares · SCORE_PRECISION)`, which does
+        // not divide 100/600 evenly — measured 166_666_666_667 against
+        // 500_000_000_000, i.e. `3·base` overshoots by exactly 1. What it has
+        // to catch is `S·f/(1−f)`, a QUARTER of SCORE_PRECISION: the same run
+        // with an arbitrary finder named reads 750_000_000_000, eleven orders
+        // of magnitude outside this.
+        const SHAPE_SLACK: u64 = 8;
+        let base = weight_of(&c.miners[0]);
+        for (idx, multiple) in [(1usize, 2u64), (2, 3)] {
+            let got = weight_of(&c.miners[idx]);
+            let want = base * multiple;
+            assert!(
+                got.abs_diff(want) <= SHAPE_SLACK,
+                "the pool-wide build named no finder, so the seeded 100/200/300 \
+                 shares must publish as 1:2:3 — miners[{idx}] weighs {got} where \
+                 miners[0]'s {base} implies {want}, so SOME finder was boosted \
+                 into the distribution every other session also mines"
+            );
+        }
+
+        // The negative control on the same engine: the TAILORED build for that
+        // finder does carry the boost. Without this, the inequality above would
+        // also hold on an engine whose bonus never applied at all.
+        let tailored = {
+            use bp_stratum_v2::jdp_server::PayoutDistributionSource as _;
+            let finder = AddressId::new(c.miners[0].clone()).expect("finder addr");
+            source.build_for_miner(&finder).await
+        };
+        let tailored = match tailored {
+            bp_stratum_v2::jdp_server::TailoredDistribution::Built { accounting, built } => {
+                // Not `PoolWide`, and the difference is the whole reason a
+                // bonus plan carries an owner: `accounting_matches_stream`
+                // passes both on a PPLNS stream, so the address is the only
+                // thing stopping another PPLNS session from mining this plan
+                // and paying THIS finder the bonus out of its own block.
+                assert_eq!(
+                    accounting,
+                    bp_stratum_v2::bridge::DistributionAccounting::Pplns(
+                        AddressId::new(c.miners[0].clone()).expect("finder addr")
+                    ),
+                    "a bonus-tailored build must be booked to the finder it names — \
+                     PoolWide here has no owner, so the mining side would wave every \
+                     other PPLNS session through onto this plan"
+                );
+                built
+            }
+            other => panic!(
+                "a PPLNS session with the bonus on must be served its OWN \
+                 distribution, got {other:?}"
+            ),
+        };
+        let tailored_weight = |addr: &str| -> u64 {
+            let script = bp_mining_job::address_to_script(Network::Regtest, addr)
+                .expect("payable address")
+                .to_bytes();
+            tailored
+                .payouts
+                .iter()
+                .find(|o| o.script_pubkey == script)
+                .map(|o| o.weight)
+                .unwrap_or_else(|| panic!("{addr} absent from the tailored distribution"))
+        };
+        assert!(
+            tailored_weight(&c.miners[0]) > tailored_weight(&c.miners[1]),
+            "the tailored build names miners[0] as the finder, so the bonus must \
+             carry it past the miner with twice its shares — {} vs {} means the \
+             bonus is inert and the pool-wide assertion above proved nothing",
+            tailored_weight(&c.miners[0]),
+            tailored_weight(&c.miners[1])
+        );
 
         c.teardown().await;
     }
