@@ -59,6 +59,7 @@ mod jdp_hooks;
 mod listeners;
 mod live_mode_marker;
 mod live_sessions;
+mod network;
 mod network_difficulty;
 mod payout_identities;
 mod payout_resolver;
@@ -970,7 +971,7 @@ async fn main() -> ExitCode {
                         // here would resolve every rotating miner to its
                         // `payout_id` as an address and fail the coinbase.
                         engines.payout_identities.clone(),
-                        crate::stratum_v2::config_network_to_bitcoin(cfg.network),
+                        crate::network::config_network_to_bitcoin(cfg.network),
                     ));
                 // Spawn the JDP template-tx cache when the pool needs the txs
                 // (`jdp_orphan_submitblock` → reconstruct the full block +
@@ -999,7 +1000,7 @@ async fn main() -> ExitCode {
                 let jdp_ledger_booker = {
                     let mut sink =
                         crate::block_sink::TdpBlockSubmissionSink::new(tdp_handle.clone())
-                            .with_network(crate::stratum_v2::config_network_to_bitcoin(cfg.network))
+                            .with_network(crate::network::config_network_to_bitcoin(cfg.network))
                             .with_fanout(
                                 engines.mode_gate.clone(),
                                 engines.pplns.clone(),

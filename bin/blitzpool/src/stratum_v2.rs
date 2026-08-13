@@ -36,7 +36,6 @@
 
 use std::sync::{Arc, RwLock};
 
-use bitcoin::Network as BitcoinNetwork;
 use bp_common::{MiningMode, StreamKind};
 use bp_config::{AppConfig, Role};
 use bp_share::Difficulty;
@@ -66,6 +65,7 @@ use tracing::{info, warn};
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::group_service::SharedGroupService;
+use crate::network::config_network_to_bitcoin;
 use crate::payout_identities::PayoutIdentityDirectory;
 use crate::stratum_v1::{
     self, BlockpartyAdminLookup, BlockpartyApiAdminLookup, GroupLookup,
@@ -147,19 +147,6 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> Sv2ServerConfig {
     sc.share_logs = cfg.debug.stratum_share_logs;
     sc.log_submit_latency = cfg.debug.submit_latency;
     sc
-}
-
-pub(crate) fn config_network_to_bitcoin(n: bp_config::Network) -> BitcoinNetwork {
-    match n {
-        bp_config::Network::Mainnet => BitcoinNetwork::Bitcoin,
-        // testnet4 shares the `tb` HRP + address byte set with
-        // testnet3, so the bitcoin-crate's Testnet variant covers
-        // both for address parsing / script generation purposes.
-        // rust-bitcoin 0.32 doesn't have a dedicated Testnet4
-        // variant yet.
-        bp_config::Network::Testnet | bp_config::Network::Testnet4 => BitcoinNetwork::Testnet,
-        bp_config::Network::Regtest => BitcoinNetwork::Regtest,
-    }
 }
 
 /// Build one [`StratumV2MiningServer`] per SV1 port (so SV1 and SV2

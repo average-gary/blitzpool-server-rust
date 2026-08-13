@@ -181,6 +181,33 @@ pub enum Network {
     Regtest,
 }
 
+impl Network {
+    /// Every variant, for tests that must visit all of them.
+    ///
+    /// **This list is not compiler-enforced, and the honest version of that is
+    /// worth writing down.** A four-element array keeps compiling when a fifth
+    /// variant appears above, and no `match` trick fixes it: forcing an arm
+    /// requires a value to match on, which requires the list. Short of a
+    /// derive, proximity is the only guard there is — so the list lives three
+    /// lines from the variants, where adding one without extending it is a
+    /// visible omission at the edit site.
+    ///
+    /// What *is* enforced lives at the consumer: `blitzpool`'s `network` module
+    /// states each variant's mapping in an exhaustive `match`, so a new variant
+    /// cannot compile there until someone writes down what it means. This array
+    /// only decides which of those mappings a test actually exercises. That
+    /// split is the lesson from the copy this replaced — `stratum_v1`'s was the
+    /// one mapping with a test, and the test pinned three of four variants,
+    /// leaving out `Testnet4`, the newest arm and the only one carrying a
+    /// judgement call.
+    pub const ALL: [Network; 4] = [
+        Network::Mainnet,
+        Network::Testnet,
+        Network::Testnet4,
+        Network::Regtest,
+    ];
+}
+
 /// Fine-grained deployment role. A process runs one or more roles; the set it
 /// runs (`roles` in config, or `--roles` / `BLITZPOOL_ROLES`) is what gates
 /// each subsystem at boot — and how the back-office splits into per-feature

@@ -45,9 +45,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bitcoin::Network as BitcoinNetwork;
 use bp_common::{AddressId, MiningMode, StreamKind};
-use bp_config::{AppConfig, Network as ConfigNetwork, Role};
+use bp_config::{AppConfig, Role};
 use bp_group_mgmt_engine::{GroupService, GroupServiceHooks};
 use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
@@ -64,6 +63,7 @@ use crate::block_sink::TdpBlockSubmissionSink;
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::group_service::SharedGroupService;
+use crate::network::config_network_to_bitcoin;
 use crate::payout_identities::PayoutIdentityDirectory;
 
 /// Per-port SV1 server bundle. One entry per `[stratum]`/`[pplns]`
@@ -252,17 +252,6 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
     sc.share_logs = cfg.debug.stratum_share_logs;
     sc.log_submit_latency = cfg.debug.submit_latency;
     sc
-}
-
-fn config_network_to_bitcoin(n: ConfigNetwork) -> BitcoinNetwork {
-    match n {
-        ConfigNetwork::Mainnet => BitcoinNetwork::Bitcoin,
-        // testnet4 shares the `tb` HRP + address byte set with
-        // testnet3 — rust-bitcoin 0.32's Testnet variant covers
-        // both.
-        ConfigNetwork::Testnet | ConfigNetwork::Testnet4 => BitcoinNetwork::Testnet,
-        ConfigNetwork::Regtest => BitcoinNetwork::Regtest,
-    }
 }
 
 /// Build the per-port configs from `[stratum]` + (optional)
@@ -570,6 +559,7 @@ fn mode_from_port(m: MiningMode) -> MiningModeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::Network as BitcoinNetwork;
     use bp_config::{
         ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PayoutIdentityConfig, PplnsConfig,
         RedisConfig, StratumConfig, TdpConfig as TomlTdpConfig,
@@ -719,21 +709,9 @@ mod tests {
         assert_eq!(mode_from_port(MiningMode::GroupSolo).mode, MiningMode::Solo);
     }
 
-    #[test]
-    fn config_network_maps_to_bitcoin_network() {
-        assert_eq!(
-            config_network_to_bitcoin(ConfigNetwork::Mainnet),
-            BitcoinNetwork::Bitcoin
-        );
-        assert_eq!(
-            config_network_to_bitcoin(ConfigNetwork::Testnet),
-            BitcoinNetwork::Testnet
-        );
-        assert_eq!(
-            config_network_to_bitcoin(ConfigNetwork::Regtest),
-            BitcoinNetwork::Regtest
-        );
-    }
+    // `config_network_maps_to_bitcoin_network` was here, pinning three of the
+    // four variants against this module's own copy of the mapping. Both the
+    // mapping and its pins now live in `crate::network`, over every variant.
 
     #[test]
     fn build_server_config_carries_pool_identifier() {

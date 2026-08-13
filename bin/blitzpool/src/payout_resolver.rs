@@ -84,7 +84,7 @@ pub(crate) struct ProductionPayoutResolver {
     /// [`weight_entries_to_payouts`] can ask
     /// [`bp_mining_job::is_payable_identity`], which is the renderer's own
     /// question and therefore network-aware. Not `bp_config::Network`: the
-    /// mapping belongs at the wiring edge (`stratum_v2::config_network_to_bitcoin`),
+    /// mapping belongs at the wiring edge (`network::config_network_to_bitcoin`),
     /// and one more copy of it in here is `CLAUDE.md`'s opening failure mode.
     network: bitcoin::Network,
 }

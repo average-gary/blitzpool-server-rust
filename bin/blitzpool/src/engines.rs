@@ -232,7 +232,7 @@ pub(crate) async fn spawn(
         Arc::new(crate::payout_identities::PoolPaidAddresses::new(
             payout_identities.clone(),
             handles.db.pool().clone(),
-            crate::stratum_v2::config_network_to_bitcoin(cfg.network),
+            crate::network::config_network_to_bitcoin(cfg.network),
         ));
     if let Some(engine) = pplns.as_ref() {
         // False only if something installed one first, which nothing does — the

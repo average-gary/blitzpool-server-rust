@@ -1325,17 +1325,17 @@ impl ProductionJobValidator {
         network: bp_config::Network,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<Arc<dyn DeclaredJobValidator>>, String> {
-        let sri_network = match network {
-            bp_config::Network::Mainnet => SriBitcoinNetwork::Mainnet,
-            bp_config::Network::Testnet4 => SriBitcoinNetwork::Testnet4,
-            bp_config::Network::Regtest => SriBitcoinNetwork::Regtest,
-            bp_config::Network::Testnet => {
-                warn!(
-                    "jdp: declared-job validation not available on testnet3 \
-                     (upstream has no socket layout for it) — declarations stay trusted"
-                );
-                return Ok(None);
-            }
+        // The mapping itself lives beside the `bitcoin::Network` one in
+        // `crate::network`, which documents why it cannot be derived from it:
+        // upstream's enum distinguishes the two testnets and rust-bitcoin 0.32
+        // does not. Only what "no upstream network" means for *this* caller is
+        // decided here.
+        let Some(sri_network) = crate::network::config_network_to_sri(network) else {
+            warn!(
+                "jdp: declared-job validation not available on testnet3 \
+                 (upstream has no socket layout for it) — declarations stay trusted"
+            );
+            return Ok(None);
         };
         let data_dir = Self::data_dir_for_socket(&socket_path, sri_network.clone())?;
         // Core v31 is what the pool's TDP path already speaks.
