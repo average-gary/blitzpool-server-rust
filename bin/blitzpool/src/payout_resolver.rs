@@ -664,81 +664,6 @@ impl ProductionDistributionSource {
             .map(|t| t.coinbase_tx_value_remaining)
     }
 
-    /// Lower a weight-native engine distribution into the wire shape.
-    ///
-    /// **A rotating entry makes the whole distribution unpublishable**, and this
-    /// is the same refusal the `TailoredMode::Solo` arm of
-    /// [`Self::jdp_distribution_for`] writes for a rotating miner — one reason,
-    /// stated twice because the two reach it from different directions, and the
-    /// alternative is a fall-through that publishes the wrong thing.
-    ///
-    /// A published ext 0x0003 distribution is a list of FIXED `script_pubkey`
-    /// bytes under a distribution id, which a JDC reuses across blocks. There is
-    /// no height here, so lowering a rotating identity would pin that miner to
-    /// whichever address this one build derived — for every block the JDC ever
-    /// builds against this distribution id. Rotation in name only, and the miner
-    /// who configured an xpub would never see its second address.
-    ///
-    /// `None` costs the JDC its published distribution and pays every one of
-    /// these miners correctly through the mining path instead, where
-    /// `payout_script` has the height.
-    fn lower_weight_distribution(
-        &self,
-        d: &bp_pplns::WeightDistribution,
-        fingerprint: Option<[u8; 32]>,
-        bookable: bool,
-    ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
-        let script_of = |addr: &str| -> Option<Vec<u8>> {
-            bp_mining_job::address_to_script(self.network, addr)
-                .ok()
-                .map(|s| s.to_bytes())
-        };
-        let pool_script = script_of(d.fee_address.as_str())?;
-        let mut payouts = Vec::new();
-        let mut dust_limits = Vec::new();
-        for entry in d.published() {
-            // `match` and not `if identity.rotates()`: this arm chooses what to
-            // *do* with an identity, which is the exhaustive question. The key is
-            // a ledger key, so for a rotating miner `script_of` below would be
-            // handed a 47-char `payout_id` and answer `None` — the right answer,
-            // reached for the wrong reason and logged as if the miner had
-            // configured a broken address. Say it explicitly instead.
-            match self.resolver.identity_of(entry.address.as_str()) {
-                PayoutIdentity::Rotating { payout_id, .. } => {
-                    warn!(
-                        payout_id = payout_id.as_str(),
-                        entries = d.entries.len(),
-                        "jdp distribution source: a distribution member's payout identity rotates \
-                         per block, which a published distribution's fixed scripts cannot express \
-                         — no published distribution"
-                    );
-                    return None;
-                }
-                PayoutIdentity::Static { .. } => {}
-            }
-            // A published entry whose script fails to derive would shift
-            // every §4 position — fail the whole build instead.
-            let script = script_of(entry.address.as_str())?;
-            payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
-                script_pubkey: script,
-                weight: entry.wire_weight,
-            });
-            dust_limits.push(entry.dust_limit);
-        }
-        Some(bp_stratum_v2::jdp_server::BuiltPayoutDistribution {
-            pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
-                script_pubkey: pool_script,
-                weight: d.weight_p,
-            },
-            payouts,
-            dust_limits,
-            additional_outputs: Vec::new(),
-            reference_reward_sats: d.reference_revenue_sats,
-            payouts_fingerprint: fingerprint,
-            bookable,
-        })
-    }
-
     /// Sats-at-reference as weights, for Solo — the one mode JDP serves
     /// that has its own exact allocator and settles by recompute rather
     /// than from a snapshot. `entries` in §4 order WITHOUT a pool output;
@@ -784,6 +709,89 @@ impl ProductionDistributionSource {
     }
 }
 
+/// Lower a weight-native engine distribution into the wire shape.
+///
+/// **A rotating entry makes the whole distribution unpublishable**, and this is
+/// the same refusal the `TailoredMode::Solo` arm of
+/// `ProductionDistributionSource::build_for_miner` writes for a rotating miner —
+/// one reason, stated twice because the two reach it from different directions,
+/// and the alternative is a fall-through that publishes the wrong thing.
+///
+/// A published ext 0x0003 distribution is a list of FIXED `script_pubkey` bytes
+/// under a distribution id, which a JDC reuses across blocks. There is no height
+/// here, so lowering a rotating identity would pin that miner to whichever
+/// address this one build derived — for every block the JDC ever builds against
+/// this distribution id. Rotation in name only, and the miner who configured an
+/// xpub would never see its second address.
+///
+/// `None` costs the JDC its published distribution and pays every one of these
+/// miners correctly through the mining path instead, where `payout_script` has
+/// the height.
+///
+/// A free function taking the two things it reads, for the reason
+/// [`weight_entries_to_payouts`] is one: the refusal is then provable without a
+/// live `GroupSoloEngine` (hence a Postgres pool) behind `self.resolver`. As a
+/// method it had no test at all, and one rotating miner in the window silences
+/// ext 0x0003 for the entire pool — a regression in either direction was
+/// unobservable.
+fn lower_weight_distribution(
+    d: &bp_pplns::WeightDistribution,
+    identities: &PayoutIdentityDirectory,
+    network: bitcoin::Network,
+    fingerprint: Option<[u8; 32]>,
+    bookable: bool,
+) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
+    let script_of = |addr: &str| -> Option<Vec<u8>> {
+        bp_mining_job::address_to_script(network, addr)
+            .ok()
+            .map(|s| s.to_bytes())
+    };
+    let pool_script = script_of(d.fee_address.as_str())?;
+    let mut payouts = Vec::new();
+    let mut dust_limits = Vec::new();
+    for entry in d.published() {
+        // `match` and not `if identity.rotates()`: this arm chooses what to
+        // *do* with an identity, which is the exhaustive question. The key is
+        // a ledger key, so for a rotating miner `script_of` below would be
+        // handed a 47-char `payout_id` and answer `None` — the right answer,
+        // reached for the wrong reason and logged as if the miner had
+        // configured a broken address. Say it explicitly instead.
+        match identities.identity_for(entry.address.as_str()) {
+            PayoutIdentity::Rotating { payout_id, .. } => {
+                warn!(
+                    payout_id = payout_id.as_str(),
+                    entries = d.entries.len(),
+                    "jdp distribution source: a distribution member's payout identity rotates \
+                     per block, which a published distribution's fixed scripts cannot express \
+                     — no published distribution"
+                );
+                return None;
+            }
+            PayoutIdentity::Static { .. } => {}
+        }
+        // A published entry whose script fails to derive would shift
+        // every §4 position — fail the whole build instead.
+        let script = script_of(entry.address.as_str())?;
+        payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
+            script_pubkey: script,
+            weight: entry.wire_weight,
+        });
+        dust_limits.push(entry.dust_limit);
+    }
+    Some(bp_stratum_v2::jdp_server::BuiltPayoutDistribution {
+        pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
+            script_pubkey: pool_script,
+            weight: d.weight_p,
+        },
+        payouts,
+        dust_limits,
+        additional_outputs: Vec::new(),
+        reference_reward_sats: d.reference_revenue_sats,
+        payouts_fingerprint: fingerprint,
+        bookable,
+    })
+}
+
 #[async_trait]
 impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistributionSource {
     async fn build_pool_wide(&self) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
@@ -796,8 +804,10 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                 return None;
             }
         };
-        self.lower_weight_distribution(
+        lower_weight_distribution(
             &result.distribution,
+            &self.resolver.identities,
+            self.network,
             Some(result.payouts_fingerprint()),
             result.snapshot_written,
         )
@@ -869,8 +879,10 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                     .build_distribution(group_id, t_ref, miner_address)
                     .await
                 {
-                    Ok(result) => self.lower_weight_distribution(
+                    Ok(result) => lower_weight_distribution(
                         &result.distribution,
+                        &self.resolver.identities,
+                        self.network,
                         Some(result.payouts_fingerprint()),
                         result.snapshot_written,
                     ),
@@ -1582,6 +1594,235 @@ mod tests {
             2,
             "control: two regtest literals through the same call lower to two \
              payouts, so the emptiness above is the network check"
+        );
+    }
+
+    // ── The ext 0x0003 lowering: PPLNS pool-wide and Group-Solo tailored ────
+
+    /// Reference revenue for the fixture below: a quarter-era block subsidy, so
+    /// both members' §4 amounts are ~150 M sats and `min_payout` withholds
+    /// neither.
+    const TEST_T_REF: u64 = 312_500_000;
+
+    /// A real regtest P2WPKH for the pool output. `pay_P` is structural (§4), so
+    /// [`bp_pplns::build_weight_distribution`] refuses outright on a fee address
+    /// it cannot parse — a `format!`-ed one would make the fixture below an
+    /// `Err`, not a distribution.
+    fn pool_fee_address() -> AddressId {
+        AddressId::new(bp_test_support::deterministic_p2wpkh_regtest([0x7f; 32]))
+            .expect("a derived p2wpkh is a valid payout address")
+    }
+
+    /// The two-member distribution the lowering is handed, built by the real
+    /// [`bp_pplns::build_weight_distribution`] rather than assembled field by
+    /// field: the build is what decides which entries are `published()`, and a
+    /// hand-written `WeightDistribution` could claim a published set the weight
+    /// model would never produce.
+    ///
+    /// `first_key` is the member under test — a literal regtest address for the
+    /// control, the rotating `payout_id` for the refusal. `derived` is how the
+    /// build is told a key it cannot parse is nonetheless payable
+    /// (`is_payable_payout_key`); without it the rotating row is dropped *above*
+    /// the score total, leaving a one-member distribution with nothing to refuse.
+    fn two_member_distribution(
+        first_key: &str,
+        derived: &std::collections::HashSet<String>,
+    ) -> bp_pplns::WeightDistribution {
+        let shares = std::collections::HashMap::from([
+            (
+                AddressId::new(first_key.to_string()).expect("payout key"),
+                60.0,
+            ),
+            (
+                AddressId::new(REGTEST_ADDR.to_string()).expect("regtest address"),
+                40.0,
+            ),
+        ]);
+        let balances = std::collections::HashMap::new();
+        let fee = pool_fee_address();
+        bp_pplns::build_weight_distribution(bp_pplns::WeightDistributionInput {
+            address_shares: &shares,
+            balances: &balances,
+            fee_percent: 1.5,
+            fee_address: &fee,
+            coinbase_weight_budget: 50_000,
+            min_payout_sats: Some(Sats(5_000)),
+            finder_bonus_ppm: 0,
+            finder_address: None,
+            reference_revenue_sats: TEST_T_REF,
+            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+            derived_payout_keys: derived,
+        })
+        .expect("two scored miners and a payable fee address")
+    }
+
+    /// **One rotating member costs the WHOLE pool its published distribution**,
+    /// and that is the intended trade: a published distribution is a list of
+    /// fixed `script_pubkey`s a JDC reuses across blocks, there is no height here
+    /// to derive a rotating script at, and the two alternatives are both wrong —
+    /// pinning the miner to one derived address forever, or dropping its entry
+    /// and handing its satoshis to the pool as the §4 residual.
+    ///
+    /// The control is the same fixture with two static members: it lowers to two
+    /// payouts. So the `None` below is the refusal and not a distribution that
+    /// was empty, unparseable or never built — which is what a lone `is_none()`
+    /// would have been worth here.
+    ///
+    /// **What the other modes do at this call.** This one function is the whole
+    /// weight-native lowering: PPLNS reaches it from `build_pool_wide` and
+    /// Group-Solo from the `TailoredMode::GroupSolo` arm of `build_for_miner`, so
+    /// the refusal is one implementation for both — the difference is only blast
+    /// radius (PPLNS: every JDC on the pool; Group-Solo: that group's JDC). Solo
+    /// does not come through here at all: it lowers exact sats
+    /// (`lower_exact_entries`) and refuses a rotating identity one level up, in
+    /// `build_for_miner`. Blockparty is never published over JDP at all
+    /// ([`JdpDistributionFor::Nothing`]).
+    #[test]
+    fn one_rotating_member_refuses_the_whole_published_distribution() {
+        // Distinct from REGTEST_ADDR, or the fixture's share map would collapse
+        // to a single member and the "whole distribution" would be one entry.
+        let static_first = bp_test_support::deterministic_p2wpkh_regtest([0x11; 32]);
+        let control = two_member_distribution(&static_first, &std::collections::HashSet::new());
+        assert_eq!(
+            control.published().count(),
+            2,
+            "the control's precondition: both members hold a §4 output, so the \
+             lowering below has two entries to walk"
+        );
+
+        let lowered = lower_weight_distribution(
+            &control,
+            &PayoutIdentityDirectory::new(),
+            bitcoin::Network::Regtest,
+            Some([7u8; 32]),
+            true,
+        )
+        .expect("two static regtest members are publishable");
+        assert_eq!(
+            lowered.payouts.len(),
+            2,
+            "control: every published member reaches the wire, in §4 order"
+        );
+        assert_eq!(
+            lowered.payouts.iter().map(|p| p.weight).collect::<Vec<_>>(),
+            control
+                .published()
+                .map(|e| e.wire_weight)
+                .collect::<Vec<_>>(),
+            "and carries the published wire weight untouched — §4 positions are \
+             what a JDC pays against"
+        );
+        // The weights alone are not the control. §4 pays *weight against script*,
+        // so a lowering that put the right weights beside the wrong scripts is
+        // the failure with money in it, and the assertion above cannot see it:
+        // building every `WeightedOutput` with `pool_script.clone()` sends the
+        // entire miners' cut to the pool address and keeps the weight list
+        // identical. Pairing them positionally is what closes that, and it also
+        // catches the two vectors drifting out of step, which is the specific
+        // hazard of building `payouts` and `dust_limits` in one loop.
+        assert_eq!(
+            lowered
+                .payouts
+                .iter()
+                .map(|p| p.script_pubkey.clone())
+                .collect::<Vec<_>>(),
+            control
+                .published()
+                .map(|e| {
+                    bp_mining_job::address_to_script(bitcoin::Network::Regtest, e.address.as_str())
+                        .expect("the fixture's members are real regtest addresses")
+                        .to_bytes()
+                })
+                .collect::<Vec<_>>(),
+            "each §4 weight must sit against ITS OWN member's script"
+        );
+        assert_eq!(
+            lowered.dust_limits,
+            control
+                .published()
+                .map(|e| e.dust_limit)
+                .collect::<Vec<_>>(),
+            "and the dust limits stay in step with the payouts they bound — the \
+             two vectors are filled in one loop, so nothing but position \
+             relates them"
+        );
+        assert_eq!(lowered.pool_payout.weight, control.weight_p);
+        assert_eq!(
+            lowered.pool_payout.script_pubkey,
+            bp_mining_job::address_to_script(
+                bitcoin::Network::Regtest,
+                control.fee_address.as_str()
+            )
+            .expect("the fixture's fee address is a real regtest address")
+            .to_bytes(),
+            "the pool's own output is the §4 residual's destination, so it is \
+             worth pinning that it is the fee address and not a member's"
+        );
+        assert_eq!(lowered.reference_reward_sats, TEST_T_REF);
+
+        // The same distribution with ONE member swapped to a rotating identity.
+        let identity = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB)
+            .expect("a BIP-32 vector is a valid xpub")
+            .into_payout_identity();
+        let payout_id = identity.payout_id().to_string();
+        let derived = std::collections::HashSet::from([payout_id.clone()]);
+        let rotating = two_member_distribution(&payout_id, &derived);
+        assert!(
+            rotating
+                .published()
+                .any(|e| e.address.as_str() == payout_id),
+            "the refusal's precondition: the rotating key really is in the \
+             published set. Un-vouched it is dropped at the build's own filter, \
+             and then this test would assert `None` about a distribution that \
+             never contained a rotating miner"
+        );
+        assert_eq!(
+            rotating.published().count(),
+            2,
+            "and the static member is published beside it — so what is refused \
+             below is a distribution that would otherwise have paid somebody"
+        );
+
+        let directory = PayoutIdentityDirectory::new();
+        directory.publish_for_test(identity);
+        assert!(
+            directory.identity_for(&payout_id).rotates(),
+            "the directory must answer Rotating for this key, or the lowering is \
+             being asked a different question"
+        );
+
+        assert!(
+            lower_weight_distribution(
+                &rotating,
+                &directory,
+                bitcoin::Network::Regtest,
+                Some([7u8; 32]),
+                true,
+            )
+            .is_none(),
+            "a rotating member must take the whole published distribution with \
+             it — publishing the rest would pay this miner's share to the pool \
+             output as the §4 residual, and publishing a script derived here \
+             would pin every future block a JDC builds to that one address"
+        );
+
+        // What the assertion above pins is the *scope* of the refusal: turn the
+        // `Rotating` arm into a `continue` and the other member is published
+        // alone, which fails here. It does not pin the arm's existence —
+        // measured, not assumed: deleting the `return None` and falling through
+        // still answers `None`, because the ledger key handed to
+        // `address_to_script` is a hash. That is the second guard, and the
+        // function's own comment is about reaching the right answer for the right
+        // reason rather than by accident.
+        //
+        // Which makes this assertion the one that would notice the accident going
+        // away: a `payout_id` that ever parsed as an address would leave the
+        // `match` arm as the only thing refusing this distribution.
+        assert!(
+            bp_mining_job::address_to_script(bitcoin::Network::Regtest, &payout_id).is_err(),
+            "a payout_id must stay unparseable as an address — if that changes, \
+             the `None` above is no longer over-determined and the arm alone \
+             carries it"
         );
     }
 }
