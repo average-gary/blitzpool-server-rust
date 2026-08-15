@@ -13,13 +13,14 @@
 //! value against anything, and does not reject a JDC for declaring an empty or
 //! low-fee template. **Which transactions a JDC mines is its own call — that
 //! is the entire point of job declaration**, and a small `T` is a smaller
-//! block for everyone in the distribution, not a fault. ext 0x0003/Payout
-//! Computation already requires the coinbase to pay out exactly the `T` its
-//! own template yields, and `SetCustomMiningJob` is checked against the
-//! published distribution independently ([`crate::jdp::payout_distribution`]),
-//! so the split is guarded regardless of what was declared. Settlement then
-//! books from the block's own coinbase at whatever `T` it actually paid, so a
-//! low-revenue block needs no detection to be booked correctly.
+//! block for everyone in the distribution, not a fault.
+//! ext 0x0003/Payout Computation already requires the coinbase to pay out
+//! exactly the `T` its own template yields, and `SetCustomMiningJob` is
+//! checked against the published distribution independently
+//! ([`crate::jdp::payout_distribution`]), so the split is guarded regardless
+//! of what was declared. Settlement then books from the block's own coinbase
+//! at whatever `T` it actually paid, so a low-revenue block needs no detection
+//! to be booked correctly.
 //!
 //! ## What it IS about
 //!
@@ -30,8 +31,9 @@
 //! IPC). That establishes that the DECLARED transaction set is one a block
 //! could be built from. The mining side never repeats it:
 //! `SetCustomMiningJob.merkle_path` goes into the
-//! [`crate::mining::jobs::ExtendedJob`] unexamined, and the ext 0x0003/Output
-//! Verification coinbase check says nothing about the transaction set hanging
+//! [`crate::mining::jobs::ExtendedJob`] unexamined, and the
+//! ext 0x0003/Output Verification coinbase check says nothing about the
+//! transaction set hanging
 //! off it.
 //!
 //! Without this comparison, "the declaration passed the node" and "this job

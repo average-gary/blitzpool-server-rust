@@ -29,9 +29,9 @@
 //! effective difficulty (for accounting), the classification
 //! (`Active` vs `StaleCreditable` — both credit, see
 //! [`bp_jobs_lifecycle::JobClassification`]), and the `is_block_candidate`
-//! flag indicating that `submission_difficulty >= network_difficulty`.
-//! Or [`ShareValidation::Rejected`] carrying one of four SV2 wire
-//! codes: `invalid-channel-id`, `invalid-job-id`, `stale-share`,
+//! flag indicating that `submission_difficulty >= network_difficulty`. Or
+//! [`ShareValidation::Rejected`] carrying one of four SV2 wire codes:
+//! `invalid-channel-id`, `invalid-job-id`, `stale-share`,
 //! `difficulty-too-low`.
 //!
 //! Wire codes are kept as `&'static str` constants — they're consumed
@@ -61,20 +61,26 @@ use super::jobs::{classify_extended_job, ExtendedJob};
 /// this connection.
 pub const ERR_INVALID_CHANNEL_ID: &str = "invalid-channel-id";
 
-/// Job id is genuinely unknown — past retention GC, or never sent. SV2
-/// Mining/SubmitShares.Error distinguishes this from `stale-share` (job *was*
-/// known, since superseded).
+/// Job id is genuinely unknown — past retention GC, or never sent.
+/// SV2 Mining/SubmitShares.Error distinguishes this from `stale-share` (job
+/// *was* known, since superseded).
 pub const ERR_INVALID_JOB_ID: &str = "invalid-job-id";
 
 /// Job id resolves to a retired entry past
-/// [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`]. Separate from
-/// `ERR_DUPLICATE_SHARE` per SV2 spec — both have their own wire
-/// code.
+/// [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`]. Kept separate from
+/// `ERR_DUPLICATE_SHARE` because they are different faults, not because the
+/// spec separates them — see the note on the code strings below.
 pub const ERR_STALE_SHARE: &str = "stale-share";
 
 /// Duplicate `(job_id, nonce, ntime, version[, extranonce])` tuple
-/// re-submitted on this channel. SV2 spec assigns this its own wire
-/// code, distinct from `ERR_STALE_SHARE`.
+/// re-submitted on this channel.
+///
+/// **None of these strings is spec-assigned.** SV2 Mining/SubmitShares.Error
+/// types `error_code` as a bare `STR0_255` and SV2 Overview/Error Codes says
+/// the list "can differ between implementations" and that a receiver MUST
+/// log-no-op on unknown codes. The vocabulary here is convention shared with
+/// the SRI clients, so it can be extended — but a downstream that treats an
+/// unknown code as fatal is the one breaking the spec, not us.
 pub const ERR_DUPLICATE_SHARE: &str = "duplicate-share";
 
 /// Header hash didn't meet the job-specific target. Includes the case
@@ -96,8 +102,8 @@ pub const ERR_BAD_EXTRANONCE_SIZE: &str = "bad-extranonce-size";
 
 // ── Reject reasons ───────────────────────────────────────────────────
 
-/// Internal classification of a rejected share. Maps to an SV2 wire
-/// code via [`Self::wire_code`]; the caller emits the literal in
+/// Internal classification of a rejected share. Maps to an SV2 wire code via
+/// [`Self::wire_code`]; the caller emits the literal in
 /// `SubmitSharesError.error_code`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
@@ -163,12 +169,12 @@ pub struct ShareAccept {
     /// authoritative validator — this only triggers the
     /// `TdpHandle::submit_solution` path.
     pub is_block_candidate: bool,
-    /// TDP template id the job was built against. `Some` for jobs the
-    /// pool issued from a pool-side template (Extended channels with
-    /// pool-built jobs), `None` for `SetCustomMiningJob`-declared
-    /// jobs (no pool-side template reference) and for Standard
-    /// channels until [`StandardJobContext`] threads the template id
-    /// through (Standard block-submit path).
+    /// TDP template id the job was built against. `Some` for jobs the pool
+    /// issued from a pool-side template (Extended channels with pool-built
+    /// jobs), `None` for `SetCustomMiningJob`-declared jobs (no pool-side
+    /// template reference) and for Standard channels until
+    /// [`StandardJobContext`] threads the template id through (Standard
+    /// block-submit path).
     pub template_id: Option<u64>,
     /// Copied off [`crate::mining::jobs::ExtendedJob::jdp_claims_the_block`]:
     /// `true` when a block found on this job will be claimed by the JDP
@@ -187,18 +193,20 @@ pub struct ShareAccept {
     /// before locktime). Ready to be passed to
     /// `TdpHandle::submit_solution`'s `coinbase_tx` argument.
     ///
-    /// Populated by [`validate_submit_extended`] (rebuilds the stratum coinbase
-    /// from per-channel + per-job state) AND by [`validate_submit_standard`]
-    /// (from the per-job `StandardJobEntry::coinbase_stratum` stored at
-    /// NewMiningJob send-time). **Empty** only when the job carries no pool-side
-    /// coinbase — a `SetCustomMiningJob`-declared job — in which case block-found
-    /// surfaces a WARN in the bin block-sink instead of submitting.
+    /// Populated by [`validate_submit_extended`] (rebuilds the stratum
+    /// coinbase from per-channel + per-job state) AND by
+    /// [`validate_submit_standard`] (from the per-job
+    /// `StandardJobEntry::coinbase_stratum` stored at NewMiningJob send-time).
+    /// **Empty** only when the job carries no pool-side coinbase — a
+    /// `SetCustomMiningJob`-declared job — in which case block-found surfaces
+    /// a WARN in the bin block-sink instead of submitting.
     pub witness_coinbase: Vec<u8>,
     /// Effective per-share worker name. `Some(value)` when ext 0x0002
     /// (Worker-Specific Hashrate Tracking) was negotiated AND the miner
-    /// appended a valid Worker-ID TLV to this share (ext 0x0002/Behavior Based
-    /// on Negotiation). `None` means the caller should fall back to the
-    /// channel-default `user_identity` from `OpenExtendedMiningChannel`.
+    /// appended a valid Worker-ID TLV to this share
+    /// (ext 0x0002/Behavior Based on Negotiation). `None` means the caller
+    /// should fall back to the channel-default `user_identity` from
+    /// `OpenExtendedMiningChannel`.
     ///
     /// Always `None` for Standard-channel shares (channel-default only).
     /// Always `None` for Extended-channel shares whose connection did not
@@ -300,10 +308,10 @@ pub struct StandardJobContext<'a> {
     /// `Active` / `StaleCreditable` / `StaleRejected`). `None` for
     /// genuinely missing jobs.
     pub classification: JobClassification,
-    /// TDP template id the job was built against. Threaded through
-    /// to [`ShareAccept::template_id`] so the block-sink can pass it
-    /// to `TdpHandle::submit_solution` on a block-candidate. `None`
-    /// for `SetCustomMiningJob`-derived jobs.
+    /// TDP template id the job was built against. Threaded through to
+    /// [`ShareAccept::template_id`] so the block-sink can pass it to
+    /// `TdpHandle::submit_solution` on a block-candidate. `None` for
+    /// `SetCustomMiningJob`-derived jobs.
     pub template_id: Option<u64>,
     /// Full pre-assembled non-witness coinbase bytes (matches the
     /// merkle root the miner hashed against). Source: stored on
@@ -468,11 +476,10 @@ pub struct ExtendedChannelView<'a> {
     pub job_target: Target,
 }
 
-/// Validate a `SubmitSharesExtended` frame. Pure function with the
-/// same shape as [`validate_submit_standard`], but the caller passes
-/// the resolved [`ExtendedJob`] reference (storage lives on the
-/// channel) and the validator handles coinbase reconstruction +
-/// merkle-path walking itself.
+/// Validate a `SubmitSharesExtended` frame. Pure function with the same shape
+/// as [`validate_submit_standard`], but the caller passes the resolved
+/// [`ExtendedJob`] reference (storage lives on the channel) and the validator
+/// handles coinbase reconstruction + merkle-path walking itself.
 ///
 /// **Caller's prep work**: channel lookup only (`None` → emit
 /// [`RejectReason::InvalidChannelId`] directly). Everything else —
@@ -486,8 +493,8 @@ pub struct ExtendedChannelView<'a> {
 /// the miner's hash. Accepting would credit un-verified hashpower —
 /// see memory `feedback-sv2-bad-extranonce-size-hard-reject`.
 ///
-/// `job_difficulty` is the per-job target the share validates against (SV2
-/// Mining/SubmitShares.Error). Caller resolves it from
+/// `job_difficulty` is the per-job target the share validates against
+/// (SV2 Mining/SubmitShares.Error). Caller resolves it from
 /// `channel.standard_jobs.job_id_to_difficulty` if present, else falls back to
 /// `channel.session_difficulty`. The **network** difficulty for the
 /// block-found gate is read from `ext_job.network_difficulty` (pinned at
@@ -685,11 +692,12 @@ pub fn validate_submit_extended(
     } else {
         Vec::new()
     };
-    // ext 0x0002 Worker-ID TLV resolution (ext 0x0002/Behavior Based on
-    // Negotiation). The validator operates at the channel layer and doesn't
-    // know the session-level `address` or `channel_worker` — those are
-    // session-state. We pass empty channel defaults so the resolver either
-    // returns a non-empty TLV-derived worker name (TLV present
+    // ext 0x0002 Worker-ID TLV resolution
+    // (ext 0x0002/Behavior Based on Negotiation). The validator operates at
+    // the channel layer and doesn't know the session-level `address` or
+    // `channel_worker` — those are session-state. We pass empty channel
+    // defaults so the resolver either returns a non-empty TLV-derived worker
+    // name (TLV present
     // + valid + spec-compliant) or the empty channel default. The
     // empty string is collapsed to `None` so consumers can rely on
     // `Some(_) ⇒ TLV was present and the caller should override
@@ -1390,8 +1398,8 @@ mod tests {
     fn worker_id_tlv_bytes(user_identity: &str) -> Vec<u8> {
         // Hand-built wire-form TLV: [ext_type 0x0002 LE][field_type 0x01]
         // [length LE16][value bytes]. Mirrors ext 0x0002/TLV Format for user_identity with the
-        // SV2 U16 little-endian convention (SV2 Overview/Stratum V2 TLV
-        // Encoding Model).
+        // SV2 U16 little-endian convention
+        // (SV2 Overview/Stratum V2 TLV Encoding Model).
         let value = user_identity.as_bytes();
         let mut tlv = Vec::with_capacity(5 + value.len());
         tlv.extend_from_slice(&0x0002u16.to_le_bytes());
@@ -1431,10 +1439,10 @@ mod tests {
         }
     }
 
-    /// ext 0x0002 NOT negotiated + TLV present → resolver ignores the TLV (ext
-    /// 0x0002/Behavior Based on Negotiation "server MUST ignore unexpected TLV
-    /// fields") → effective_worker_name is None (caller falls back to
-    /// channel-default).
+    /// ext 0x0002 NOT negotiated + TLV present → resolver ignores the TLV
+    /// (ext 0x0002/Behavior Based on Negotiation "server MUST ignore
+    /// unexpected TLV fields") → effective_worker_name is None (caller falls
+    /// back to channel-default).
     #[test]
     fn ext_0x0002_tlv_present_when_not_negotiated_is_ignored() {
         let mut ch = ext_channel();

@@ -103,8 +103,8 @@ pub fn designated_payout_script(coinbase_outputs: &[u8]) -> Option<Vec<u8>> {
     outputs.first().map(|o| o.script_pubkey.as_bytes().to_vec())
 }
 
-/// Does this coinbase honour the pool's designated payout output (SV2
-/// JDP/AllocateMiningJobToken.Success)?
+/// Does this coinbase honour the pool's designated payout output
+/// (SV2 JDP/AllocateMiningJobToken.Success)?
 ///
 /// The rule the spec states is narrow, and everything around it is
 /// explicitly free: "JDC MUST allocate sats into the pool payout output in
@@ -144,13 +144,13 @@ pub fn pays_designated_output(outputs: &[TxOut], designated_script: &[u8]) -> bo
 /// The declared coinbase rebuilt as a whole transaction, plus the width of the
 /// extranonce slot that was zero-filled to get there.
 ///
-/// Every consumer that needs more than the outputs — the ext 0x0003/Output
-/// Verification payout check reads `tx.output`, the declared-job binding
-/// ([`crate::jdp::custom_job_binding`]) reads the version, scriptSig,
-/// nSequence and locktime as well, and both need the coinbase txid for the
-/// merkle branch — goes through this one reconstruction. The scriptSig it
-/// returns carries the slot as zeroes, so `script_sig[..len - slot]` is the
-/// prefix the JDC actually committed to.
+/// Every consumer that needs more than the outputs — the
+/// ext 0x0003/Output Verification payout check reads `tx.output`, the
+/// declared-job binding ([`crate::jdp::custom_job_binding`]) reads the
+/// version, scriptSig, nSequence and locktime as well, and both need the
+/// coinbase txid for the merkle branch — goes through this one reconstruction.
+/// The scriptSig it returns carries the slot as zeroes, so `script_sig[..len -
+/// slot]` is the prefix the JDC actually committed to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclaredCoinbase {
     pub tx: bitcoin::Transaction,

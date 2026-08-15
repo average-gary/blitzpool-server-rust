@@ -22,11 +22,16 @@
 //!
 //! Body fields use the standard SV2 little-endian encoding. **TLV headers are
 //! little-endian too**: SV2 Overview/Stratum V2 TLV Encoding Model types the
-//! header fields as U16/U8, and U16 is little-endian everywhere in SV2. (The
-//! 0x0002 ext 0x0002/Extended SubmitSharesExtended Message Format wire example
-//! shows the extension type as `00 02`, which contradicts the base data-type
-//! convention — the example is the error, not the rule.) Worker-ID has a
-//! 32-byte cap on `user_identity` (ext 0x0002/TLV Format for user_identity).
+//! header fields as U16/U8, and U16 is little-endian everywhere in SV2. The
+//! worked example in ext 0x0002/Extended SubmitSharesExtended Message Format
+//! shows the extension type as `00 02` — big-endian, contradicting that. We
+//! treat the example as the error and the data-type rule as binding. Note this
+//! is a spec-level contradiction, not a stray example in an extension: the
+//! SAME byte sequence appears in the core
+//! SV2 Overview/Stratum V2 TLV Encoding Model, in the section that defines the
+//! convention it breaks. Worth raising upstream rather than working around
+//! twice. Worker-ID has a 32-byte cap on `user_identity`
+//! (ext 0x0002/TLV Format for user_identity).
 
 // ── Spec constants ─────────────────────────────────────────────────
 
@@ -68,8 +73,9 @@ pub enum WorkerIdEncodeError {
 // We keep these in-file rather than depend on `stratum_core::binary_sv2`
 // because the SV2 spec pins exact byte sequences and we want the Rust tests to
 // assert against the same fixtures with no abstraction drift. Everything is
-// straight-line LE — body fields and TLV headers alike (SV2 Overview/Stratum
-// V2 TLV Encoding Model types TLV headers as U16/U8, and U16 is LE in SV2).
+// straight-line LE — body fields and TLV headers alike
+// (SV2 Overview/Stratum V2 TLV Encoding Model types TLV headers as U16/U8, and
+// U16 is LE in SV2).
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -338,23 +344,24 @@ impl SetPayoutDistribution {
     }
 }
 
-/// Error-code vocabulary for the push-model 0x0003 extension (ext 0x0003/Error
-/// Codes), emitted on `DeclareMiningJob.Error` / `SetCustomMiningJob.Error`.
+/// Error-code vocabulary for the push-model 0x0003 extension
+/// (ext 0x0003/Error Codes), emitted on `DeclareMiningJob.Error` /
+/// `SetCustomMiningJob.Error`.
 pub mod payout_distribution_error_codes {
     /// ext 0x0003/Error Codes — the referenced `distribution_id` is not
     /// accepted: too old (outside the grace window), unknown, or invalidated
     /// by a settlement event (ext 0x0003/Implementation Notes).
     pub const STALE_PAYOUT_DISTRIBUTION: &str = "stale-payout-distribution";
-    /// ext 0x0003/Error Codes — the declared coinbase outputs violate ext
-    /// 0x0003/Payout Computation (recomputed vector mismatch, non-0-value
+    /// ext 0x0003/Error Codes — the declared coinbase outputs violate
+    /// ext 0x0003/Payout Computation (recomputed vector mismatch, non-0-value
     /// trailing output, missing/mis-typed `distribution_id` TLV where the
     /// extension is negotiated).
     pub const INVALID_PAYOUT_DISTRIBUTION: &str = "invalid-payout-distribution";
 }
 
-/// Extract the ext 0x0003 `distribution_id` from parsed trailing TLVs (ext
-/// 0x0003/distribution_id TLV Field: Type `0x0003`/`0x01`, length 8, value
-/// U64-LE). Returns `None` when absent or malformed — the caller decides
+/// Extract the ext 0x0003 `distribution_id` from parsed trailing TLVs
+/// (ext 0x0003/distribution_id TLV Field: Type `0x0003`/`0x01`, length 8,
+/// value U64-LE). Returns `None` when absent or malformed — the caller decides
 /// whether a missing TLV is an error (it is, when the extension was
 /// negotiated).
 pub fn parse_distribution_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Option<u64> {
@@ -366,8 +373,9 @@ pub fn parse_distribution_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Opt
     })
 }
 
-/// Encode the `distribution_id` TLV in wire form (ext 0x0003/distribution_id
-/// TLV Field) — used by tests standing in for a JDC.
+/// Encode the `distribution_id` TLV in wire form
+/// (ext 0x0003/distribution_id TLV Field) — used by tests standing in for a
+/// JDC.
 pub fn encode_distribution_id_tlv(distribution_id: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(13);
     buf.extend_from_slice(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS.to_le_bytes());
@@ -381,9 +389,9 @@ pub fn encode_distribution_id_tlv(distribution_id: u64) -> Vec<u8> {
 
 /// Encode a Worker-ID TLV, ready to be appended to `SubmitSharesExtended`.
 ///
-/// Wire shape (TLV header fields are U16/U8 per SV2 Overview/Stratum V2 TLV
-/// Encoding Model, so the U16s are **little-endian** like every SV2 integer;
-/// value is UTF-8):
+/// Wire shape (TLV header fields are U16/U8 per
+/// SV2 Overview/Stratum V2 TLV Encoding Model, so the U16s are
+/// **little-endian** like every SV2 integer; value is UTF-8):
 /// `[Type: ext_type U16-LE | field_type U8] [Length U16-LE] [UTF-8 bytes]`.
 ///
 /// `"Worker_001"` therefore encodes as
@@ -738,8 +746,8 @@ mod tests {
         assert_eq!(encode_worker_id_tlv(""), Err(WorkerIdEncodeError::Empty));
     }
 
-    /// `rejects > 32 byte user_identity at encode (ext 0x0002/TLV Format for
-    /// user_identity)`
+    /// `rejects > 32 byte user_identity at encode
+    /// (ext 0x0002/TLV Format for user_identity)`
     #[test]
     fn worker_id_tlv_rejects_too_long() {
         let too_long = "x".repeat(33);

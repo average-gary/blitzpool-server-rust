@@ -31,8 +31,9 @@
 //! - **ext 0x0003 (Non-Custodial Pool Payouts)** is push-only: the
 //!   `SetPayoutDistribution` message isn't in `stratum-core::AnyMessage`, so
 //!   the per-connection task serialises it via the raw-bytes pre-encoder —
-//!   first frame after `RequestExtensions.Success` (ext
-//!   0x0003/SetPayoutDistribution), then re-published by the publisher task on
+//!   first frame after `RequestExtensions.Success`
+//!   (ext 0x0003/SetPayoutDistribution), then re-published by the publisher
+//!   task on
 //!   interval / settlement invalidation.
 //! - **Payout validation** in `accept_declaration` is positional
 //!   recompute-and-compare (ext 0x0003/Output Verification) against the
@@ -97,9 +98,9 @@ pub trait JdpAllocateResolver: Send + Sync {
     ///
     /// `payout_distribution_negotiated` — ext 0x0003 is active on this
     /// connection. ext 0x0003/Negotiation then REQUIRES `coinbase_tx_outputs`
-    /// to be empty (the distribution replaces the base SV2
-    /// JDP/AllocateMiningJobToken.Success output semantics); the resolver must
-    /// not build outputs at all in that case.
+    /// to be empty (the distribution replaces the base
+    /// SV2 JDP/AllocateMiningJobToken.Success output semantics); the resolver
+    /// must not build outputs at all in that case.
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
@@ -248,9 +249,9 @@ pub enum TailoredDistribution {
 /// The publisher task calls [`Self::build_pool_wide`] on its interval
 /// (and forced after a settlement); the per-connection task calls
 /// [`Self::build_for_miner`] once an allocate reveals the miner's
-/// identity (Solo and Group-Solo get a tailored distribution; a PPLNS
-/// miner rides the pool-wide one; Blockparty is not served over JDP —
-/// see [`TailoredDistribution`]).
+/// identity (Solo and Group-Solo get a tailored distribution; a PPLNS miner
+/// rides the pool-wide one; Blockparty is not served over JDP — see
+/// [`TailoredDistribution`]).
 /// [`Self::next_distribution_id`] allocates the
 /// ext 0x0003/SetPayoutDistribution strictly-
 /// increasing pool-global id — infra-backed in production (the stratum
@@ -289,9 +290,9 @@ pub trait PayoutDistributionSource: Send + Sync {
 /// `TdpHandle::submit_solution`; tests use a recording sink.
 ///
 /// `booking` is `Some` only when the declared coinbase was validated
-/// positionally against a published payout distribution (ext 0x0003/Output
-/// Verification declare-time check). `None` means the pool cannot say what
-/// this block paid it — report it, book nothing.
+/// positionally against a published payout distribution
+/// (ext 0x0003/Output Verification declare-time check). `None` means the pool
+/// cannot say what this block paid it — report it, book nothing.
 #[async_trait]
 pub trait JdpBlockSubmissionSink: Send + Sync {
     #[allow(clippy::too_many_arguments)]
@@ -763,8 +764,9 @@ const DENIED_REBUILD_INTERVAL_MS: u64 = 30_000;
 ///   wake it.
 /// - `Tailored` / `PoolWide` — only when the mode MOVED. These used to answer
 ///   `false` unconditionally, on the reasoning that a served session
-///   re-decides when its slot is invalidated (ext 0x0003/Implementation
-///   Notes). That holds for a settlement and for nothing else:
+///   re-decides when its slot is invalidated
+///   (ext 0x0003/Implementation Notes). That holds for a settlement and for
+///   nothing else:
 ///   `cache_sync::reconcile_gate_modes` flips a live address between Solo and
 ///   Group-Solo on a group join or leave, deliberately without a reconnect,
 ///   and until the pool next found a block the session kept being served the
@@ -865,15 +867,16 @@ impl AwaitingModeWatch {
 
 /// Build and push a fresh tailored distribution for `miner` on this session.
 ///
-/// Three callers, one implementation: the first allocate; a ext
-/// 0x0003/Implementation Notes settlement, which invalidates a tailored slot
-/// exactly like the pool-wide one while the publisher only ever republishes
-/// the latter; and the session's own frames, which retry an undecided or
-/// refused build and answer a mode that moved.
+/// Three callers, one implementation: the first allocate; a
+/// ext 0x0003/Implementation Notes settlement, which invalidates a tailored
+/// slot exactly like the pool-wide one while the publisher only ever
+/// republishes the latter; and the session's own frames, which retry an
+/// undecided or refused build and answer a mode that moved.
 ///
 /// It rebuilds from the mode gate every time, so it needs to be told nothing
 /// about WHY it was called. What the mode-moved caller has to do on top is
-/// drop the plan on file first — see [`SessionDistribution::is_serving_a_plan`].
+/// drop the plan on file first — see
+/// [`SessionDistribution::is_serving_a_plan`].
 #[allow(clippy::too_many_arguments)]
 async fn republish_tailored(
     hooks: &JdpServerHooks,
@@ -1031,9 +1034,9 @@ async fn republish_tailored(
         // Same lock as the publish, so there is no window in which the session
         // has neither plan. Only when the accounting actually changed: a
         // rebuild for the SAME accounting (an ext 0x0003/Implementation Notes
-        // settlement, a fresh allocate) legitimately supersedes, and ext
-        // 0x0003/Grace Window's grace entry is what a declaration already in
-        // flight resolves against.
+        // settlement, a fresh allocate) legitimately supersedes, and
+        // ext 0x0003/Grace Window's grace entry is what a declaration already
+        // in flight resolves against.
         if serving.accounting().is_some_and(|was| *was != accounting) {
             let dropped = guard.clear_tailored(session_id);
             info!(
@@ -1087,9 +1090,10 @@ async fn run_jdp_connection(
     let mut state = JdpSessionState::new(session_id);
     // What this session is being served. Once an identity is known, a session
     // that is NOT on the pool-wide distribution must not receive the pool-wide
-    // push — ext 0x0003/Payout Computation "latest MUST be used" makes its own
-    // stream authoritative, and for a Solo or Group-Solo miner the pool-wide
-    // one is the PPLNS window's, not theirs.
+    // push — ext 0x0003/Payout Computation makes the newest received
+    // distribution "the basis for all subsequently declared jobs", so its own
+    // stream is authoritative, and for a Solo or Group-Solo miner the
+    // pool-wide one is the PPLNS window's, not theirs.
     let mut served = SessionDistribution::AwaitingMode;
     // The miner this session belongs to, learned from the first allocate and
     // never cleared. Kept so an ext 0x0003/Implementation Notes settlement can
@@ -1134,15 +1138,17 @@ async fn run_jdp_connection(
                     served,
                     SessionDistribution::Served(DistributionAccounting::PoolWide)
                 ) {
-                    // A tailored session ignores the pool-wide push — ext
-                    // 0x0003/Payout Computation "latest MUST be used" makes
-                    // its own stream authoritative. But the publisher fires
-                    // this watch after an ext 0x0003/Implementation Notes
-                    // settlement too, and a settlement invalidates EVERY
-                    // distribution including this session's. Nobody else
-                    // republishes a tailored one, so without this the JDC is
-                    // answered `stale-payout-distribution` forever and simply
-                    // stops declaring.
+                    // A tailored session ignores the pool-wide push —
+                    // ext 0x0003/Payout Computation makes the newest received
+                    // distribution the basis for every subsequent declaration,
+                    // so its own stream is authoritative. But the publisher
+                    // fires this watch after an
+                    // ext 0x0003/Implementation Notes settlement too, and a
+                    // settlement invalidates EVERY distribution including this
+                    // session's. Nobody else republishes a tailored one, so
+                    // without this the JDC is answered
+                    // `stale-payout-distribution` forever and simply stops
+                    // declaring.
                     let still_current = bridge
                         .read()
                         .expect("bridge RwLock poisoned")
@@ -1212,9 +1218,9 @@ async fn run_jdp_connection(
                     }
                 };
                 // The push model defines no inbound ext-0x0003 frames
-                // (`SetPayoutDistribution` is JDS→JDC only; ext
-                // 0x0003/distribution_id TLV Field references arrive as TLVs
-                // on base frames). An ext-0x0003 frame from a client is a
+                // (`SetPayoutDistribution` is JDS→JDC only;
+                // ext 0x0003/distribution_id TLV Field references arrive as
+                // TLVs on base frames). An ext-0x0003 frame from a client is a
                 // protocol error — drop it.
                 let ext_type = header.ext_type_without_channel_msg();
                 if ext_type == SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS {
@@ -1344,8 +1350,8 @@ async fn run_jdp_connection(
                 // contains `DeclareMiningJobSuccess{new_mining_job_token}`,
                 // and the JDC's MINING connection is a separate socket served
                 // by an independent task. The moment that token is on the wire
-                // the JDC may send `SetCustomMiningJob` for it. Per ext
-                // 0x0003/distribution_id TLV Field a Full-Template frame
+                // the JDC may send `SetCustomMiningJob` for it. Per
+                // ext 0x0003/distribution_id TLV Field a Full-Template frame
                 // carries no `distribution_id` TLV, so everything backing that
                 // job — the declaration binding AND its distribution reference
                 // — lives in the bridge entry alone; a lookup that misses
@@ -1382,8 +1388,8 @@ async fn run_jdp_connection(
                         let JdpSessionEvent::TokenAllocated { miner_address, .. } = event else {
                             continue;
                         };
-                        // One implementation, shared with the ext
-                        // 0x0003/Implementation Notes-settlement republish
+                        // One implementation, shared with the
+                        // ext 0x0003/Implementation Notes-settlement republish
                         // above. This used to be a second copy of it, and the
                         // copy had already drifted: on a failed
                         // `next_distribution_id` it skipped the publish
@@ -1429,8 +1435,9 @@ async fn run_jdp_connection(
                     //   a live address between Solo and Group-Solo on a group
                     //   join or leave, deliberately without a reconnect; until
                     //   this existed the session kept being served the plan
-                    //   for the mode it no longer had, and only an ext
-                    //   0x0003/Implementation Notes settlement or a reconnect
+                    //   for the mode it no longer had, and only an
+                    //   ext 0x0003/Implementation Notes settlement or a
+                    //   reconnect
                     //   ever corrected it.
                     //
                     // `rebuild_due` owns which state gets which treatment, off
@@ -1541,8 +1548,8 @@ async fn dispatch_jdp_inbound(
                 AllocateOutcome::Granted(ctx) => handle_allocate_token(state, &input, ctx, now_ms),
                 // SV2 has no `AllocateMiningJobToken.Error`, so the only way
                 // to tell a JDC "this pool cannot serve you" is to stop
-                // talking. Closing turns an indefinite wait into the SV2
-                // JDP/Job Declarator Client fallback the JDC already
+                // talking. Closing turns an indefinite wait into the
+                // SV2 JDP/Job Declarator Client fallback the JDC already
                 // implements.
                 AllocateOutcome::Refused { reason } => {
                     warn!(
@@ -1917,9 +1924,9 @@ pub(crate) enum AllocationDisposition<'a> {
     Register { payout_script: &'a [u8] },
     /// Full-Template: the declaration is the record, not this. Registering its
     /// allocate token too would let the JDC skip `DeclareMiningJob`, where
-    /// bitcoin-core validates its transaction set (SV2 JDP/Job Declarator
-    /// Server), and mine a job no node ever saw — no tip binding, no
-    /// merkle-path check.
+    /// bitcoin-core validates its transaction set
+    /// (SV2 JDP/Job Declarator Server), and mine a job no node ever saw — no
+    /// tip binding, no merkle-path check.
     LeftToTheDeclaration,
     /// ext 0x0003: ext 0x0003/Negotiation requires the allocate's outputs to
     /// be empty, so there is no designated script by design. The job is judged
@@ -1927,12 +1934,12 @@ pub(crate) enum AllocationDisposition<'a> {
     /// distribution, which is the stronger check.
     ///
     /// Registered all the same, as [`AllocationKind::JudgedByDistribution`] —
-    /// the SV2 JDP/AllocateMiningJobToken.Success test cannot stand in for ext
-    /// 0x0003/Output Verification because the entry says which it is. It used
-    /// to register nothing, on the reasoning that the coinbase was already
-    /// better checked; that reasoning is about the coinbase and left the TOKEN
-    /// unknown to the mining side, which then bound neither the miner address
-    /// nor the chain tip for such a job.
+    /// the SV2 JDP/AllocateMiningJobToken.Success test cannot stand in for
+    /// ext 0x0003/Output Verification because the entry says which it is. It
+    /// used to register nothing, on the reasoning that the coinbase was
+    /// already better checked; that reasoning is about the coinbase and left
+    /// the TOKEN unknown to the mining side, which then bound neither the
+    /// miner address nor the chain tip for such a job.
     JudgedByTheDistribution,
     /// A base-protocol allocate that designated nothing. The pool built that
     /// blob, so this is OUR bug, not the client's — and it is invisible from
@@ -2933,14 +2940,14 @@ mod tests {
     /// nothing and the registry cannot tell them apart — only the reason
     /// differs, and only ONE of them is a fault.
     ///
-    /// The row this pins is `(script: None, Coinbase-only, negotiated)`. ext
-    /// 0x0003/Negotiation REQUIRES an ext 0x0003 allocate to carry empty
+    /// The row this pins is `(script: None, Coinbase-only, negotiated)`.
+    /// ext 0x0003/Negotiation REQUIRES an ext 0x0003 allocate to carry empty
     /// `coinbase_tx_outputs`, so it has no designated script — and reading
     /// that absence as "the pool built a broken blob" made every Coinbase-only
     /// 0x0003 connection log a pool bug and predict `invalid-mining-job-token`
-    /// on every job it would ever build. Those jobs are served: the ext
-    /// 0x0003/distribution_id TLV Field rides the frame in that mode and the
-    /// ext 0x0003/Output Verification recompute judges them.
+    /// on every job it would ever build. Those jobs are served: the
+    /// ext 0x0003/distribution_id TLV Field rides the frame in that mode and
+    /// the ext 0x0003/Output Verification recompute judges them.
     #[test]
     fn an_allocate_is_classified_by_all_three_flags() {
         use AllocationDisposition as D;
@@ -2962,13 +2969,13 @@ mod tests {
             // judging.
             (None, false, true, D::JudgedByTheDistribution),
             // The same session shape with a script somehow present is still
-            // the distribution's to judge — registering would let the weak SV2
-            // JDP/AllocateMiningJobToken.Success check stand in for the ext
-            // 0x0003/Output Verification recompute.
+            // the distribution's to judge — registering would let the weak
+            // SV2 JDP/AllocateMiningJobToken.Success check stand in for the
+            // ext 0x0003/Output Verification recompute.
             (Some(SCRIPT), false, true, D::JudgedByTheDistribution),
             // Full-Template: the declaration is the record, whatever else is
-            // true. Registering would let the JDC skip SV2 JDP/Job Declarator
-            // Server validation.
+            // true. Registering would let the JDC skip
+            // SV2 JDP/Job Declarator Server validation.
             (Some(SCRIPT), true, false, D::LeftToTheDeclaration),
             (Some(SCRIPT), true, true, D::LeftToTheDeclaration),
             (None, true, false, D::LeftToTheDeclaration),

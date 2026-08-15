@@ -13,11 +13,20 @@
 //!    ~1–2 MB of raw tx data — bounded memory).
 //!
 //! Later, when the JDC submits a `PushSolution`, the JDS uses
-//! `match_for_solution(prev_hash)` to find which declared job the
-//! solution belongs to. SV2 JDP/PushSolution says to match by `prev_hash`; we
-//! prefer `prev_hash` matches and fall back to "most recent"
-//! when no match (defensive: declarations that pre-date the JDS
-//! observing the current prev_hash store `prev_hash = None`).
+//! `match_for_solution(prev_hash)` to find which declared job the solution
+//! belongs to.
+//!
+//! **The prev_hash-first order is ours, and it is stricter than the spec.**
+//! SV2 JDP/PushSolution carries a `prev hash` field but does not make it the
+//! matching key: it says JDS "MUST attempt to reconstruct and propagate the
+//! block using the template data associated with its most recently sent
+//! `DeclareMiningJob.Success`", and MAY try other recent ones. So the spec's
+//! rule is most-recent-first. We prefer a `prev_hash` match and fall back to
+//! most-recent, which cannot pick a job the spec would have rejected — it only
+//! declines to reconstruct against a declaration the solution demonstrably
+//! does not belong to. Declarations that pre-date the JDS observing a current
+//! prev_hash store `prev_hash = None` and are reachable through the fallback
+//! alone.
 //!
 //! ## FIFO eviction
 //!
@@ -200,7 +209,9 @@ impl DeclaredJobStore {
     ///    recently declared.
     /// 2. Fall back to the most-recently-declared job overall when
     ///    no `prev_hash` match exists — defensive for declarations
-    ///    that pre-date the JDS observing a current prev_hash.
+    ///    that pre-date the JDS observing a current prev_hash. This
+    ///    fallback IS the spec's rule (SV2 JDP/PushSolution); step 1 is
+    ///    our narrowing of it.
     ///
     /// Returns `None` only when the store is empty.
     pub fn match_for_solution(&self, solution_prev_hash: &[u8; 32]) -> Option<&DeclaredJob> {

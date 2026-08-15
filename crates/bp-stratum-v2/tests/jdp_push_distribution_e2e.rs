@@ -8,14 +8,14 @@
 //!
 //! 1. **ext 0x0003/SetPayoutDistribution first-message guarantee** — after
 //!    `RequestExtensions.Success` negotiating 0x0003, the very NEXT frame is
-//!    `SetPayoutDistribution` (raw ext-0x0003 frame), carrying the ext
-//!    0x0003/SetPayoutDistribution weight distribution.
+//!    `SetPayoutDistribution` (raw ext-0x0003 frame), carrying the
+//!    ext 0x0003/SetPayoutDistribution weight distribution.
 //! 2. **ext 0x0003/Negotiation empty allocate** — with 0x0003 negotiated,
 //!    `AllocateMiningJobToken.Success.coinbase_tx_outputs` is empty.
 //! 3. **ext 0x0003/Payout Computation + Output Verification declare** — a
 //!    coinbase whose suffix outputs are the ext 0x0003/Payout Computation
-//!    recompute of the published distribution, referenced via the ext
-//!    0x0003/distribution_id TLV Field `distribution_id` TLV (LE), is accepted
+//!    recompute of the published distribution, referenced via the
+//!    ext 0x0003/distribution_id TLV Field (LE), is accepted
 //!    positionally.
 //! 4. **Booking** — `PushSolution` hands the block-submission sink a
 //!    `PayoutBooking` naming exactly the validated distribution.
@@ -35,8 +35,9 @@
 //! 8. **SV2 JDP/AllocateMiningJobToken.Success base protocol** — a connection
 //!    that never negotiates 0x0003 is answered with exactly ONE designated
 //!    payout output at 0 sats paying the miner itself, and that token reaches
-//!    the bridge as an allocation. Coinbase-only mode never declares (SV2
-//!    JDP/Coinbase-only Mode), so this allocate is the only record the mining
+//!    the bridge as an allocation. Coinbase-only mode never declares
+//!    (SV2 JDP/Coinbase-only Mode), so this allocate is the only record the
+//!    mining
 //!    side will have of it.
 //!
 //! Needs no bitcoin-node / TDP / PG — declare-time validation runs
@@ -349,8 +350,8 @@ async fn jdp_push_distribution_end_to_end() {
     assert_eq!(distribution.distribution_id, FIRST_ID);
     assert_eq!(distribution.dust_limits, dust_limits());
     assert!(distribution.additional_outputs.is_empty());
-    // The weights ride in the consensus TxOut amount fields (ext
-    // 0x0003/SetPayoutDistribution).
+    // The weights ride in the consensus TxOut amount fields
+    // (ext 0x0003/SetPayoutDistribution).
     let pool_out: bitcoin::TxOut =
         bitcoin::consensus::deserialize(&distribution.pool_payout).expect("pool_payout TxOut");
     assert_eq!(pool_out.value.to_sat(), pool_slot().weight);
@@ -403,8 +404,8 @@ async fn jdp_push_distribution_end_to_end() {
     // the coinbase.
     let suffix = conformant_suffix(&pool_out, &wire_payouts, &distribution.dust_limits);
 
-    // Declare #9: negotiated but NO TLV → invalid (ext 0x0003/distribution_id
-    // TLV Field mandatory).
+    // Declare #9: negotiated but NO TLV → invalid
+    // (ext 0x0003/distribution_id TLV Field mandatory).
     write_declare(&mut writer, 9, &token, &suffix, None).await;
     expect_declare_error(
         read_jdc(&mut reader).await,
@@ -413,8 +414,8 @@ async fn jdp_push_distribution_end_to_end() {
     );
 
     // An ACCEPTED declaration issues its job token through the shared
-    // per-connection TokenStore, which rate-limits to 1/s (SV2
-    // JDP/AllocateMiningJobToken) and silently drops the declaration when
+    // per-connection TokenStore, which rate-limits to 1/s
+    // (SV2 JDP/AllocateMiningJobToken) and silently drops the declaration when
     // exceeded — space the token-allocating declares out accordingly.
     tokio::time::sleep(Duration::from_millis(1100)).await;
 
@@ -908,10 +909,10 @@ async fn write_msg(writer: &mut Writer, msg: AnyMessage<'static>) {
     writer.write_frame(Frame::Sv2(frame)).await.expect("write");
 }
 
-/// Write a `DeclareMiningJob`, optionally with the ext 0x0003/distribution_id
-/// TLV Field `distribution_id` TLV appended to the frame tail (LE, per SV2
-/// Overview/Stratum V2 TLV Encoding Model data types). The frame header's
-/// msg_length is patched to cover the tail.
+/// Write a `DeclareMiningJob`, optionally with the
+/// ext 0x0003/distribution_id TLV Field `distribution_id` TLV appended to the
+/// frame tail (LE, per SV2 Overview/Stratum V2 TLV Encoding Model data types).
+/// The frame header's msg_length is patched to cover the tail.
 async fn write_declare(
     writer: &mut Writer,
     request_id: u32,

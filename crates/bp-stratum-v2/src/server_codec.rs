@@ -130,9 +130,9 @@ pub enum InboundMiningFrame {
 
 /// Translate one wire-shape SV2 message into an
 /// [`InboundMiningFrame`]. Caller wraps this in the per-connection
-/// task: read a frame, parse to `AnyMessage`, call
-/// `.into_static()`, hand off here, dispatch the result to the
-/// matching `handle_*` in [`crate::mining::client`].
+/// task: read a frame, parse to `AnyMessage`, call `.into_static()`, hand off
+/// here, dispatch the result to the matching `handle_*` in
+/// [`crate::mining::client`].
 ///
 /// `Ok(None)` means "not a mining-server message" (log + ignore).
 /// `Err(...)` means the wire frame was malformed or the conversion
@@ -431,9 +431,9 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
                     extranonce_prefix: extranonce_prefix
                         .try_into()
                         .map_err(CodecError::from_conv)?,
-                    // Group this channel belongs to (SV2 Mining/Group
-                    // Channel), or 0 when un-grouped. Set by the Extended-open
-                    // handler's eager group assignment for
+                    // Group this channel belongs to
+                    // (SV2 Mining/Group Channel), or 0 when un-grouped. Set by
+                    // the Extended-open handler's eager group assignment for
                     // non-REQUIRES_STANDARD_JOBS connections; the downstream
                     // infers membership from it.
                     group_channel_id,

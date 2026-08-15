@@ -25,11 +25,11 @@
 //!
 //! ## Why 5 traits, not 8
 //!
-//! The earlier skeleton listed 8 hooks (block submission, accepted /
-//! rejected sinks, session persistence, block-found notification,
-//! mempool validator, miner lookup, coinbase distributor). The 5
-//! above cover the **mining-server** per-connection task. None of the
-//! other three is owed here:
+//! The earlier skeleton listed 8 hooks (block submission, accepted / rejected
+//! sinks, session persistence, block-found notification, mempool validator,
+//! miner lookup, coinbase distributor). The 5 above cover the
+//! **mining-server** per-connection task. None of the other three is owed
+//! here:
 //!
 //! - `BlockFoundNotificationSink` lives in `bp_notifications`
 //!   (Telegram / ntfy / push). It's downstream of the share-accept
@@ -54,10 +54,10 @@ use crate::mining::submit::{RejectReason, ShareAccept};
 
 // ── PayoutResolver ──────────────────────────────────────────────────
 
-/// Resolve a miner address to a coinbase payout list. Called per
-/// template broadcast inside the per-connection task; the returned
-/// list is fed to [`bp_mining_job::build_mining_job_from_tdp`] to
-/// produce the `MiningJob` consumed by
+/// Resolve a miner address to a coinbase payout list. Called per template
+/// broadcast inside the per-connection task; the returned list is fed to
+/// [`bp_mining_job::build_mining_job_from_tdp`] to produce the `MiningJob`
+/// consumed by
 /// [`crate::mining::client::apply_template_broadcast`].
 ///
 /// Production impl runs the service-layer mode-resolver

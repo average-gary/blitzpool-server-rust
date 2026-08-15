@@ -71,11 +71,11 @@ pub enum InboundJdpFrame {
 
 // ── decode_jdp_inbound ──────────────────────────────────────────────
 
-/// ext 0x0003/Message Types: `SetPayoutDistribution` (JDS → JDC,
-/// channel_msg bit unset). The push model defines no inbound ext-0x0003 frames
-/// — the `distribution_id` reference arrives as an ext 0x0003/distribution_id
-/// TLV Field on the base-protocol `DeclareMiningJob` / `SetCustomMiningJob`
-/// frames.
+/// ext 0x0003/Message Types: `SetPayoutDistribution` (JDS → JDC, channel_msg
+/// bit unset). The push model defines no inbound ext-0x0003 frames — the
+/// `distribution_id` reference arrives as an
+/// ext 0x0003/distribution_id TLV Field on the base-protocol
+/// `DeclareMiningJob` / `SetCustomMiningJob` frames.
 pub const EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION: u8 = 0x00;
 
 pub fn decode_jdp_inbound(msg: AnyMessage<'static>) -> Result<Option<InboundJdpFrame>, CodecError> {
@@ -326,9 +326,9 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
 }
 
 /// Raw-bytes encoder for ext 0x0003 outbound frames. Returns
-/// `Some((message_type, payload_bytes))` when the frame is an
-/// ext 0x0003 variant the codec can serialise, `None` otherwise
-/// (caller falls through to [`encode_jdp_outbound`]).
+/// `Some((message_type, payload_bytes))` when the frame is an ext 0x0003
+/// variant the codec can serialise, `None` otherwise (caller falls through to
+/// [`encode_jdp_outbound`]).
 ///
 /// The returned `payload_bytes` is just the message body; the IO
 /// layer wraps it in a `Sv2Frame` with the 6-byte header

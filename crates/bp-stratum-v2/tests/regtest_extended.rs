@@ -143,12 +143,12 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
-            // Deliberately NO flags — not REQUIRES_VERSION_ROLLING either. SV2
-            // Mining/SetupConnection Flags for Mining Protocol's flag means "I
-            // need version rolling", so a client that omits it has said
-            // nothing, and the job it gets must still allow rolling. Asserted
-            // below; this is also what makes this test fail against the code
-            // that derived the job flag from this field.
+            // Deliberately NO flags — not REQUIRES_VERSION_ROLLING either.
+            // SV2 Mining/SetupConnection Flags for Mining Protocol's flag
+            // means "I need version rolling", so a client that omits it has
+            // said nothing, and the job it gets must still allow rolling.
+            // Asserted below; this is also what makes this test fail against
+            // the code that derived the job flag from this field.
             flags: 0,
             endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
             endpoint_port: addr.port(),
@@ -165,9 +165,10 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     match resp {
         AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s)) => {
             assert_eq!(s.used_version, 2);
-            // Server capability bits (SV2 Mining/SetupConnection Flags for
-            // Mining Protocol) are built fresh, NOT echoed: a version-rolling
-            // client must NOT get REQUIRES_FIXED_VERSION back.
+            // Server capability bits
+            // (SV2 Mining/SetupConnection Flags for Mining Protocol) are built
+            // fresh, NOT echoed: a version-rolling client must NOT get
+            // REQUIRES_FIXED_VERSION back.
             assert_eq!(
                 s.flags, 0,
                 "Success.flags must be 0, not an echo of the request flags"
@@ -316,8 +317,9 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     );
 
     // ── Oversize extranonce request → OpenMiningChannelError (not a
-    //    silently-smaller grant). SV2 Mining/OpenExtendedMiningChannel:
-    //    grant >= requested min or reject.
+    //    silently-smaller grant). Our rule, not the spec's —
+    //    SV2 Mining/OpenExtendedMiningChannel binds the granted size to the
+    //    requested minimum nowhere.
     //    17 > the pool's 16-byte rollable cap.
     let oversize = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {

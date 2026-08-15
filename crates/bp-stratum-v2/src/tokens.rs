@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-connection JDP-token store. Tokens are opaque 16-byte
-//! identifiers the JDS hands to a JDC on
-//! `AllocateMiningJobToken`. The JDC then references them in
-//! `DeclareMiningJob` and `SetCustomMiningJob`. Each
-//! token has a 1 h TTL (SV2 JDP/AllocateMiningJobToken — "the JDC SHOULD
-//! use the token within a reasonable amount of time") and the pool
-//! rate-limits allocations to one per 1 s per connection (SV2
-//! JDP/AllocateMiningJobToken — "rate limited to a rather slow rate").
+//! Per-connection JDP-token store. Tokens are opaque 16-byte identifiers the
+//! JDS hands to a JDC on `AllocateMiningJobToken`. The JDC then references
+//! them in `DeclareMiningJob` and `SetCustomMiningJob`. Each token has a 1 h
+//! TTL — OUR policy, the spec sets no lifetime — and the pool rate-limits
+//! allocations to one per 1 s per connection, which is the spec's only
+//! constraint here (SV2 JDP/AllocateMiningJobToken — "rate limited to a rather
+//! slow rate", no number given).
 //!
 //! ## Format
 //!
@@ -42,14 +41,13 @@ use std::collections::HashMap;
 
 use bp_common::AddressId;
 
-/// Test-side RNG hook signature. The store holds an `Option<Box<…>>`
-/// of this so production code uses `getrandom::getrandom` and tests
-/// can inject a deterministic byte-stream. Returning the `String`
-/// error matches what `getrandom::Error::to_string` would produce.
-/// Boxed RNG closure type used by [`TokenStore::set_rng`]. Public so
-/// callers wrapping `TokenStore` (e.g. `jdp::client::JdpSessionState`)
-/// can expose a deterministic-RNG hook without re-declaring the
-/// `dyn FnMut` shape and tripping `clippy::type_complexity`.
+/// Test-side RNG hook signature. The store holds an `Option<Box<…>>` of this
+/// so production code uses `getrandom::getrandom` and tests can inject a
+/// deterministic byte-stream. Returning the `String` error matches what
+/// `getrandom::Error::to_string` would produce. Boxed RNG closure type used by
+/// [`TokenStore::set_rng`]. Public so callers wrapping `TokenStore` (e.g.
+/// `jdp::client::JdpSessionState`) can expose a deterministic-RNG hook without
+/// re-declaring the `dyn FnMut` shape and tripping `clippy::type_complexity`.
 pub type RngFn = dyn FnMut(&mut [u8]) -> Result<(), String> + Send + 'static;
 
 /// Token length in bytes. SV2 spec doesn't pin a specific length;
@@ -118,9 +116,9 @@ impl std::fmt::Debug for Token {
 
 // ── AllocatedToken ───────────────────────────────────────────────────
 
-/// One issued token's bookkeeping. `coinbase_outputs` is the SV2
-/// JDP/AllocateMiningJobToken.Success fallback single-output payload returned
-/// in `AllocateMiningJobTokenSuccess.coinbase_outputs`. Used later by
+/// One issued token's bookkeeping. `coinbase_outputs` is the
+/// SV2 JDP/AllocateMiningJobToken.Success fallback single-output payload
+/// returned in `AllocateMiningJobTokenSuccess.coinbase_outputs`. Used later by
 /// `jdp::dynamic_outputs` as the fallback when a 0x0003-unaware JDC skips the
 /// dynamic step.
 #[derive(Clone, Debug)]
@@ -311,9 +309,9 @@ impl TokenStore {
     /// minting. Storage, TTL and the rate limit all live in the callers,
     /// because those are the three things that legitimately differ.
     ///
-    /// `last_alloc_ms` is deliberately NOT stamped here: it is the SV2
-    /// JDP/AllocateMiningJobToken budget of the CLIENT's allocate message, and
-    /// `allocate` stamps it before calling in. Stamping here would make a
+    /// `last_alloc_ms` is deliberately NOT stamped here: it is the
+    /// SV2 JDP/AllocateMiningJobToken budget of the CLIENT's allocate message,
+    /// and `allocate` stamps it before calling in. Stamping here would make a
     /// pool-minted declaration token block the miner's next allocate for a
     /// second — the same interop bug mirrored.
     fn next_token(&mut self) -> Result<Token, TokenAllocError> {

@@ -25,8 +25,9 @@
 //!   decision. Eigen-Code only for pool-side state machine + Blitzpool
 //!   behaviour.
 //! - **Functional reactions** (frame shape, vendor quirks, retire-not-clear
-//!   job lifecycle from sv2-ui#143, jobIdToDifficulty for SV2
-//!   Mining/SubmitShares.Error, stored-merkle-root to avoid mutation bugs,
+//!   job lifecycle from sv2-ui#143, jobIdToDifficulty for
+//!   SV2 Mining/SubmitShares.Error, stored-merkle-root to avoid mutation
+//!   bugs,
 //!   dust-suppression in JDP ext 0x0003) are implemented as specified.
 //!   Internal performance improvements are allowed where they don't change
 //!   observable behaviour.

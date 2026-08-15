@@ -12,12 +12,11 @@
 //!   connections and handles the `SetCustomMiningJob` frame when a
 //!   JDC miner finalises its declared job.
 //!
-//! The two share a process but live in independent per-connection
-//! tasks. When a JDC sends `SetCustomMiningJob{mining_job_token: T}`
-//! on its **mining** connection, the mining-side handler needs to
-//! retrieve the [`crate::jdp::declarations::DeclaredJob`] payload
-//! that was stored on its **JDP** connection — same miner, different
-//! connection, different task.
+//! The two share a process but live in independent per-connection tasks. When
+//! a JDC sends `SetCustomMiningJob{mining_job_token: T}` on its **mining**
+//! connection, the mining-side handler needs to retrieve the
+//! [`crate::jdp::declarations::DeclaredJob`] payload that was stored on its
+//! **JDP** connection — same miner, different connection, different task.
 //!
 //! [`JdpDeclaredJobRegistry`] is the bridge: a pool-wide token-keyed
 //! map populated by the JDP-server (via the
@@ -257,16 +256,16 @@ impl DistributionReference {
 /// gates on it). Split in two they would drift into resolving one
 /// distribution and validating against another.
 ///
-/// A reference is inherited from the declaration wherever ext
-/// 0x0003/Negotiation lets this connection use the extension at all.
+/// A reference is inherited from the declaration wherever
+/// ext 0x0003/Negotiation lets this connection use the extension at all.
 /// Everything else about the job is judged exactly as it was before this path
 /// existed.
 ///
 /// **It takes no stream, and must not.** It used to skip inheritance on a Solo
 /// stream, on the reasoning that a Solo job pays its own finder and had always
-/// been served without a reference — so subjecting it to the ext 0x0003/Grace
-/// Window + Implementation Notes acceptance would be a new way to refuse a
-/// job that used to work. Two things were wrong with that:
+/// been served without a reference — so subjecting it to the
+/// ext 0x0003/Grace Window + Implementation Notes acceptance would be a new
+/// way to refuse a job that used to work. Two things were wrong with that:
 ///
 /// 1. It made the answer depend on an operand the two callers could disagree
 ///    about, and they did. One passed the frozen template stream, the other the
@@ -276,8 +275,9 @@ impl DistributionReference {
 ///    connection whose accounting reads Solo may be holding a declaration
 ///    bound to a POOL-WIDE plan — its address flipped after the declare — and
 ///    dropping the reference there sent it to the base-protocol arm, which
-///    serves a Solo connection with no acceptance check and no ext
-///    0x0003/Output Verification recompute. The coinbase then pays the PPLNS
+///    serves a Solo connection with no acceptance check and no
+///    ext 0x0003/Output Verification recompute. The coinbase then pays the
+///    PPLNS
 ///    window on-chain while the booking resolves Solo and writes nothing, so
 ///    the window's claims survive and the pool pays them a second time.
 ///
@@ -324,10 +324,10 @@ pub fn resolve_distribution_reference(
 /// and the answers do not line up with any single `Option` on the inputs.
 ///
 /// Derived before this type existed by asking `bridge_job.is_some()` /
-/// `allocation.is_some()` at four separate places, which is what SV2 JDP/Job
-/// Declaration Modes look like when nothing names them: a fourth mode would
-/// have fallen through every one of those tests without the compiler saying a
-/// word.
+/// `allocation.is_some()` at four separate places, which is what
+/// SV2 JDP/Job Declaration Modes look like when nothing names them: a fourth
+/// mode would have fallen through every one of those tests without the
+/// compiler saying a word.
 ///
 /// **This is the token's authority, not its payout coverage.** Whether a
 /// published distribution pins the coinbase split is a SEPARATE question,
@@ -353,8 +353,8 @@ pub enum TokenBacking<'a> {
     Declared(&'a BridgeJobRef),
     /// Coinbase-only on the base protocol (SV2 JDP/Coinbase-only Mode:
     /// `DeclareMiningJob` "is never used"): the allocate is the pool's only
-    /// record, so the job is held to what SV2
-    /// JDP/AllocateMiningJobToken.Success gives — the coinbase pays
+    /// record, so the job is held to what
+    /// SV2 JDP/AllocateMiningJobToken.Success gives — the coinbase pays
     /// `payout_script` — and to the token's own miner address and the pool's
     /// tip.
     ///
@@ -365,10 +365,10 @@ pub enum TokenBacking<'a> {
         token: &'a AllocatedTokenRef,
         payout_script: &'a [u8],
     },
-    /// Coinbase-only under ext 0x0003: the allocate is on file, but ext
-    /// 0x0003/Negotiation left it without a designated output, so the ext
-    /// 0x0003/Output Verification recompute against the published distribution
-    /// is what judges the coinbase.
+    /// Coinbase-only under ext 0x0003: the allocate is on file, but
+    /// ext 0x0003/Negotiation left it without a designated output, so the
+    /// ext 0x0003/Output Verification recompute against the published
+    /// distribution is what judges the coinbase.
     ///
     /// The token is still the pool's own record and is bound exactly as the
     /// base-protocol one is — same miner address, same tip. Only the coinbase
@@ -573,8 +573,8 @@ pub fn accounting_fits_mode(
 /// One published `SetPayoutDistribution` (ext 0x0003/SetPayoutDistribution),
 /// tracked pool-wide so both the JDP declare path and the mining-side
 /// `SetCustomMiningJob` path can resolve a `distribution_id` TLV to the
-/// weights it references and validate the coinbase per ext 0x0003/Output
-/// Verification.
+/// weights it references and validate the coinbase per
+/// ext 0x0003/Output Verification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayoutDistributionEntry {
     /// ext 0x0003/SetPayoutDistribution: strictly increasing, universal across
@@ -623,8 +623,9 @@ pub enum DistributionScope<'a> {
 pub enum DistributionAcceptance {
     /// Within the acceptance window — validate against these weights.
     Accepted(Arc<PayoutDistributionEntry>),
-    /// Known but superseded / settlement-invalidated (ext 0x0003/Grace Window
-    /// + Implementation Notes) → `stale-payout-distribution`.
+    /// Known but superseded / settlement-invalidated
+    /// (ext 0x0003/Grace Window + Implementation Notes) →
+    /// `stale-payout-distribution`.
     Stale,
     /// Never published (or long pruned). The spec folds this into the
     /// same error code — a JDC can't distinguish "too old" from
@@ -697,8 +698,8 @@ pub struct JdpDeclaredJobRegistry {
     /// build failed. Without this they would silently resolve against
     /// `pool_wide_distribution` — see [`Self::deny_pool_wide`].
     pool_wide_denied: HashSet<u32>,
-    /// Bumped by [`Self::invalidate_all_distributions`] (ext
-    /// 0x0003/Implementation Notes). Every entry published under an older
+    /// Bumped by [`Self::invalidate_all_distributions`]
+    /// (ext 0x0003/Implementation Notes). Every entry published under an older
     /// epoch resolves as `Stale`.
     settlement_epoch: u64,
 }
@@ -708,10 +709,10 @@ impl JdpDeclaredJobRegistry {
         Self::default()
     }
 
-    /// Register a declared job. Returns the previously-registered
-    /// entry if the token was already in the map (which should not
-    /// happen with a unique-token-per-allocation invariant — kept
-    /// for symmetry with [`HashMap::insert`]).
+    /// Register a declared job. Returns the previously-registered entry if the
+    /// token was already in the map (which should not happen with a
+    /// unique-token-per-allocation invariant — kept for symmetry with
+    /// [`HashMap::insert`]).
     pub fn register(
         &mut self,
         token: Token,
@@ -811,13 +812,13 @@ impl JdpDeclaredJobRegistry {
     /// The pool-wide distribution is the PPLNS window's. A Solo or Group-Solo
     /// session honouring it declares a coinbase that pays the PPLNS window —
     /// and the seeded entry stayed in the acceptance window for the whole
-    /// session (nothing republishes a tailored entry except a ext
-    /// 0x0003/Implementation Notes settlement), so this was not a brief race
-    /// but a standing offer. A block found on such a job pays miners whose
-    /// accounting it does not belong to, and the booking then resolves the
-    /// mode from the miner's ADDRESS, so for Solo nothing is booked at all:
-    /// the PPLNS miners are paid on-chain and their ledger never hears about
-    /// it.
+    /// session (nothing republishes a tailored entry except a
+    /// ext 0x0003/Implementation Notes settlement), so this was not a brief
+    /// race but a standing offer. A block found on such a job pays miners
+    /// whose accounting it does not belong to, and the booking then resolves
+    /// the mode from the miner's ADDRESS, so for Solo nothing is booked at
+    /// all: the PPLNS miners are paid on-chain and their ledger never hears
+    /// about it.
     ///
     /// The right answer to that race is the wire error the spec already
     /// has: the session's own slot does not hold the pool-wide id, so it
@@ -836,12 +837,12 @@ impl JdpDeclaredJobRegistry {
     /// connection-open push and the publisher's skip-if-unchanged
     /// comparison).
     ///
-    /// `None` once a settlement invalidated it (ext 0x0003/Implementation
-    /// Notes), even though the entry is still held for history: handing it out
-    /// would push a JDC a distribution that every declaration referencing it
-    /// is then answered `stale-payout-distribution` for, and would let the
-    /// publisher compare a rebuilt distribution equal to it and skip the
-    /// republish the settlement exists to force.
+    /// `None` once a settlement invalidated it
+    /// (ext 0x0003/Implementation Notes), even though the entry is still held
+    /// for history: handing it out would push a JDC a distribution that every
+    /// declaration referencing it is then answered `stale-payout-distribution`
+    /// for, and would let the publisher compare a rebuilt distribution equal
+    /// to it and skip the republish the settlement exists to force.
     pub fn current_pool_wide(&self) -> Option<Arc<PayoutDistributionEntry>> {
         self.pool_wide_distribution
             .latest
@@ -850,9 +851,9 @@ impl JdpDeclaredJobRegistry {
             .map(|p| p.entry.clone())
     }
 
-    /// The current tailored distribution for a JDP session, if one is
-    /// usable. Settlement-invalidated entries are withheld for the same
-    /// reason as in [`Self::current_pool_wide`].
+    /// The current tailored distribution for a JDP session, if one is usable.
+    /// Settlement-invalidated entries are withheld for the same reason as in
+    /// [`Self::current_pool_wide`].
     pub fn current_tailored(&self, jdp_session_id: u32) -> Option<Arc<PayoutDistributionEntry>> {
         self.tailored_distributions
             .get(&jdp_session_id)
@@ -1684,9 +1685,9 @@ mod tests {
         );
     }
 
-    /// A tailored session's own grace slot still works — the ext 0x0003/Grace
-    /// Window window is latest + previous of ITS OWN entries, and only the
-    /// cross-scope seed is gone.
+    /// A tailored session's own grace slot still works — the
+    /// ext 0x0003/Grace Window is latest + previous of ITS OWN entries, and
+    /// only the cross-scope seed is gone.
     #[test]
     fn a_tailored_session_still_graces_its_own_previous_entry() {
         let mut reg = JdpDeclaredJobRegistry::new();

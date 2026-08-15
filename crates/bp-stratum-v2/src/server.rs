@@ -63,6 +63,14 @@
 //! so a block-change between job-send and share-submit can't reclassify an
 //! in-flight share's block-candidacy.
 //!
+//! **"strict" throughout this crate means our reading, not a spec mandate.**
+//! SV2 Mining/SubmitShares.Error is where the spec acknowledges the race —
+//! "this delayed validation can occur when a miner gets faster updates about a
+//! new prevhash than the server does" — but it defines an error message, not a
+//! pinning rule; nothing there says which template a share is judged against.
+//! The citations on the pinning code point at that acknowledgement, and the
+//! rule built on it is the pool's.
+//!
 //! ## Tests
 //!
 //! Real-TCP/Noise-handshake e2e tests live in `tests/regtest_*.rs`. Unit
@@ -110,14 +118,13 @@ use crate::server_codec::{decode_mining_inbound, encode_mining_outbound, Inbound
 
 // ── ServerConfig ────────────────────────────────────────────────────
 
-/// Pool-wide config slice for the mining server. Per-port settings
-/// live in [`PortConfig`] and are passed at `accept_connection` time.
+/// Pool-wide config slice for the mining server. Per-port settings live in
+/// [`PortConfig`] and are passed at `accept_connection` time.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// Network for `bitcoin::Address`-related operations. Caller
-    /// matches this to the bitcoin-core deployment
-    /// ([`Network::Bitcoin`] in production, [`Network::Regtest`] in
-    /// e2e tests).
+    /// Network for `bitcoin::Address`-related operations. Caller matches this
+    /// to the bitcoin-core deployment ([`Network::Bitcoin`] in production,
+    /// [`Network::Regtest`] in e2e tests).
     pub network: Network,
     /// Pool identifier suffix appended to coinbase scriptSigs after
     /// the BIP-34 height push (until the 100-byte limit drops it).
@@ -682,11 +689,11 @@ async fn run_mining_connection(
                 // SubmitSharesExtended, re-serialise the parsed TLVs into the
                 // wire-form tail bytes and attach to the input. The validator
                 // + `resolve_share_worker_name_from_tlv` consume the wire-form
-                // bytes (ext 0x0002/TLV Format for user_identity / ext
-                // 0x0002/Extended SubmitSharesExtended Message Format). When
-                // ext 0x0002 isn't in `state.negotiated_extensions`, the
-                // validator will silently ignore any TLV (ext 0x0002/Behavior
-                // Based on Negotiation).
+                // bytes (ext 0x0002/TLV Format for user_identity /
+                // ext 0x0002/Extended SubmitSharesExtended Message Format).
+                // When ext 0x0002 isn't in `state.negotiated_extensions`, the
+                // validator will silently ignore any TLV
+                // (ext 0x0002/Behavior Based on Negotiation).
                 if let InboundMiningFrame::SubmitSharesExtended(ref mut submit) = inbound {
                     if let Some(tlv_list) = &tlvs {
                         let mut tail = Vec::new();
@@ -1119,8 +1126,9 @@ fn channel_alloc_key(session_id: u32, channel_id: u32) -> u64 {
 ///   block-candidacy.
 /// - **SetCustomMiningJob**: queries the bridge for the `mining_job_token` and
 ///   resolves the job's `distribution_id` TLV against the distribution
-///   registry (`MinerAddress` scope); the cross-checks + ext 0x0003/Output
-///   Verification payout validation happen inside the handler. Distributions
+///   registry (`MinerAddress` scope); the cross-checks +
+///   ext 0x0003/Output Verification payout validation happen inside the
+///   handler. Distributions
 ///   are multi-use — nothing is consumed on success.
 pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     state: &mut MiningSessionState<C>,
@@ -1191,9 +1199,10 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                 // the lock is held. The raw transactions the handler never
                 // needs.
                 let bridge_job = guard.job_ref(&input.mining_job_token);
-                // Coinbase-only mode never declares (SV2 JDP/Coinbase-only
-                // Mode), so the only record of its token is the allocate.
-                // Base-protocol allocations only — see `AllocatedTokenRef`.
+                // Coinbase-only mode never declares
+                // (SV2 JDP/Coinbase-only Mode), so the only record of its
+                // token is the allocate. Base-protocol allocations only — see
+                // `AllocatedTokenRef`.
                 let allocation = guard
                     .allocation_ref(&input.mining_job_token, now_ms)
                     .cloned();
@@ -1527,9 +1536,10 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             SessionEvent::ShareAccepted { channel_id, accept } => {
                 // ext 0x0002 Worker-ID TLV: when the per-share TLV resolves to
                 // a non-empty worker name, attribute the share to that worker
-                // rather than the channel-default (ext 0x0002/Behavior Based
-                // on Negotiation). When None, fall back to channel-default (no
-                // TLV present, or ext 0x0002 not negotiated).
+                // rather than the channel-default
+                // (ext 0x0002/Behavior Based on Negotiation). When None, fall
+                // back to channel-default (no TLV present, or ext 0x0002 not
+                // negotiated).
                 let effective_worker = accept
                     .effective_worker_name
                     .as_deref()
@@ -2349,13 +2359,13 @@ mod tests {
         assert!(s.channels.is_empty());
     }
 
-    /// ext 0x0003 end-to-end through dispatch: the ext 0x0003/distribution_id
-    /// TLV Field `distribution_id` TLV resolves against the bridge
-    /// (miner-address scope on a mining connection) and an ext 0x0003/Payout
-    /// Computation-conformant coinbase is accepted. Distributions are
-    /// multi-use — a second job referencing the same id passes too — until a
-    /// ext 0x0003/Implementation Notes settlement invalidation turns the same
-    /// reference into `stale-payout-distribution`.
+    /// ext 0x0003 end-to-end through dispatch: the
+    /// ext 0x0003/distribution_id TLV Field `distribution_id` TLV resolves
+    /// against the bridge (miner-address scope on a mining connection) and an
+    /// ext 0x0003/Payout Computation-conformant coinbase is accepted.
+    /// Distributions are multi-use — a second job referencing the same id
+    /// passes too — until a ext 0x0003/Implementation Notes settlement
+    /// invalidation turns the same reference into `stale-payout-distribution`.
     #[test]
     fn dispatch_set_custom_mining_job_resolves_distribution_multi_use() {
         use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
@@ -2523,10 +2533,10 @@ mod tests {
     }
 
     /// The IO-layer half of the ext-0x0003 twin, which nothing else covers: a
-    /// Full-Template `SetCustomMiningJob` carries no ext
-    /// 0x0003/distribution_id TLV Field, so the acceptance has to be resolved
-    /// from the reference its DECLARATION was accepted under — and under the
-    /// scope it was accepted in.
+    /// Full-Template `SetCustomMiningJob` carries no
+    /// ext 0x0003/distribution_id TLV Field, so the acceptance has to be
+    /// resolved from the reference its DECLARATION was accepted under — and
+    /// under the scope it was accepted in.
     ///
     /// The trap this pins: one payout address is one account, so it can own
     /// several tailored slots (two jd-clients, or a ghost left by an
@@ -2796,8 +2806,8 @@ mod tests {
             // A SECOND declaration, byte-identical but under its own token. A
             // token authorises exactly one custom job now, so the two
             // dispatches below cannot share one — and they must not: reusing
-            // it would test the consume rule, not the ext
-            // 0x0003/Implementation Notes refusal this test is about.
+            // it would test the consume rule, not the
+            // ext 0x0003/Implementation Notes refusal this test is about.
             guard.register(
                 SECOND_TOKEN,
                 crate::bridge::RegisteredDeclaredJob {

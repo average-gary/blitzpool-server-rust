@@ -5,8 +5,8 @@
 //!
 //! One ext 0x0003/Payout Computation evaluation serves every consumer: the JDS
 //! builds the expected output vector from `(distribution, T)` and the
-//! validator compares a declared coinbase POSITIONALLY against it (ext
-//! 0x0003/Output Verification — the spec fixes the output order, so
+//! validator compares a declared coinbase POSITIONALLY against it
+//! (ext 0x0003/Output Verification — the spec fixes the output order, so
 //! containment games like paying two distributions at once are structurally
 //! impossible; nothing here needs the old multiset machinery).
 //!
@@ -54,8 +54,8 @@ pub enum PayoutComputeError {
     /// An `additional_outputs` blob did not consensus-decode to a TxOut.
     #[error("additional output {index} is not a consensus TxOut")]
     UnparsableAdditionalOutput { index: usize },
-    /// An `additional_outputs` TxOut carried a non-0 amount (ext
-    /// 0x0003/SetPayoutDistribution MUST).
+    /// An `additional_outputs` TxOut carried a non-0 amount
+    /// (ext 0x0003/SetPayoutDistribution MUST).
     #[error("additional output {index} carries a non-zero amount")]
     NonZeroAdditionalOutput { index: usize },
 }
@@ -107,8 +107,8 @@ pub enum DistributionViolation {
     WrongOutputAt { position: usize },
     /// The declared coinbase ends before the recomputed vector does.
     MissingExpectedOutput { position: usize },
-    /// A trailing (JDC/TP-appended) output carries a non-0 amount — ext
-    /// 0x0003/Payout Computation only permits 0-value outputs after the
+    /// A trailing (JDC/TP-appended) output carries a non-0 amount —
+    /// ext 0x0003/Payout Computation only permits 0-value outputs after the
     /// distribution block.
     NonZeroTrailingOutput { position: usize },
     /// The distribution itself cannot be evaluated (zero weight sum /
@@ -119,10 +119,10 @@ pub enum DistributionViolation {
     /// No coinbase can pay more than the money supply, so this is a
     /// malformed declaration rather than an internal failure.
     RevenueOverflow,
-    /// The declared coinbase pays nothing at all. Self-consistent (every ext
-    /// 0x0003/Payout Computation amount is 0 at T = 0) and therefore invisible
-    /// to the compare, but it is a block that forfeits its own subsidy — never
-    /// a job a pool should declare valid.
+    /// The declared coinbase pays nothing at all. Self-consistent (every
+    /// ext 0x0003/Payout Computation amount is 0 at T = 0) and therefore
+    /// invisible to the compare, but it is a block that forfeits its own
+    /// subsidy — never a job a pool should declare valid.
     ZeroRevenue,
 }
 
@@ -165,18 +165,18 @@ pub fn validate_coinbase_outputs_against_distribution(
     // from something other than the declared outputs — keep it so that
     // change cannot silently open a valued-trailing-output hole.
     //
-    // Trailing outputs are checked for VALUE only, deliberately. ext
-    // 0x0003/Payout Computation also requires the witness commitment to come
-    // last, but that is a construction rule for the JDC; ext 0x0003/Output
-    // Verification defines this verifier's job as recompute-and-compare plus
-    // "only 0-value outputs may follow", and that is what this is. Nor is it a
-    // consensus "last": BIP-141 takes the HIGHEST-index output matching the
-    // commitment pattern, so a 0-value output after it is inert unless it
-    // matches too — in which case the JDC has invalidated its own block and
-    // forfeited its own payout with it. bitcoind is the authority on that, and
-    // rejects it at submit. Checking it here would mix "does this coinbase pay
-    // the published distribution?" (ours) with "is this block valid?" (not
-    // ours).
+    // Trailing outputs are checked for VALUE only, deliberately.
+    // ext 0x0003/Payout Computation also requires the witness commitment to
+    // come last, but that is a construction rule for the JDC;
+    // ext 0x0003/Output Verification defines this verifier's job as
+    // recompute-and-compare "allowing only JDC-appended 0-value outputs in
+    // position 4", and that is what this is. Nor is it a consensus "last":
+    // BIP-141 takes the HIGHEST-index output matching the commitment pattern,
+    // so a 0-value output after it is inert unless it matches too — in which
+    // case the JDC has invalidated its own block and forfeited its own payout
+    // with it. bitcoind is the authority on that, and rejects it at submit.
+    // Checking it here would mix "does this coinbase pay the published
+    // distribution?" (ours) with "is this block valid?" (not ours).
     for (offset, got) in declared[expected.len()..].iter().enumerate() {
         if got.value != Amount::ZERO {
             return Err(DistributionViolation::NonZeroTrailingOutput {

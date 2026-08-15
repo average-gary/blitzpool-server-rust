@@ -73,18 +73,18 @@ pub struct ExtendedJob {
     pub prev_hash: [u8; 32],
     pub n_bits: u32,
     pub min_ntime: u32,
-    /// Per-job session difficulty stored at send-time. SV2
-    /// Mining/SubmitShares.Error requires share validation against the target
-    /// the job was issued at, NOT the current `session_difficulty` — without
-    /// this a vardiff ratchet between job-send and share-submit would falsely
-    /// accept / reject in-flight shares. The Standard side stores the same
-    /// field on [`StandardJobEntry::difficulty`]; mirroring it here lets the
-    /// Extended submit-handler read directly from the job record instead of
-    /// cross-referencing the Standard-side map.
+    /// Per-job session difficulty stored at send-time.
+    /// SV2 Mining/SubmitShares.Error requires share validation against the
+    /// target the job was issued at, NOT the current `session_difficulty` —
+    /// without this a vardiff ratchet between job-send and share-submit would
+    /// falsely accept / reject in-flight shares. The Standard side stores the
+    /// same field on [`StandardJobEntry::difficulty`]; mirroring it here lets
+    /// the Extended submit-handler read directly from the job record instead
+    /// of cross-referencing the Standard-side map.
     pub difficulty: Difficulty,
-    /// Per-job **network** difficulty pinned at send-time (SV2
-    /// Mining/SubmitShares.Error). The block-found gate compares the share's
-    /// solved difficulty against THIS, not the current template's — a
+    /// Per-job **network** difficulty pinned at send-time
+    /// (SV2 Mining/SubmitShares.Error). The block-found gate compares the
+    /// share's solved difficulty against THIS, not the current template's — a
     /// block-change between job-send and share-submit must not retroactively
     /// reclassify an in-flight share's block-candidacy. Mirrors the Standard
     /// side, which pins it on
@@ -216,10 +216,10 @@ pub struct StandardTemplateSnapshot {
 /// One Standard `NewMiningJob` we've sent, with everything the share
 /// validator + retire-not-clear lifecycle need.
 ///
-/// `difficulty` + `merkle_root` are stored at send time (SV2
-/// Mining/SubmitShares.Error — job-specific target; store-on-send merkle root
-/// avoids the `applyExtranonceAndGetCoinbaseHash` mutation bug that caused
-/// ~19% reject on BraiinsOS).
+/// `difficulty` + `merkle_root` are stored at send time
+/// (SV2 Mining/SubmitShares.Error — job-specific target; store-on-send merkle
+/// root avoids the `applyExtranonceAndGetCoinbaseHash` mutation bug that
+/// caused ~19% reject on BraiinsOS).
 ///
 /// `template_snapshot` is the **template the miner is hashing
 /// against**. On block change retired entries keep their snapshot —
@@ -250,9 +250,9 @@ pub struct StandardJobEntry {
     pub template_snapshot: StandardTemplateSnapshot,
     /// Full non-witness coinbase bytes (= `mining_job.coinbase_prefix() +
     /// channel.extranonce_prefix + [0u8; 8] + mining_job.coinbase_suffix()`
-    /// for Standard pool-built jobs). Convertible to the
-    /// witness-form by [`bp_stratum_v2::mining::submit::assemble_witness_coinbase`]
-    /// at submit time. Empty for `SetCustomMiningJob`-derived jobs.
+    /// for Standard pool-built jobs). Convertible to the witness-form by
+    /// [`bp_stratum_v2::mining::submit::assemble_witness_coinbase`] at submit
+    /// time. Empty for `SetCustomMiningJob`-derived jobs.
     pub coinbase_stratum: Vec<u8>,
     /// Identity of the payout list this job's coinbase pays — copied off
     /// the `MiningJob` it was built from. Lets a block found on this job
@@ -276,13 +276,12 @@ pub struct StandardJobEntry {
 /// [`bp_jobs_lifecycle`].
 ///
 /// **Retire-not-clear (SV2 Mining/SubmitShares.Error)**: on block change the IO layer
-/// calls [`Self::retire`] (stamps `retired_at_ms` on every entry,
-/// idempotent) — it does **not** delete entries. In-flight shares for
-/// the retired jobs then classify as `StaleCreditable` (within grace —
-/// still credited) or `StaleRejected` (past grace — emits wire-code
-/// `stale-share`, NOT the spec-incorrect `invalid-job-id`). Older
-/// retired entries get GC'd by [`Self::cleanup_expired`] using the
-/// shared two-tier aging algorithm.
+/// calls [`Self::retire`] (stamps `retired_at_ms` on every entry, idempotent)
+/// — it does **not** delete entries. In-flight shares for the retired jobs
+/// then classify as `StaleCreditable` (within grace — still credited) or
+/// `StaleRejected` (past grace — emits wire-code `stale-share`, NOT the
+/// spec-incorrect `invalid-job-id`). Older retired entries get GC'd by
+/// [`Self::cleanup_expired`] using the shared two-tier aging algorithm.
 ///
 /// Genuinely missing entries (past retention GC, or never sent) still
 /// resolve to `invalid-job-id` via [`Self::classify`] returning `None`.
