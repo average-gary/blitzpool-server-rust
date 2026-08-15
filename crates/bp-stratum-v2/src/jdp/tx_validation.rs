@@ -100,8 +100,9 @@ pub struct PendingDeclaration {
     /// `unknown_tx_position_list` field in
     /// `ProvideMissingTransactions`).
     pub missing_positions: Vec<u32>,
-    /// Raw txs we already had locally. Caller folds the provided list in via
-    /// [`merge_provided_with_known`] when the Success frame arrives.
+    /// Raw txs we already had locally. Caller folds the provided
+    /// list in via [`merge_provided_with_known`] when the Success
+    /// frame arrives.
     pub known_raw_txs: HashMap<u32, Vec<u8>>,
 }
 

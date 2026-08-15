@@ -118,13 +118,14 @@ use crate::server_codec::{decode_mining_inbound, encode_mining_outbound, Inbound
 
 // ── ServerConfig ────────────────────────────────────────────────────
 
-/// Pool-wide config slice for the mining server. Per-port settings live in
-/// [`PortConfig`] and are passed at `accept_connection` time.
+/// Pool-wide config slice for the mining server. Per-port settings
+/// live in [`PortConfig`] and are passed at `accept_connection` time.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// Network for `bitcoin::Address`-related operations. Caller matches this
-    /// to the bitcoin-core deployment ([`Network::Bitcoin`] in production,
-    /// [`Network::Regtest`] in e2e tests).
+    /// Network for `bitcoin::Address`-related operations. Caller
+    /// matches this to the bitcoin-core deployment
+    /// ([`Network::Bitcoin`] in production, [`Network::Regtest`] in
+    /// e2e tests).
     pub network: Network,
     /// Pool identifier suffix appended to coinbase scriptSigs after
     /// the BIP-34 height push (until the 100-byte limit drops it).

@@ -1430,11 +1430,11 @@ fn stamp_submission_heartbeat<C: Clock>(state: &mut MiningSessionState<C>, chann
     }
 }
 
-/// Handle `SubmitSharesStandard`. Resolves the channel + per-job context
-/// (stored merkle root + difficulty + template snapshot) and delegates to
-/// [`validate_submit_standard`]. Emits `SubmitSharesSuccess` /
-/// `SubmitSharesError` on the wire + `ShareAccepted` / `ShareRejected` for the
-/// hooks layer.
+/// Handle `SubmitSharesStandard`. Resolves the channel + per-job
+/// context (stored merkle root + difficulty + template snapshot) and
+/// delegates to [`validate_submit_standard`]. Emits
+/// `SubmitSharesSuccess` / `SubmitSharesError` on the wire +
+/// `ShareAccepted` / `ShareRejected` for the hooks layer.
 ///
 /// SV2 Mining/SubmitShares.Error strict: validation runs against the
 /// [`StandardTemplateSnapshot`] stored on the `StandardJobEntry` at
@@ -1893,13 +1893,13 @@ pub fn handle_close_channel<C: Clock>(
 
 // ── apply_vardiff_check ─────────────────────────────────────────────
 
-/// Periodic vardiff tick. For each channel, reads that channel's own
-/// [`bp_vardiff::VarDiffEngine::suggested_difficulty`] against the channel's
-/// current difficulty; if a retarget is recommended it clamps against the
-/// channel's `declared_max_target`, updates the channel's difficulty, and
-/// emits `SetTarget` + `DifficultyChanged`. Each channel retargets
-/// independently from its own share rate — SV2 difficulty is per channel, so
-/// several channels on one connection never pool their rate.
+/// Periodic vardiff tick. For each channel, reads that channel's
+/// own [`bp_vardiff::VarDiffEngine::suggested_difficulty`] against the
+/// channel's current difficulty; if a retarget is recommended it clamps
+/// against the channel's `declared_max_target`, updates the channel's
+/// difficulty, and emits `SetTarget` + `DifficultyChanged`. Each channel
+/// retargets independently from its own share rate — SV2 difficulty is per
+/// channel, so several channels on one connection never pool their rate.
 ///
 /// Job-declaration clients are retargeted by this same path. A JDC runs no
 /// vardiff of its own on the pool-facing channel — it only ever applies the
@@ -2055,11 +2055,12 @@ fn standard_member_root_and_coinbase(
 /// Caller pre-resolves payouts and packs the per-template coinbase
 /// fields into a [`MiningJobInputs`]; this handler builds a fresh
 /// [`MiningJob`] per channel with the channel-specific extranonce-slot
-/// size baked into the scriptsig (Standard channels use the pool default
-/// [`EXTRANONCE_SLOT_LEN`]; Extended channels use `extranonce_prefix.len() +
-/// extranonce_size`). The handler still owns the per-channel work: extranonce
-/// splicing, merkle root assembly for Standard, prefix/suffix split for
-/// Extended, and the retire-not-clear lifecycle bookkeeping on block change.
+/// size baked into the scriptsig (Standard channels use the pool
+/// default [`EXTRANONCE_SLOT_LEN`]; Extended channels use
+/// `extranonce_prefix.len() + extranonce_size`). The handler still
+/// owns the per-channel work: extranonce splicing, merkle root
+/// assembly for Standard, prefix/suffix split for Extended, and the
+/// retire-not-clear lifecycle bookkeeping on block change.
 ///
 /// Per-channel decisions:
 ///
@@ -2595,10 +2596,10 @@ pub fn apply_template_broadcast<C: Clock>(
 /// [`ExtendedJob`] under a fresh channel-local job_id and replies
 /// with `Success` so the JDC can submit shares against it.
 ///
-/// `coinbase_prefix` here is **just the scriptSig prefix bytes** (everything
-/// inside scriptSig BEFORE the extranonce slot). The handler wraps it with the
-/// standard non-witness coinbase header (version + input_count +
-/// null_outpoint + scriptSig_len_varint).
+/// `coinbase_prefix` here is **just the scriptSig prefix bytes**
+/// (everything inside scriptSig BEFORE the extranonce slot). The
+/// handler wraps it with the standard non-witness coinbase header
+/// (version + input_count + null_outpoint + scriptSig_len_varint).
 ///
 /// `coinbase_tx_outputs` carries the output_count varint + serialized
 /// `TxOut`s as a single blob — the JDC pre-encodes per SV2 spec.
@@ -2632,14 +2633,14 @@ pub struct SetCustomMiningJobInput {
 ///
 /// **Caller-resolved context**: the IO layer looks up the declared-job
 /// entry for `mining_job_token` in [`crate::bridge::JdpDeclaredJobRegistry`]
-/// and passes its projection as `bridge_job` ([`crate::bridge::BridgeJobRef`]
-/// — address, declared tip, and the declaration's own fields, but not its raw
-/// transactions). If `Some`, the handler cross-checks the channel's locked
-/// miner address (mismatch → `invalid-job-param-value-token-mismatch`), the
-/// tip binding — the custom job MUST build on the tip its declaration was
-/// accepted under (drift → `stale-chain-tip`, the retryable stale-race
-/// classification) — and the declaration binding of
-/// [`crate::jdp::custom_job_binding`].
+/// and passes its projection as `bridge_job`
+/// ([`crate::bridge::BridgeJobRef`] — address, declared tip, and the
+/// declaration's own fields, but not its raw transactions). If `Some`, the
+/// handler cross-checks the channel's locked miner address (mismatch →
+/// `invalid-job-param-value-token-mismatch`), the tip binding — the custom
+/// job MUST build on the tip its declaration was accepted under (drift →
+/// `stale-chain-tip`, the retryable stale-race classification) — and the
+/// declaration binding of [`crate::jdp::custom_job_binding`].
 ///
 /// **Two questions, two `match`es.** What AUTHORISES the token
 /// ([`crate::bridge::TokenBacking`] — a declared job, a base-protocol

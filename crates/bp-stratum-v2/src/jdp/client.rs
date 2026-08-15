@@ -204,8 +204,8 @@ pub struct PushSolutionInput {
 
 // ── Pre-resolved hook arguments (caller-supplied) ───────────────────
 
-/// Payload the caller resolves between the wire frame arriving and invoking
-/// [`handle_allocate_token`]. The IO layer:
+/// Payload the caller resolves between the wire frame arriving and
+/// invoking [`handle_allocate_token`]. The IO layer:
 ///
 /// 1. Calls a `MinerLookup` hook with the connection's remote IP if
 ///    the JDC's `user_identifier` doesn't parse as a BTC address.
@@ -464,8 +464,9 @@ impl JdpSessionState {
         }
     }
 
-    /// Test/IO-layer hook to inject a deterministic RNG into the underlying
-    /// [`TokenStore`]. Production paths use the default `getrandom` source.
+    /// Test/IO-layer hook to inject a deterministic RNG into the
+    /// underlying [`TokenStore`]. Production paths use the default
+    /// `getrandom` source.
     pub fn set_token_rng(&mut self, rng: Option<Box<crate::tokens::RngFn>>) {
         self.tokens.set_rng(rng);
     }

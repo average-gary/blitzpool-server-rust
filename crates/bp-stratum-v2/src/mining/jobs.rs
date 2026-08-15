@@ -250,9 +250,9 @@ pub struct StandardJobEntry {
     pub template_snapshot: StandardTemplateSnapshot,
     /// Full non-witness coinbase bytes (= `mining_job.coinbase_prefix() +
     /// channel.extranonce_prefix + [0u8; 8] + mining_job.coinbase_suffix()`
-    /// for Standard pool-built jobs). Convertible to the witness-form by
-    /// [`bp_stratum_v2::mining::submit::assemble_witness_coinbase`] at submit
-    /// time. Empty for `SetCustomMiningJob`-derived jobs.
+    /// for Standard pool-built jobs). Convertible to the
+    /// witness-form by [`bp_stratum_v2::mining::submit::assemble_witness_coinbase`]
+    /// at submit time. Empty for `SetCustomMiningJob`-derived jobs.
     pub coinbase_stratum: Vec<u8>,
     /// Identity of the payout list this job's coinbase pays — copied off
     /// the `MiningJob` it was built from. Lets a block found on this job

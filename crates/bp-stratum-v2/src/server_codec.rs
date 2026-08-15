@@ -130,9 +130,9 @@ pub enum InboundMiningFrame {
 
 /// Translate one wire-shape SV2 message into an
 /// [`InboundMiningFrame`]. Caller wraps this in the per-connection
-/// task: read a frame, parse to `AnyMessage`, call `.into_static()`, hand off
-/// here, dispatch the result to the matching `handle_*` in
-/// [`crate::mining::client`].
+/// task: read a frame, parse to `AnyMessage`, call
+/// `.into_static()`, hand off here, dispatch the result to the
+/// matching `handle_*` in [`crate::mining::client`].
 ///
 /// `Ok(None)` means "not a mining-server message" (log + ignore).
 /// `Err(...)` means the wire frame was malformed or the conversion

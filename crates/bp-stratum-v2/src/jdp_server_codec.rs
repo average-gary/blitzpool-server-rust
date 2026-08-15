@@ -326,9 +326,9 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
 }
 
 /// Raw-bytes encoder for ext 0x0003 outbound frames. Returns
-/// `Some((message_type, payload_bytes))` when the frame is an ext 0x0003
-/// variant the codec can serialise, `None` otherwise (caller falls through to
-/// [`encode_jdp_outbound`]).
+/// `Some((message_type, payload_bytes))` when the frame is an
+/// ext 0x0003 variant the codec can serialise, `None` otherwise
+/// (caller falls through to [`encode_jdp_outbound`]).
 ///
 /// The returned `payload_bytes` is just the message body; the IO
 /// layer wraps it in a `Sv2Frame` with the 6-byte header

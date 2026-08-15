@@ -29,9 +29,9 @@
 //! effective difficulty (for accounting), the classification
 //! (`Active` vs `StaleCreditable` — both credit, see
 //! [`bp_jobs_lifecycle::JobClassification`]), and the `is_block_candidate`
-//! flag indicating that `submission_difficulty >= network_difficulty`. Or
-//! [`ShareValidation::Rejected`] carrying one of four SV2 wire codes:
-//! `invalid-channel-id`, `invalid-job-id`, `stale-share`,
+//! flag indicating that `submission_difficulty >= network_difficulty`.
+//! Or [`ShareValidation::Rejected`] carrying one of four SV2 wire
+//! codes: `invalid-channel-id`, `invalid-job-id`, `stale-share`,
 //! `difficulty-too-low`.
 //!
 //! Wire codes are kept as `&'static str` constants — they're consumed
@@ -102,8 +102,8 @@ pub const ERR_BAD_EXTRANONCE_SIZE: &str = "bad-extranonce-size";
 
 // ── Reject reasons ───────────────────────────────────────────────────
 
-/// Internal classification of a rejected share. Maps to an SV2 wire code via
-/// [`Self::wire_code`]; the caller emits the literal in
+/// Internal classification of a rejected share. Maps to an SV2 wire
+/// code via [`Self::wire_code`]; the caller emits the literal in
 /// `SubmitSharesError.error_code`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
@@ -169,12 +169,12 @@ pub struct ShareAccept {
     /// authoritative validator — this only triggers the
     /// `TdpHandle::submit_solution` path.
     pub is_block_candidate: bool,
-    /// TDP template id the job was built against. `Some` for jobs the pool
-    /// issued from a pool-side template (Extended channels with pool-built
-    /// jobs), `None` for `SetCustomMiningJob`-declared jobs (no pool-side
-    /// template reference) and for Standard channels until
-    /// [`StandardJobContext`] threads the template id through (Standard
-    /// block-submit path).
+    /// TDP template id the job was built against. `Some` for jobs the
+    /// pool issued from a pool-side template (Extended channels with
+    /// pool-built jobs), `None` for `SetCustomMiningJob`-declared
+    /// jobs (no pool-side template reference) and for Standard
+    /// channels until [`StandardJobContext`] threads the template id
+    /// through (Standard block-submit path).
     pub template_id: Option<u64>,
     /// Copied off [`crate::mining::jobs::ExtendedJob::jdp_claims_the_block`]:
     /// `true` when a block found on this job will be claimed by the JDP
@@ -193,13 +193,12 @@ pub struct ShareAccept {
     /// before locktime). Ready to be passed to
     /// `TdpHandle::submit_solution`'s `coinbase_tx` argument.
     ///
-    /// Populated by [`validate_submit_extended`] (rebuilds the stratum
-    /// coinbase from per-channel + per-job state) AND by
-    /// [`validate_submit_standard`] (from the per-job
-    /// `StandardJobEntry::coinbase_stratum` stored at NewMiningJob send-time).
-    /// **Empty** only when the job carries no pool-side coinbase — a
-    /// `SetCustomMiningJob`-declared job — in which case block-found surfaces
-    /// a WARN in the bin block-sink instead of submitting.
+    /// Populated by [`validate_submit_extended`] (rebuilds the stratum coinbase
+    /// from per-channel + per-job state) AND by [`validate_submit_standard`]
+    /// (from the per-job `StandardJobEntry::coinbase_stratum` stored at
+    /// NewMiningJob send-time). **Empty** only when the job carries no pool-side
+    /// coinbase — a `SetCustomMiningJob`-declared job — in which case block-found
+    /// surfaces a WARN in the bin block-sink instead of submitting.
     pub witness_coinbase: Vec<u8>,
     /// Effective per-share worker name. `Some(value)` when ext 0x0002
     /// (Worker-Specific Hashrate Tracking) was negotiated AND the miner
@@ -308,10 +307,10 @@ pub struct StandardJobContext<'a> {
     /// `Active` / `StaleCreditable` / `StaleRejected`). `None` for
     /// genuinely missing jobs.
     pub classification: JobClassification,
-    /// TDP template id the job was built against. Threaded through to
-    /// [`ShareAccept::template_id`] so the block-sink can pass it to
-    /// `TdpHandle::submit_solution` on a block-candidate. `None` for
-    /// `SetCustomMiningJob`-derived jobs.
+    /// TDP template id the job was built against. Threaded through
+    /// to [`ShareAccept::template_id`] so the block-sink can pass it
+    /// to `TdpHandle::submit_solution` on a block-candidate. `None`
+    /// for `SetCustomMiningJob`-derived jobs.
     pub template_id: Option<u64>,
     /// Full pre-assembled non-witness coinbase bytes (matches the
     /// merkle root the miner hashed against). Source: stored on
@@ -476,10 +475,11 @@ pub struct ExtendedChannelView<'a> {
     pub job_target: Target,
 }
 
-/// Validate a `SubmitSharesExtended` frame. Pure function with the same shape
-/// as [`validate_submit_standard`], but the caller passes the resolved
-/// [`ExtendedJob`] reference (storage lives on the channel) and the validator
-/// handles coinbase reconstruction + merkle-path walking itself.
+/// Validate a `SubmitSharesExtended` frame. Pure function with the
+/// same shape as [`validate_submit_standard`], but the caller passes
+/// the resolved [`ExtendedJob`] reference (storage lives on the
+/// channel) and the validator handles coinbase reconstruction +
+/// merkle-path walking itself.
 ///
 /// **Caller's prep work**: channel lookup only (`None` → emit
 /// [`RejectReason::InvalidChannelId`] directly). Everything else —

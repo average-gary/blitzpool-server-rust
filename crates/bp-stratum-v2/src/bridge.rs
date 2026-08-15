@@ -12,11 +12,12 @@
 //!   connections and handles the `SetCustomMiningJob` frame when a
 //!   JDC miner finalises its declared job.
 //!
-//! The two share a process but live in independent per-connection tasks. When
-//! a JDC sends `SetCustomMiningJob{mining_job_token: T}` on its **mining**
-//! connection, the mining-side handler needs to retrieve the
-//! [`crate::jdp::declarations::DeclaredJob`] payload that was stored on its
-//! **JDP** connection — same miner, different connection, different task.
+//! The two share a process but live in independent per-connection
+//! tasks. When a JDC sends `SetCustomMiningJob{mining_job_token: T}`
+//! on its **mining** connection, the mining-side handler needs to
+//! retrieve the [`crate::jdp::declarations::DeclaredJob`] payload
+//! that was stored on its **JDP** connection — same miner, different
+//! connection, different task.
 //!
 //! [`JdpDeclaredJobRegistry`] is the bridge: a pool-wide token-keyed
 //! map populated by the JDP-server (via the
@@ -709,10 +710,10 @@ impl JdpDeclaredJobRegistry {
         Self::default()
     }
 
-    /// Register a declared job. Returns the previously-registered entry if the
-    /// token was already in the map (which should not happen with a
-    /// unique-token-per-allocation invariant — kept for symmetry with
-    /// [`HashMap::insert`]).
+    /// Register a declared job. Returns the previously-registered
+    /// entry if the token was already in the map (which should not
+    /// happen with a unique-token-per-allocation invariant — kept
+    /// for symmetry with [`HashMap::insert`]).
     pub fn register(
         &mut self,
         token: Token,
@@ -851,9 +852,9 @@ impl JdpDeclaredJobRegistry {
             .map(|p| p.entry.clone())
     }
 
-    /// The current tailored distribution for a JDP session, if one is usable.
-    /// Settlement-invalidated entries are withheld for the same reason as in
-    /// [`Self::current_pool_wide`].
+    /// The current tailored distribution for a JDP session, if one is
+    /// usable. Settlement-invalidated entries are withheld for the same
+    /// reason as in [`Self::current_pool_wide`].
     pub fn current_tailored(&self, jdp_session_id: u32) -> Option<Arc<PayoutDistributionEntry>> {
         self.tailored_distributions
             .get(&jdp_session_id)
