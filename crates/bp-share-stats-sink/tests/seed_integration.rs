@@ -103,8 +103,13 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
             rejected_duplicate_share_diff1: 0.0,
             rejected_low_difficulty_share_count: 1,
             rejected_low_difficulty_share_diff1: 0.5,
-            rejected_version_rolling_count: 0,
-            rejected_version_rolling_diff1: 0.0,
+            // Three reject reasons at three distinct diff-1 weights, so the
+            // `rejectedShares` assertion below fails if the seed's SUM drops
+            // any one term — the silent under-report the seed doc warns about.
+            rejected_version_rolling_count: 1,
+            rejected_version_rolling_diff1: 0.25,
+            rejected_stale_count: 1,
+            rejected_stale_diff1: 0.125,
         },
         ClientStatsUpsert {
             address: "test_seed_fire_bob".to_string(),
@@ -122,6 +127,8 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
             rejected_low_difficulty_share_diff1: 0.0,
             rejected_version_rolling_count: 0,
             rejected_version_rolling_diff1: 0.0,
+            rejected_stale_count: 0,
+            rejected_stale_diff1: 0.0,
         },
     ];
     bulk_upsert_client_statistics_entity(&mut *tx, &stats)
@@ -141,6 +148,21 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
             .await
             .expect("alice");
     assert!((alice_shares - 100.0).abs() < 0.01);
+
+    // 0.5 low-difficulty + 0.25 version-rolling + 0.125 stale. Dropping any
+    // single term from the seed's SUM lands on a different number, so this
+    // pins every reject reason having a place in it.
+    let alice_rejected: f64 = sqlx::query_scalar(
+        r#"SELECT "rejectedShares" FROM worker_shares_entity WHERE address = $1"#,
+    )
+    .bind("test_seed_fire_alice")
+    .fetch_one(&mut *tx)
+    .await
+    .expect("alice rejected");
+    assert!(
+        (alice_rejected - 0.875).abs() < 0.001,
+        "every rejected*Diff1 column must be summed: got {alice_rejected}"
+    );
 
     let bob_shares: f64 =
         sqlx::query_scalar(r#"SELECT shares FROM worker_shares_entity WHERE address = $1"#)

@@ -173,6 +173,8 @@ pub struct ClientStatsUpsert {
     pub rejected_low_difficulty_share_diff1: f32,
     pub rejected_version_rolling_count: i32,
     pub rejected_version_rolling_diff1: f32,
+    pub rejected_stale_count: i32,
+    pub rejected_stale_diff1: f32,
 }
 
 /// Bulk-upsert client-statistics rows. UNIQUE (address, clientName,
@@ -232,6 +234,8 @@ where
         .iter()
         .map(|r| r.rejected_version_rolling_diff1)
         .collect();
+    let r_stale_count: Vec<i32> = rows.iter().map(|r| r.rejected_stale_count).collect();
+    let r_stale_diff: Vec<f32> = rows.iter().map(|r| r.rejected_stale_diff1).collect();
 
     let result = sqlx::query!(
         r#"INSERT INTO client_statistics_entity
@@ -241,6 +245,7 @@ where
               "rejectedDuplicateShareCount",   "rejectedDuplicateShareDiff1",
               "rejectedLowDifficultyShareCount","rejectedLowDifficultyShareDiff1",
               "rejectedVersionRollingCount",   "rejectedVersionRollingDiff1",
+              "rejectedStaleCount",            "rejectedStaleDiff1",
               "updatedAt")
            SELECT
              u.addr, u.cname, u.sid, u.t, u.sh,
@@ -249,6 +254,7 @@ where
              u.rdc, u.rdd,
              u.rlc, u.rld,
              u.rvc, u.rvd,
+             u.rsc, u.rsd,
              (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
            FROM UNNEST(
              $1::varchar[], $2::varchar[], $3::varchar[], $4::bigint[], $5::real[],
@@ -256,8 +262,9 @@ where
              $8::int[], $9::real[],
              $10::int[], $11::real[],
              $12::int[], $13::real[],
-             $14::int[], $15::real[]
-           ) AS u(addr, cname, sid, t, sh, ac, rc, rjc, rjd, rdc, rdd, rlc, rld, rvc, rvd)
+             $14::int[], $15::real[],
+             $16::int[], $17::real[]
+           ) AS u(addr, cname, sid, t, sh, ac, rc, rjc, rjd, rdc, rdd, rlc, rld, rvc, rvd, rsc, rsd)
            ON CONFLICT (address, "clientName", "sessionId", "time") DO UPDATE
            SET shares                              = client_statistics_entity.shares                              + EXCLUDED.shares,
                "acceptedCount"                     = client_statistics_entity."acceptedCount"                     + EXCLUDED."acceptedCount",
@@ -270,6 +277,8 @@ where
                "rejectedLowDifficultyShareDiff1"   = client_statistics_entity."rejectedLowDifficultyShareDiff1"   + EXCLUDED."rejectedLowDifficultyShareDiff1",
                "rejectedVersionRollingCount"       = client_statistics_entity."rejectedVersionRollingCount"       + EXCLUDED."rejectedVersionRollingCount",
                "rejectedVersionRollingDiff1"       = client_statistics_entity."rejectedVersionRollingDiff1"       + EXCLUDED."rejectedVersionRollingDiff1",
+               "rejectedStaleCount"                = client_statistics_entity."rejectedStaleCount"                + EXCLUDED."rejectedStaleCount",
+               "rejectedStaleDiff1"                = client_statistics_entity."rejectedStaleDiff1"                + EXCLUDED."rejectedStaleDiff1",
                "updatedAt"                         = EXCLUDED."updatedAt""#,
         &addresses,
         &client_names,
@@ -286,6 +295,8 @@ where
         &r_low_diff,
         &r_vr_count,
         &r_vr_diff,
+        &r_stale_count,
+        &r_stale_diff,
     )
     .execute(executor)
     .await
@@ -491,9 +502,11 @@ where
 /// NOTHING — if rows exist already (concurrent seed by another
 /// instance), the second call is harmless.
 ///
-/// Aggregates `shares` (accepted-diff sum) and the three
-/// `rejected*Diff1` columns into `rejectedShares` (`rejectedShares` is
-/// the diff sum across all reject reasons).
+/// Aggregates `shares` (accepted-diff sum) and EVERY `rejected*Diff1`
+/// column into `rejectedShares` (the diff sum across all reject reasons).
+/// A reason added without a term here under-reports the worker row
+/// silently — the same contract [`bp_stats::ClientStatisticsRecord::
+/// rejected_diff_total`] carries on the in-memory side.
 pub async fn seed_worker_shares_from_client_statistics<'e, E>(executor: E) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -506,7 +519,8 @@ where
                   SUM("rejectedJobNotFoundDiff1"
                       + "rejectedDuplicateShareDiff1"
                       + "rejectedLowDifficultyShareDiff1"
-                      + "rejectedVersionRollingDiff1")::double precision
+                      + "rejectedVersionRollingDiff1"
+                      + "rejectedStaleDiff1")::double precision
            FROM client_statistics_entity
            GROUP BY address, "clientName"
            ON CONFLICT (address, "clientName") DO NOTHING"#,

@@ -195,7 +195,9 @@ pub async fn find_client_statistics_since(
             "rejectedLowDifficultyShareCount" AS "rejected_low_difficulty_share_count!",
             "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!",
             "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
-            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!"
+            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!",
+            "rejectedStaleCount" AS "rejected_stale_count!",
+            "rejectedStaleDiff1" AS "rejected_stale_diff1!"
            FROM client_statistics_entity
            WHERE "deletedAt" IS NULL AND "time" >= $1
            ORDER BY "time" ASC"#,
@@ -267,7 +269,9 @@ pub async fn find_client_statistics_since_for_address(
             "rejectedLowDifficultyShareCount" AS "rejected_low_difficulty_share_count!",
             "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!",
             "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
-            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!"
+            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!",
+            "rejectedStaleCount" AS "rejected_stale_count!",
+            "rejectedStaleDiff1" AS "rejected_stale_diff1!"
            FROM client_statistics_entity
            WHERE "deletedAt" IS NULL AND address = $1 AND "time" >= $2
            ORDER BY "time" ASC"#,
@@ -371,6 +375,10 @@ pub struct ClientStatisticsRow {
     pub rejected_version_rolling_count: i32,
     #[sqlx(rename = "rejectedVersionRollingDiff1")]
     pub rejected_version_rolling_diff1: f32,
+    #[sqlx(rename = "rejectedStaleCount")]
+    pub rejected_stale_count: i32,
+    #[sqlx(rename = "rejectedStaleDiff1")]
+    pub rejected_stale_diff1: f32,
 }
 
 pub async fn find_client_statistics(
@@ -398,7 +406,9 @@ pub async fn find_client_statistics(
             "rejectedLowDifficultyShareCount" AS "rejected_low_difficulty_share_count!",
             "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!",
             "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
-            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!"
+            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!",
+            "rejectedStaleCount" AS "rejected_stale_count!",
+            "rejectedStaleDiff1" AS "rejected_stale_diff1!"
            FROM client_statistics_entity WHERE id = $1 LIMIT 1"#,
         id
     )

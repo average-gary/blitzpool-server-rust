@@ -152,16 +152,13 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             rejected_count: 1.0,
             ..Default::default()
         };
+        // One column pair per reason, no folds — every arm below writes a
+        // different pair, so the five counters sum to `rejected_count`. Adding
+        // a `RejectedReason` variant without a pair to put it in would break
+        // that sum silently; give it its own, the way migrations 0010 and 0011
+        // did for version rolling and Stale.
         match reason {
-            // ⚠️ DEBT: Stale has no column pair of its own, so it folds
-            // into the JobNotFound bucket here and the two are
-            // indistinguishable in the per-session counters. That fold
-            // predates the table having room for more pairs — migration
-            // 0010 added one for version rolling and Stale should get the
-            // same treatment. The pool-wide
-            // `pool_rejected_statistics_entity` already keeps Stale as its
-            // own row, so only these counters are affected.
-            RejectedReason::JobNotFound | RejectedReason::Stale => {
+            RejectedReason::JobNotFound => {
                 delta.rejected_job_not_found_count = 1.0;
                 delta.rejected_job_not_found_diff1 = difficulty;
             }
@@ -169,19 +166,24 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
                 delta.rejected_duplicate_share_count = 1.0;
                 delta.rejected_duplicate_share_diff1 = difficulty;
             }
-            // Same reason Stale folds above: there is no fourth column
-            // pair. Version-rolling rejects land in the low-difficulty
             RejectedReason::LowDifficulty => {
                 delta.rejected_low_difficulty_share_count = 1.0;
                 delta.rejected_low_difficulty_share_diff1 = difficulty;
             }
-            // Its own pair (migration 0010), not folded: such a share's
-            // proof-of-work may be perfectly good, so an operator seeing it
-            // in the low-difficulty bucket would read normal churn where a
-            // miner is ignoring the mask it negotiated.
+            // Not folded into low-difficulty: such a share's proof-of-work may
+            // be perfectly good, so an operator seeing it there would read
+            // normal churn where a miner is ignoring the mask it negotiated.
             RejectedReason::VersionRollingNotAllowed => {
                 delta.rejected_version_rolling_count = 1.0;
                 delta.rejected_version_rolling_diff1 = difficulty;
+            }
+            // Not folded into job-not-found: this is the ordinary tail of a
+            // block transition and needs no action, that one is work the pool
+            // never had. Folded together, every block change read as a fleet
+            // of broken miners.
+            RejectedReason::Stale => {
+                delta.rejected_stale_count = 1.0;
+                delta.rejected_stale_diff1 = difficulty;
             }
         }
         self.accumulators.client_statistics.add(key, &delta);

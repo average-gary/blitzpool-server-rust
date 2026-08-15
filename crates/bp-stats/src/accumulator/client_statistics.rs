@@ -40,6 +40,12 @@ pub struct ClientStatisticsRecord {
     /// low-difficulty: such a share's proof-of-work may be perfectly good.
     pub rejected_version_rolling_count: f64,
     pub rejected_version_rolling_diff1: f64,
+    /// Shares whose job existed but had been retired past the grace window.
+    /// Its own pair (migration 0011), not folded into job-not-found: this is
+    /// the ordinary tail of a block transition, that one is work the pool
+    /// never had.
+    pub rejected_stale_count: f64,
+    pub rejected_stale_diff1: f64,
 }
 
 impl ClientStatisticsRecord {
@@ -53,6 +59,7 @@ impl ClientStatisticsRecord {
             + self.rejected_duplicate_share_diff1
             + self.rejected_low_difficulty_share_diff1
             + self.rejected_version_rolling_diff1
+            + self.rejected_stale_diff1
     }
 }
 
@@ -69,6 +76,8 @@ impl BufferRecord for ClientStatisticsRecord {
             && self.rejected_low_difficulty_share_diff1 == 0.0
             && self.rejected_version_rolling_count == 0.0
             && self.rejected_version_rolling_diff1 == 0.0
+            && self.rejected_stale_count == 0.0
+            && self.rejected_stale_diff1 == 0.0
     }
 
     fn add_assign(&mut self, rhs: &Self) {
@@ -83,6 +92,8 @@ impl BufferRecord for ClientStatisticsRecord {
         self.rejected_low_difficulty_share_diff1 += rhs.rejected_low_difficulty_share_diff1;
         self.rejected_version_rolling_count += rhs.rejected_version_rolling_count;
         self.rejected_version_rolling_diff1 += rhs.rejected_version_rolling_diff1;
+        self.rejected_stale_count += rhs.rejected_stale_count;
+        self.rejected_stale_diff1 += rhs.rejected_stale_diff1;
     }
 
     fn sub_assign_clamped(&mut self, rhs: &Self) -> bool {
@@ -97,6 +108,8 @@ impl BufferRecord for ClientStatisticsRecord {
         self.rejected_low_difficulty_share_diff1 -= rhs.rejected_low_difficulty_share_diff1;
         self.rejected_version_rolling_count -= rhs.rejected_version_rolling_count;
         self.rejected_version_rolling_diff1 -= rhs.rejected_version_rolling_diff1;
+        self.rejected_stale_count -= rhs.rejected_stale_count;
+        self.rejected_stale_diff1 -= rhs.rejected_stale_diff1;
         self.shares <= 0.0
             && self.accepted_count <= 0.0
             && self.rejected_count <= 0.0
@@ -108,6 +121,8 @@ impl BufferRecord for ClientStatisticsRecord {
             && self.rejected_low_difficulty_share_diff1 <= 0.0
             && self.rejected_version_rolling_count <= 0.0
             && self.rejected_version_rolling_diff1 <= 0.0
+            && self.rejected_stale_count <= 0.0
+            && self.rejected_stale_diff1 <= 0.0
     }
 }
 

@@ -466,3 +466,121 @@ async fn client_reset_best_difficulty_succeeds() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["status"], "reset");
 }
+
+#[tokio::test]
+async fn worker_chart_breaks_rejects_down_by_every_reason() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // A worker page shows the per-reason breakdown against `rejectedCount`.
+    // A reason with a column but no field in `WorkerChartEntry` is a reject
+    // the operator sees in the total and cannot find in the breakdown —
+    // which is what happened to version rolling between migration 0010 and
+    // the field being added. Five distinct counts, so a field wired to the
+    // wrong column shows up as a wrong number rather than a coincidence.
+    let addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let worker = "chart_breakdown_probe";
+    // `client_entity."sessionId"` is varchar(8).
+    let session = "chartbrk";
+    // `TimeSlot` is the slot's END, and the handler keeps rows strictly
+    // below `chart_visibility_cutoff_slot`. One slot below it is therefore
+    // the newest visible one, and well inside the default 1d window.
+    let slot = bp_stats::slot::chart_visibility_cutoff_slot()
+        .previous()
+        .as_millis();
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(
+        r#"INSERT INTO client_entity (address, "clientName", "sessionId", "startTime")
+           VALUES ($1, $2, $3, $4)"#,
+    )
+    .bind(addr)
+    .bind(worker)
+    .bind(session)
+    .bind(slot)
+    .execute(&mut *tx)
+    .await
+    .expect("seed client");
+    sqlx::query(
+        r#"INSERT INTO client_statistics_entity
+             (address, "clientName", "sessionId", "time", shares,
+              "acceptedCount", "rejectedCount",
+              "rejectedJobNotFoundCount",       "rejectedJobNotFoundDiff1",
+              "rejectedDuplicateShareCount",    "rejectedDuplicateShareDiff1",
+              "rejectedLowDifficultyShareCount","rejectedLowDifficultyShareDiff1",
+              "rejectedVersionRollingCount",    "rejectedVersionRollingDiff1",
+              "rejectedStaleCount",             "rejectedStaleDiff1")
+           VALUES ($1,$2,$3,$4, 10, 1, 15, 1,0.5, 2,0.25, 3,0.125, 4,0.0625, 5,0.03125)"#,
+    )
+    .bind(addr)
+    .bind(worker)
+    .bind(session)
+    .bind(slot)
+    .execute(&mut *tx)
+    .await
+    .expect("seed stats");
+    tx.commit().await.expect("commit");
+
+    let router = build_router(minimal_state(pool.clone()));
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/client/{addr}/{worker}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+
+    // Clean up before asserting, so a failure doesn't poison the next run.
+    let _ = sqlx::query(
+        r#"DELETE FROM client_statistics_entity
+           WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
+    )
+    .bind(addr)
+    .bind(worker)
+    .bind(session)
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        r#"DELETE FROM client_entity
+           WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
+    )
+    .bind(addr)
+    .bind(worker)
+    .bind(session)
+    .execute(&pool)
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let entry = json["chartData"]
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("no chartData in {json}"));
+
+    let n = |k: &str| -> f64 {
+        entry
+            .get(k)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("missing `{k}` in {entry}"))
+    };
+    assert_eq!(n("rejectedJobNotFound"), 1.0);
+    assert_eq!(n("rejectedDuplicatedShare"), 2.0);
+    assert_eq!(n("rejectedLowDifficultyShare"), 3.0);
+    assert_eq!(n("rejectedVersionRolling"), 4.0);
+    assert_eq!(n("rejectedStale"), 5.0);
+    // The point of the whole struct: the breakdown accounts for the total.
+    let sum = n("rejectedJobNotFound")
+        + n("rejectedDuplicatedShare")
+        + n("rejectedLowDifficultyShare")
+        + n("rejectedVersionRolling")
+        + n("rejectedStale");
+    assert_eq!(sum, 15.0, "breakdown must sum to rejectedCount, got {sum}");
+    // Diff-1 weights ride along per reason and must not be cross-wired.
+    assert_eq!(n("rejectedVersionRollingDiff1"), 0.0625);
+    assert_eq!(n("rejectedStaleDiff1"), 0.03125);
+}

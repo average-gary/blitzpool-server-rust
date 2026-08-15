@@ -431,6 +431,13 @@ where
 /// Per-slot chart entry for a worker page. Carries the hashrate
 /// (`data`), the raw accepted-share weight, and the per-reason
 /// rejection breakdowns (count + diff-1) the worker tile renders.
+///
+/// **One field pair per `bp_stats::RejectedReason`, and that is a
+/// contract, not tidiness.** The tile shows these against
+/// `rejectedCount`, so a reason with no pair here is a reject the
+/// operator sees in the total and cannot find in the breakdown — which
+/// is exactly what happened to version rolling between migration 0010
+/// (which gave it a column) and this struct learning to emit it.
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct WorkerChartEntry {
@@ -451,6 +458,14 @@ struct WorkerChartEntry {
     rejected_low_difficulty_share: f64,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     rejected_low_difficulty_share_diff1: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    rejected_version_rolling: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    rejected_version_rolling_diff1: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    rejected_stale: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    rejected_stale_diff1: f64,
 }
 
 #[derive(Serialize)]
@@ -517,6 +532,10 @@ where
                 entry.rejected_low_difficulty_share += r.rejected_low_difficulty_share_count as f64;
                 entry.rejected_low_difficulty_share_diff1 +=
                     r.rejected_low_difficulty_share_diff1 as f64;
+                entry.rejected_version_rolling += r.rejected_version_rolling_count as f64;
+                entry.rejected_version_rolling_diff1 += r.rejected_version_rolling_diff1 as f64;
+                entry.rejected_stale += r.rejected_stale_count as f64;
+                entry.rejected_stale_diff1 += r.rejected_stale_diff1 as f64;
             }
             for e in grouped.values_mut() {
                 e.data = e.accepted * DIFFICULTY_1 / SLOT_SECONDS;
