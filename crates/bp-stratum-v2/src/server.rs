@@ -54,7 +54,7 @@
 //!   `miner_address` (cloned alone, not the whole entry) is passed to the
 //!   handler as `Option<&AddressId>`.
 //!
-//! ## Per-job template pinning (SV2 §5.3.14 strict — implemented)
+//! ## Per-job template pinning (SV2 Mining/SubmitShares.Error strict — implemented)
 //!
 //! Both Standard and Extended share validation use the template the miner
 //! actually hashed against, pinned on the job record at send-time — the
@@ -638,12 +638,11 @@ async fn run_mining_connection(
                 };
                 let payload_len = sv2_frame.payload().len();
                 let header_msg_type = header.msg_type();
-                // §2: a 0x0003 reference from a session that never
-                // negotiated the extension MUST be rejected — so the TLV
-                // has to be SEEN, not silently filtered away with the
-                // rest of the un-negotiated tail. Widen the filter for
-                // the one message that carries it; the handler enforces
-                // the gate.
+                // ext 0x0003/Negotiation: a 0x0003 reference from a session
+                // that never negotiated the extension MUST be rejected — so
+                // the TLV has to be SEEN, not silently filtered away with the
+                // rest of the un-negotiated tail. Widen the filter for the one
+                // message that carries it; the handler enforces the gate.
                 let mut tlv_extensions = state.negotiated_extensions.clone();
                 if header_msg_type == MESSAGE_TYPE_SET_CUSTOM_MINING_JOB
                     && !tlv_extensions.contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
@@ -679,13 +678,15 @@ async fn run_mining_connection(
                         continue;
                     }
                 };
-                // ext 0x0002 Worker-ID TLV wiring: when the frame is
-                // a SubmitSharesExtended, re-serialise the parsed TLVs
-                // into the wire-form tail bytes and attach to the
-                // input. The validator + `resolve_share_worker_name_from_tlv`
-                // consume the wire-form bytes (spec §1.1 / §2). When
-                // ext 0x0002 isn't in `state.negotiated_extensions`,
-                // the validator will silently ignore any TLV (spec §1.3).
+                // ext 0x0002 Worker-ID TLV wiring: when the frame is a
+                // SubmitSharesExtended, re-serialise the parsed TLVs into the
+                // wire-form tail bytes and attach to the input. The validator
+                // + `resolve_share_worker_name_from_tlv` consume the wire-form
+                // bytes (ext 0x0002/TLV Format for user_identity / ext
+                // 0x0002/Extended SubmitSharesExtended Message Format). When
+                // ext 0x0002 isn't in `state.negotiated_extensions`, the
+                // validator will silently ignore any TLV (ext 0x0002/Behavior
+                // Based on Negotiation).
                 if let InboundMiningFrame::SubmitSharesExtended(ref mut submit) = inbound {
                     if let Some(tlv_list) = &tlvs {
                         let mut tail = Vec::new();
@@ -703,9 +704,10 @@ async fn run_mining_connection(
                         submit.tail_tlvs = tail;
                     }
                 }
-                // ext 0x0003 §6: the `distribution_id` TLV rides on the
-                // base SetCustomMiningJob frame (captured unconditionally
-                // above; the handler enforces the negotiation gate).
+                // ext 0x0003/distribution_id TLV Field: the `distribution_id`
+                // TLV rides on the base SetCustomMiningJob frame (captured
+                // unconditionally above; the handler enforces the negotiation
+                // gate).
                 if let InboundMiningFrame::SetCustomMiningJob(ref mut custom) = inbound {
                     custom.distribution_id = tlvs
                         .as_deref()
@@ -755,10 +757,11 @@ async fn run_mining_connection(
                     &bridge,
                     now_ms(),
                 );
-                // SV2 §3.6.3: `SetupConnection.Error` is sent "prior to
-                // closing the connection". Read the request BEFORE the write
-                // consumes the outbound batch; act on it AFTER, so the client
-                // still receives the frame telling it why.
+                // SV2 Overview/SetupConnection.Error: `SetupConnection.Error`
+                // is sent "prior to closing the connection". Read the request
+                // BEFORE the write consumes the outbound batch; act on it
+                // AFTER, so the client still receives the frame telling it
+                // why.
                 let disconnect = outcome.events.iter().find_map(|e| match e {
                     SessionEvent::Disconnect { reason } => Some(reason.clone()),
                     _ => None,
@@ -1105,20 +1108,20 @@ fn channel_alloc_key(session_id: u32, channel_id: u32) -> u64 {
 ///   acceptable since channel-open errors are rare.
 /// - **CloseChannel**: releases the extranonce-prefix of every channel the
 ///   handler actually closed — one for a normal close, ALL members for a
-///   group-channel close (spec §5.3.9). Driven by the emitted
+///   group-channel close (SV2 Mining/CloseChannel). Driven by the emitted
 ///   `ChannelClosed` events so both paths share one release point.
-/// - **SubmitSharesStandard / SubmitSharesExtended**: both validate
-///   against the **per-job template snapshot** pinned on the job record
-///   at send-time (SV2 §5.3.14 strict) — the `StandardJobEntry`'s
+/// - **SubmitSharesStandard / SubmitSharesExtended**: both validate against
+///   the **per-job template snapshot** pinned on the job record at send-time
+///   (SV2 Mining/SubmitShares.Error strict) — the `StandardJobEntry`'s
 ///   `template_snapshot` and the `ExtendedJob`'s `network_difficulty`
-///   respectively. Neither consults the current template, so a
-///   block-change between job-send and share-submit can't reclassify an
-///   in-flight share's block-candidacy.
-/// - **SetCustomMiningJob**: queries the bridge for the
-///   `mining_job_token` and resolves the job's `distribution_id` TLV
-///   against the distribution registry (`MinerAddress` scope); the
-///   cross-checks + §7.1 payout validation happen inside the handler.
-///   Distributions are multi-use — nothing is consumed on success.
+///   respectively. Neither consults the current template, so a block-change
+///   between job-send and share-submit can't reclassify an in-flight share's
+///   block-candidacy.
+/// - **SetCustomMiningJob**: queries the bridge for the `mining_job_token` and
+///   resolves the job's `distribution_id` TLV against the distribution
+///   registry (`MinerAddress` scope); the cross-checks + ext 0x0003/Output
+///   Verification payout validation happen inside the handler. Distributions
+///   are multi-use — nothing is consumed on success.
 pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     state: &mut MiningSessionState<C>,
     inbound: InboundMiningFrame,
@@ -1152,8 +1155,8 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             let outcome = handle_close_channel(state, &input);
             // Release the extranonce prefix of every channel the close
             // actually removed — one for a normal close, all members for a
-            // group-channel close (spec §5.3.9). Releasing an id with no
-            // allocation is a harmless no-op.
+            // group-channel close (SV2 Mining/CloseChannel). Releasing an id
+            // with no allocation is a harmless no-op.
             let mut alloc = extranonce_allocator
                 .lock()
                 .expect("extranonce allocator mutex poisoned");
@@ -1166,15 +1169,16 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             outcome
         }
         InboundMiningFrame::SubmitSharesStandard(input) => {
-            // SV2 §5.3.14 strict: the per-job snapshot is stored on
-            // the StandardJobEntry at send-time. Handler reads it
+            // SV2 Mining/SubmitShares.Error strict: the per-job snapshot is
+            // stored on the StandardJobEntry at send-time. Handler reads it
             // out itself — no IO-layer template snapshot needed.
             handle_submit_shares_standard(state, &input, now_ms)
         }
         InboundMiningFrame::SubmitSharesExtended(input) => {
-            // SV2 §5.3.14 strict: the per-job `network_difficulty` is pinned
-            // on the ExtendedJob at send-time. Handler reads it from the job
-            // record — no IO-layer current-template lookup needed.
+            // SV2 Mining/SubmitShares.Error strict: the per-job
+            // `network_difficulty` is pinned on the ExtendedJob at send-time.
+            // Handler reads it from the job record — no IO-layer
+            // current-template lookup needed.
             handle_submit_shares_extended(state, &input, now_ms)
         }
         InboundMiningFrame::SetCustomMiningJob(input) => {
@@ -1187,17 +1191,18 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                 // the lock is held. The raw transactions the handler never
                 // needs.
                 let bridge_job = guard.job_ref(&input.mining_job_token);
-                // Coinbase-only mode never declares (§6.3.1), so the only
-                // record of its token is the allocate. Base-protocol
-                // allocations only — see `AllocatedTokenRef`.
+                // Coinbase-only mode never declares (SV2 JDP/Coinbase-only
+                // Mode), so the only record of its token is the allocate.
+                // Base-protocol allocations only — see `AllocatedTokenRef`.
                 let allocation = guard
                     .allocation_ref(&input.mining_job_token, now_ms)
                     .cloned();
-                // §7.2/§10 acceptance for the referenced distribution. The
-                // reference decides its own scope: a frame TLV (Coinbase-only)
-                // has no declaration behind it and resolves by owner address,
-                // while an inherited one (Full-Template) must resolve under the
-                // JDP session that accepted it — see `DistributionReference`.
+                // ext 0x0003/Grace Window + Implementation Notes acceptance
+                // for the referenced distribution. The reference decides its
+                // own scope: a frame TLV (Coinbase-only) has no declaration
+                // behind it and resolves by owner address, while an inherited
+                // one (Full-Template) must resolve under the JDP session that
+                // accepted it — see `DistributionReference`.
                 let distribution = crate::bridge::resolve_distribution_reference(
                     input.distribution_id,
                     bridge_job.as_ref(),
@@ -1520,11 +1525,11 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 bp_metrics::record_stratum_difficulty_adjustment();
             }
             SessionEvent::ShareAccepted { channel_id, accept } => {
-                // ext 0x0002 Worker-ID TLV: when the per-share TLV
-                // resolves to a non-empty worker name, attribute the
-                // share to that worker rather than the channel-default
-                // (spec §1.3). When None, fall back to channel-default
-                // (no TLV present, or ext 0x0002 not negotiated).
+                // ext 0x0002 Worker-ID TLV: when the per-share TLV resolves to
+                // a non-empty worker name, attribute the share to that worker
+                // rather than the channel-default (ext 0x0002/Behavior Based
+                // on Negotiation). When None, fall back to channel-default (no
+                // TLV present, or ext 0x0002 not negotiated).
                 let effective_worker = accept
                     .effective_worker_name
                     .as_deref()
@@ -2288,9 +2293,9 @@ mod tests {
     }
 
     /// A `CloseChannel` addressed to a group_channel_id releases the
-    /// extranonce prefix of EVERY member (spec §5.3.9), driven by the per-
-    /// member `ChannelClosed` events. Two grouped Extended channels → both
-    /// prefixes freed on a single group close.
+    /// extranonce prefix of EVERY member (SV2 Mining/CloseChannel), driven by
+    /// the per- member `ChannelClosed` events. Two grouped Extended channels →
+    /// both prefixes freed on a single group close.
     #[test]
     fn dispatch_group_close_releases_all_member_prefixes() {
         let mut s = fresh_test_session();
@@ -2344,12 +2349,13 @@ mod tests {
         assert!(s.channels.is_empty());
     }
 
-    /// ext 0x0003 end-to-end through dispatch: the §6 `distribution_id`
-    /// TLV resolves against the bridge (miner-address scope on a mining
-    /// connection) and a §4-conformant coinbase is accepted. Distributions
-    /// are multi-use — a second job referencing the same id passes too —
-    /// until a §10 settlement invalidation turns the same reference into
-    /// `stale-payout-distribution`.
+    /// ext 0x0003 end-to-end through dispatch: the ext 0x0003/distribution_id
+    /// TLV Field `distribution_id` TLV resolves against the bridge
+    /// (miner-address scope on a mining connection) and an ext 0x0003/Payout
+    /// Computation-conformant coinbase is accepted. Distributions are
+    /// multi-use — a second job referencing the same id passes too — until a
+    /// ext 0x0003/Implementation Notes settlement invalidation turns the same
+    /// reference into `stale-payout-distribution`.
     #[test]
     fn dispatch_set_custom_mining_job_resolves_distribution_multi_use() {
         use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
@@ -2370,8 +2376,8 @@ mod tests {
             device_id: "d".to_string(),
         });
         let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
-        // §2 gate: 0x0003 must be negotiated on the MINING connection for
-        // the TLV to be honoured.
+        // ext 0x0003/Negotiation gate: 0x0003 must be negotiated on the MINING
+        // connection for the TLV to be honoured.
         let negotiate =
             InboundMiningFrame::RequestExtensions(crate::extensions::RequestExtensions {
                 request_id: 1,
@@ -2427,7 +2433,8 @@ mod tests {
             jdp_session_id: None,
             published_at_ms: 0,
         };
-        // §4-conformant coinbase outputs for the published weights.
+        // ext 0x0003/Payout Computation-conformant coinbase outputs for the
+        // published weights.
         let conformant = bitcoin::consensus::serialize(
             &compute_payout_vector(
                 &entry.pool_payout,
@@ -2439,10 +2446,11 @@ mod tests {
             .unwrap(),
         );
         bridge.write().unwrap().publish_pool_wide(entry);
-        // The allocate the JDC took this token from. §2 empties its outputs,
-        // so it carries no designated script — but it is still the pool's
-        // record that the token exists and whose it is, without which the
-        // handler refuses the job as `invalid-mining-job-token`.
+        // The allocate the JDC took this token from. ext 0x0003/Negotiation
+        // empties its outputs, so it carries no designated script — but it is
+        // still the pool's record that the token exists and whose it is,
+        // without which the handler refuses the job as
+        // `invalid-mining-job-token`.
         bridge.write().unwrap().register_allocation(
             Token([7u8; 16]),
             crate::bridge::AllocatedTokenRef {
@@ -2491,7 +2499,8 @@ mod tests {
             );
         }
 
-        // §10: a settlement invalidates every published distribution.
+        // ext 0x0003/Implementation Notes: a settlement invalidates every
+        // published distribution.
         bridge.write().unwrap().invalidate_all_distributions();
         let out = dispatch_inbound_frame(
             &mut s,
@@ -2513,10 +2522,11 @@ mod tests {
         }
     }
 
-    /// The IO-layer half of the ext-0x0003 twin, which nothing else covers:
-    /// a Full-Template `SetCustomMiningJob` carries no §6 TLV, so the
-    /// acceptance has to be resolved from the reference its DECLARATION was
-    /// accepted under — and under the scope it was accepted in.
+    /// The IO-layer half of the ext-0x0003 twin, which nothing else covers: a
+    /// Full-Template `SetCustomMiningJob` carries no ext
+    /// 0x0003/distribution_id TLV Field, so the acceptance has to be resolved
+    /// from the reference its DECLARATION was accepted under — and under the
+    /// scope it was accepted in.
     ///
     /// The trap this pins: one payout address is one account, so it can own
     /// several tailored slots (two jd-clients, or a ghost left by an
@@ -2783,11 +2793,11 @@ mod tests {
                     jdp_session_id: OLD_SESSION,
                 },
             );
-            // A SECOND declaration, byte-identical but under its own token.
-            // A token authorises exactly one custom job now, so the two
+            // A SECOND declaration, byte-identical but under its own token. A
+            // token authorises exactly one custom job now, so the two
             // dispatches below cannot share one — and they must not: reusing
-            // it would test the consume rule, not the §10 refusal this test
-            // is about.
+            // it would test the consume rule, not the ext
+            // 0x0003/Implementation Notes refusal this test is about.
             guard.register(
                 SECOND_TOKEN,
                 crate::bridge::RegisteredDeclaredJob {
@@ -2836,7 +2846,8 @@ mod tests {
             out.outbound[0]
         );
 
-        // §10 settlement: now it genuinely is withdrawn and must be refused.
+        // ext 0x0003/Implementation Notes settlement: now it genuinely is
+        // withdrawn and must be refused.
         bridge.write().unwrap().invalidate_all_distributions();
         let out = dispatch_inbound_frame(
             &mut s,

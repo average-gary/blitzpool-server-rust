@@ -61,8 +61,8 @@ use super::jobs::{classify_extended_job, ExtendedJob};
 /// this connection.
 pub const ERR_INVALID_CHANNEL_ID: &str = "invalid-channel-id";
 
-/// Job id is genuinely unknown — past retention GC, or never sent.
-/// SV2 spec §5.3.14 distinguishes this from `stale-share` (job *was*
+/// Job id is genuinely unknown — past retention GC, or never sent. SV2
+/// Mining/SubmitShares.Error distinguishes this from `stale-share` (job *was*
 /// known, since superseded).
 pub const ERR_INVALID_JOB_ID: &str = "invalid-job-id";
 
@@ -142,11 +142,11 @@ pub struct ShareAccept {
     /// `Active` or `StaleCreditable`. Both credit the share; the caller
     /// may want to bookkeep them separately for diagnostics.
     pub classification: JobClassification,
-    /// Difficulty the share is **credited at** — the job-specific
-    /// difficulty stored at send-time (SV2 §5.3.14). Used by both
-    /// PPLNS / group-solo accounting and the `add_accepted_share`
-    /// accumulators. May be lower than the session's current diff when
-    /// the share was issued before a vardiff ratchet.
+    /// Difficulty the share is **credited at** — the job-specific difficulty
+    /// stored at send-time (SV2 Mining/SubmitShares.Error). Used by both PPLNS
+    /// / group-solo accounting and the `add_accepted_share` accumulators. May
+    /// be lower than the session's current diff when the share was issued
+    /// before a vardiff ratchet.
     pub effective_difficulty: Difficulty,
     /// Difficulty the share **actually solved for**, derived from the
     /// header hash. Drives the block-found gate and the personal-best
@@ -194,15 +194,15 @@ pub struct ShareAccept {
     /// coinbase — a `SetCustomMiningJob`-declared job — in which case block-found
     /// surfaces a WARN in the bin block-sink instead of submitting.
     pub witness_coinbase: Vec<u8>,
-    /// Effective per-share worker name. `Some(value)` when ext
-    /// 0x0002 (Worker-Specific Hashrate Tracking) was negotiated
-    /// AND the miner appended a valid Worker-ID TLV to this share
-    /// (spec §1.3). `None` means the caller should fall back to the
+    /// Effective per-share worker name. `Some(value)` when ext 0x0002
+    /// (Worker-Specific Hashrate Tracking) was negotiated AND the miner
+    /// appended a valid Worker-ID TLV to this share (ext 0x0002/Behavior Based
+    /// on Negotiation). `None` means the caller should fall back to the
     /// channel-default `user_identity` from `OpenExtendedMiningChannel`.
     ///
-    /// Always `None` for Standard-channel shares (channel-default
-    /// only). Always `None` for Extended-channel shares whose
-    /// connection did not negotiate ext 0x0002 (spec §1.3 — "the
+    /// Always `None` for Standard-channel shares (channel-default only).
+    /// Always `None` for Extended-channel shares whose connection did not
+    /// negotiate ext 0x0002 (ext 0x0002/Behavior Based on Negotiation — "the
     /// server MUST ignore unexpected TLV fields").
     pub effective_worker_name: Option<String>,
     /// Block-reward portion the coinbase claims — the per-job pinned
@@ -272,7 +272,8 @@ pub struct SubmitSharesExtendedInput {
     /// Resolved into [`ShareAccept::effective_worker_name`] by
     /// [`validate_submit_extended`] via
     /// [`crate::extensions::resolve_share_worker_name_from_tlv`] —
-    /// spec §1.3: scan-for-known-TLV semantics, TLV-order-irrelevant.
+    /// ext 0x0002/Behavior Based on Negotiation: scan-for-known-TLV semantics,
+    /// TLV-order-irrelevant.
     pub tail_tlvs: Vec<u8>,
 }
 
@@ -485,13 +486,14 @@ pub struct ExtendedChannelView<'a> {
 /// the miner's hash. Accepting would credit un-verified hashpower —
 /// see memory `feedback-sv2-bad-extranonce-size-hard-reject`.
 ///
-/// `job_difficulty` is the per-job target the share validates against
-/// (SV2 §5.3.14). Caller resolves it from
-/// `channel.standard_jobs.job_id_to_difficulty` if present, else falls
-/// back to `channel.session_difficulty`. The **network** difficulty for
-/// the block-found gate is read from `ext_job.network_difficulty` (pinned
-/// at send-time, SV2 §5.3.14 strict) — NOT the current template, so a
-/// block-change between job-send and submit can't reclassify the share.
+/// `job_difficulty` is the per-job target the share validates against (SV2
+/// Mining/SubmitShares.Error). Caller resolves it from
+/// `channel.standard_jobs.job_id_to_difficulty` if present, else falls back to
+/// `channel.session_difficulty`. The **network** difficulty for the
+/// block-found gate is read from `ext_job.network_difficulty` (pinned at
+/// send-time, SV2 Mining/SubmitShares.Error strict) — NOT the current
+/// template, so a block-change between job-send and submit can't reclassify
+/// the share.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_submit_extended(
     submission_cache: &mut SubmissionCache,
@@ -670,8 +672,9 @@ pub fn validate_submit_extended(
 
     submission_cache.insert_extended(dedup_key);
 
-    // Per-job pinned network difficulty (SV2 §5.3.14 strict) — the gate
-    // uses the template the miner hashed against, not the latest one.
+    // Per-job pinned network difficulty (SV2 Mining/SubmitShares.Error strict)
+    // — the gate uses the template the miner hashed against, not the latest
+    // one.
     let is_block_candidate = pow.submission_difficulty >= ext_job.network_difficulty;
     // Witness-form coinbase for the block-found path. Built only for
     // block-candidates to keep the per-share allocation off the hot
@@ -682,11 +685,11 @@ pub fn validate_submit_extended(
     } else {
         Vec::new()
     };
-    // ext 0x0002 Worker-ID TLV resolution (spec §1.3). The validator
-    // operates at the channel layer and doesn't know the
-    // session-level `address` or `channel_worker` — those are
-    // session-state. We pass empty channel defaults so the resolver
-    // either returns a non-empty TLV-derived worker name (TLV present
+    // ext 0x0002 Worker-ID TLV resolution (ext 0x0002/Behavior Based on
+    // Negotiation). The validator operates at the channel layer and doesn't
+    // know the session-level `address` or `channel_worker` — those are
+    // session-state. We pass empty channel defaults so the resolver either
+    // returns a non-empty TLV-derived worker name (TLV present
     // + valid + spec-compliant) or the empty channel default. The
     // empty string is collapsed to `None` so consumers can rely on
     // `Some(_) ⇒ TLV was present and the caller should override
@@ -1152,12 +1155,13 @@ mod tests {
         assert_eq!(ch.submission_cache.len(), 1);
     }
 
-    /// 5b (SV2 §5.3.14 strict): the block-candidate gate reads the network
-    /// difficulty **pinned on the job at send-time**, not any current/latest
-    /// template. A job pinned with a trivial network difficulty yields a
-    /// block-candidate for the same easy share that the default (1e15) job
-    /// classifies as non-candidate — proving the gate is per-job, so a
-    /// block-change between send and submit can't reclassify an in-flight share.
+    /// 5b (SV2 Mining/SubmitShares.Error strict): the block-candidate gate
+    /// reads the network difficulty **pinned on the job at send-time**, not
+    /// any current/latest template. A job pinned with a trivial network
+    /// difficulty yields a block-candidate for the same easy share that the
+    /// default (1e15) job classifies as non-candidate — proving the gate is
+    /// per-job, so a block-change between send and submit can't reclassify an
+    /// in-flight share.
     #[test]
     fn extended_block_candidate_uses_per_job_pinned_network_difficulty() {
         let mut ch = ext_channel();
@@ -1385,8 +1389,9 @@ mod tests {
 
     fn worker_id_tlv_bytes(user_identity: &str) -> Vec<u8> {
         // Hand-built wire-form TLV: [ext_type 0x0002 LE][field_type 0x01]
-        // [length LE16][value bytes]. Mirrors ext 0x0002 §1.1 with the
-        // SV2 U16 little-endian convention (§3.4.3).
+        // [length LE16][value bytes]. Mirrors ext 0x0002/TLV Format for user_identity with the
+        // SV2 U16 little-endian convention (SV2 Overview/Stratum V2 TLV
+        // Encoding Model).
         let value = user_identity.as_bytes();
         let mut tlv = Vec::with_capacity(5 + value.len());
         tlv.extend_from_slice(&0x0002u16.to_le_bytes());
@@ -1397,7 +1402,7 @@ mod tests {
     }
 
     /// ext 0x0002 negotiated + valid TLV → `ShareAccept.effective_worker_name`
-    /// carries the TLV value (spec §1.3).
+    /// carries the TLV value (ext 0x0002/Behavior Based on Negotiation).
     #[test]
     fn ext_0x0002_tlv_present_when_negotiated_sets_effective_worker_name() {
         let mut ch = ext_channel();
@@ -1426,9 +1431,10 @@ mod tests {
         }
     }
 
-    /// ext 0x0002 NOT negotiated + TLV present → resolver ignores the
-    /// TLV (spec §1.3 "server MUST ignore unexpected TLV fields") →
-    /// effective_worker_name is None (caller falls back to channel-default).
+    /// ext 0x0002 NOT negotiated + TLV present → resolver ignores the TLV (ext
+    /// 0x0002/Behavior Based on Negotiation "server MUST ignore unexpected TLV
+    /// fields") → effective_worker_name is None (caller falls back to
+    /// channel-default).
     #[test]
     fn ext_0x0002_tlv_present_when_not_negotiated_is_ignored() {
         let mut ch = ext_channel();
@@ -1449,7 +1455,7 @@ mod tests {
             ShareValidation::Accepted(a) => {
                 assert!(
                     a.effective_worker_name.is_none(),
-                    "non-negotiated TLV must be silently dropped (spec §1.3)"
+                    "non-negotiated TLV must be silently dropped (ext 0x0002/Behavior Based on Negotiation)"
                 );
             }
             _ => panic!("expected Accept"),

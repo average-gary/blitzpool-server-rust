@@ -7,7 +7,7 @@
 //!
 //! The JDC sends a wtxid list as part of `DeclareMiningJob`. The JDS
 //! needs raw transaction bytes for every wtxid so it can later
-//! reconstruct the block on `PushSolution` (spec §6.4.9). What drives
+//! reconstruct the block on `PushSolution` (SV2 JDP/PushSolution). What drives
 //! the response is which of them the JDS already holds: the wtxids it
 //! has raw bytes for in its current template are covered, and the
 //! missing positions are requested from the JDC via
@@ -110,7 +110,7 @@ pub struct PendingDeclaration {
 
 /// Error from [`merge_provided_with_known`]. The Success frame's
 /// `transaction_list` MUST contain exactly one entry per requested
-/// position (SV2 spec §6.4.7). A length mismatch is a JDC
+/// position (SV2 JDP/ProvideMissingTransactions). A length mismatch is a JDC
 /// protocol-error — the caller decides whether to silently drop or
 /// reset the connection.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

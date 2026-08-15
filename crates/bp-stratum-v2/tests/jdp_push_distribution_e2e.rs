@@ -6,34 +6,38 @@
 //!
 //! What the wire choreography pins (SV2 ext 0x0003):
 //!
-//! 1. **§3.1 first-message guarantee** — after `RequestExtensions.Success`
-//!    negotiating 0x0003, the very NEXT frame is `SetPayoutDistribution`
-//!    (raw ext-0x0003 frame), carrying the §3.1 weight distribution.
-//! 2. **§2 empty allocate** — with 0x0003 negotiated,
+//! 1. **ext 0x0003/SetPayoutDistribution first-message guarantee** — after
+//!    `RequestExtensions.Success` negotiating 0x0003, the very NEXT frame is
+//!    `SetPayoutDistribution` (raw ext-0x0003 frame), carrying the ext
+//!    0x0003/SetPayoutDistribution weight distribution.
+//! 2. **ext 0x0003/Negotiation empty allocate** — with 0x0003 negotiated,
 //!    `AllocateMiningJobToken.Success.coinbase_tx_outputs` is empty.
-//! 3. **§4/§7.1 declare** — a coinbase whose suffix outputs are the §4
-//!    recompute of the published distribution, referenced via the §6
-//!    `distribution_id` TLV (LE), is accepted positionally.
+//! 3. **ext 0x0003/Payout Computation + Output Verification declare** — a
+//!    coinbase whose suffix outputs are the ext 0x0003/Payout Computation
+//!    recompute of the published distribution, referenced via the ext
+//!    0x0003/distribution_id TLV Field `distribution_id` TLV (LE), is accepted
+//!    positionally.
 //! 4. **Booking** — `PushSolution` hands the block-submission sink a
 //!    `PayoutBooking` naming exactly the validated distribution.
-//! 5. **§7.2 grace window** — after the pool-wide distribution slides
+//! 5. **ext 0x0003/Grace Window** — after the pool-wide distribution slides
 //!    twice, the k-2 id is rejected `stale-payout-distribution` while
 //!    k-1 is still accepted.
-//! 6. **§2 negotiation gate** — a `distribution_id` TLV on a connection
-//!    that never negotiated 0x0003 is rejected
-//!    `invalid-payout-distribution` (the IO layer must surface the TLV
-//!    despite the extension being un-negotiated).
-//! 7. **The JDP → Mining seam** — an accepted declaration is resolvable
-//!    in the bridge under its issued token, carrying the binding, the
-//!    declared tip and the §6 `distribution_id`. That is everything the
-//!    mining connection judges a Full-Template `SetCustomMiningJob`
-//!    against, and it was previously untested: removing the
-//!    registration call left the whole suite green.
-//! 8. **§6.4.3 base protocol** — a connection that never negotiates
-//!    0x0003 is answered with exactly ONE designated payout output at 0
-//!    sats paying the miner itself, and that token reaches the bridge as
-//!    an allocation. Coinbase-only mode never declares (§6.3.1), so this
-//!    allocate is the only record the mining side will have of it.
+//! 6. **ext 0x0003/Negotiation gate** — a `distribution_id` TLV on a
+//!    connection that never negotiated 0x0003 is rejected
+//!    `invalid-payout-distribution` (the IO layer must surface the TLV despite
+//!    the extension being un-negotiated).
+//! 7. **The JDP → Mining seam** — an accepted declaration is resolvable in the
+//!    bridge under its issued token, carrying the binding, the declared tip
+//!    and the ext 0x0003/distribution_id TLV Field. That is everything the
+//!    mining connection judges a Full-Template `SetCustomMiningJob` against,
+//!    and it was previously untested: removing the registration call left the
+//!    whole suite green.
+//! 8. **SV2 JDP/AllocateMiningJobToken.Success base protocol** — a connection
+//!    that never negotiates 0x0003 is answered with exactly ONE designated
+//!    payout output at 0 sats paying the miner itself, and that token reaches
+//!    the bridge as an allocation. Coinbase-only mode never declares (SV2
+//!    JDP/Coinbase-only Mode), so this allocate is the only record the mining
+//!    side will have of it.
 //!
 //! Needs no bitcoin-node / TDP / PG — declare-time validation runs
 //! entirely against the published distribution.
@@ -120,8 +124,8 @@ fn dust_limits() -> Vec<u32> {
     vec![546, 546]
 }
 
-/// Fixed-weight distribution source: same §3.1 shape every build, ids
-/// strictly increasing from [`FIRST_ID`].
+/// Fixed-weight distribution source: same ext 0x0003/SetPayoutDistribution
+/// shape every build, ids strictly increasing from [`FIRST_ID`].
 struct FixedSource {
     next_id: AtomicU64,
 }
@@ -164,9 +168,10 @@ impl CurrentPrevHashProvider for FixedPrevHash {
     }
 }
 
-/// Allocate resolver mirroring what production answers, on both paths:
-/// empty outputs once ext 0x0003 is negotiated (§2), and otherwise the one
-/// §6.4.3 designated payout output at 0 sats paying the miner itself.
+/// Allocate resolver mirroring what production answers, on both paths: empty
+/// outputs once ext 0x0003 is negotiated (ext 0x0003/Negotiation), and
+/// otherwise the one SV2 JDP/AllocateMiningJobToken.Success designated payout
+/// output at 0 sats paying the miner itself.
 ///
 /// It has to be spelled out here rather than borrowed from
 /// [`JdpServerHooks::no_op`], whose base-path answer is an EMPTY output
@@ -335,15 +340,17 @@ async fn jdp_push_distribution_end_to_end() {
         other => panic!("expected RequestExtensionsSuccess, got {other:?}"),
     }
 
-    // §3.1: the very next frame MUST be SetPayoutDistribution.
+    // ext 0x0003/SetPayoutDistribution: the very next frame MUST be
+    // SetPayoutDistribution.
     let distribution = match read_jdc(&mut reader).await {
         JdcInbound::PayoutDistribution(d) => d,
-        other => panic!("§3.1 violated — expected SetPayoutDistribution next, got {other:?}"),
+        other => panic!("ext 0x0003/SetPayoutDistribution violated — expected SetPayoutDistribution next, got {other:?}"),
     };
     assert_eq!(distribution.distribution_id, FIRST_ID);
     assert_eq!(distribution.dust_limits, dust_limits());
     assert!(distribution.additional_outputs.is_empty());
-    // The weights ride in the consensus TxOut amount fields (§3.1).
+    // The weights ride in the consensus TxOut amount fields (ext
+    // 0x0003/SetPayoutDistribution).
     let pool_out: bitcoin::TxOut =
         bitcoin::consensus::deserialize(&distribution.pool_payout).expect("pool_payout TxOut");
     assert_eq!(pool_out.value.to_sat(), pool_slot().weight);
@@ -364,7 +371,8 @@ async fn jdp_push_distribution_end_to_end() {
         .collect();
     assert_eq!(wire_payouts, miner_slots());
 
-    // §2: allocate returns EMPTY coinbase outputs when 0x0003 is on.
+    // ext 0x0003/Negotiation: allocate returns EMPTY coinbase outputs when
+    // 0x0003 is on.
     write_msg(
         &mut writer,
         AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
@@ -383,18 +391,20 @@ async fn jdp_push_distribution_end_to_end() {
             assert_eq!(s.request_id, 2);
             assert!(
                 s.coinbase_outputs.as_bytes().is_empty(),
-                "§2: coinbase_outputs MUST be empty when 0x0003 is negotiated"
+                "ext 0x0003/Negotiation: coinbase_outputs MUST be empty when 0x0003 is negotiated"
             );
             s.mining_job_token.as_bytes().to_vec()
         }
         other => panic!("expected AllocateMiningJobTokenSuccess, got {other:?}"),
     };
 
-    // The JDC computes the §4 output vector from the RECEIVED wire
-    // distribution at its own template revenue and builds the coinbase.
+    // The JDC computes the ext 0x0003/Payout Computation output vector from
+    // the RECEIVED wire distribution at its own template revenue and builds
+    // the coinbase.
     let suffix = conformant_suffix(&pool_out, &wire_payouts, &distribution.dust_limits);
 
-    // Declare #9: negotiated but NO TLV → invalid (§6 mandatory).
+    // Declare #9: negotiated but NO TLV → invalid (ext 0x0003/distribution_id
+    // TLV Field mandatory).
     write_declare(&mut writer, 9, &token, &suffix, None).await;
     expect_declare_error(
         read_jdc(&mut reader).await,
@@ -403,9 +413,9 @@ async fn jdp_push_distribution_end_to_end() {
     );
 
     // An ACCEPTED declaration issues its job token through the shared
-    // per-connection TokenStore, which rate-limits to 1/s (spec §6.4.2)
-    // and silently drops the declaration when exceeded — space the
-    // token-allocating declares out accordingly.
+    // per-connection TokenStore, which rate-limits to 1/s (SV2
+    // JDP/AllocateMiningJobToken) and silently drops the declaration when
+    // exceeded — space the token-allocating declares out accordingly.
     tokio::time::sleep(Duration::from_millis(1100)).await;
 
     // Declare #10: conformant coinbase + TLV(FIRST_ID) → accepted.
@@ -415,12 +425,13 @@ async fn jdp_push_distribution_end_to_end() {
     // ── The JDP → Mining seam ─────────────────────────────────────────
     //
     // An accepted declaration has to become resolvable on the OTHER
-    // connection: the JDC opens a separate mining socket and presents
-    // this token in `SetCustomMiningJob`. Everything that job is judged
-    // against lives in the bridge entry — the declaration binding, the
-    // tip it was accepted under, and the §6 `distribution_id`, which in
-    // Full-Template mode rides on `DeclareMiningJob` and is therefore
-    // never seen on the mining wire at all.
+    // connection: the JDC opens a separate mining socket and presents this
+    // token in `SetCustomMiningJob`. Everything that job is judged against
+    // lives in the bridge entry — the declaration binding, the tip it was
+    // accepted under, and the ext 0x0003/distribution_id TLV Field
+    // `distribution_id`, which in Full-Template mode rides on
+    // `DeclareMiningJob` and is therefore never seen on the mining wire at
+    // all.
     //
     // No race: the registration happens BEFORE the Success frame is
     // written (see `run_jdp_connection`), so holding the frame means the
@@ -446,7 +457,7 @@ async fn jdp_push_distribution_end_to_end() {
     assert_eq!(
         job_ref.distribution_id,
         Some(FIRST_ID),
-        "§6 puts the TLV on DeclareMiningJob in Full-Template mode — the mining \
+        "ext 0x0003/distribution_id TLV Field puts the TLV on DeclareMiningJob in Full-Template mode — the mining \
          side can only inherit the reference from here"
     );
     // Presence is not enough: a stub entry would satisfy the lookup and
@@ -512,7 +523,7 @@ async fn jdp_push_distribution_end_to_end() {
         assert_eq!(&raw[plen + extranonce.len()..], &suffix[..]);
     }
 
-    // ── §7.2 grace window: slide the pool-wide distribution twice ─────
+    // ── ext 0x0003/Grace Window: slide the pool-wide distribution twice ───
     // (Direct registry publishes — the same slot the publisher writes.)
     for id in [FIRST_ID + 1, FIRST_ID + 2] {
         bridge.write().unwrap().publish_pool_wide(entry_with_id(id));
@@ -531,7 +542,7 @@ async fn jdp_push_distribution_end_to_end() {
     write_declare(&mut writer, 13, &token, &suffix, Some(FIRST_ID + 1)).await;
     expect_declare_success(read_jdc(&mut reader).await, 13);
 
-    // ── Connection 2: TLV without negotiation → rejected (§2) ─────────
+    // ── Connection 2: TLV without negotiation → rejected (ext 0x0003/Negotiation) ───
     let (mut reader2, mut writer2) = connect_jdc(addr).await;
     write_msg(&mut writer2, setup_connection(addr.port())).await;
     expect_setup_success(read_jdc(&mut reader2).await);
@@ -550,15 +561,19 @@ async fn jdp_push_distribution_end_to_end() {
         JdcInbound::Message(AnyMessage::JobDeclaration(
             JobDeclaration::AllocateMiningJobTokenSuccess(s),
         )) => {
-            // §6.4.3 on the wire: exactly one designated payout output,
-            // sent with a 0 amount, paying this miner. The 0 is what lets a
-            // conformant JD-client write its whole template revenue into
-            // it; a second valued output here would make its coinbase
-            // overspend the block.
+            // SV2 JDP/AllocateMiningJobToken.Success on the wire: exactly one
+            // designated payout output, sent with a 0 amount, paying this
+            // miner. The 0 is what lets a conformant JD-client write its whole
+            // template revenue into it; a second valued output here would make
+            // its coinbase overspend the block.
             let outputs: Vec<bitcoin::TxOut> =
                 bitcoin::consensus::deserialize(s.coinbase_outputs.as_bytes())
                     .expect("allocate outputs must decode");
-            assert_eq!(outputs.len(), 1, "§6.4.3 designates ONE payout output");
+            assert_eq!(
+                outputs.len(),
+                1,
+                "SV2 JDP/AllocateMiningJobToken.Success designates ONE payout output"
+            );
             assert_eq!(outputs[0].value, bitcoin::Amount::ZERO);
             assert_eq!(
                 outputs[0].script_pubkey,
@@ -573,13 +588,14 @@ async fn jdp_push_distribution_end_to_end() {
     // This connection is FULL-TEMPLATE (it set `DECLARE_TX_DATA`), so its
     // allocate token must NOT be resolvable on its own: that mode owes a
     // `DeclareMiningJob`, which is where bitcoin-core validates its
-    // transaction set (§6.1). Registering it would let the JDC skip the
-    // declaration and mine a job no node ever saw.
+    // transaction set (SV2 JDP/Job Declarator Server). Registering it would
+    // let the JDC skip the declaration and mine a job no node ever saw.
     //
-    // Connection 1's token must not resolve either, for a different reason:
-    // it negotiated 0x0003, so §2 left it no designated output and its jobs
-    // are judged by the §7.1 recompute. Two ways to be absent, both checked
-    // — the positive case is connection 4 below.
+    // Connection 1's token must not resolve either, for a different reason: it
+    // negotiated 0x0003, so ext 0x0003/Negotiation left it no designated
+    // output and its jobs are judged by the ext 0x0003/Output Verification
+    // recompute. Two ways to be absent, both checked — the positive case is
+    // connection 4 below.
     {
         let reg = bridge.read().unwrap();
         let full_template_token =
@@ -604,12 +620,12 @@ async fn jdp_push_distribution_end_to_end() {
 
     // ── Connection 3: a refused setup is answered, then closed ────────
     //
-    // SV2 §3.6.3: `SetupConnection.Error` is sent "prior to closing the
-    // connection". Both halves matter and are asserted here: the client
-    // must LEARN why (the error frame arrives), and the socket must then
-    // go (the next read ends). Without the close the pool holds an FD for
-    // a session that can do nothing — there is no idle timeout on this
-    // path.
+    // SV2 Overview/SetupConnection.Error: `SetupConnection.Error` is sent
+    // "prior to closing the connection". Both halves matter and are asserted
+    // here: the client must LEARN why (the error frame arrives), and the
+    // socket must then go (the next read ends). Without the close the pool
+    // holds an FD for a session that can do nothing — there is no idle timeout
+    // on this path.
     let (mut reader3, mut writer3) = connect_jdc(addr).await;
     write_msg(&mut writer3, setup_connection_wrong_protocol(addr.port())).await;
     match read_jdc(&mut reader3).await {
@@ -633,12 +649,13 @@ async fn jdp_push_distribution_end_to_end() {
 
     // ── Connection 4: a real Coinbase-only JDC (the base path) ────────
     //
-    // No `DECLARE_TX_DATA`, no 0x0003. §6.3.1: "the `DeclareMiningJob`
-    // message is never used" in this mode, so the allocate is the pool's
-    // ONLY record of the token — the mining connection resolves it here and
-    // holds the custom job's coinbase to the script registered with it.
-    // Without the entry this JDC is answered `invalid-mining-job-token` on
-    // every job it ever builds, which an SRI jd-client treats as fatal.
+    // No `DECLARE_TX_DATA`, no 0x0003. SV2 JDP/Coinbase-only Mode: "the
+    // `DeclareMiningJob` message is never used" in this mode, so the allocate
+    // is the pool's ONLY record of the token — the mining connection resolves
+    // it here and holds the custom job's coinbase to the script registered
+    // with it. Without the entry this JDC is answered
+    // `invalid-mining-job-token` on every job it ever builds, which an SRI
+    // jd-client treats as fatal.
     let (mut reader4, mut writer4) = connect_jdc(addr).await;
     write_msg(&mut writer4, setup_connection_coinbase_only(addr.port())).await;
     expect_setup_success(read_jdc(&mut reader4).await);
@@ -657,14 +674,19 @@ async fn jdp_push_distribution_end_to_end() {
         JdcInbound::Message(AnyMessage::JobDeclaration(
             JobDeclaration::AllocateMiningJobTokenSuccess(s),
         )) => {
-            // §6.4.3 on the wire: exactly ONE designated payout output, sent
-            // with a 0 amount. The 0 is what lets a conformant JD-client
-            // write its whole template revenue into it; a second VALUED
-            // output would make its coinbase overspend the block.
+            // SV2 JDP/AllocateMiningJobToken.Success on the wire: exactly ONE
+            // designated payout output, sent with a 0 amount. The 0 is what
+            // lets a conformant JD-client write its whole template revenue
+            // into it; a second VALUED output would make its coinbase
+            // overspend the block.
             let outputs: Vec<bitcoin::TxOut> =
                 bitcoin::consensus::deserialize(s.coinbase_outputs.as_bytes())
                     .expect("allocate outputs must decode");
-            assert_eq!(outputs.len(), 1, "§6.4.3 designates ONE payout output");
+            assert_eq!(
+                outputs.len(),
+                1,
+                "SV2 JDP/AllocateMiningJobToken.Success designates ONE payout output"
+            );
             assert_eq!(outputs[0].value, bitcoin::Amount::ZERO);
             s.mining_job_token.as_bytes().to_vec()
         }
@@ -760,15 +782,16 @@ fn setup_connection(port: u16) -> AnyMessage<'static> {
     ))
 }
 
-/// A coinbase suffix whose outputs are the §4 recompute at the JDC's
-/// own template revenue: `[sequence][outputs][locktime]`.
+/// A coinbase suffix whose outputs are the ext 0x0003/Payout Computation
+/// recompute at the JDC's own template revenue:
+/// `[sequence][outputs][locktime]`.
 fn conformant_suffix(pool: &bitcoin::TxOut, payouts: &[WeightedOutput], dust: &[u32]) -> Vec<u8> {
     let pool_slot = WeightedOutput {
         script_pubkey: pool.script_pubkey.to_bytes(),
         weight: pool.value.to_sat(),
     };
     let outputs = compute_payout_vector(&pool_slot, payouts, dust, &[], REFERENCE_REWARD)
-        .expect("§4 compute");
+        .expect("ext 0x0003/Payout Computation compute");
     let mut suffix = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
     suffix.extend_from_slice(&bitcoin::consensus::serialize(&outputs));
     suffix.extend_from_slice(&0u32.to_le_bytes());
@@ -800,7 +823,7 @@ type Writer = NoiseTcpWriteHalf<AnyMessage<'static>>;
 
 /// A Coinbase-only `SetupConnection`: `DECLARE_TX_DATA` clear, so the JDC
 /// never declares and takes its allocate token straight to the mining
-/// connection (§6.3.1).
+/// connection (SV2 JDP/Coinbase-only Mode).
 fn setup_connection_coinbase_only(port: u16) -> AnyMessage<'static> {
     AnyMessage::Common(CommonMessages::SetupConnection(
         SetupConnection {
@@ -885,9 +908,10 @@ async fn write_msg(writer: &mut Writer, msg: AnyMessage<'static>) {
     writer.write_frame(Frame::Sv2(frame)).await.expect("write");
 }
 
-/// Write a `DeclareMiningJob`, optionally with the §6 `distribution_id`
-/// TLV appended to the frame tail (LE, per §3.4.3 data types). The
-/// frame header's msg_length is patched to cover the tail.
+/// Write a `DeclareMiningJob`, optionally with the ext 0x0003/distribution_id
+/// TLV Field `distribution_id` TLV appended to the frame tail (LE, per SV2
+/// Overview/Stratum V2 TLV Encoding Model data types). The frame header's
+/// msg_length is patched to cover the tail.
 async fn write_declare(
     writer: &mut Writer,
     request_id: u32,
@@ -1132,10 +1156,13 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
         other => panic!("expected RequestExtensionsSuccess, got {other:?}"),
     }
     // Before any allocate the pool does not know WHO this is, so the pool-wide
-    // push is all it can offer and §3.1 requires it right here.
+    // push is all it can offer and ext 0x0003/SetPayoutDistribution requires
+    // it right here.
     match read_jdc(&mut reader).await {
         JdcInbound::PayoutDistribution(d) => assert_eq!(d.distribution_id, FIRST_ID),
-        other => panic!("§3.1: expected the pool-wide distribution, got {other:?}"),
+        other => panic!(
+            "ext 0x0003/SetPayoutDistribution: expected the pool-wide distribution, got {other:?}"
+        ),
     }
 
     // ── Identity known, mode NOT known ────────────────────────────────
@@ -1298,7 +1325,8 @@ impl PayoutDistributionSource for FlippableSource {
 }
 
 /// Bring a JDC up to the point where it has negotiated 0x0003 and consumed the
-/// §3.1 initial pool-wide push. Returns the id it saw.
+/// ext 0x0003/SetPayoutDistribution initial pool-wide push. Returns the id it
+/// saw.
 async fn negotiated_jdc(addr: std::net::SocketAddr) -> (Reader, Writer, u64) {
     let (mut reader, mut writer) = connect_jdc(addr).await;
     write_msg(&mut writer, setup_connection(addr.port())).await;
@@ -1324,7 +1352,9 @@ async fn negotiated_jdc(addr: std::net::SocketAddr) -> (Reader, Writer, u64) {
     }
     let first = match read_jdc(&mut reader).await {
         JdcInbound::PayoutDistribution(d) => d.distribution_id,
-        other => panic!("§3.1: expected the pool-wide distribution, got {other:?}"),
+        other => panic!(
+            "ext 0x0003/SetPayoutDistribution: expected the pool-wide distribution, got {other:?}"
+        ),
     };
     (reader, writer, first)
 }
@@ -1402,10 +1432,11 @@ fn suffix_for_test_weights() -> Vec<u8> {
     conformant_suffix(&pool, &miner_slots(), &dust_limits())
 }
 
-/// §6.4.2 rate-limits token issuance to 1/s per connection, and an over-limit
-/// request is dropped in silence. Everything that takes a token — an allocate,
-/// and an accepted declare — has to be spaced out or the test reads the NEXT
-/// frame as the answer to a request that was never answered.
+/// SV2 JDP/AllocateMiningJobToken rate-limits token issuance to 1/s per
+/// connection, and an over-limit request is dropped in silence. Everything
+/// that takes a token — an allocate, and an accepted declare — has to be
+/// spaced out or the test reads the NEXT frame as the answer to a request that
+/// was never answered.
 async fn respect_token_rate_limit() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
 }
@@ -1416,10 +1447,11 @@ async fn respect_token_rate_limit() {
 /// While it waited it was excluded from the pool-wide pushes — correctly, the
 /// pool did not know they were its. So the last id it holds is whatever was
 /// current when it connected, and by the time the mode arrives that id has
-/// fallen out of the §7.2 window. Lifting the denial alone leaves it declaring
-/// against a stale id and answered `stale-payout-distribution`, which is not a
-/// benign error: `stale-chain-tip` is the only code an SRI jd-client retries,
-/// every other one sends it off the pool into solo fallback.
+/// fallen out of the ext 0x0003/Grace Window. Lifting the denial alone
+/// leaves it declaring against a stale id and answered
+/// `stale-payout-distribution`, which is not a benign error: `stale-chain-tip`
+/// is the only code an SRI jd-client retries, every other one sends it off the
+/// pool into solo fallback.
 ///
 /// The publisher goes quiet before the flip (an unchanged fingerprint is not
 /// republished), so the frame the client receives cannot have come from a tick.
@@ -1552,10 +1584,10 @@ fn flippable_source() -> Arc<FlippableSource> {
 /// The plan built for the mode that moved is DROPPED, not merely superseded —
 /// and on BOTH paths that republish one.
 ///
-/// §7.2 keeps the immediately-previous entry of a slot acceptable, so
-/// republishing over a stale plan leaves it declarable for one more
-/// distribution. The declare-time mode check hides that almost everywhere —
-/// almost, because it can only refuse when the pool HAS an answer, and "no
+/// ext 0x0003/Grace Window keeps the immediately-previous entry of a slot
+/// acceptable, so republishing over a stale plan leaves it declarable for one
+/// more distribution. The declare-time mode check hides that almost everywhere
+/// — almost, because it can only refuse when the pool HAS an answer, and "no
 /// live mining session for this address" is not an answer. A miner going
 /// offline is not exotic; it is a rig rebooting.
 ///
@@ -1687,7 +1719,8 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
     // …and the session is not merely broken: the plan it was just handed
     // works, which is the whole difference from hanging until a reconnect.
     // Same token — a refused declare must not burn one, or the recovery would
-    // cost a round-trip the §6.4.2 rate limit charges a second for.
+    // cost a round-trip the SV2 JDP/AllocateMiningJobToken rate limit charges
+    // a second for.
     respect_token_rate_limit().await;
     write_declare(
         &mut writer,
@@ -1713,9 +1746,9 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
 /// the session is refused for the life of the connection while the pool
 /// believes it is serving it correctly.
 ///
-/// Reached here through a §10 settlement, which is what invalidates a tailored
-/// slot and makes the session re-ask what it should be served — by which time
-/// the answer has changed.
+/// Reached here through an ext 0x0003/Implementation Notes settlement, which
+/// is what invalidates a tailored slot and makes the session re-ask what it
+/// should be served — by which time the answer has changed.
 ///
 /// The declare at the end is what pins it: the id the pool has just pushed,
 /// against the coinbase the pool published, must be accepted.

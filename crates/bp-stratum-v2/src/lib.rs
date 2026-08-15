@@ -24,12 +24,12 @@
 //!   utils) are git+rev-pinned runtime-deps per the 2026-05-16 strategy
 //!   decision. Eigen-Code only for pool-side state machine + Blitzpool
 //!   behaviour.
-//! - **Functional reactions** (frame shape, vendor quirks,
-//!   retire-not-clear job lifecycle from sv2-ui#143, jobIdToDifficulty
-//!   for SV2 §5.3.14, stored-merkle-root to avoid mutation bugs,
+//! - **Functional reactions** (frame shape, vendor quirks, retire-not-clear
+//!   job lifecycle from sv2-ui#143, jobIdToDifficulty for SV2
+//!   Mining/SubmitShares.Error, stored-merkle-root to avoid mutation bugs,
 //!   dust-suppression in JDP ext 0x0003) are implemented as specified.
-//!   Internal performance improvements are allowed where they don't
-//!   change observable behaviour.
+//!   Internal performance improvements are allowed where they don't change
+//!   observable behaviour.
 //! - **Hooks for I/O.** All side-effects (DB upserts, Redis writes,
 //!   notifications, block-submit) flow through `ServerHooks` so that
 //!   `bin/blitzpool` can wire production adapters and tests can use

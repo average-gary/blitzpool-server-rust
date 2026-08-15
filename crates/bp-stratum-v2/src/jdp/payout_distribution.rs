@@ -3,25 +3,27 @@
 //! Payout-distribution computation + declared-coinbase validation for
 //! SV2 ext 0x0003 (push model).
 //!
-//! One §4 evaluation serves every consumer: the JDS builds the
-//! expected output vector from `(distribution, T)` and the validator
-//! compares a declared coinbase POSITIONALLY against it (§7.1 — the
-//! spec fixes the output order, so containment games like paying two
-//! distributions at once are structurally impossible; nothing here
-//! needs the old multiset machinery).
+//! One ext 0x0003/Payout Computation evaluation serves every consumer: the JDS
+//! builds the expected output vector from `(distribution, T)` and the
+//! validator compares a declared coinbase POSITIONALLY against it (ext
+//! 0x0003/Output Verification — the spec fixes the output order, so
+//! containment games like paying two distributions at once are structurally
+//! impossible; nothing here needs the old multiset machinery).
 //!
-//! `T` is taken as the sum of the declared coinbase's output values.
-//! That is self-consistent: a §4-correct vector for revenue `T'` sums
-//! to exactly `T'` (the pool output absorbs the remainder), so any
-//! tampering either changes the sum — and with it every recomputed
-//! amount — or changes a position; both are caught by the compare.
+//! `T` is taken as the sum of the declared coinbase's output values. That is
+//! self-consistent: an ext 0x0003/Payout Computation-correct vector for
+//! revenue `T'` sums to exactly `T'` (the pool output absorbs the
+//! remainder), so any tampering either changes the sum — and with it every
+//! recomputed amount — or changes a position; both are caught by the
+//! compare.
 
 use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::{Amount, ScriptBuf, TxOut};
 use bp_share::{compute_payout_amounts, WeightPayoutError};
 
-/// One §3.1 payout slot as the registry stores it: a locking script
-/// plus its relative weight (the TxOut amount field on the wire).
+/// One ext 0x0003/SetPayoutDistribution payout slot as the registry stores it:
+/// a locking script plus its relative weight (the TxOut amount field on the
+/// wire).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedOutput {
     pub script_pubkey: Vec<u8>,
@@ -29,8 +31,8 @@ pub struct WeightedOutput {
 }
 
 impl WeightedOutput {
-    /// Consensus-serialize as the §3.1 wire form: a `TxOut` whose
-    /// amount field carries the weight.
+    /// Consensus-serialize as the ext 0x0003/SetPayoutDistribution wire form:
+    /// a `TxOut` whose amount field carries the weight.
     pub fn to_wire_txout(&self) -> Vec<u8> {
         let txout = TxOut {
             value: Amount::from_sat(self.weight),
@@ -52,16 +54,17 @@ pub enum PayoutComputeError {
     /// An `additional_outputs` blob did not consensus-decode to a TxOut.
     #[error("additional output {index} is not a consensus TxOut")]
     UnparsableAdditionalOutput { index: usize },
-    /// An `additional_outputs` TxOut carried a non-0 amount (§3.1 MUST).
+    /// An `additional_outputs` TxOut carried a non-0 amount (ext
+    /// 0x0003/SetPayoutDistribution MUST).
     #[error("additional output {index} carries a non-zero amount")]
     NonZeroAdditionalOutput { index: usize },
 }
 
-/// Build the §4 expected coinbase output vector for revenue `t`:
-/// `pool_payout` (amount `pay_P`), kept `payouts` in distribution
-/// order (dust-pruned ones omitted), then `additional_outputs`
-/// (amounts 0). Trailing JDC/TP outputs are NOT part of this vector —
-/// the validator checks them separately (must be 0-value).
+/// Build the ext 0x0003/Payout Computation expected coinbase output vector for
+/// revenue `t`: `pool_payout` (amount `pay_P`), kept `payouts` in distribution
+/// order (dust-pruned ones omitted), then `additional_outputs` (amounts 0).
+/// Trailing JDC/TP outputs are NOT part of this vector — the validator checks
+/// them separately (must be 0-value).
 pub fn compute_payout_vector(
     pool_payout: &WeightedOutput,
     payouts: &[WeightedOutput],
@@ -100,12 +103,13 @@ pub fn compute_payout_vector(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DistributionViolation {
     /// Output at `position` differs (script or amount) from the
-    /// recomputed §4 vector.
+    /// recomputed ext 0x0003/Payout Computation vector.
     WrongOutputAt { position: usize },
     /// The declared coinbase ends before the recomputed vector does.
     MissingExpectedOutput { position: usize },
-    /// A trailing (JDC/TP-appended) output carries a non-0 amount —
-    /// §4 only permits 0-value outputs after the distribution block.
+    /// A trailing (JDC/TP-appended) output carries a non-0 amount — ext
+    /// 0x0003/Payout Computation only permits 0-value outputs after the
+    /// distribution block.
     NonZeroTrailingOutput { position: usize },
     /// The distribution itself cannot be evaluated (zero weight sum /
     /// malformed additional output) — a registry entry this JDS
@@ -115,16 +119,17 @@ pub enum DistributionViolation {
     /// No coinbase can pay more than the money supply, so this is a
     /// malformed declaration rather than an internal failure.
     RevenueOverflow,
-    /// The declared coinbase pays nothing at all. Self-consistent (every
-    /// §4 amount is 0 at T = 0) and therefore invisible to the compare,
-    /// but it is a block that forfeits its own subsidy — never a job a
-    /// pool should declare valid.
+    /// The declared coinbase pays nothing at all. Self-consistent (every ext
+    /// 0x0003/Payout Computation amount is 0 at T = 0) and therefore invisible
+    /// to the compare, but it is a block that forfeits its own subsidy — never
+    /// a job a pool should declare valid.
     ZeroRevenue,
 }
 
-/// Recompute-and-compare (§7.1) against POSITIONAL §4 order. Returns
-/// the accepted revenue `T` (= Σ declared output values) so the caller
-/// can band-check it for booking and stamp it onto the job.
+/// Recompute-and-compare (ext 0x0003/Output Verification) against POSITIONAL
+/// ext 0x0003/Payout Computation order. Returns the accepted revenue `T` (= Σ
+/// declared output values) so the caller can band-check it for booking and
+/// stamp it onto the job.
 pub fn validate_coinbase_outputs_against_distribution(
     declared: &[TxOut],
     pool_payout: &WeightedOutput,
@@ -160,18 +165,18 @@ pub fn validate_coinbase_outputs_against_distribution(
     // from something other than the declared outputs — keep it so that
     // change cannot silently open a valued-trailing-output hole.
     //
-    // Trailing outputs are checked for VALUE only, deliberately. §4
-    // also requires the witness commitment to come last, but that is a
-    // construction rule for the JDC; §7.1 defines this verifier's job
-    // as recompute-and-compare plus "only 0-value outputs may follow",
-    // and that is what this is. Nor is it a consensus "last": BIP-141
-    // takes the HIGHEST-index output matching the commitment pattern,
-    // so a 0-value output after it is inert unless it matches too — in
-    // which case the JDC has invalidated its own block and forfeited
-    // its own payout with it. bitcoind is the authority on that, and
-    // rejects it at submit. Checking it here would mix "does this
-    // coinbase pay the published distribution?" (ours) with "is this
-    // block valid?" (not ours).
+    // Trailing outputs are checked for VALUE only, deliberately. ext
+    // 0x0003/Payout Computation also requires the witness commitment to come
+    // last, but that is a construction rule for the JDC; ext 0x0003/Output
+    // Verification defines this verifier's job as recompute-and-compare plus
+    // "only 0-value outputs may follow", and that is what this is. Nor is it a
+    // consensus "last": BIP-141 takes the HIGHEST-index output matching the
+    // commitment pattern, so a 0-value output after it is inert unless it
+    // matches too — in which case the JDC has invalidated its own block and
+    // forfeited its own payout with it. bitcoind is the authority on that, and
+    // rejects it at submit. Checking it here would mix "does this coinbase pay
+    // the published distribution?" (ours) with "is this block valid?" (not
+    // ours).
     for (offset, got) in declared[expected.len()..].iter().enumerate() {
         if got.value != Amount::ZERO {
             return Err(DistributionViolation::NonZeroTrailingOutput {
@@ -214,9 +219,9 @@ mod tests {
         buf
     }
 
-    /// A coinbase paying nothing is self-consistent under the compare
-    /// (every §4 amount is 0 at T = 0) but forfeits the block's subsidy
-    /// and pays the pool and every miner nothing.
+    /// A coinbase paying nothing is self-consistent under the compare (every
+    /// ext 0x0003/Payout Computation amount is 0 at T = 0) but forfeits the
+    /// block's subsidy and pays the pool and every miner nothing.
     #[test]
     fn declared_zero_revenue_is_rejected() {
         let declared = vec![txout(0, script(0xFF))];
@@ -296,7 +301,8 @@ mod tests {
         );
     }
 
-    /// `a §4-correct coinbase validates and returns its T`
+    /// `an ext 0x0003/Payout Computation-correct coinbase validates and
+    /// returns its T`
     #[test]
     fn validate_accepts_correct_coinbase() {
         let pool = wo(0xFF, 1);

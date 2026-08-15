@@ -74,7 +74,8 @@ use super::submit::{
 };
 use super::translator::{TemplateBroadcast, TemplateChange};
 
-// ── SetupConnection flags (BIP-310 / SV2 spec §4.1) ─────────────────
+// ── SetupConnection flags ──────────────────────────────────────────
+// (BIP-310 / SV2 Mining/SetupConnection Flags for Mining Protocol)
 
 /// Protocol code for the mining sub-protocol (SV2 spec).
 pub const PROTOCOL_MINING: u8 = 0;
@@ -95,17 +96,19 @@ pub const FLAG_REQUIRES_WORK_SELECTION: u32 = 1 << 1;
 /// decide from it.
 pub const FLAG_REQUIRES_VERSION_ROLLING: u32 = 1 << 2;
 
-/// `NewExtendedMiningJob.version_rolling_allowed` (§5.3.16) for every extended
-/// job this pool serves, whatever the client asked for at `SetupConnection`.
+/// `NewExtendedMiningJob.version_rolling_allowed` (SV2
+/// Mining/NewExtendedMiningJob) for every extended job this pool serves,
+/// whatever the client asked for at `SetupConnection`.
 ///
 /// It used to be `flags & FLAG_REQUIRES_VERSION_ROLLING`, which turned "didn't
-/// ask" into "may not". §5.3.1 does not support that reading: the flag is
-/// one-directional — "the client REQUIRES version rolling ... and the server
-/// MUST NOT send jobs which do not allow version rolling" — so its ABSENCE
-/// licenses nothing. §5.3.16 meanwhile makes the `false` a real order: "the
-/// downstream node MUST use version as it is defined by this message". A
-/// miner that can roll but never bothered to set the flag was being told to
-/// give up 24 bits of search space.
+/// ask" into "may not". SV2 Mining/SetupConnection Flags for Mining Protocol
+/// does not support that reading: the flag is one-directional — "the client
+/// REQUIRES version rolling ... and the server MUST NOT send jobs which do not
+/// allow version rolling" — so its ABSENCE licenses nothing. SV2
+/// Mining/NewExtendedMiningJob meanwhile makes the `false` a real order: "the
+/// downstream node MUST use version as it is defined by this message". A miner
+/// that can roll but never bothered to set the flag was being told to give up
+/// 24 bits of search space.
 ///
 /// It was also a restriction we never enforced: `validate_submit_extended`
 /// builds the header from `submission.version` verbatim and compares nothing
@@ -126,9 +129,10 @@ pub const FLAG_REQUIRES_VERSION_ROLLING: u32 = 1 << 2;
 /// as a valid share — and is deliberately not part of this.
 pub const VERSION_ROLLING_ALLOWED: bool = true;
 
-// `SetupConnection.Success.flags` (SV2 spec §5.3.2, server→client) is a
-// SEPARATE capability bitset whose bit meanings are UNRELATED to the client
-// request flags above — the two spaces merely reuse bit indices 0/1.
+// `SetupConnection.Success.flags` (SV2 Mining/SetupConnection Flags for Mining
+// Protocol, server→client) is a SEPARATE capability bitset whose bit meanings
+// are UNRELATED to the client request flags above — the two spaces merely
+// reuse bit indices 0/1.
 /// Server will NOT accept version-field changes. Per spec MUST NOT be set if
 /// the client requested [`FLAG_REQUIRES_VERSION_ROLLING`].
 pub const FLAG_SUCCESS_REQUIRES_FIXED_VERSION: u32 = 1 << 0;
@@ -175,11 +179,11 @@ pub const ERR_MAX_TARGET_OUT_OF_RANGE: &str = "max-target-out-of-range";
 /// different address than the connection's first channel.
 pub const ERR_ADDRESS_LOCKED: &str = "address-locked";
 
-/// `min-extranonce-size-too-large` — an `OpenExtendedMiningChannel`
-/// requested a `min_extranonce_size` larger than the rollable region the
-/// pool can grant ([`MAX_EXTENDED_ROLLABLE`] bytes, bounded so the total
-/// extranonce stays within the SV2 32-byte cap). SV2 §5.3.2 requires the
-/// server to grant at least the requested minimum or reject — we reject
+/// `min-extranonce-size-too-large` — an `OpenExtendedMiningChannel` requested
+/// a `min_extranonce_size` larger than the rollable region the pool can grant
+/// ([`MAX_EXTENDED_ROLLABLE`] bytes, bounded so the total extranonce stays
+/// within the SV2 32-byte cap). SV2 Mining/OpenExtendedMiningChannel requires
+/// the server to grant at least the requested minimum or reject — we reject
 /// rather than silently hand back a smaller region (which would make an
 /// aggregating proxy tear down the upstream).
 pub const ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE: &str = "min-extranonce-size-too-large";
@@ -219,10 +223,10 @@ pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 /// distribution reference) on a non-Solo stream. Off Solo the shares enter
 /// SHARED accounting (PPLNS window / group), but nothing validates that the
 /// self-built coinbase pays that accounting — the job's finder would collect
-/// window share while contributing blocks that pay the pool's window
-/// nothing. With a referenced distribution the §7.1 positional check forces
-/// the coinbase to pay the published split, so non-Solo is legitimate there
-/// (the whole point of the extension).
+/// window share while contributing blocks that pay the pool's window nothing.
+/// With a referenced distribution the ext 0x0003/Output Verification
+/// positional check forces the coinbase to pay the published split, so
+/// non-Solo is legitimate there (the whole point of the extension).
 pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 
 /// `invalid-nbits` — a custom job **on the pool's own tip** whose `n_bits` is
@@ -255,11 +259,12 @@ pub const ERR_INVALID_NBITS: &str = "invalid-nbits";
 ///
 /// Both payout regimes end here, because the JDC's remedy is the same in
 /// each: rebuild the coinbase from what the pool sent.
-/// - ext 0x0003: the outputs violate the §4 recompute against the
-///   referenced distribution (missing / modified / reordered).
-/// - base protocol: the outputs do not allocate sats to the §6.4.3
-///   designated pool payout output, which that section tells JDS and Pool
-///   to reject.
+/// - ext 0x0003: the outputs violate the ext 0x0003/Payout Computation
+///   recompute against the referenced distribution (missing / modified /
+///   reordered).
+/// - base protocol: the outputs do not allocate sats to the SV2
+///   JDP/AllocateMiningJobToken.Success designated pool payout output, which
+///   that section tells JDS and Pool to reject.
 pub const ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS: &str =
     "invalid-job-param-value-coinbase_tx_outputs";
 
@@ -275,23 +280,26 @@ pub const ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH: &str =
     "invalid-job-param-value-declaration-mismatch";
 
 /// `stale-payout-distribution` — the `distribution_id` referenced by this
-/// `SetCustomMiningJob` is outside the acceptance window (ext 0x0003
-/// §7.2/§10). The JDC re-declares against the latest distribution.
+/// `SetCustomMiningJob` is outside the acceptance window (ext 0x0003 ext
+/// 0x0003/Grace Window + Implementation Notes). The JDC re-declares against
+/// the latest distribution.
 pub const ERR_STALE_PAYOUT_DISTRIBUTION: &str =
     crate::extensions::payout_distribution_error_codes::STALE_PAYOUT_DISTRIBUTION;
 
-/// `invalid-payout-distribution` — the job's coinbase outputs violate
-/// §4 against the referenced distribution, or the §6 TLV is missing on
-/// a negotiated Coinbase-only custom job.
+/// `invalid-payout-distribution` — the job's coinbase outputs violate ext
+/// 0x0003/Payout Computation against the referenced distribution, or the ext
+/// 0x0003/distribution_id TLV Field is missing on a negotiated Coinbase-only
+/// custom job.
 pub const ERR_INVALID_PAYOUT_DISTRIBUTION: &str =
     crate::extensions::payout_distribution_error_codes::INVALID_PAYOUT_DISTRIBUTION;
 
 /// Set of SV2 mining-side extensions our pool supports:
 /// - Worker-ID TLV (0x0002) for per-share worker attribution on
 ///   `SubmitSharesExtended`.
-/// - Non-Custodial Payouts (0x0003): §2 requires negotiation on BOTH
-///   the JDP and the Mining Protocol connection; the mining side
-///   carries the §6 `distribution_id` TLV on `SetCustomMiningJob`.
+/// - Non-Custodial Payouts (0x0003): ext 0x0003/Negotiation requires
+///   negotiation on BOTH the JDP and the Mining Protocol connection; the
+///   mining side carries the ext 0x0003/distribution_id TLV Field on
+///   `SetCustomMiningJob`.
 pub const SUPPORTED_MINING_EXTENSIONS: &[u16] = &[
     SV2_EXTENSION_TYPE_WORKER_ID,
     SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
@@ -380,7 +388,7 @@ pub enum OutboundFrame {
     /// Ext 0x0001 negotiation success. `supported_extensions` is the
     /// intersection of the miner's requested set and our pool's
     /// `SUPPORTED_MINING_EXTENSIONS` — may be empty if the miner sent
-    /// an empty request (legal under spec ext 0x0001 §4.1).
+    /// an empty request (legal under ext 0x0001/Implementation Notes).
     RequestExtensionsSuccess {
         request_id: u16,
         supported_extensions: Vec<u16>,
@@ -410,8 +418,8 @@ pub enum OutboundFrame {
         /// only, NOT including the pool prefix).
         extranonce_size: u16,
         extranonce_prefix: Vec<u8>,
-        /// Group this channel was assigned to (spec §5.2.3), or `0` when
-        /// un-grouped. Non-zero for Extended channels on a
+        /// Group this channel was assigned to (SV2 Mining/Group Channel), or
+        /// `0` when un-grouped. Non-zero for Extended channels on a
         /// non-`REQUIRES_STANDARD_JOBS` connection — the downstream infers
         /// group membership from this id (we don't send `SetGroupChannel`).
         group_channel_id: u32,
@@ -424,8 +432,8 @@ pub enum OutboundFrame {
         channel_id: u32,
         maximum_target: [u8; 32],
     },
-    /// SV2 §5.3.10 `SetExtranoncePrefix` — changes a channel's extranonce
-    /// prefix. Per spec it applies to all jobs sent *after* this message on the
+    /// SV2 Mining/SetExtranoncePrefix — changes a channel's extranonce prefix.
+    /// Per spec it applies to all jobs sent *after* this message on the
     /// channel, so the caller emits it immediately before the next job frame
     /// (the same "announce, then next job" model as SV1's
     /// `mining.set_extranonce`). Valid only for explicitly opened standard /
@@ -435,7 +443,7 @@ pub enum OutboundFrame {
         channel_id: u32,
         extranonce_prefix: Vec<u8>,
     },
-    /// SV2 §5.3.4 `SetNewPrevHash` — sent per-channel on a block change
+    /// SV2 Mining/SetNewPrevHash — sent per-channel on a block change
     /// to ACTIVATE a future job, AFTER the matching `NewMiningJob` /
     /// `NewExtendedMiningJob` (which carried an empty `min_ntime`).
     /// `job_id` MUST match the immediately-preceding future-job frame on
@@ -448,7 +456,7 @@ pub enum OutboundFrame {
         min_ntime: u32,
         n_bits: u32,
     },
-    /// SV2 §5.3.7 `NewMiningJob` — Standard channels only. The pool
+    /// SV2 Mining/NewMiningJob — Standard channels only. The pool
     /// pre-spliced the channel's `extranonce_prefix` (and zero-padded
     /// the rollable slot, which is empty for Standard) into the
     /// coinbase before computing the merkle root, so the miner just
@@ -467,7 +475,7 @@ pub enum OutboundFrame {
         merkle_root: [u8; 32],
         min_ntime: Option<u32>,
     },
-    /// SV2 §5.3.8 `NewExtendedMiningJob` — Extended channels only.
+    /// SV2 Mining/NewExtendedMiningJob — Extended channels only.
     /// Carries the pre/suffix split of the coinbase so the miner can
     /// roll their portion of the extranonce, plus the merkle path for
     /// recomputing the root. `min_ntime` follows the same future-job
@@ -531,9 +539,10 @@ pub enum SessionEvent {
     /// connection level (we accepted its protocol version + vendor).
     /// Caller can register the connection in the live-clients registry.
     SetupComplete,
-    /// The connection must be closed once the pending outbound frames
-    /// are on the wire. Emitted with `SetupConnection.Error`, which SV2
-    /// §3.6.3 defines as being sent "prior to closing the connection".
+    /// The connection must be closed once the pending outbound frames are on
+    /// the wire. Emitted with `SetupConnection.Error`, which SV2 SV2
+    /// Overview/SetupConnection.Error defines as being sent "prior to closing
+    /// the connection".
     Disconnect { reason: String },
     /// A new mining channel opened. Caller can record per-channel
     /// metadata (DB, registry).
@@ -636,9 +645,10 @@ pub struct MiningSessionState<C: Clock> {
     ///   miner parked there is still Group-Solo, and reading `stream` would
     ///   let it reference the pool-wide (PPLNS) distribution.
     ///
-    /// Every accounting question — the base-protocol Solo gate, the §7.2
-    /// reference inheritance and the accounting/stream pair — reads THIS one.
-    /// Only the template and submit routing read `stream`.
+    /// Every accounting question — the base-protocol Solo gate, the ext
+    /// 0x0003/Grace Window reference inheritance and the accounting/stream
+    /// pair — reads THIS one. Only the template and submit routing read
+    /// `stream`.
     pub accounting_stream: StreamKind,
 
     // Negotiated state from SetupConnection
@@ -671,13 +681,13 @@ pub struct MiningSessionState<C: Clock> {
     /// Connection-local channel-id counter — incremented on each
     /// `OpenChannel`. Channel-ids are scoped to a connection, not to
     /// the whole pool. Also the source of `group_channel_id`s (same
-    /// namespace, must not collide — spec §5.2.3).
+    /// namespace, must not collide — SV2 Mining/Group Channel).
     pub next_channel_id: u32,
-    /// SV2 group channels (spec §5.2.3) for this connection. Populated
-    /// eagerly when a non-`REQUIRES_STANDARD_JOBS` connection opens
-    /// Extended channels — they're grouped by full extranonce size so
-    /// the broadcast sends ONE job per group. Empty for standard-jobs /
-    /// TDP / JDC connections.
+    /// SV2 group channels (SV2 Mining/Group Channel) for this connection.
+    /// Populated eagerly when a non-`REQUIRES_STANDARD_JOBS` connection opens
+    /// Extended channels — they're grouped by full extranonce size so the
+    /// broadcast sends ONE job per group. Empty for standard-jobs / TDP / JDC
+    /// connections.
     pub groups: GroupChannelRegistry,
 
     // Vardiff state
@@ -837,18 +847,19 @@ impl<C: Clock + Clone> MiningSessionState<C> {
 /// - Mismatched protocol version → `SetupConnectionError`
 /// - Mismatched sub-protocol (we accept Mining only for now) →
 ///   `SetupConnectionError`
-/// - Else → `SetupConnectionSuccess` whose `flags` are the SERVER
-///   capability bits (SV2 §5.3.2), built fresh — NOT an echo of the
-///   client's request flags (the two bitsets have different meanings).
+/// - Else → `SetupConnectionSuccess` whose `flags` are the SERVER capability
+///   bits (SV2 Mining/SetupConnection Flags for Mining Protocol), built fresh
+///   — NOT an echo of the client's request flags (the two bitsets have
+///   different meanings).
 ///
 /// SV2 spec returns `SetupConnectionError.flags` as the bitset of
 /// flags we DON'T accept — for `protocol-version-mismatch` it's 0;
 /// for unsupported flags it's the offending bits.
 /// `SetupConnection.Error` plus the request to close.
 ///
-/// SV2 §3.6.3: the server sends this message "prior to closing the
-/// connection". The frame goes out first — the IO layer breaks only after
-/// the write — or the client never learns why it was refused.
+/// SV2 Overview/SetupConnection.Error: the server sends this message "prior to
+/// closing the connection". The frame goes out first — the IO layer breaks
+/// only after the write — or the client never learns why it was refused.
 fn setup_rejected(error_code: &str, reason: String) -> HandlerOutcome {
     let mut outcome = HandlerOutcome::with_frame(OutboundFrame::SetupConnectionError {
         flags: 0,
@@ -900,14 +911,15 @@ pub fn handle_setup_connection<C: Clock>(
     state.work_selection = (input.flags & FLAG_REQUIRES_WORK_SELECTION) != 0;
 
     // Build `Success.flags` fresh — NEVER echo `input.flags`. The success
-    // bitset (SV2 §5.3.2) is a distinct server-capability field: bit 0 is
-    // REQUIRES_FIXED_VERSION, bit 1 is REQUIRES_EXTENDED_CHANNELS. Echoing the
-    // request would map the client's REQUIRES_STANDARD_JOBS (bit 0) onto
-    // REQUIRES_FIXED_VERSION and REQUIRES_WORK_SELECTION (bit 1) onto
-    // REQUIRES_EXTENDED_CHANNELS. The spec forbids REQUIRES_FIXED_VERSION when
-    // the client asked for version rolling, so an echo can tell a version-
-    // rolling proxy it may not roll — a contradiction that makes strict
-    // clients drop the connection right after setup/first job.
+    // bitset (SV2 Mining/SetupConnection Flags for Mining Protocol) is a
+    // distinct server-capability field: bit 0 is REQUIRES_FIXED_VERSION, bit 1
+    // is REQUIRES_EXTENDED_CHANNELS. Echoing the request would map the
+    // client's REQUIRES_STANDARD_JOBS (bit 0) onto REQUIRES_FIXED_VERSION and
+    // REQUIRES_WORK_SELECTION (bit 1) onto REQUIRES_EXTENDED_CHANNELS. The
+    // spec forbids REQUIRES_FIXED_VERSION when the client asked for version
+    // rolling, so an echo can tell a version- rolling proxy it may not roll —
+    // a contradiction that makes strict clients drop the connection right
+    // after setup/first job.
     //
     // We impose no fixed version (we serve version-rollable jobs) and we DO
     // accept standard channels, so both bits are 0 by default. A work-selection
@@ -930,18 +942,17 @@ pub fn handle_setup_connection<C: Clock>(
 
 // ── Handler: RequestExtensions (ext 0x0001) ─────────────────────────
 
-/// Handle `RequestExtensions` (ext 0x0001 §4.1, msg_type 0x00 on
+/// Handle `RequestExtensions` (ext 0x0001/Message Types, msg_type 0x00 on
 /// extension_type 0x0001). Negotiates which SV2 extensions the
 /// connection has enabled.
 ///
 /// Semantics:
 ///
-/// - **Pre-setup**: spec ext 0x0001 §4.2 says `RequestExtensions`
-///   MUST arrive after `SetupConnection.Success`. We **silently
-///   drop** stray pre-setup requests (returning a `HandlerOutcome`
-///   with no frames + no events) rather than answering — answering
-///   would let a client skip the SetupConnection handshake. Do
-///   the same.
+/// - **Pre-setup**: ext 0x0001/Implementation Notes says
+///   `RequestExtensions` MUST arrive after `SetupConnection.Success`. We
+///   **silently drop** stray pre-setup requests (returning a `HandlerOutcome`
+///   with no frames + no events) rather than answering — answering would let a
+///   client skip the SetupConnection handshake. Do the same.
 /// - **All requested supported** → `Success` with the supported
 ///   list. State's `negotiated_extensions` adds every entry.
 /// - **Mixed**: produce `Success` with the supported subset;
@@ -1069,18 +1080,18 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
     }
 }
 
-/// Eager SV2 group assignment (spec §5.2.3) for the Extended open handler.
-/// A connection without `REQUIRES_STANDARD_JOBS` (and not a TDP-only /
-/// work-selection connection) is a proxy that understands extended jobs +
+/// Eager SV2 group assignment (SV2 Mining/Group Channel) for the Extended open
+/// handler. A connection without `REQUIRES_STANDARD_JOBS` (and not a TDP-only
+/// / work-selection connection) is a proxy that understands extended jobs +
 /// group channels, so its Extended channels are grouped by full extranonce
-/// size; the broadcast then emits ONE `NewExtendedMiningJob` per group
-/// instead of one per member. Standard channels are never grouped.
+/// size; the broadcast then emits ONE `NewExtendedMiningJob` per group instead
+/// of one per member. Standard channels are never grouped.
 ///
 /// Returns the assigned `group_channel_id`, or `0` when the connection must
-/// not be grouped. The id is drawn from the session's channel-id namespace
-/// (so it can never collide with a `channel_id` — spec §5.2.3 line 185) and
-/// is communicated implicitly via the OpenChannel.Success message; we never
-/// emit `SetGroupChannel`.
+/// not be grouped. The id is drawn from the session's channel-id namespace (so
+/// it can never collide with a `channel_id` — SV2 Mining/Group Channel) and is
+/// communicated implicitly via the OpenChannel.Success message; we never emit
+/// `SetGroupChannel`.
 fn assign_channel_to_group<C: Clock>(
     state: &mut MiningSessionState<C>,
     channel_id: u32,
@@ -1110,13 +1121,14 @@ fn assign_channel_to_group<C: Clock>(
 /// Handle `OpenExtendedMiningChannel`. Same flow as Standard plus:
 ///
 /// - The miner-rollable extranonce region **exactly honors** the requested
-///   `min_extranonce_size` (SV2 §5.3.2: the granted size must be at least the
-///   requested minimum). We grant up to [`MAX_EXTENDED_ROLLABLE`] bytes so an
-///   aggregating proxy has room to subdivide the space; a request larger than
-///   that (or larger than the SV2 32-byte total-extranonce cap allows after
-///   the pool prefix) is REJECTED with [`ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE`]
-///   rather than silently under-granted — silently handing back fewer bytes
-///   than requested makes an aggregating proxy tear down the upstream.
+///   `min_extranonce_size` (SV2 Mining/OpenExtendedMiningChannel: the granted
+///   size must be at least the requested minimum). We grant up to
+///   [`MAX_EXTENDED_ROLLABLE`] bytes so an aggregating proxy has room to
+///   subdivide the space; a request larger than that (or larger than the SV2
+///   32-byte total-extranonce cap allows after the pool prefix) is REJECTED
+///   with [`ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE`] rather than silently
+///   under-granted — silently handing back fewer bytes than requested makes an
+///   aggregating proxy tear down the upstream.
 /// - `extranonce_size = 0` in Standard is replaced by this rollable size for
 ///   Extended.
 pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
@@ -1135,15 +1147,16 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
             error_code: ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE.to_string(),
         });
     }
-    // Grant exactly the requested minimum. SV2 §5.3.2 only constrains the
-    // granted size to be >= the requested minimum; the server picks the value.
-    // Honoring the request (rather than always granting the cap) keeps the
-    // granted size byte-identical to what every direct miner already receives
-    // — e.g. Axe-class firmware requests a small size and mines with exactly
-    // what the pool grants — so this only changes behaviour for aggregating
-    // proxies that need more than the old cap. It also never over-grants, so it
-    // can't misfeed firmware that assumes a fixed rollable width. An
-    // aggregating proxy still gets the full size it asks for.
+    // Grant exactly the requested minimum. SV2
+    // Mining/OpenExtendedMiningChannel only constrains the granted size to be
+    // >= the requested minimum; the server picks the value. Honoring the
+    // request (rather than always granting the cap) keeps the granted size
+    // byte-identical to what every direct miner already receives — e.g.
+    // Axe-class firmware requests a small size and mines with exactly what the
+    // pool grants — so this only changes behaviour for aggregating proxies
+    // that need more than the old cap. It also never over-grants, so it can't
+    // misfeed firmware that assumes a fixed rollable width. An aggregating
+    // proxy still gets the full size it asks for.
     let rollable_size = requested as u8;
 
     let ctx = match resolve_open_context(
@@ -1175,10 +1188,10 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
     }
     state.session_difficulty = ctx.assigned_difficulty;
 
-    // Eager group assignment (SV2 §5.2.3): an Extended channel on a
-    // non-`REQUIRES_STANDARD_JOBS` proxy connection is grouped by its full
-    // extranonce size (`prefix.len() + rollable`) so the broadcast sends ONE
-    // `NewExtendedMiningJob` per group. See [`assign_channel_to_group`].
+    // Eager group assignment (SV2 Mining/Group Channel): an Extended channel
+    // on a non-`REQUIRES_STANDARD_JOBS` proxy connection is grouped by its
+    // full extranonce size (`prefix.len() + rollable`) so the broadcast sends
+    // ONE `NewExtendedMiningJob` per group. See [`assign_channel_to_group`].
     let group_channel_id =
         assign_channel_to_group(state, channel_id, prefix_len + rollable_size as usize);
 
@@ -1415,7 +1428,7 @@ fn stamp_submission_heartbeat<C: Clock>(state: &mut MiningSessionState<C>, chann
 /// `SubmitSharesSuccess` / `SubmitSharesError` on the wire +
 /// `ShareAccepted` / `ShareRejected` for the hooks layer.
 ///
-/// SV2 §5.3.14 strict: validation runs against the
+/// SV2 Mining/SubmitShares.Error strict: validation runs against the
 /// [`StandardTemplateSnapshot`] stored on the `StandardJobEntry` at
 /// **send-time**, not the current template. This guarantees that
 /// in-flight shares for retired-but-still-credited jobs hash against
@@ -1443,10 +1456,10 @@ pub fn handle_submit_shares_standard<C: Clock>(
         );
     }
 
-    // SV2 §5.3.14 retire-not-clear: classify first so retired-but-
-    // known jobs emit `stale-share`, not `invalid-job-id`. A `None`
-    // return means the entry is genuinely missing (never sent or
-    // aged past retention) — that's the real `invalid-job-id` case.
+    // SV2 Mining/SubmitShares.Error retire-not-clear: classify first so
+    // retired-but- known jobs emit `stale-share`, not `invalid-job-id`. A
+    // `None` return means the entry is genuinely missing (never sent or aged
+    // past retention) — that's the real `invalid-job-id` case.
     let Some(classification) = channel.standard_jobs.classify(submission.job_id, now_ms) else {
         let reject = ShareReject::from(RejectReason::InvalidJobId);
         return submit_error_with_event(submission.channel_id, submission.sequence_number, reject);
@@ -1561,9 +1574,9 @@ pub fn handle_submit_shares_extended<C: Clock>(
         );
     }
 
-    // SV2 §5.3.14: per-job difficulty stored on ExtendedJob at send
-    // time. Read it out by value (it's `Copy`) so the channel borrow is
-    // released before computing the target memo below.
+    // SV2 Mining/SubmitShares.Error: per-job difficulty stored on ExtendedJob
+    // at send time. Read it out by value (it's `Copy`) so the channel borrow
+    // is released before computing the target memo below.
     let Some(frozen_difficulty) = channel
         .extended_jobs
         .get(&submission.job_id)
@@ -1753,10 +1766,10 @@ pub fn handle_update_channel<C: Clock>(
             // statistically loud — and a proxy whose rigs take a minute to
             // attach would have had its first honest declaration capped.
             //
-            // Sits before `clamp_difficulty_to_max_target` so the §5.3.7
-            // MUST on `maximum_target` still wins, with the power-of-two
-            // rounding still last. The ceiling is itself a floored,
-            // rounding-safe value.
+            // Sits before `clamp_difficulty_to_max_target` so the SV2
+            // Mining/UpdateChannel MUST on `maximum_target` still wins, with
+            // the power-of-two rounding still last. The ceiling is itself a
+            // floored, rounding-safe value.
             raw = Difficulty(ceiling);
         }
     }
@@ -1802,11 +1815,11 @@ pub fn handle_update_channel<C: Clock>(
 // ── Handler: CloseChannel ───────────────────────────────────────────
 
 /// Handle `CloseChannel`. Removes the channel from the session map +
-/// rotates `primary_channel` if it was the primary. SV2 spec §5.3.9:
+/// rotates `primary_channel` if it was the primary. SV2 Mining/CloseChannel:
 /// the connection survives an empty channel set — we do NOT close
 /// the socket here.
 ///
-/// **Group close (spec §5.3.9 line 318):** if `channel_id` addresses a
+/// **Group close (SV2 Mining/CloseChannel):** if `channel_id` addresses a
 /// **group** channel, ALL channels belonging to that group MUST be closed.
 /// We emit one [`SessionEvent::ChannelClosed`] per removed member so the IO
 /// layer releases each member's extranonce prefix (it drives the allocator
@@ -2134,8 +2147,8 @@ pub fn apply_template_broadcast<C: Clock>(
         None => state.channels.keys().copied().collect(),
     };
 
-    // Partition into grouped vs un-grouped (SV2 §5.2.3). A grouped channel's
-    // work rides ONE `NewExtendedMiningJob` addressed to its
+    // Partition into grouped vs un-grouped (SV2 Mining/Group Channel). A
+    // grouped channel's work rides ONE `NewExtendedMiningJob` addressed to its
     // `group_channel_id` (emitted once in `broadcast_group_job` below, even
     // when several members appear here); un-grouped channels keep the
     // per-channel path verbatim — zero change for the common single-channel
@@ -2227,11 +2240,10 @@ pub fn apply_template_broadcast<C: Clock>(
                 }
                 channel.last_sent_job_signature = Some(sig);
 
-                // Snapshot the template context at send-time. SV2
-                // §5.3.14 strict: in-flight shares for this job hash
-                // against the same prev_hash / n_bits / version
-                // regardless of how many blocks have passed before
-                // validation.
+                // Snapshot the template context at send-time. SV2 SV2
+                // Mining/SubmitShares.Error strict: in-flight shares for this
+                // job hash against the same prev_hash / n_bits / version
+                // regardless of how many blocks have passed before validation.
                 let template_snapshot = StandardTemplateSnapshot {
                     version: template.version,
                     prev_hash: template.prev_hash,
@@ -2354,8 +2366,8 @@ pub fn apply_template_broadcast<C: Clock>(
         }
 
         // Activate the future job (sent above) on a block change. Emitted
-        // AFTER the job per SV2 §7.4 so the miner already holds the job the
-        // `job_id` refers to.
+        // AFTER the job per SV2 TDP/SetNewPrevHash so the miner already holds
+        // the job the `job_id` refers to.
         if is_new_block {
             outcome.push_frame(OutboundFrame::SetNewPrevHash {
                 channel_id,
@@ -2367,7 +2379,7 @@ pub fn apply_template_broadcast<C: Clock>(
         }
     }
 
-    // ── Grouped channels (SV2 §5.2.3) — Extended channels only ──
+    // ── Grouped channels (SV2 Mining/Group Channel) — Extended channels only ───
     // Two modes:
     //   • OPEN (`only_channel = Some(X)`): hand the freshly-opened member X a
     //     per-channel `NewExtendedMiningJob` addressed to its OWN id,
@@ -2471,7 +2483,7 @@ pub fn apply_template_broadcast<C: Clock>(
                         let cs = job.coinbase_suffix.clone();
                         ch.extended_jobs.insert(jid, job);
                         // Future job first (empty `min_ntime`), then the
-                        // activating SetNewPrevHash — SV2 §7.4.
+                        // activating SetNewPrevHash — SV2 TDP/SetNewPrevHash.
                         outcome.push_frame(OutboundFrame::NewExtendedMiningJob {
                             channel_id: new_id,
                             job_id: jid,
@@ -2537,7 +2549,7 @@ pub fn apply_template_broadcast<C: Clock>(
         }
 
         // Future job first (empty `min_ntime` on a block change), then the
-        // activating SetNewPrevHash — SV2 §7.4. A same-block
+        // activating SetNewPrevHash — SV2 TDP/SetNewPrevHash. A same-block
         // refresh sends an active job (`Some`) with no SetNewPrevHash.
         outcome.push_frame(OutboundFrame::NewExtendedMiningJob {
             channel_id: gid,
@@ -2570,7 +2582,7 @@ pub fn apply_template_broadcast<C: Clock>(
 // ── handle_set_custom_mining_job ────────────────────────────────────
 
 /// Inputs from a deserialized `SetCustomMiningJob` frame (SV2
-/// mining-protocol §5.3.18). The JDC builds the entire coinbase
+/// SV2 Mining/SetCustomMiningJob). The JDC builds the entire coinbase
 /// itself (via its own Template Provider) and hands the pool the
 /// raw fields to assemble + reference. The pool stores the resulting
 /// [`ExtendedJob`] under a fresh channel-local job_id and replies
@@ -2598,14 +2610,14 @@ pub struct SetCustomMiningJobInput {
     pub coinbase_tx_outputs: Vec<u8>,
     pub coinbase_tx_locktime: u32,
     pub merkle_path: Vec<[u8; 32]>,
-    /// The ext 0x0003 §6 `distribution_id` TLV, exactly as it arrived on this
-    /// frame — extracted by the IO layer UNCONDITIONALLY, *not* filtered by
-    /// the negotiated set.
+    /// The ext 0x0003/distribution_id TLV Field, exactly
+    /// as it arrived on this frame — extracted by the IO layer
+    /// UNCONDITIONALLY, *not* filtered by the negotiated set.
     ///
-    /// That is deliberate and load-bearing: §2 requires a TLV from a
-    /// non-negotiated client to be rejected, and a field that were pre-filtered
-    /// to `None` would make that gate unreachable and invite its deletion. The
-    /// handler owns the check.
+    /// That is deliberate and load-bearing: ext 0x0003/Negotiation requires a
+    /// TLV from a non-negotiated client to be rejected, and a field that were
+    /// pre-filtered to `None` would make that gate unreachable and invite its
+    /// deletion. The handler owns the check.
     pub distribution_id: Option<u64>,
 }
 
@@ -2628,8 +2640,8 @@ pub struct SetCustomMiningJobInput {
 /// split ([`crate::bridge::resolve_distribution_reference`] — a distribution
 /// reference, or nothing) are independent: a declared job may or may not
 /// reference a distribution, and so may an allocation. Both are answered
-/// exhaustively, so a §6.3 mode added later has to be classified rather than
-/// fall through every arm.
+/// exhaustively, so a mode added later (SV2 JDP/Job Declaration Modes) has to
+/// be classified rather than fall through every arm.
 ///
 /// **Fail-closed token check**: the token must resolve to one of the three
 /// backings. None of them → unknown / expired / evicted with its JDP session
@@ -2637,28 +2649,30 @@ pub struct SetCustomMiningJobInput {
 /// arbitrary self-built coinbase feed the share pipeline.
 ///
 /// **Base-protocol Coinbase-only** (`allocation`, no declaration and no
-/// distribution): §6.3.1 says `DeclareMiningJob` is never used in that
-/// mode, so the allocate is the pool's only record of the token. The job is
-/// held to what §6.4.3 actually requires — the coinbase allocates sats to
-/// the designated payout output — and to the token's own miner address.
-/// Order and extra outputs are the JDC's to choose, so this is a search and
-/// not a byte compare; [`crate::jdp::dynamic_outputs::pays_designated_output`]
-/// carries the reasoning. The Solo gate below then confines the path to the
-/// one stream where a self-chosen split cannot take from anyone else.
+/// distribution): SV2 JDP/Coinbase-only Mode says `DeclareMiningJob` is never
+/// used in that mode, so the allocate is the pool's only record of the token.
+/// The job is held to what SV2 JDP/AllocateMiningJobToken.Success actually
+/// requires — the coinbase allocates sats to the designated payout output —
+/// and to the token's own miner address. Order and extra outputs are the JDC's
+/// to choose, so this is a search and not a byte compare;
+/// [`crate::jdp::dynamic_outputs::pays_designated_output`] carries the
+/// reasoning. The Solo gate below then confines the path to the one stream
+/// where a self-chosen split cannot take from anyone else.
 ///
 /// **ext 0x0003 payout validation**: the IO layer resolves the job's
-/// distribution reference — the §6 TLV on this frame (Coinbase-only) or the
-/// one the declaration carried (Full-Template, where §6 puts the TLV on
+/// distribution reference — the ext 0x0003/distribution_id TLV Field on this
+/// frame (Coinbase-only) or the one the declaration carried (Full-Template,
+/// where ext 0x0003/distribution_id TLV Field puts the TLV on
 /// `DeclareMiningJob` instead), via
 /// [`crate::bridge::resolve_distribution_reference`] — against the bridge registry
 /// and passes the [`DistributionAcceptance`]. The submitted
-/// `coinbase_tx_outputs` MUST
-/// match the §4 recompute positionally (§7.1), and for a tailored
+/// `coinbase_tx_outputs` MUST match the ext 0x0003/Payout Computation
+/// recompute positionally (ext 0x0003/Output Verification), and for a tailored
 /// distribution the channel address MUST match its owner (the sole
 /// cross-account guard in Coinbase-only mode, where there is no
-/// `RegisteredDeclaredJob`). Distributions are multi-use — under
-/// positional equality a coinbase cannot pay anything but the published
-/// split, so there is nothing to consume.
+/// `RegisteredDeclaredJob`). Distributions are multi-use — under positional
+/// equality a coinbase cannot pay anything but the published split, so there
+/// is nothing to consume.
 ///
 /// - Channel unknown → `SetCustomMiningJobError` with
 ///   `invalid-channel-id`.
@@ -2791,25 +2805,27 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         });
     }
 
-    // ext 0x0003 §6 places the `distribution_id` TLV per Job Declaration mode,
-    // and only Coinbase-only puts it on THIS message — a conformant
-    // Full-Template JDC put it on `DeclareMiningJob`, where the JDP side
-    // validated the declared coinbase against it and stored it with the
-    // declaration. Reading the frame alone would see `None` for that JDC and
-    // classify a fully-backed job as an unbacked self-built one.
+    // ext 0x0003/distribution_id TLV Field places the `distribution_id` TLV
+    // per Job Declaration mode, and only Coinbase-only puts it on THIS message
+    // — a conformant Full-Template JDC put it on `DeclareMiningJob`, where the
+    // JDP side validated the declared coinbase against it and stored it with
+    // the declaration. Reading the frame alone would see `None` for that JDC
+    // and classify a fully-backed job as an unbacked self-built one.
     //
     // Inheriting the reference does NOT inherit its acceptance: the resolution
-    // still runs against the §7.2/§10 window, so a declaration accepted under
-    // a since-superseded or settlement-invalidated distribution is rejected
-    // here exactly as a stale TLV would be.
+    // still runs against the ext 0x0003/Grace Window + Implementation Notes
+    // window, so a declaration accepted under a since-superseded or
+    // settlement-invalidated distribution is rejected here exactly as a stale
+    // TLV would be.
     //
-    // Inheritance is narrow in exactly one way — §2 must let this connection
-    // use the extension at all. `resolve_distribution_reference` owns that
-    // guard, and the IO layer resolved the acceptance above through the same
-    // call with the same arguments, so the id validated here is the id that
-    // was resolved. It takes no stream, which is what makes "the same
-    // arguments" something the compiler can hold up: the operand the two
-    // callers used to disagree about no longer exists.
+    // Inheritance is narrow in exactly one way — ext 0x0003/Negotiation must
+    // let this connection use the extension at all.
+    // `resolve_distribution_reference` owns that guard, and the IO layer
+    // resolved the acceptance above through the same call with the same
+    // arguments, so the id validated here is the id that was resolved. It
+    // takes no stream, which is what makes "the same arguments" something the
+    // compiler can hold up: the operand the two callers used to disagree about
+    // no longer exists.
     let distribution_ref = crate::bridge::resolve_distribution_reference(
         input.distribution_id,
         bridge_job,
@@ -2858,9 +2874,10 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     };
 
     // What the token authorises, and therefore which record the job is held
-    // to. A `match` and not three `Option` tests: these are the §6.3 Job
-    // Declaration modes, and a mode added later must be answered here rather
-    // than slip through every arm — see [`crate::bridge::TokenBacking`].
+    // to. A `match` and not three `Option` tests: these are the SV2 JDP/Job
+    // Declaration Modes Job Declaration modes, and a mode added later must be
+    // answered here rather than slip through every arm — see
+    // [`crate::bridge::TokenBacking`].
     match backing {
         crate::bridge::TokenBacking::Declared(job) => {
             // The miner address MUST match the channel's locked address (stops
@@ -2882,11 +2899,12 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // Declaration binding: the job asked for here MUST be the job the
             // token was declared for. NOT a revenue check — how much a JDC's
             // template is worth is its own call. What it carries over is the
-            // §6.1 node validation: `jdp_server` had bitcoin-core check the
-            // DECLARED job, and nothing on this side re-examines the tx set the
-            // `merkle_path` commits to. Without the comparison, "the node
-            // approved the declaration" and "this coinbase pays the published
-            // distribution" describe two jobs that need not be the same one.
+            // SV2 JDP/Job Declarator Server node validation: `jdp_server` had
+            // bitcoin-core check the DECLARED job, and nothing on this side
+            // re-examines the tx set the `merkle_path` commits to. Without the
+            // comparison, "the node approved the declaration" and "this
+            // coinbase pays the published distribution" describe two jobs that
+            // need not be the same one.
             let Some(binding) = job.binding.as_ref() else {
                 // A declaration that will not project. The coinbase half of that
                 // is now caught where it belongs — `accept_declaration` refuses a
@@ -2924,9 +2942,10 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 return reject(ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
             }
         }
-        // Base-protocol Coinbase-only (§6.3.1: "the `DeclareMiningJob` message
-        // is never used"). The allocate is the pool's only record of this
-        // token, so the job is held to the §6.4.3 designated output.
+        // Base-protocol Coinbase-only (SV2 JDP/Coinbase-only Mode: "the
+        // `DeclareMiningJob` message is never used"). The allocate is the
+        // pool's only record of this token, so the job is held to the SV2
+        // JDP/AllocateMiningJobToken.Success designated output.
         crate::bridge::TokenBacking::BaseAllocation {
             token,
             payout_script,
@@ -2943,22 +2962,25 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 tracing::warn!(
                     channel_id = input.channel_id,
                     "sv2: base-protocol custom job allocates nothing to the pool's designated \
-                     payout output (§6.4.3) — rejecting"
+                     payout output (SV2 JDP/AllocateMiningJobToken.Success) — rejecting"
                 );
                 return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS);
             }
         }
         // Coinbase-only under ext 0x0003. Same token bindings as the base
         // protocol — the allocate is on file either way — and no designated
-        // output to compare, because §2 is what removed it. The coinbase is
-        // judged instead by the §7.1 recompute below, which pins every payout
-        // slot rather than the single one §6.4.3 can express.
+        // output to compare, because ext 0x0003/Negotiation is what removed
+        // it. The coinbase is judged instead by the ext 0x0003/Output
+        // Verification recompute below, which pins every payout slot rather
+        // than the single one SV2 JDP/AllocateMiningJobToken.Success can
+        // express.
         //
-        // Do NOT read the missing coinbase test here as "§7.1 covers this
-        // arm". It covers the COINBASE. The tip and the miner address are
-        // properties of the job and the token, and §7.1 examines neither —
-        // which is precisely how this path once served a job on a tip the pool
-        // had left, on a token nobody issued.
+        // Do NOT read the missing coinbase test here as "ext 0x0003/Output
+        // Verification covers this arm". It covers the COINBASE. The tip and
+        // the miner address are properties of the job and the token, and ext
+        // 0x0003/Output Verification examines neither — which is precisely how
+        // this path once served a job on a tip the pool had left, on a token
+        // nobody issued.
         crate::bridge::TokenBacking::DistributionAllocation(token) => {
             if let Some(code) = bind_allocation(token) {
                 return reject(code);
@@ -2971,12 +2993,12 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // a declared job may or may not reference a distribution, and so may a
     // base-protocol allocation.
     //
-    // The Solo gate and the §7.1 recompute are the two answers to ONE
-    // question — what pins this coinbase's payout split — so they are the
-    // arms of one `match` and not two `Option` tests forty lines apart. Read
-    // separately they drifted: `distribution_ref.is_none()` here and
-    // `distribution_ref.is_some()` there described the same job in opposite
-    // words, with nothing making them agree.
+    // The Solo gate and the ext 0x0003/Output Verification recompute are the
+    // two answers to ONE question — what pins this coinbase's payout split —
+    // so they are the arms of one `match` and not two `Option` tests forty
+    // lines apart. Read separately they drifted: `distribution_ref.is_none()`
+    // here and `distribution_ref.is_some()` there described the same job in
+    // opposite words, with nothing making them agree.
     //
     // Settlement identity of the distribution this job's coinbase pays. It is
     // what lets a block found on a Coinbase-only ext 0x0003 job be BOOKED and
@@ -2985,15 +3007,15 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // fingerprint has. `None` for a base-protocol job (nothing was published)
     // and for a Solo distribution (books without a snapshot).
     let settlement_fingerprint: Option<[u8; 32]> = match distribution_ref {
-        // Base protocol — nothing published. The backing check above bound
-        // the coinbase to ONE designated output, which is all §6.4.3 gives a
-        // pool. That is enough for Solo, where the designated script is the
-        // miner's own address and a self-chosen split can only shortchange
-        // itself. It is not enough off Solo: a shared window needs every
-        // payout slot pinned, and the base protocol has no way to express
-        // more than the one output — so those shares would enter PPLNS/group
-        // accounting behind a coinbase nobody validated the split of. ext
-        // 0x0003 is what expresses it.
+        // Base protocol — nothing published. The backing check above bound the
+        // coinbase to ONE designated output, which is all SV2
+        // JDP/AllocateMiningJobToken.Success gives a pool. That is enough for
+        // Solo, where the designated script is the miner's own address and a
+        // self-chosen split can only shortchange itself. It is not enough off
+        // Solo: a shared window needs every payout slot pinned, and the base
+        // protocol has no way to express more than the one output — so those
+        // shares would enter PPLNS/group accounting behind a coinbase nobody
+        // validated the split of. ext 0x0003 is what expresses it.
         //
         // `accounting_stream` and not `stream`: this asks whose money the
         // block pays, not which template it was built on. A solo miner that
@@ -3008,11 +3030,12 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             None
         }
         // ext 0x0003 (push model). This is the Pool's sole validation point
-        // for the coinbase the miner will ACTUALLY mine: §2 requires the
-        // extension negotiated on THIS (mining) connection, the referenced
-        // distribution must sit in the acceptance window (§7.2/§10), and
-        // the submitted outputs must match the §4 recompute POSITIONALLY
-        // (§7.1).
+        // for the coinbase the miner will ACTUALLY mine: ext
+        // 0x0003/Negotiation requires the extension negotiated on THIS
+        // (mining) connection, the referenced distribution must sit in the
+        // acceptance window (ext 0x0003/Grace Window + Implementation Notes),
+        // and the submitted outputs must match the ext 0x0003/Payout
+        // Computation recompute POSITIONALLY (ext 0x0003/Output Verification).
         //
         // It runs for Full-Template jobs too, and must — for a reason the
         // declaration binding above does NOT cover, so do not delete it on
@@ -3021,10 +3044,11 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         // The binding answers "is this the job that was declared?". It says
         // nothing about whether the distribution that job referenced is still
         // live. A declaration accepted under distribution k can arrive here
-        // after k was superseded or settlement-invalidated (§7.2/§10) — same
-        // job, same bytes, binding satisfied, and a coinbase paying a
-        // withdrawn split. Only this arm resolves the reference against
-        // the acceptance window and re-checks the §4 recompute, and it is
+        // after k was superseded or settlement-invalidated (ext 0x0003/Grace
+        // Window + Implementation Notes) — same job, same bytes, binding
+        // satisfied, and a coinbase paying a withdrawn split. Only this arm
+        // resolves the reference against the acceptance window and re-checks
+        // the ext 0x0003/Payout Computation recompute, and it is
         // `input.coinbase_tx_outputs` the `ExtendedJob` is assembled from.
         //
         // (Before the binding existed this block also carried the weight of
@@ -3036,11 +3060,11 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         // distributions at once is structurally impossible under positional
         // equality — so nothing here is consumed.
         Some(reference) => {
-            // §2: TLV fields from a non-negotiated extension are a protocol
-            // violation, not something to silently honour — and only ONE of
-            // the two reference origins is a TLV the client sent, which is
-            // why this asks the origin rather than re-reading
-            // `input.distribution_id` to infer it.
+            // ext 0x0003/Negotiation: TLV fields from a non-negotiated
+            // extension are a protocol violation, not something to silently
+            // honour — and only ONE of the two reference origins is a TLV the
+            // client sent, which is why this asks the origin rather than
+            // re-reading `input.distribution_id` to infer it.
             match reference {
                 crate::bridge::DistributionReference::FromFrame { .. } => {
                     if !state
@@ -3050,12 +3074,12 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                         return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
                     }
                 }
-                // §2 speaks about "any job declaration carrying this
-                // extension's TLV fields". An inherited reference is the
-                // pool's own inference and can only exist when this
-                // connection negotiated (`resolve_distribution_reference`
-                // refuses to synthesise one otherwise), so judging it here
-                // would be judging ourselves.
+                // ext 0x0003/Negotiation speaks about "any job declaration
+                // carrying this extension's TLV fields". An inherited
+                // reference is the pool's own inference and can only exist
+                // when this connection negotiated
+                // (`resolve_distribution_reference` refuses to synthesise one
+                // otherwise), so judging it here would be judging ourselves.
                 crate::bridge::DistributionReference::FromDeclaration { .. } => {}
             }
             let entry = match distribution {
@@ -3131,8 +3155,9 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             {
                 return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
             }
-            // Only now, past §7.1 — a fingerprint stamped before the recompute
-            // would name a distribution this coinbase was never proven to pay.
+            // Only now, past ext 0x0003/Output Verification — a fingerprint
+            // stamped before the recompute would name a distribution this
+            // coinbase was never proven to pay.
             entry.payouts_fingerprint
         }
     };
@@ -3182,9 +3207,10 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             coinbase_suffix: coinbase_tx_suffix,
             // JDC-declared coinbase. Zeroed on the base protocol — the pool
             // published nothing, so there is no snapshot to bind. Under ext
-            // 0x0003 the pool DID publish, the §7.1 recompute above proved
-            // this coinbase pays it, and the fingerprint is what a found
-            // block resolves that distribution's settlement inputs by.
+            // 0x0003 the pool DID publish, the ext 0x0003/Output Verification
+            // recompute above proved this coinbase pays it, and the
+            // fingerprint is what a found block resolves that distribution's
+            // settlement inputs by.
             payouts_fingerprint: settlement_fingerprint.unwrap_or([0u8; 32]),
             merkle_path: input.merkle_path.clone(),
             version: input.version,
@@ -3209,20 +3235,21 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             //
             // Only a `Declared` backing can be claimed, and that is the other
             // half of it: Coinbase-only mode is refused at `DeclareMiningJob`
-            // (§6.3.1), so its token only ever reaches the allocation map and
-            // `PushSolution` can never claim its block.
+            // (SV2 JDP/Coinbase-only Mode), so its token only ever reaches the
+            // allocation map and `PushSolution` can never claim its block.
             //
             // NOT `distribution_ref`. That one is the reference this job is
             // VALIDATED against, and the two part ways on a Solo stream:
             // `resolve_distribution_reference` refuses to inherit a
             // declaration's reference there (inheriting it would subject a
-            // Solo job to the §7.2/§10 window for the first time), while the
-            // JDP side stamps `distribution_id` on every accepted 0x0003
-            // declaration, Solo included. Asking the wrong one said "the
-            // mining side records it" for a block the JDP path books anyway
-            // — two rows for one block on an insert with no `ON CONFLICT`,
-            // and two block-found notifications. The two questions read alike
-            // as bare `Option`s, which is why the backing is a type now.
+            // Solo job to the ext 0x0003/Grace Window + Implementation Notes
+            // window for the first time), while the JDP side stamps
+            // `distribution_id` on every accepted 0x0003 declaration, Solo
+            // included. Asking the wrong one said "the mining side records it"
+            // for a block the JDP path books anyway — two rows for one block
+            // on an insert with no `ON CONFLICT`, and two block-found
+            // notifications. The two questions read alike as bare `Option`s,
+            // which is why the backing is a type now.
             //
             // It closes the mirror case too: a JDC that negotiated 0x0003 on
             // the MINING connection alone declares without a reference, so
@@ -3392,9 +3419,10 @@ pub(crate) mod tests {
         assert!(s.setup_complete);
     }
 
-    /// SV2 §5.3.2: `Success.flags` is the SERVER bitset and MUST NOT echo the
-    /// client's request flags. A miner that asked for REQUIRES_STANDARD_JOBS +
-    /// REQUIRES_VERSION_ROLLING must NOT get REQUIRES_FIXED_VERSION (bit 0) or
+    /// SV2 Mining/SetupConnection Flags for Mining Protocol: `Success.flags`
+    /// is the SERVER bitset and MUST NOT echo the client's request flags. A
+    /// miner that asked for REQUIRES_STANDARD_JOBS + REQUIRES_VERSION_ROLLING
+    /// must NOT get REQUIRES_FIXED_VERSION (bit 0) or
     /// REQUIRES_EXTENDED_CHANNELS (bit 1) back — both are 0 for our pool (we
     /// serve rollable jobs and accept standard channels). Guards the flag-echo
     /// regression that told version-rolling proxies "fixed version required".
@@ -3450,7 +3478,8 @@ pub(crate) mod tests {
             }
             _ => panic!("expected error"),
         }
-        // SV2 §3.6.3: the error is sent prior to closing the connection.
+        // SV2 Overview/SetupConnection.Error: the error is sent prior to
+        // closing the connection.
         assert!(
             out.events
                 .iter()
@@ -3725,8 +3754,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// A request larger than the pool can grant is REJECTED (SV2 §5.3.2 —
-    /// grant the minimum or reject), never silently under-granted.
+    /// A request larger than the pool can grant is REJECTED (SV2
+    /// Mining/OpenExtendedMiningChannel — grant the minimum or reject), never
+    /// silently under-granted.
     #[test]
     fn open_extended_channel_rejects_oversize_request() {
         let mut s = fresh_session();
@@ -4060,10 +4090,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// SV2 §5.3.14 retire-not-clear: a job that was retired ≤ grace
-    /// ago must still be credited. The handler reads classification
-    /// from `standard_jobs`, so `retire(now_ms)` before submit must
-    /// flow through to `StaleCreditable` → accept.
+    /// SV2 Mining/SubmitShares.Error retire-not-clear: a job that was retired
+    /// ≤ grace ago must still be credited. The handler reads classification
+    /// from `standard_jobs`, so `retire(now_ms)` before submit must flow
+    /// through to `StaleCreditable` → accept.
     #[test]
     fn submit_standard_retired_within_grace_is_credited() {
         let mut s = fresh_session();
@@ -4099,7 +4129,7 @@ pub(crate) mod tests {
         assert!(matches!(out.events[0], SessionEvent::ShareAccepted { .. }));
     }
 
-    /// SV2 §5.3.14: a job retired past grace emits wire-code
+    /// SV2 Mining/SubmitShares.Error: a job retired past grace emits wire-code
     /// `stale-share`, NOT `invalid-job-id`. This ensures shares are
     /// credited when submitted within the grace window, even as the job
     /// map is being managed. See feedback memory
@@ -4416,10 +4446,10 @@ pub(crate) mod tests {
         assert!(out.events.is_empty());
     }
 
-    /// Spec §5.3.9 line 318: a `CloseChannel` addressed to a `group_channel_id`
-    /// closes ALL channels in that group and drops the group. One
-    /// `ChannelClosed` event per member (the IO layer releases each member's
-    /// extranonce prefix off these).
+    /// SV2 Mining/CloseChannel: a `CloseChannel` addressed to a
+    /// `group_channel_id` closes ALL channels in that group and drops the
+    /// group. One `ChannelClosed` event per member (the IO layer releases each
+    /// member's extranonce prefix off these).
     #[test]
     fn close_channel_addressed_to_group_closes_all_members() {
         let mut s = fresh_session();
@@ -4699,9 +4729,9 @@ pub(crate) mod tests {
     fn request_extensions_mixed_emits_success_with_subset() {
         let mut s = fresh_session();
         handle_setup_connection(&mut s, &good_setup());
-        // 0x0002 and 0x0003 are supported mining-side (Worker-ID TLVs +
-        // the §6 distribution_id TLV on SetCustomMiningJob); 0x00FF is
-        // bogus.
+        // 0x0002 and 0x0003 are supported mining-side (Worker-ID TLVs + the
+        // ext 0x0003/distribution_id TLV Field on SetCustomMiningJob);
+        // 0x00FF is bogus.
         let out = handle_request_extensions(&mut s, &req_ext(9, vec![0x0002, 0x0003, 0x00FF]));
         match &out.outbound[0] {
             OutboundFrame::RequestExtensionsSuccess {
@@ -5054,9 +5084,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// The guard sits BEFORE the max_target clamp, so the spec MUST in
-    /// §5.3.7 still wins: a downstream that requests a harder target gets
-    /// it even while the channel is unproven.
+    /// The guard sits BEFORE the max_target clamp, so the spec MUST in SV2
+    /// Mining/UpdateChannel still wins: a downstream that requests a harder
+    /// target gets it even while the channel is unproven.
     #[test]
     fn update_channel_max_target_still_overrides_the_guard() {
         let clock = Arc::new(TestClock::new(0));
@@ -5537,7 +5567,7 @@ pub(crate) mod tests {
             allowed,
             Some(true),
             "an extended job must allow BIP-323 rolling even when the client \
-             never required it — §5.3.1's flag says 'I need this', not 'I may'"
+             never required it — SV2 Mining/SetupConnection Flags for Mining Protocol's flag says 'I need this', not 'I may'"
         );
     }
 
@@ -5548,7 +5578,7 @@ pub(crate) mod tests {
     fn template_broadcast_extended_new_block_emits_set_prev_and_new_ext_mining_job() {
         let mut s = session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        // Eager grouping (SV2 §5.2.3): the channel opened on a
+        // Eager grouping (SV2 Mining/Group Channel): the channel opened on a
         // non-REQUIRES_STANDARD_JOBS connection, so it was grouped — the job
         // is addressed to its `group_channel_id`, not the channel id, and the
         // shared group `job_id` starts at 1.
@@ -5617,7 +5647,7 @@ pub(crate) mod tests {
         assert!(stored.retired_at.is_none());
     }
 
-    // ── Group channels (SV2 §5.2.3) ────────────────────────────────
+    // ── Group channels (SV2 Mining/Group Channel) ───────────────────
 
     fn open_group_id(out: &HandlerOutcome) -> u32 {
         match &out.outbound[0] {
@@ -5647,7 +5677,7 @@ pub(crate) mod tests {
         assert_ne!(g1, 0, "non-RSJ extended channel must be grouped");
         assert_eq!(g1, g2, "same full extranonce size → one shared group");
         // The group id is drawn from the channel-id namespace and never
-        // collides with a channel id (spec §5.2.3 line 185).
+        // collides with a channel id (SV2 Mining/Group Channel).
         assert!(
             !s.channels.contains_key(&g1),
             "group id must not be a channel id"
@@ -6409,8 +6439,9 @@ pub(crate) mod tests {
     }
 
     /// A Full-Template declaration accepted against `distribution_id` — what
-    /// the JDP side writes when the §6 TLV rode on `DeclareMiningJob` and the
-    /// coinbase recomputed against that distribution.
+    /// the JDP side writes when the ext 0x0003/distribution_id TLV Field rode
+    /// on `DeclareMiningJob` and the coinbase recomputed against that
+    /// distribution.
     fn declared_under_distribution(
         mut entry: RegisteredDeclaredJob,
         distribution_id: u64,
@@ -6620,11 +6651,11 @@ pub(crate) mod tests {
         assert!(ch.extended_jobs.is_empty(), "no job may be registered");
     }
 
-    // ── Base-protocol Coinbase-only (§6.3.1) ───────────────────────
+    // ── Base-protocol Coinbase-only (SV2 JDP/Coinbase-only Mode) ────
     //
-    // No declaration exists in that mode, so the allocate is the only
-    // record of the token and §6.4.3's designated payout output is the
-    // only thing the coinbase owes.
+    // No declaration exists in that mode, so the allocate is the only record
+    // of the token and SV2 JDP/AllocateMiningJobToken.Success's designated
+    // payout output is the only thing the coinbase owes.
 
     /// The script the pool designates for a Solo miner: its own address.
     fn designated_script(address: &str) -> Vec<u8> {
@@ -6635,9 +6666,9 @@ pub(crate) mod tests {
     }
 
     /// The allocate an ext 0x0003 Coinbase-only JDC gets: on file like any
-    /// other token, with no designated script because §2 empties the outputs.
-    /// Passing `None` instead is not "the 0x0003 case" — it is a token the
-    /// pool never issued, and the handler refuses it.
+    /// other token, with no designated script because ext 0x0003/Negotiation
+    /// empties the outputs. Passing `None` instead is not "the 0x0003 case" —
+    /// it is a token the pool never issued, and the handler refuses it.
     fn distribution_allocation(address: &str, session_id: u32) -> crate::bridge::AllocatedTokenRef {
         crate::bridge::AllocatedTokenRef {
             miner_address: AddressId::new(address.to_string()).unwrap(),
@@ -6692,9 +6723,10 @@ pub(crate) mod tests {
     }
 
     /// The feature: a Solo JDC that never negotiated ext 0x0003 and never
-    /// declares gets its job served, on the strength of its allocate alone.
-    /// It reorders and appends outputs the way §6.4.3 permits, so this also
-    /// pins that the check is not positional.
+    /// declares gets its job served, on the strength of its allocate alone. It
+    /// reorders and appends outputs the way SV2
+    /// JDP/AllocateMiningJobToken.Success permits, so this also pins that the
+    /// check is not positional.
     #[test]
     fn a_coinbase_only_solo_job_is_served_off_its_allocation() {
         let mut s = solo_session_with_extended_channel();
@@ -7110,7 +7142,8 @@ pub(crate) mod tests {
     use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
 
     /// Registry entry with one weight-9 miner slot behind a weight-1 pool
-    /// output. `owner: None` = pool-wide, `Some` = tailored (§3.1).
+    /// output. `owner: None` = pool-wide, `Some` = tailored (ext
+    /// 0x0003/SetPayoutDistribution).
     fn distribution_entry(
         accounting: crate::bridge::DistributionAccounting,
     ) -> crate::bridge::PayoutDistributionEntry {
@@ -7135,7 +7168,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// §4-conformant `coinbase_tx_outputs` blob for `entry` at revenue `t`.
+    /// ext 0x0003/Payout Computation-conformant `coinbase_tx_outputs` blob for
+    /// `entry` at revenue `t`.
     fn conformant_outputs(entry: &crate::bridge::PayoutDistributionEntry, t: u64) -> Vec<u8> {
         let outputs = compute_payout_vector(
             &entry.pool_payout,
@@ -7155,10 +7189,10 @@ pub(crate) mod tests {
     }
 
     /// Extended-channel session with ext 0x0003 negotiated on the mining
-    /// connection (the §2 gate for the `distribution_id` TLV). Stays on
-    /// the default (PPLNS) stream — a distribution-referenced custom job
-    /// is legitimate off Solo, exactly where the base-protocol job above
-    /// is rejected.
+    /// connection (the ext 0x0003/Negotiation gate for the `distribution_id`
+    /// TLV). Stays on the default (PPLNS) stream — a distribution-referenced
+    /// custom job is legitimate off Solo, exactly where the base-protocol job
+    /// above is rejected.
     fn negotiated_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
         let mut s = session_with_extended_channel();
         s.negotiated_extensions
@@ -7188,14 +7222,15 @@ pub(crate) mod tests {
 
     /// Row 3, the one that was wrong: **Coinbase-only + ext 0x0003**.
     ///
-    /// §6.3.1 says that mode never sends `DeclareMiningJob`, so its token
-    /// resolves to no declaration — and `handle_push_solution` matches a
-    /// solution against declared jobs only, on Full-Template connections
-    /// only. Nothing on the JDP side will ever hear about this block. Read
-    /// as "distribution-backed" the flag handed it to that side anyway, and
-    /// the block ended up with no `blocks_entity` row, no notification and
-    /// no §10 settle — so the published weights kept encoding balances its
-    /// coinbase had already paid out.
+    /// SV2 JDP/Coinbase-only Mode says that mode never sends
+    /// `DeclareMiningJob`, so its token resolves to no declaration — and
+    /// `handle_push_solution` matches a solution against declared jobs only,
+    /// on Full-Template connections only. Nothing on the JDP side will ever
+    /// hear about this block. Read as "distribution-backed" the flag handed it
+    /// to that side anyway, and the block ended up with no `blocks_entity`
+    /// row, no notification and no ext 0x0003/Implementation Notes settle — so
+    /// the published weights kept encoding balances its coinbase had already
+    /// paid out.
     ///
     /// The fingerprint is the second half: recording is not enough, the
     /// block has to be BOOKABLE, and the distribution's settlement identity
@@ -7209,11 +7244,12 @@ pub(crate) mod tests {
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
-        input.distribution_id = Some(9); // §6: the TLV rides the FRAME in this mode
+        input.distribution_id = Some(9); // ext 0x0003/distribution_id TLV Field: the TLV rides the FRAME in this mode
         input.coinbase_tx_outputs = blob;
 
         // No bridge entry and no allocation: nothing declared, and an ext
-        // 0x0003 allocate registers none (§2 leaves it no designated output).
+        // 0x0003 allocate registers none (ext 0x0003/Negotiation leaves it no
+        // designated output).
         let out = handle_set_custom_mining_job(
             &mut s,
             &input,
@@ -7247,11 +7283,11 @@ pub(crate) mod tests {
     /// them twice".
     ///
     /// The reference rides the DECLARATION and not the frame, because that is
-    /// where §6 puts it for Full-Template and because it is the field
-    /// `handle_push_solution` reads. The fixture used to stamp it on the
-    /// frame instead, which describes no conformant client and — worse — made
-    /// the test pass for a declaration the JDP path would have classified
-    /// `BaseProtocol` and recorded nowhere.
+    /// where ext 0x0003/distribution_id TLV Field puts it for Full-Template
+    /// and because it is the field `handle_push_solution` reads. The fixture
+    /// used to stamp it on the frame instead, which describes no conformant
+    /// client and — worse — made the test pass for a declaration the JDP path
+    /// would have classified `BaseProtocol` and recorded nowhere.
     ///
     /// Both streams, because the flag must not come out of whichever answer
     /// `resolve_distribution_reference` happened to give: reading its answer
@@ -7280,8 +7316,8 @@ pub(crate) mod tests {
             let cid = s.primary_channel.unwrap();
             let entry = distribution_entry(accounting);
             // Declared WITH the conformant coinbase, so the declaration
-            // binding and §7.1 both pass and the only variable left is the
-            // declaration itself.
+            // binding and ext 0x0003/Output Verification both pass and the
+            // only variable left is the declaration itself.
             let blob = conformant_outputs(&entry, 312_500_000);
             let bridge = declared_under_distribution(
                 bridge_entry_declaring(
@@ -7294,8 +7330,8 @@ pub(crate) mod tests {
                 9,
             );
             let acc = accepted(entry);
-            // No frame TLV — §6 puts a Full-Template job's reference on
-            // `DeclareMiningJob`.
+            // No frame TLV — ext 0x0003/distribution_id TLV Field puts a
+            // Full-Template job's reference on `DeclareMiningJob`.
             let input = custom_job_matching(cid, &bridge);
 
             let out = handle_set_custom_mining_job(
@@ -7326,12 +7362,13 @@ pub(crate) mod tests {
     /// the flag asks: a declaration with no distribution reference is
     /// `BaseProtocol` on the JDP side and records nothing there — so the
     /// mining side must record it, even though the frame's own TLV made the
-    /// §7.1 gate resolve a distribution for the job.
+    /// ext 0x0003/Output Verification gate resolve a distribution for the job.
     ///
     /// Reachable for real: a JDC that negotiated 0x0003 on the mining
-    /// connection but not on the JDP one declares without a reference (§2
-    /// forbids it there) and may still send the TLV here. Keying the flag on
-    /// the resolved reference left such a block recorded by nobody.
+    /// connection but not on the JDP one declares without a reference (ext
+    /// 0x0003/Negotiation forbids it there) and may still send the TLV here.
+    /// Keying the flag on the resolved reference left such a block recorded by
+    /// nobody.
     #[test]
     fn a_frame_tlv_does_not_hand_an_undeclared_distribution_to_the_jdp_path() {
         let mut s = negotiated_session_with_extended_channel();
@@ -7425,9 +7462,10 @@ pub(crate) mod tests {
     ///
     /// Each case is paired with the accepting one in the same test, so it
     /// cannot pass on a precondition that silently did not hold: every arm
-    /// here builds a §7.1-conformant coinbase, and §7.1 is the ONLY check
-    /// this path had before. Both refusals were `Success` until the allocate
-    /// started being registered — the coinbase is identical in all three.
+    /// here builds an ext 0x0003/Output Verification-conformant coinbase, and
+    /// ext 0x0003/Output Verification is the ONLY check this path had before.
+    /// Both refusals were `Success` until the allocate started being
+    /// registered — the coinbase is identical in all three.
     #[test]
     fn a_distribution_backed_job_is_bound_to_the_tip_and_the_token() {
         let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
@@ -7504,8 +7542,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// §7.1 recompute-and-compare: a coinbase positionally matching the
-    /// referenced distribution's §4 vector is accepted.
+    /// ext 0x0003/Output Verification recompute-and-compare: a coinbase
+    /// positionally matching the referenced distribution's ext 0x0003/Payout
+    /// Computation vector is accepted.
     #[test]
     fn set_custom_mining_job_conformant_distribution_coinbase_accepts() {
         let mut s = negotiated_session_with_extended_channel();
@@ -7530,7 +7569,8 @@ pub(crate) mod tests {
         ));
     }
 
-    /// §7.1: a coinbase that does not reproduce the §4 vector is rejected
+    /// ext 0x0003/Output Verification: a coinbase that does not reproduce the
+    /// ext 0x0003/Payout Computation vector is rejected
     /// `invalid-payout-distribution`; no ExtendedJob is stored.
     #[test]
     fn set_custom_mining_job_nonconformant_coinbase_rejects() {
@@ -7588,8 +7628,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// §7.2/§10: a referenced distribution outside the acceptance window
-    /// (superseded or settlement-invalidated) → `stale-payout-distribution`.
+    /// ext 0x0003/Grace Window + Implementation Notes: a referenced
+    /// distribution outside the acceptance window (superseded or
+    /// settlement-invalidated) → `stale-payout-distribution`.
     #[test]
     fn set_custom_mining_job_stale_distribution_rejects() {
         let mut s = negotiated_session_with_extended_channel();
@@ -7641,9 +7682,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// §2: a `distribution_id` TLV on a connection that never negotiated
-    /// 0x0003 is a protocol violation — rejected even when the referenced
-    /// distribution would resolve.
+    /// ext 0x0003/Negotiation: a `distribution_id` TLV on a connection that
+    /// never negotiated 0x0003 is a protocol violation — rejected even when
+    /// the referenced distribution would resolve.
     #[test]
     fn set_custom_mining_job_distribution_tlv_without_negotiation_rejects() {
         let mut s = session_with_extended_channel(); // 0x0003 NOT negotiated
@@ -7899,9 +7940,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// The same flip, on a Full-Template job — where the §6 TLV rides on
-    /// `DeclareMiningJob` and the reference is INHERITED from the declaration
-    /// rather than read off this frame.
+    /// The same flip, on a Full-Template job — where the ext
+    /// 0x0003/distribution_id TLV Field rides on `DeclareMiningJob` and the
+    /// reference is INHERITED from the declaration rather than read off this
+    /// frame.
     ///
     /// A separate test because the case above cannot reach this code at all:
     /// its `distribution_id` is a frame TLV, and `resolve_distribution_
@@ -8005,7 +8047,8 @@ pub(crate) mod tests {
     }
 
     /// The base-protocol Solo gate reads the same live mode. A JDC on the base
-    /// protocol is only served because §6.4.3's one designated output pays the
+    /// protocol is only served because SV2
+    /// JDP/AllocateMiningJobToken.Success's one designated output pays the
     /// miner itself, so a self-chosen split can only shortchange itself. The
     /// moment that miner joins a group the sentence stops being true — the
     /// block is the group's and the one output is his.
@@ -8046,26 +8089,26 @@ pub(crate) mod tests {
         }
     }
 
-    /// A Full-Template job (bridge entry present) must be §7.1-validated on
-    /// the outputs it SUBMITS, not waved through because it matches its
-    /// declaration.
+    /// A Full-Template job (bridge entry present) must be ext 0x0003/Output
+    /// Verification-validated on the outputs it SUBMITS, not waved through
+    /// because it matches its declaration.
     ///
-    /// The declaration binding cannot stand in for this. It proves the job
-    /// is the one that was declared — and a JDC whose own template pays
-    /// itself declares and mines exactly that, consistently. What §7.1 adds
-    /// is the question the binding never asks: does this coinbase pay the
-    /// distribution the pool published? The `ExtendedJob` is assembled from
-    /// the SUBMITTED outputs, so without the check those are whatever the
-    /// JDC chose, while its shares earn in the shared window.
+    /// The declaration binding cannot stand in for this. It proves the job is
+    /// the one that was declared — and a JDC whose own template pays itself
+    /// declares and mines exactly that, consistently. What ext 0x0003/Output
+    /// Verification adds is the question the binding never asks: does this
+    /// coinbase pay the distribution the pool published? The `ExtendedJob` is
+    /// assembled from the SUBMITTED outputs, so without the check those are
+    /// whatever the JDC chose, while its shares earn in the shared window.
     #[test]
     fn set_custom_mining_job_full_template_nonconformant_coinbase_rejects() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        // Pays a single output to the miner instead of the published
-        // weights. DECLARED that way too, so the declaration binding passes
-        // and §7.1 is what has to catch it — a JDC whose own template pays
-        // itself, rather than one that swapped after declaring.
+        // Pays a single output to the miner instead of the published weights.
+        // DECLARED that way too, so the declaration binding passes and ext
+        // 0x0003/Output Verification is what has to catch it — a JDC whose own
+        // template pays itself, rather than one that swapped after declaring.
         let self_paying = bitcoin::consensus::serialize(&vec![bitcoin::TxOut {
             value: bitcoin::Amount::from_sat(312_500_000),
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xBB]),
@@ -8093,7 +8136,7 @@ pub(crate) mod tests {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_PAYOUT_DISTRIBUTION);
             }
-            other => panic!("a Full-Template job must still be §7.1-checked, got {other:?}"),
+            other => panic!("a Full-Template job must still be ext 0x0003/Output Verification-checked, got {other:?}"),
         }
     }
 
@@ -8154,11 +8197,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// ext 0x0003 §6 places the `distribution_id` TLV per Job Declaration
-    /// mode, and Full-Template puts it on `DeclareMiningJob` — NOT on
-    /// `SetCustomMiningJob`. So a conformant Full-Template JDC arrives here
-    /// with no TLV at all, and the reference has to come from its
-    /// declaration.
+    /// ext 0x0003/distribution_id TLV Field places the `distribution_id` TLV
+    /// per Job Declaration mode, and Full-Template puts it on
+    /// `DeclareMiningJob` — NOT on `SetCustomMiningJob`. So a conformant
+    /// Full-Template JDC arrives here with no TLV at all, and the reference
+    /// has to come from its declaration.
     ///
     /// Both directions in one test on purpose: the accept alone would also
     /// pass if the Solo gate had simply stopped gating, and the reject alone
@@ -8225,9 +8268,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// Inheriting the reference must not inherit a pass. The §7.1 recompute
-    /// runs on the SUBMITTED outputs either way — otherwise Full-Template
-    /// would be the one mode where dropping the TLV skips the check.
+    /// Inheriting the reference must not inherit a pass. The ext 0x0003/Output
+    /// Verification recompute runs on the SUBMITTED outputs either way —
+    /// otherwise Full-Template would be the one mode where dropping the TLV
+    /// skips the check.
     #[test]
     fn inherited_distribution_still_validates_the_submitted_coinbase() {
         let mut s = negotiated_session_with_extended_channel();
@@ -8264,7 +8308,7 @@ pub(crate) mod tests {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_PAYOUT_DISTRIBUTION);
             }
-            other => panic!("an inherited reference must still be §7.1-checked, got {other:?}"),
+            other => panic!("an inherited reference must still be ext 0x0003/Output Verification-checked, got {other:?}"),
         }
     }
 
@@ -8312,10 +8356,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// §2: the extension must be negotiated on BOTH connections, and a client
-    /// that negotiated on only one MUST NOT use it. A declaration that
-    /// negotiated 0x0003 on its JDP connection therefore does not license a
-    /// mining connection that never did.
+    /// ext 0x0003/Negotiation: the extension must be negotiated on BOTH
+    /// connections, and a client that negotiated on only one MUST NOT use it.
+    /// A declaration that negotiated 0x0003 on its JDP connection therefore
+    /// does not license a mining connection that never did.
     ///
     /// The refusal is the base-protocol one — `custom-jobs-require-solo`,
     /// exactly what this connection got before the inheritance path existed.
@@ -8347,7 +8391,9 @@ pub(crate) mod tests {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
             }
-            other => panic!("§2 requires negotiation on this connection too, got {other:?}"),
+            other => panic!(
+                "ext 0x0003/Negotiation requires negotiation on this connection too, got {other:?}"
+            ),
         }
     }
 
@@ -8357,8 +8403,9 @@ pub(crate) mod tests {
     ///
     /// "Never consulted" means its DECLARATION referenced nothing
     /// (`distribution_id: None`, the base-protocol shape). Such a job is
-    /// judged as it always was: the §6.4.3 designated output on the
-    /// allocation, the declaration binding here, and no acceptance window.
+    /// judged as it always was: the SV2 JDP/AllocateMiningJobToken.Success
+    /// designated output on the allocation, the declaration binding here, and
+    /// no acceptance window.
     ///
     /// The carve-out used to be phrased as "a Solo stream inherits nothing",
     /// and its fixture declared under a POOL-WIDE plan — which is not a Solo
@@ -8407,10 +8454,10 @@ pub(crate) mod tests {
     /// mode gate (a second session on the solo port), so `accounting_stream`
     /// re-resolves to Solo on the next `SetCustomMiningJob`. Dropping the
     /// inherited reference there sent the job to the base-protocol arm, which
-    /// serves a Solo connection with NO acceptance check and NO §7.1
-    /// recompute: the block pays the PPLNS window on-chain while the booking
-    /// resolves Solo and writes nothing, so the window's claims survive and
-    /// the pool pays them a second time.
+    /// serves a Solo connection with NO acceptance check and NO ext
+    /// 0x0003/Output Verification recompute: the block pays the PPLNS window
+    /// on-chain while the booking resolves Solo and writes nothing, so the
+    /// window's claims survive and the pool pays them a second time.
     ///
     /// Both a live and a withdrawn plan, because only the pair check catches
     /// the live one — an acceptance test alone would wave it through.
@@ -8608,11 +8655,11 @@ pub(crate) mod tests {
 
     // ── Declaration binding ────────────────────────────────────────────
 
-    /// Both coinbases are §7.1-conformant against the same distribution —
-    /// they differ only in the `T` they divide, so the payout check passes
-    /// either way and cannot tell a declared job from a substituted one.
-    /// That is what makes this the case worth pinning: the binding is the
-    /// only thing that notices the substitution.
+    /// Both coinbases are ext 0x0003/Output Verification-conformant against
+    /// the same distribution — they differ only in the `T` they divide, so the
+    /// payout check passes either way and cannot tell a declared job from a
+    /// substituted one. That is what makes this the case worth pinning: the
+    /// binding is the only thing that notices the substitution.
     ///
     /// Note what is NOT asserted here. Mining for a lower `T` is not itself
     /// an offence — a JDC picks its own template, and settlement books from
@@ -8631,13 +8678,14 @@ pub(crate) mod tests {
         let halved_blob = conformant_outputs(&entry, 156_250_000);
         assert_ne!(declared_blob, halved_blob, "the two revenues must differ");
 
-        // Pin the premise the whole test rests on: BOTH blobs satisfy §7.1
-        // against this distribution, so the payout check cannot tell them
-        // apart and only the binding can. Left implicit, a later change to
-        // dust pruning or rounding could make the halved vector
-        // non-conformant — §7.1 would then be the thing rejecting it, except
-        // it never gets the chance, because the binding runs first. The test
-        // would stay green and stop demonstrating anything.
+        // Pin the premise the whole test rests on: BOTH blobs satisfy ext
+        // 0x0003/Output Verification against this distribution, so the payout
+        // check cannot tell them apart and only the binding can. Left
+        // implicit, a later change to dust pruning or rounding could make the
+        // halved vector non-conformant — ext 0x0003/Output Verification would
+        // then be the thing rejecting it, except it never gets the chance,
+        // because the binding runs first. The test would stay green and stop
+        // demonstrating anything.
         for (label, blob) in [("declared", &declared_blob), ("halved", &halved_blob)] {
             let outputs: Vec<bitcoin::TxOut> =
                 bitcoin::consensus::deserialize(blob).expect("conformant blob must decode");
@@ -8650,7 +8698,7 @@ pub(crate) mod tests {
                     &entry.additional_outputs,
                 )
                 .is_ok(),
-                "the {label} coinbase must be §7.1-conformant, or this test \
+                "the {label} coinbase must be ext 0x0003/Output Verification-conformant, or this test \
                  proves nothing about the binding"
             );
         }
@@ -8707,10 +8755,10 @@ pub(crate) mod tests {
     }
 
     /// The case this module exists for: leave the coinbase alone and change
-    /// the transaction set. §7.1 sees an untouched coinbase and passes, and
-    /// nothing else on the mining side looks at the `merkle_path` — so the
-    /// node validation `jdp_server` ran over the DECLARED set would carry
-    /// over to a set no one checked.
+    /// the transaction set. ext 0x0003/Output Verification sees an untouched
+    /// coinbase and passes, and nothing else on the mining side looks at the
+    /// `merkle_path` — so the node validation `jdp_server` ran over the
+    /// DECLARED set would carry over to a set no one checked.
     #[test]
     fn a_swapped_merkle_path_is_rejected() {
         let mut s = solo_session_with_extended_channel();

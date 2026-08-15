@@ -20,13 +20,13 @@
 //! `SubmitSharesExtended` payload, whose frame retains
 //! `extension_type = 0x0000`.
 //!
-//! Body fields use the standard SV2 little-endian encoding. **TLV
-//! headers are little-endian too**: §3.4.3 types the header fields as
-//! U16/U8, and U16 is little-endian everywhere in SV2. (The 0x0002
-//! spec's §2 wire example shows the extension type as `00 02`, which
-//! contradicts the base data-type convention — the example is the
-//! error, not the rule.) Worker-ID has a 32-byte cap on
-//! `user_identity` (spec §1.1).
+//! Body fields use the standard SV2 little-endian encoding. **TLV headers are
+//! little-endian too**: SV2 Overview/Stratum V2 TLV Encoding Model types the
+//! header fields as U16/U8, and U16 is little-endian everywhere in SV2. (The
+//! 0x0002 ext 0x0002/Extended SubmitSharesExtended Message Format wire example
+//! shows the extension type as `00 02`, which contradicts the base data-type
+//! convention — the example is the error, not the rule.) Worker-ID has a
+//! 32-byte cap on `user_identity` (ext 0x0002/TLV Format for user_identity).
 
 // ── Spec constants ─────────────────────────────────────────────────
 
@@ -36,7 +36,8 @@ pub const SV2_EXTENSION_TYPE_WORKER_ID: u16 = 0x0002;
 /// TLV field-type for `user_identity` inside the Worker-ID TLV (0x01).
 pub const SV2_FIELD_TYPE_USER_IDENTITY: u8 = 0x01;
 
-/// Maximum length of `user_identity` (spec §1.1) in bytes.
+/// Maximum length of `user_identity` (ext 0x0002/TLV Format for user_identity)
+/// in bytes.
 pub const SV2_USER_IDENTITY_MAX_BYTES: usize = 32;
 
 /// Extension identifier for **Non-Custodial Pool Payouts** (0x0003).
@@ -65,10 +66,10 @@ pub enum WorkerIdEncodeError {
 // ── Minimal LE/BE codec helpers (private) ──────────────────────────
 //
 // We keep these in-file rather than depend on `stratum_core::binary_sv2`
-// because the SV2 spec pins exact byte sequences and we want the
-// Rust tests to assert against the same fixtures with no abstraction
-// drift. Everything is straight-line LE — body fields and TLV headers
-// alike (§3.4.3 types TLV headers as U16/U8, and U16 is LE in SV2).
+// because the SV2 spec pins exact byte sequences and we want the Rust tests to
+// assert against the same fixtures with no abstraction drift. Everything is
+// straight-line LE — body fields and TLV headers alike (SV2 Overview/Stratum
+// V2 TLV Encoding Model types TLV headers as U16/U8, and U16 is LE in SV2).
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -267,21 +268,21 @@ impl RequestExtensionsError {
 // ── 0x0003 Non-Custodial Payouts (push model) ──────────────────────
 
 /// TLV field-type for `distribution_id` on `DeclareMiningJob` /
-/// `SetCustomMiningJob` (ext 0x0003 §6).
+/// `SetCustomMiningJob` (ext 0x0003/distribution_id TLV Field).
 pub const SV2_FIELD_TYPE_DISTRIBUTION_ID: u8 = 0x01;
 
-/// `SetPayoutDistribution` — JDS → JDC (ext 0x0003 §3.1).
+/// `SetPayoutDistribution` — JDS → JDC (ext 0x0003/SetPayoutDistribution).
 /// Frame: `extension_type = 0x0003`, `msg_type = 0x00`, channel bit 0.
 ///
-/// MUST be the first message the JDS sends after `SetupConnection.Success`
-/// and `RequestExtensions.Success`; re-sent (with a higher
-/// `distribution_id`) whenever the pool updates the distribution.
-/// Amount fields inside `pool_payout` / `payouts` carry relative
-/// WEIGHTS, not satoshis — the JDC derives amounts per §4.
+/// MUST be the first message the JDS sends after `SetupConnection.Success` and
+/// `RequestExtensions.Success`; re-sent (with a higher `distribution_id`)
+/// whenever the pool updates the distribution. Amount fields inside
+/// `pool_payout` / `payouts` carry relative WEIGHTS, not satoshis — the JDC
+/// derives amounts per ext 0x0003/Payout Computation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetPayoutDistribution {
     /// Strictly increasing, universal across all connections of this
-    /// pool (§3.1).
+    /// pool (ext 0x0003/SetPayoutDistribution).
     pub distribution_id: u64,
     /// Consensus-serialized `TxOut`; amount field = `weight_P` (non-0).
     /// Locking script MUST be pool-controlled.
@@ -337,23 +338,25 @@ impl SetPayoutDistribution {
     }
 }
 
-/// Error-code vocabulary for the push-model 0x0003 extension (§7.3),
-/// emitted on `DeclareMiningJob.Error` / `SetCustomMiningJob.Error`.
+/// Error-code vocabulary for the push-model 0x0003 extension (ext 0x0003/Error
+/// Codes), emitted on `DeclareMiningJob.Error` / `SetCustomMiningJob.Error`.
 pub mod payout_distribution_error_codes {
-    /// §7.3 — the referenced `distribution_id` is not accepted: too
-    /// old (outside the grace window), unknown, or invalidated by a
-    /// settlement event (§10).
+    /// ext 0x0003/Error Codes — the referenced `distribution_id` is not
+    /// accepted: too old (outside the grace window), unknown, or invalidated
+    /// by a settlement event (ext 0x0003/Implementation Notes).
     pub const STALE_PAYOUT_DISTRIBUTION: &str = "stale-payout-distribution";
-    /// §7.3 — the declared coinbase outputs violate §4 (recomputed
-    /// vector mismatch, non-0-value trailing output, missing/mis-typed
-    /// `distribution_id` TLV where the extension is negotiated).
+    /// ext 0x0003/Error Codes — the declared coinbase outputs violate ext
+    /// 0x0003/Payout Computation (recomputed vector mismatch, non-0-value
+    /// trailing output, missing/mis-typed `distribution_id` TLV where the
+    /// extension is negotiated).
     pub const INVALID_PAYOUT_DISTRIBUTION: &str = "invalid-payout-distribution";
 }
 
-/// Extract the ext 0x0003 `distribution_id` from parsed trailing TLVs
-/// (§6: Type `0x0003`/`0x01`, length 8, value U64-LE). Returns `None`
-/// when absent or malformed — the caller decides whether a missing
-/// TLV is an error (it is, when the extension was negotiated).
+/// Extract the ext 0x0003 `distribution_id` from parsed trailing TLVs (ext
+/// 0x0003/distribution_id TLV Field: Type `0x0003`/`0x01`, length 8, value
+/// U64-LE). Returns `None` when absent or malformed — the caller decides
+/// whether a missing TLV is an error (it is, when the extension was
+/// negotiated).
 pub fn parse_distribution_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Option<u64> {
     tlvs.iter().find_map(|tlv| {
         (tlv.r#type.extension_type == SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS
@@ -363,8 +366,8 @@ pub fn parse_distribution_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Opt
     })
 }
 
-/// Encode the `distribution_id` TLV in wire form (§6) — used by tests
-/// standing in for a JDC.
+/// Encode the `distribution_id` TLV in wire form (ext 0x0003/distribution_id
+/// TLV Field) — used by tests standing in for a JDC.
 pub fn encode_distribution_id_tlv(distribution_id: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(13);
     buf.extend_from_slice(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS.to_le_bytes());
@@ -378,8 +381,9 @@ pub fn encode_distribution_id_tlv(distribution_id: u64) -> Vec<u8> {
 
 /// Encode a Worker-ID TLV, ready to be appended to `SubmitSharesExtended`.
 ///
-/// Wire shape (TLV header fields are U16/U8 per §3.4.3, so the U16s
-/// are **little-endian** like every SV2 integer; value is UTF-8):
+/// Wire shape (TLV header fields are U16/U8 per SV2 Overview/Stratum V2 TLV
+/// Encoding Model, so the U16s are **little-endian** like every SV2 integer;
+/// value is UTF-8):
 /// `[Type: ext_type U16-LE | field_type U8] [Length U16-LE] [UTF-8 bytes]`.
 ///
 /// `"Worker_001"` therefore encodes as
@@ -407,8 +411,9 @@ pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEnco
 /// base `SubmitSharesExtended` serialisation). Returns the
 /// `user_identity` string, or `None` if no 0x0002 TLV is present.
 ///
-/// Unknown TLVs are skipped per ext 0x0001 §3 (receivers MUST ignore
-/// unexpected TLVs). Little-endian header per the SV2 U16 convention.
+/// Unknown TLVs are skipped per SV2 Overview/Stratum V2 TLV Encoding Model
+/// (receivers MUST ignore unexpected TLVs). Little-endian header per the SV2
+/// U16 convention.
 ///
 /// Returns `None` on malformed TLV (truncated header / value, length
 /// cap exceeded). Callers SHOULD treat a malformed TLV the same as
@@ -457,7 +462,7 @@ pub struct ResolveWorkerNameInput<'a> {
 ///
 /// Semantics:
 /// - If ext 0x0002 isn't negotiated → channel default. The TLV (if
-///   any) is silently ignored per ext 0x0001 §3.
+///   any) is silently ignored per SV2 Overview/Stratum V2 TLV Encoding Model.
 /// - If the TLV is missing or malformed → channel default.
 /// - If the TLV's `user_identity` is bare (`"workerName"`) → that's
 ///   the worker; channel address is implicit.
@@ -601,7 +606,8 @@ mod tests {
         assert_eq!(SetPayoutDistribution::deserialize(&bytes).unwrap(), msg);
     }
 
-    /// `SetPayoutDistribution wire layout (§3.1 field order, all LE)`
+    /// `SetPayoutDistribution wire layout (ext 0x0003/SetPayoutDistribution
+    /// field order, all LE)`
     #[test]
     fn set_payout_distribution_wire_layout() {
         let msg = SetPayoutDistribution {
@@ -692,9 +698,11 @@ mod tests {
     #[test]
     fn worker_id_tlv_wire_layout_is_little_endian() {
         let tlv = encode_worker_id_tlv("Worker_001").unwrap();
-        // §3.4.3 types the header as U16|U8 + U16 — U16 is LE in SV2.
-        // (The 0x0002 spec's §2 example shows `00 02 …`, contradicting
-        // the base data-type convention; the example is wrong.)
+        // SV2 Overview/Stratum V2 TLV Encoding Model types the header as
+        // U16|U8 + U16 — U16 is LE in SV2.
+        // (ext 0x0002/Extended SubmitSharesExtended Message Format example
+        // shows `00 02 …`, contradicting the base data-type convention; the
+        // example is wrong.)
         assert_eq!(hex::encode(&tlv), "0200010a00576f726b65725f303031");
     }
 
@@ -730,7 +738,8 @@ mod tests {
         assert_eq!(encode_worker_id_tlv(""), Err(WorkerIdEncodeError::Empty));
     }
 
-    /// `rejects > 32 byte user_identity at encode (spec §1.1)`
+    /// `rejects > 32 byte user_identity at encode (ext 0x0002/TLV Format for
+    /// user_identity)`
     #[test]
     fn worker_id_tlv_rejects_too_long() {
         let too_long = "x".repeat(33);

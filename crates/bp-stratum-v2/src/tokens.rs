@@ -4,10 +4,10 @@
 //! identifiers the JDS hands to a JDC on
 //! `AllocateMiningJobToken`. The JDC then references them in
 //! `DeclareMiningJob` and `SetCustomMiningJob`. Each
-//! token has a 1 h TTL (SV2 spec 6.4.2 — "the JDC SHOULD use the token
-//! within a reasonable amount of time") and the pool rate-limits
-//! allocations to one per 1 s per connection (spec 6.4.2 — "rate
-//! limited to a rather slow rate").
+//! token has a 1 h TTL (SV2 JDP/AllocateMiningJobToken — "the JDC SHOULD
+//! use the token within a reasonable amount of time") and the pool
+//! rate-limits allocations to one per 1 s per connection (SV2
+//! JDP/AllocateMiningJobToken — "rate limited to a rather slow rate").
 //!
 //! ## Format
 //!
@@ -67,7 +67,8 @@ pub const TOKEN_RANDOM_LEN: usize = TOKEN_LEN - TOKEN_COUNTER_LEN;
 pub const DEFAULT_TOKEN_TTL_MS: u64 = 3_600_000;
 
 /// Default rate limit between allocations on the same connection.
-/// SV2 spec 6.4.2: "rate limited to a rather slow rate" — 1 second.
+/// SV2 JDP/AllocateMiningJobToken: "rate limited to a rather slow rate"
+/// — 1 second.
 pub const DEFAULT_RATE_LIMIT_MS: u64 = 1_000;
 
 // ── Token ────────────────────────────────────────────────────────────
@@ -117,11 +118,11 @@ impl std::fmt::Debug for Token {
 
 // ── AllocatedToken ───────────────────────────────────────────────────
 
-/// One issued token's bookkeeping. `coinbase_outputs` is the
-/// §6.4.3 fallback single-output payload returned in
-/// `AllocateMiningJobTokenSuccess.coinbase_outputs`. Used later by
-/// `jdp::dynamic_outputs` as the fallback when a 0x0003-unaware JDC
-/// skips the dynamic step.
+/// One issued token's bookkeeping. `coinbase_outputs` is the SV2
+/// JDP/AllocateMiningJobToken.Success fallback single-output payload returned
+/// in `AllocateMiningJobTokenSuccess.coinbase_outputs`. Used later by
+/// `jdp::dynamic_outputs` as the fallback when a 0x0003-unaware JDC skips the
+/// dynamic step.
 #[derive(Clone, Debug)]
 pub struct AllocatedToken {
     pub token: Token,
@@ -144,8 +145,8 @@ impl AllocatedToken {
 pub enum TokenAllocError {
     /// Caller breached the per-connection allocation rate limit
     /// (`now - last_alloc_ms < rate_limit_ms`). The caller should
-    /// silently drop the request — SV2 spec 6.4.2 says nothing about a
-    /// wire response for rate limiting.
+    /// silently drop the request — SV2 JDP/AllocateMiningJobToken says
+    /// nothing about a wire response for rate limiting.
     #[error("allocation rate limited: {elapsed_ms} ms since last (min {min_ms} ms)")]
     RateLimited { elapsed_ms: u64, min_ms: u64 },
     /// `getrandom` returned an error. The OS RNG only fails in
@@ -229,14 +230,14 @@ impl TokenStore {
     /// `new_mining_job_token` of a `DeclareMiningJobSuccess`.
     ///
     /// Deliberately not rate-limited, and that is the whole point of it
-    /// existing separately. §6.4.2 asks for the limit on
-    /// `AllocateMiningJobToken`, the message a client sends; minting through
-    /// [`Self::allocate`] made the pool's own answer draw from the client's
-    /// budget. A JDC that allocates and then declares inside the same second
-    /// — which the reference client does on every block change, since it
-    /// refills its token queue fire-and-forget from four call sites — had its
-    /// `DeclareMiningJob` silently dropped, no frame at all, and waited for
-    /// an answer that never came.
+    /// existing separately. SV2 JDP/AllocateMiningJobToken asks for the limit
+    /// on `AllocateMiningJobToken`, the message a client sends; minting
+    /// through [`Self::allocate`] made the pool's own answer draw from the
+    /// client's budget. A JDC that allocates and then declares inside the
+    /// same second — which the reference client does on every block change,
+    /// since it refills its token queue fire-and-forget from four call sites
+    /// — had its `DeclareMiningJob` silently dropped, no frame at all, and
+    /// waited for an answer that never came.
     ///
     /// It is also **not stored**, and that is not an optimisation. Nothing
     /// ever looks a declaration token up here: the declare handler's only
@@ -259,9 +260,10 @@ impl TokenStore {
     }
 
     /// Allocate a new token + record it under `(miner_address,
-    /// coinbase_outputs)`. Enforces the §6.4.2 rate limit — see
-    /// [`Self::mint_for_declaration`] for the path that must not. Bumps the
-    /// per-connection counter (BE-encoded into the token prefix).
+    /// coinbase_outputs)`. Enforces the SV2 JDP/AllocateMiningJobToken rate
+    /// limit — see [`Self::mint_for_declaration`] for the path that must
+    /// not. Bumps the per-connection counter (BE-encoded into the token
+    /// prefix).
     ///
     /// Sweeps expired entries on the way in, which is what bounds this map:
     /// the rate limit caps inserts at one per second and the TTL caps their
@@ -309,11 +311,11 @@ impl TokenStore {
     /// minting. Storage, TTL and the rate limit all live in the callers,
     /// because those are the three things that legitimately differ.
     ///
-    /// `last_alloc_ms` is deliberately NOT stamped here: it is the §6.4.2
-    /// budget of the CLIENT's allocate message, and `allocate` stamps it
-    /// before calling in. Stamping here would make a pool-minted declaration
-    /// token block the miner's next allocate for a second — the same interop
-    /// bug mirrored.
+    /// `last_alloc_ms` is deliberately NOT stamped here: it is the SV2
+    /// JDP/AllocateMiningJobToken budget of the CLIENT's allocate message, and
+    /// `allocate` stamps it before calling in. Stamping here would make a
+    /// pool-minted declaration token block the miner's next allocate for a
+    /// second — the same interop bug mirrored.
     fn next_token(&mut self) -> Result<Token, TokenAllocError> {
         self.counter = self
             .counter

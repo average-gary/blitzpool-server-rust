@@ -38,11 +38,11 @@
 //!   miner-address; that's caller-supplied state inside
 //!   `MiningServerContext`, not an async hook (it's a sync registry
 //!   lookup, see [`crate::bridge::JdpDeclaredJobRegistry`]).
-//! - `MempoolValidator` was never built, and nothing is waiting for
-//!   it: a declared job gets its node-side verdict from
+//! - `MempoolValidator` was never built, and nothing is waiting for it: a
+//!   declared job gets its node-side verdict from
 //!   [`crate::jdp_server::DeclaredJobValidator`] over bitcoin-core's
-//!   job-declaration IPC (SV2 §6.1) — a consensus answer, not a
-//!   mempool guess.
+//!   job-declaration IPC (SV2 JDP/Job Declarator Server) — a consensus answer,
+//!   not a mempool guess.
 
 use std::sync::Arc;
 
@@ -61,11 +61,10 @@ use crate::mining::submit::{RejectReason, ShareAccept};
 /// [`crate::mining::client::apply_template_broadcast`].
 ///
 /// Production impl runs the service-layer mode-resolver
-/// ([`bp_mining_mode::ModeResolver`]) + evaluates the per-mode
-/// distribution (PPLNS/Group-Solo: the SV2 ext 0x0003 §4 weight
-/// formula at this reward; Blockparty / single-output solo: their own
-/// exact allocators). Tests use [`NoOpHooks`] returning a single
-/// 100%-to-self entry.
+/// ([`bp_mining_mode::ModeResolver`]) + evaluates the per-mode distribution
+/// (PPLNS/Group-Solo: the SV2 ext 0x0003/Payout Computation weight formula at
+/// this reward; Blockparty / single-output solo: their own exact allocators).
+/// Tests use [`NoOpHooks`] returning a single 100%-to-self entry.
 #[async_trait::async_trait]
 pub trait PayoutResolver: Send + Sync {
     /// Resolve the payout list for a given connection's locked

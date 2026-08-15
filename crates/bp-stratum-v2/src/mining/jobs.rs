@@ -23,7 +23,7 @@
 //!
 //! - [`StandardJobMaps`] covers the **Standard** channel side: per-jobId
 //!   we record the session difficulty at send time
-//!   (`job_id_to_difficulty`, SV2 spec §5.3.14 — share validated
+//!   (`job_id_to_difficulty`, SV2 Mining/SubmitShares.Error — share validated
 //!   against the target the job was issued at, not the current session
 //!   target) AND the exact 32-byte merkle root the miner received in
 //!   `NewMiningJob` (`job_id_to_merkle_root` — store-on-send, NOT
@@ -73,20 +73,21 @@ pub struct ExtendedJob {
     pub prev_hash: [u8; 32],
     pub n_bits: u32,
     pub min_ntime: u32,
-    /// Per-job session difficulty stored at send-time. SV2 spec §5.3.14
-    /// requires share validation against the target the job was issued
-    /// at, NOT the current `session_difficulty` — without this a vardiff
-    /// ratchet between job-send and share-submit would falsely accept /
-    /// reject in-flight shares. The Standard side stores the same field
-    /// on [`StandardJobEntry::difficulty`]; mirroring it here lets the
-    /// Extended submit-handler read directly from the job record
-    /// instead of cross-referencing the Standard-side map.
+    /// Per-job session difficulty stored at send-time. SV2
+    /// Mining/SubmitShares.Error requires share validation against the target
+    /// the job was issued at, NOT the current `session_difficulty` — without
+    /// this a vardiff ratchet between job-send and share-submit would falsely
+    /// accept / reject in-flight shares. The Standard side stores the same
+    /// field on [`StandardJobEntry::difficulty`]; mirroring it here lets the
+    /// Extended submit-handler read directly from the job record instead of
+    /// cross-referencing the Standard-side map.
     pub difficulty: Difficulty,
-    /// Per-job **network** difficulty pinned at send-time (SV2 §5.3.14).
-    /// The block-found gate compares the share's solved difficulty against
-    /// THIS, not the current template's — a block-change between job-send
-    /// and share-submit must not retroactively reclassify an in-flight
-    /// share's block-candidacy. Mirrors the Standard side, which pins it on
+    /// Per-job **network** difficulty pinned at send-time (SV2
+    /// Mining/SubmitShares.Error). The block-found gate compares the share's
+    /// solved difficulty against THIS, not the current template's — a
+    /// block-change between job-send and share-submit must not retroactively
+    /// reclassify an in-flight share's block-candidacy. Mirrors the Standard
+    /// side, which pins it on
     /// [`StandardTemplateSnapshot::network_difficulty`].
     pub network_difficulty: Difficulty,
     /// Block-reward portion the coinbase claims (= the template's
@@ -115,24 +116,25 @@ pub struct ExtendedJob {
     /// |---|---|---|
     /// | declared, declaration referenced a distribution | yes | JDP |
     /// | declared, base protocol | no — `BaseProtocol`, nothing to record | mining side |
-    /// | Coinbase-only + ext 0x0003 | **no** — §6.3.1, that mode never declares | mining side |
+    /// | Coinbase-only + ext 0x0003 | **no** — SV2 JDP/Coinbase-only Mode, that mode never declares | mining side |
     /// | Coinbase-only, base protocol | no — never declares | mining side |
     ///
     /// Reading it as "distribution-backed" put row three on the JDP side,
-    /// which never hears about it: the block was credited as a share and
-    /// then recorded nowhere — no `blocks_entity` row, no notification, and
-    /// (worse) no §10 settle, so the published weights kept encoding
-    /// balances the block had already paid out.
+    /// which never hears about it: the block was credited as a share and then
+    /// recorded nowhere — no `blocks_entity` row, no notification, and (worse)
+    /// no ext 0x0003/Implementation Notes settle, so the published weights
+    /// kept encoding balances the block had already paid out.
     ///
-    /// Reading it as "did the §7.1 gate resolve a distribution for this
-    /// job?" — i.e. `distribution_ref` in
+    /// Reading it as "did the ext 0x0003/Output Verification gate resolve a
+    /// distribution for this job?" — i.e. `distribution_ref` in
     /// `crate::mining::client::handle_set_custom_mining_job` — broke row ONE
-    /// on a Solo stream, in the other direction: `resolve_distribution_reference`
-    /// deliberately declines to inherit a declaration's reference there,
-    /// while the JDP side stamps one on every accepted 0x0003 declaration,
-    /// Solo included. Both sides then recorded the block: two `blocks_entity`
-    /// rows and two notifications. The two questions look identical and are
-    /// not; this field answers only the JDP one.
+    /// on a Solo stream, in the other direction:
+    /// `resolve_distribution_reference` deliberately declines to inherit a
+    /// declaration's reference there, while the JDP side stamps one on every
+    /// accepted 0x0003 declaration, Solo included. Both sides then recorded
+    /// the block: two `blocks_entity` rows and two notifications. The two
+    /// questions look identical and are not; this field answers only the JDP
+    /// one.
     ///
     /// Always `false` for pool-built jobs, which carry a `template_id` and
     /// take the ordinary submit path instead.
@@ -189,9 +191,9 @@ where
 
 // ── StandardTemplateSnapshot ─────────────────────────────────────────
 
-/// Per-job template context — stored on [`StandardJobEntry`] at
-/// send-time so share validation uses the *same* template the miner
-/// hashed against, not the most-recent one (SV2 §5.3.14 strict).
+/// Per-job template context — stored on [`StandardJobEntry`] at send-time so
+/// share validation uses the *same* template the miner hashed against, not the
+/// most-recent one (SV2 Mining/SubmitShares.Error strict).
 ///
 /// Lives in `mining/jobs.rs` (not `mining/client.rs`) because the
 /// storage owns the lifecycle. The handler re-exports it via
@@ -214,16 +216,16 @@ pub struct StandardTemplateSnapshot {
 /// One Standard `NewMiningJob` we've sent, with everything the share
 /// validator + retire-not-clear lifecycle need.
 ///
-/// `difficulty` + `merkle_root` are stored at send time (SV2 §5.3.14
-/// — job-specific target; store-on-send merkle root avoids the
-/// `applyExtranonceAndGetCoinbaseHash` mutation bug that caused ~19%
-/// reject on BraiinsOS).
+/// `difficulty` + `merkle_root` are stored at send time (SV2
+/// Mining/SubmitShares.Error — job-specific target; store-on-send merkle root
+/// avoids the `applyExtranonceAndGetCoinbaseHash` mutation bug that caused
+/// ~19% reject on BraiinsOS).
 ///
 /// `template_snapshot` is the **template the miner is hashing
 /// against**. On block change retired entries keep their snapshot —
 /// in-flight shares for the retired job validate against the snapshot
 /// they were issued under, not the current template. This is the
-/// strict SV2 §5.3.14 per-job-template-pinning fix.
+/// strict SV2 Mining/SubmitShares.Error per-job-template-pinning fix.
 ///
 /// `created_at_ms` / `retired_at_ms` drive the same retire-not-clear
 /// algorithm the Extended side uses, via [`bp_jobs_lifecycle`].
@@ -273,7 +275,7 @@ pub struct StandardJobEntry {
 /// the retire-not-clear algorithm shared with the Extended side via
 /// [`bp_jobs_lifecycle`].
 ///
-/// **Retire-not-clear (SV2 §5.3.14)**: on block change the IO layer
+/// **Retire-not-clear (SV2 Mining/SubmitShares.Error)**: on block change the IO layer
 /// calls [`Self::retire`] (stamps `retired_at_ms` on every entry,
 /// idempotent) — it does **not** delete entries. In-flight shares for
 /// the retired jobs then classify as `StaleCreditable` (within grace —
@@ -325,7 +327,7 @@ impl StandardJobMaps {
     /// freezes the template context (version / prev_hash / n_bits /
     /// network_difficulty) at send-time so submit-validation can
     /// reconstruct the exact 80-byte header the miner hashed against
-    /// — SV2 §5.3.14 strict-conform.
+    /// — SV2 Mining/SubmitShares.Error strict-conform.
     ///
     /// Re-sending the same `job_id` (shouldn't happen —
     /// channel-local ids are `next_job_id`-allocated) overwrites the
@@ -618,7 +620,7 @@ mod tests {
         assert_eq!(maps.difficulty_of(99), None);
     }
 
-    /// SV2 §5.3.14: per-job template-snapshot pinning. Two
+    /// SV2 Mining/SubmitShares.Error: per-job template-snapshot pinning. Two
     /// record_send calls with different snapshots produce entries
     /// whose snapshots survive retire (in-flight shares for the old
     /// job hash against the OLD prev_hash + n_bits + version, not

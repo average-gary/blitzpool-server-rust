@@ -71,10 +71,11 @@ pub enum InboundJdpFrame {
 
 // ── decode_jdp_inbound ──────────────────────────────────────────────
 
-/// ext 0x0003 §8 message type: `SetPayoutDistribution` (JDS → JDC,
-/// channel_msg bit unset). The push model defines no inbound ext-0x0003
-/// frames — the `distribution_id` reference arrives as a §6 TLV on the
-/// base-protocol `DeclareMiningJob` / `SetCustomMiningJob` frames.
+/// ext 0x0003/Message Types: `SetPayoutDistribution` (JDS → JDC,
+/// channel_msg bit unset). The push model defines no inbound ext-0x0003 frames
+/// — the `distribution_id` reference arrives as an ext 0x0003/distribution_id
+/// TLV Field on the base-protocol `DeclareMiningJob` / `SetCustomMiningJob`
+/// frames.
 pub const EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION: u8 = 0x00;
 
 pub fn decode_jdp_inbound(msg: AnyMessage<'static>) -> Result<Option<InboundJdpFrame>, CodecError> {
@@ -164,8 +165,8 @@ fn decode_declare(m: Sv2DeclareMiningJob<'static>) -> Result<DeclareMiningJobInp
         wtxid_list.push(bytes_to_32(b)?);
     }
     Ok(DeclareMiningJobInput {
-        // §6 TLV — extracted by the IO layer from the frame's trailing
-        // TLVs, not part of the base-message decode.
+        // ext 0x0003/distribution_id TLV Field — extracted by the IO layer
+        // from the frame's trailing TLVs, not part of the base-message decode.
         distribution_id: None,
         request_id: m.request_id,
         mining_job_token: token_from_bytes(m.mining_job_token.as_bytes())?,

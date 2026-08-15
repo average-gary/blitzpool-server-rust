@@ -10,27 +10,29 @@
 //! ## What this is NOT about
 //!
 //! Revenue. This module does not look at fees, does not compare the block's
-//! value against anything, and does not reject a JDC for declaring an empty
-//! or low-fee template. **Which transactions a JDC mines is its own call —
-//! that is the entire point of job declaration**, and a small `T` is a
-//! smaller block for everyone in the distribution, not a fault. §4 already
-//! requires the coinbase to pay out exactly the `T` its own template yields,
-//! and `SetCustomMiningJob` is checked against the published distribution
-//! independently ([`crate::jdp::payout_distribution`]), so the split is
-//! guarded regardless of what was declared. Settlement then books from the
-//! block's own coinbase at whatever `T` it actually paid, so a low-revenue
-//! block needs no detection to be booked correctly.
+//! value against anything, and does not reject a JDC for declaring an empty or
+//! low-fee template. **Which transactions a JDC mines is its own call — that
+//! is the entire point of job declaration**, and a small `T` is a smaller
+//! block for everyone in the distribution, not a fault. ext 0x0003/Payout
+//! Computation already requires the coinbase to pay out exactly the `T` its
+//! own template yields, and `SetCustomMiningJob` is checked against the
+//! published distribution independently ([`crate::jdp::payout_distribution`]),
+//! so the split is guarded regardless of what was declared. Settlement then
+//! books from the block's own coinbase at whatever `T` it actually paid, so a
+//! low-revenue block needs no detection to be booked correctly.
 //!
 //! ## What it IS about
 //!
 //! Making the node validation apply to the job being mined.
 //!
 //! `jdp_server` hands every declaration to bitcoin-core before accepting it
-//! (SV2 §6.1 — `checkBlock` over the job-declaration IPC). That establishes
-//! that the DECLARED transaction set is one a block could be built from.
-//! The mining side never repeats it: `SetCustomMiningJob.merkle_path` goes
-//! into the [`crate::mining::jobs::ExtendedJob`] unexamined, and the §7.1
-//! coinbase check says nothing about the transaction set hanging off it.
+//! (SV2 JDP/Job Declarator Server — `checkBlock` over the job-declaration
+//! IPC). That establishes that the DECLARED transaction set is one a block
+//! could be built from. The mining side never repeats it:
+//! `SetCustomMiningJob.merkle_path` goes into the
+//! [`crate::mining::jobs::ExtendedJob`] unexamined, and the ext 0x0003/Output
+//! Verification coinbase check says nothing about the transaction set hanging
+//! off it.
 //!
 //! Without this comparison, "the declaration passed the node" and "this job
 //! pays the published distribution" are two true statements about two
@@ -44,10 +46,10 @@
 //! - It is only worth as much as the validator behind it. `job_validator` is
 //!   optional; with none wired, declarations are accepted untested and this
 //!   binds a job to an unverified one.
-//! - Coinbase-only jobs have no declaration to bind, so the same freedom
-//!   over the transaction set exists there. That is base JDP §6.3.1 and is
-//!   accepted, not closed here. This raises a Full-Template declaration back
-//!   to meaning what it says, nothing wider.
+//! - Coinbase-only jobs have no declaration to bind, so the same freedom over
+//!   the transaction set exists there. That is SV2 JDP/Coinbase-only Mode and
+//!   is accepted, not closed here. This raises a Full-Template declaration
+//!   back to meaning what it says, nothing wider.
 //!
 //! This module is pure. It projects a stored [`DeclaredJob`] down to the
 //! fields `SetCustomMiningJob` repeats ([`DeclaredJobBinding`]) and compares
@@ -191,22 +193,23 @@ pub fn check_custom_job(
     // descriptions name BIP-323 and that reads at first like a licence for
     // the two to differ:
     //
-    //   §6.4.4 `DeclareMiningJob.version` — "Version header field. To be
+    //   SV2 JDP/DeclareMiningJob.version — "Version header field. To be
     //   later modified by BIP323-consistent changes."
-    //   §5.3.18 `SetCustomMiningJob.version` — "... The general purpose bits
+    //   SV2 Mining/SetCustomMiningJob.version — "... The general purpose bits
     //   (as specified in BIP323) can be freely manipulated by the downstream
     //   node."
     //
     // Neither says these two may differ FROM EACH OTHER. Where the spec means
     // that, it says so without room to read it otherwise, and it says it in
-    // exactly one place: TDP §7.7 `SubmitSolution.version` — "Bits not
-    // defined by BIP323 as additional nonce MUST be the same as they appear
-    // in the NewTemplate message, other bits may be set to any value." That
-    // is the MINED HEADER against its template, and "to be LATER modified" is
-    // the same rule foreshadowed: later means at hashing time, not at the
-    // next message. §5.3.18's sentence is in turn copied verbatim from
-    // §5.3.15 `NewMiningJob.version`, where "the downstream node" is the node
-    // that HASHES the job — it describes rolling, not a second base version.
+    // exactly one place: SV2 TDP/SubmitSolution.version — "Bits not defined by
+    // BIP323 as additional nonce MUST be the same as they appear in the
+    // NewTemplate message, other bits may be set to any value." That is the
+    // MINED HEADER against its template, and "to be LATER modified" is the
+    // same rule foreshadowed: later means at hashing time, not at the next
+    // message. SV2 Mining/SetCustomMiningJob.version's sentence is in turn
+    // copied verbatim from SV2 Mining/NewMiningJob.version, where "the
+    // downstream node" is the node that HASHES the job — it describes rolling,
+    // not a second base version.
     //
     // The reference agrees on both sides: its JDS compares the two for exact
     // equality under a comment that lists `version` among the fields which

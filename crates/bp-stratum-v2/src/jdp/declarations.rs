@@ -14,7 +14,7 @@
 //!
 //! Later, when the JDC submits a `PushSolution`, the JDS uses
 //! `match_for_solution(prev_hash)` to find which declared job the
-//! solution belongs to. Spec §6.4.9 says to match by `prev_hash`; we
+//! solution belongs to. SV2 JDP/PushSolution says to match by `prev_hash`; we
 //! prefer `prev_hash` matches and fall back to "most recent"
 //! when no match (defensive: declarations that pre-date the JDS
 //! observing the current prev_hash store `prev_hash = None`).
@@ -89,8 +89,9 @@ pub struct DeclaredJob {
     /// declaration, or a connection that never negotiated 0x0003 — and then
     /// a found block is reported but not booked.
     pub booking: Option<PayoutBooking>,
-    /// ext 0x0003 §6: the `distribution_id` this declaration was accepted
-    /// against, whether or not a block found on it can be booked.
+    /// ext 0x0003/distribution_id TLV Field: the `distribution_id` this
+    /// declaration was accepted against, whether or not a block found on it
+    /// can be booked.
     ///
     /// Deliberately NOT read off [`Self::booking`], which is the narrower
     /// claim: `booking` additionally requires the distribution's settlement
