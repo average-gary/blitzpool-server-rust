@@ -866,6 +866,80 @@ impl AwaitingModeWatch {
     }
 }
 
+/// Everything a session's payout plan is tracked with.
+///
+/// A struct because three of the four move TOGETHER on every rebuild, and
+/// nothing but a convention said so: each of the three call sites set
+/// `served`, stamped `last_rebuild_ms` and fed [`AwaitingModeWatch::observe`]
+/// by hand, at one of them with thirty lines in between. Forgetting the stamp
+/// costs `Denied` its throttle — a whole distribution build per inbound frame;
+/// forgetting the observe costs the stuck-session warning its state machine,
+/// which is exactly what that type's doc demands ("Feed EVERY `served`
+/// transition through here"). Neither would have failed to compile.
+///
+/// `last_pool_wide_written` rides along because it is the same session's plan
+/// seen from the wire side, and [`republish_tailored`] already had to be
+/// handed it.
+struct SessionPlan {
+    /// What this session is being served, and why.
+    served: SessionDistribution,
+    /// When the pool last TRIED to build this session a plan, whatever came
+    /// of it — [`rebuild_due`]'s throttle for the refused case.
+    last_rebuild_ms: u64,
+    /// Makes a session stuck without a known payout mode visible.
+    awaiting: AwaitingModeWatch,
+    /// The pool-wide distribution id last written to this client, so a session
+    /// arriving on that stream can be told whether it is behind. `None` while
+    /// it holds something else (nothing yet, or a tailored push).
+    last_pool_wide_written: Option<u64>,
+}
+
+impl SessionPlan {
+    fn new() -> Self {
+        Self {
+            served: SessionDistribution::AwaitingMode,
+            last_rebuild_ms: 0,
+            awaiting: AwaitingModeWatch::new(),
+            last_pool_wide_written: None,
+        }
+    }
+}
+
+/// Rebuild this session's plan and record it — the three post-conditions in
+/// one place, so a fourth call site cannot half-apply them.
+///
+/// What it deliberately does NOT do is drop a plan the rebuild failed to
+/// replace. Only the mode-moved caller does that, and only it can: the
+/// condition is "was serving a plan, now serves none", which the other two
+/// callers reach under circumstances where the old entry is either already
+/// settlement-invalidated or still the right one.
+#[allow(clippy::too_many_arguments)]
+async fn republish_tailored(
+    hooks: &JdpServerHooks,
+    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    session_id: u32,
+    session_id_hex: &str,
+    miner: &AddressId,
+    plan: &mut SessionPlan,
+) {
+    plan.served = rebuild_tailored_plan(
+        hooks,
+        bridge,
+        writer,
+        session_id,
+        session_id_hex,
+        miner,
+        &plan.served,
+        &mut plan.last_pool_wide_written,
+    )
+    .await;
+    let now = SystemClock.now_ms();
+    plan.last_rebuild_ms = now;
+    plan.awaiting
+        .observe(&plan.served, session_id_hex, miner, now);
+}
+
 /// Build and push a fresh tailored distribution for `miner` on this session.
 ///
 /// Three callers, one implementation: the first allocate; a
@@ -878,7 +952,7 @@ impl AwaitingModeWatch {
 /// about WHY it was called. What the mode-moved caller has to do on top is
 /// drop the plan on file first — see [`SessionDistribution::accounting`].
 #[allow(clippy::too_many_arguments)]
-async fn republish_tailored(
+async fn rebuild_tailored_plan(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
@@ -1094,23 +1168,20 @@ async fn run_jdp_connection(
     // distribution "the basis for all subsequently declared jobs", so its own
     // stream is authoritative, and for a Solo or Group-Solo miner the
     // pool-wide one is the PPLNS window's, not theirs.
-    let mut served = SessionDistribution::AwaitingMode;
+    let mut plan = SessionPlan::new();
     // The miner this session belongs to, learned from the first allocate and
     // never cleared. Kept so an ext 0x0003/Implementation Notes settlement can
     // be answered with a FRESH tailored distribution, and so an undecided mode
     // can be re-asked — the publisher only ever republishes the pool-wide one,
     // which this session is (correctly) not listening for.
     let mut identity: Option<AddressId> = None;
-    let mut awaiting = AwaitingModeWatch::new();
     // When the pool last tried to build this session a distribution, so the
     // refused case can be retried on the session's own frames without
     // rebuilding once per frame. Stamped after every attempt, whatever it
     // returned.
-    let mut last_rebuild_ms: u64 = 0;
     // The pool-wide distribution id last written to this client, so a session
     // arriving on that stream can be told whether it is behind. `None` while
     // it is holding something else (nothing yet, or a tailored push).
-    let mut last_pool_wide_written: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -1135,7 +1206,7 @@ async fn run_jdp_connection(
                 // No identity yet: nothing else can be right, so the
                 // pool-wide push stands (that is also the PPLNS default).
                 if identity.is_some() && !matches!(
-                    served,
+                    plan.served,
                     SessionDistribution::Served(DistributionAccounting::PoolWide)
                 ) {
                     // A tailored session ignores the pool-wide push —
@@ -1165,20 +1236,16 @@ async fn run_jdp_connection(
                     // arrived since, this retries it on the publisher's tick.
                     // `None` on the way out is deliberate — better no
                     // distribution than the PPLNS one.
-                    let next = republish_tailored(
+                    republish_tailored(
                         &hooks,
                         &bridge,
                         &mut writer,
                         session_id,
                         &session_id_hex,
                         &miner,
-                        &served,
-                        &mut last_pool_wide_written,
+                        &mut plan,
                     )
                     .await;
-                    served = next;
-                    last_rebuild_ms = SystemClock.now_ms();
-                    awaiting.observe(&served, &session_id_hex, &miner, SystemClock.now_ms());
                     continue;
                 }
                 let current = bridge
@@ -1192,7 +1259,7 @@ async fn run_jdp_connection(
                         warn!("jdp {session_id_hex} distribution push write: {err:?}");
                         break;
                     }
-                    last_pool_wide_written = Some(entry.distribution_id);
+                    plan.last_pool_wide_written = Some(entry.distribution_id);
                 }
             }
             frame_recv = reader.read_frame() => {
@@ -1319,7 +1386,7 @@ async fn run_jdp_connection(
                         .current_pool_wide();
                     match current {
                         Some(entry) => {
-                            last_pool_wide_written = Some(entry.distribution_id);
+                            plan.last_pool_wide_written = Some(entry.distribution_id);
                             outcome.outbound.push(JdpOutboundFrame::SetPayoutDistribution(
                                 wire_from_entry(&entry),
                             ));
@@ -1403,20 +1470,16 @@ async fn run_jdp_connection(
                         // PPLNS miners are paid on-chain and their ledger
                         // never hears about it.
                         identity = Some(miner_address.clone());
-                        let next = republish_tailored(
+                        republish_tailored(
                             &hooks,
                             &bridge,
                             &mut writer,
                             session_id,
                             &session_id_hex,
                             miner_address,
-                            &served,
-                            &mut last_pool_wide_written,
+                            &mut plan,
                         )
                         .await;
-                        served = next;
-                        last_rebuild_ms = SystemClock.now_ms();
-                        awaiting.observe(&served, &session_id_hex, miner_address, SystemClock.now_ms());
                     }
 
                     // Re-decide on the session's OWN frames, not only on the
@@ -1444,22 +1507,25 @@ async fn run_jdp_connection(
                     // the mode read before the dispatch.
                     if let (Some(miner), true) = (
                         &identity,
-                        rebuild_due(&served, current_mode, SystemClock.now_ms(), last_rebuild_ms),
+                        rebuild_due(
+                            &plan.served,
+                            current_mode,
+                            SystemClock.now_ms(),
+                            plan.last_rebuild_ms,
+                        ),
                     ) {
                         let miner = miner.clone();
-                        let was = served.clone();
-                        let next = republish_tailored(
+                        let was = plan.served.clone();
+                        republish_tailored(
                             &hooks,
                             &bridge,
                             &mut writer,
                             session_id,
                             &session_id_hex,
                             &miner,
-                            &was,
-                            &mut last_pool_wide_written,
+                            &mut plan,
                         )
                         .await;
-                        served = next;
                         // A plan on file AND a rebuild due can only mean the
                         // mode moved — that is the sole condition under which
                         // `rebuild_due` says yes for a served state. If the
@@ -1473,7 +1539,7 @@ async fn run_jdp_connection(
                         // Dropped after the attempt, not before, so a rebuild
                         // that succeeds never opens a window in which the
                         // session has no plan at all.
-                        if was.accounting().is_some() && served.accounting().is_none() {
+                        if was.accounting().is_some() && plan.served.accounting().is_none() {
                             let dropped = bridge
                                 .write()
                                 .expect("bridge RwLock poisoned")
@@ -1488,8 +1554,6 @@ async fn run_jdp_connection(
                                  nothing rather than a coinbase paying the wrong miners"
                             );
                         }
-                        last_rebuild_ms = SystemClock.now_ms();
-                        awaiting.observe(&served, &session_id_hex, &miner, SystemClock.now_ms());
                     }
                 }
                 fan_out_events(outcome.events, &hooks).await;
