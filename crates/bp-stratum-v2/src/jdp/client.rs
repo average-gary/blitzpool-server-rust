@@ -639,8 +639,26 @@ pub fn handle_allocate_token(
         context.coinbase_outputs,
     ) {
         Ok(entry) => entry,
+        // Silent by design: SV2 JDP/AllocateMiningJobToken asks for the limit
+        // and defines no wire answer for hitting it, so there is nothing to
+        // send and nothing an operator needs to see.
         Err(TokenAllocError::RateLimited { .. }) => return JdpHandlerOutcome::default(),
-        Err(_) => return JdpHandlerOutcome::default(),
+        // Entropy failure or a saturated counter. Both are pool-side faults
+        // the JDC cannot act on and cannot see — SV2 has no error for them
+        // either, so the allocate goes unanswered and the client reads an
+        // unresponsive JDS. The declaration path says so loudly for the same
+        // two (`mint_for_declaration` below); this one used to fold them into
+        // the rate-limit arm's silence, where a pool that cannot draw entropy
+        // looked exactly like a client asking too fast.
+        Err(err) => {
+            tracing::error!(
+                %err,
+                request_id = input.request_id,
+                "jdp: could not allocate a mining-job token — dropping \
+                 AllocateMiningJobToken with no response"
+            );
+            return JdpHandlerOutcome::default();
+        }
     };
 
     let token = alloc.token;
@@ -1713,6 +1731,27 @@ mod tests {
         // 999ms later — below 1s rate-limit window.
         let out = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 1_999);
         assert!(out.outbound.is_empty(), "rate-limited alloc must drop");
+    }
+
+    /// An entropy failure drops the allocate too — same outcome as the rate
+    /// limit, and that is the point: the two are told apart only by what they
+    /// LOG, so this pins that the arm is reachable and answers nothing.
+    ///
+    /// It cannot assert the log line itself without a subscriber, and a
+    /// subscriber for one `error!` would cost more than it proves. What it
+    /// does prove is that the arm is not dead: `set_token_rng` is the only
+    /// way to reach `TokenAllocError::EntropyFailed`, and before this the
+    /// path was covered by nothing at all.
+    #[test]
+    fn an_entropy_failure_drops_the_allocate_without_a_frame() {
+        let mut s = fresh();
+        handle_setup_connection(&mut s, &good_setup());
+        s.set_token_rng(Some(Box::new(|_| Err("no entropy".to_string()))));
+        let out = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
+        assert!(
+            out.outbound.is_empty() && out.events.is_empty(),
+            "an allocate the pool cannot answer must produce no frame and no event"
+        );
     }
 
     // ── parse_user_identifier_as_address ──────────────────────────
