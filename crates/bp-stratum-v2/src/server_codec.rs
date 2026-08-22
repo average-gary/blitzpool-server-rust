@@ -67,47 +67,13 @@ use stratum_core::parsers_sv2::{
     AnyMessage, CommonMessages, Extensions, ExtensionsNegotiation, Mining,
 };
 
+use crate::codec_common::{bytes_to_32, str0255, token_from_bytes, utf8_from_bytes, CodecError};
 use crate::extensions::RequestExtensions as LocalRequestExtensions;
 use crate::mining::client::{
     CloseChannelInput, OpenExtendedMiningChannelInput, OpenStandardMiningChannelInput,
     OutboundFrame, SetCustomMiningJobInput, SetupConnectionInput, UpdateChannelInput,
 };
 use crate::mining::submit::{SubmitSharesExtendedInput, SubmitSharesStandardInput};
-use crate::tokens::Token;
-
-// ── Errors ──────────────────────────────────────────────────────────
-
-/// Codec-layer failures. Production wiring logs + drops the frame;
-/// the per-connection task continues. None of these are connection-fatal
-/// in the spec sense.
-#[derive(Debug, thiserror::Error)]
-pub enum CodecError {
-    /// Inbound message arrived on the wrong sub-protocol port —
-    /// e.g. a JDP frame on the mining listener. Caller logs +
-    /// ignores (the per-connection task already routed by port).
-    #[error("message type not relevant to mining server: {0:?}")]
-    NotMiningRelated(&'static str),
-    /// Sv2 wire type → owned-data conversion failure. Typically a
-    /// length mismatch on a fixed-size byte field.
-    #[error("conversion: {0}")]
-    Conversion(String),
-    /// A miner-supplied string failed UTF-8 validation. Caller
-    /// reports + drops (a malicious miner can otherwise corrupt
-    /// downstream string handling).
-    #[error("invalid UTF-8: {0}")]
-    InvalidUtf8(String),
-    /// Outbound frame variant doesn't yet have a wire-codec
-    /// implementation. Placeholder during the iterative build-out;
-    /// disappears once every variant is covered.
-    #[error("encode not yet implemented for variant: {0}")]
-    EncodeUnimplemented(&'static str),
-}
-
-impl CodecError {
-    fn from_conv<E: core::fmt::Debug>(e: E) -> Self {
-        CodecError::Conversion(format!("{e:?}"))
-    }
-}
 
 // ── InboundMiningFrame ──────────────────────────────────────────────
 
@@ -178,7 +144,9 @@ fn decode_mining_message(m: Mining<'static>) -> Result<InboundMiningFrame, Codec
         Mining::SetCustomMiningJob(m) => Ok(InboundMiningFrame::SetCustomMiningJob(
             decode_set_custom_mining_job(m)?,
         )),
-        other => Err(CodecError::NotMiningRelated(mining_variant_name(&other))),
+        other => Err(CodecError::NotForThisSubProtocol(mining_variant_name(
+            &other,
+        ))),
     }
 }
 
@@ -594,37 +562,6 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn utf8_from_bytes(b: &[u8]) -> Result<String, CodecError> {
-    std::str::from_utf8(b)
-        .map(|s| s.to_string())
-        .map_err(|e| CodecError::InvalidUtf8(e.to_string()))
-}
-
-fn bytes_to_32(b: &[u8]) -> Result<[u8; 32], CodecError> {
-    if b.len() != 32 {
-        return Err(CodecError::Conversion(format!(
-            "expected 32-byte field, got {}",
-            b.len()
-        )));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(b);
-    Ok(arr)
-}
-
-fn token_from_bytes(b: &[u8]) -> Result<Token, CodecError> {
-    if b.len() != crate::tokens::TOKEN_LEN {
-        return Err(CodecError::Conversion(format!(
-            "expected {}-byte token, got {}",
-            crate::tokens::TOKEN_LEN,
-            b.len()
-        )));
-    }
-    let mut arr = [0u8; crate::tokens::TOKEN_LEN];
-    arr.copy_from_slice(b);
-    Ok(Token(arr))
-}
-
 fn merkle_path_from_seq(
     seq: &stratum_core::binary_sv2::Seq0255<'_, stratum_core::binary_sv2::U256<'_>>,
 ) -> Result<Vec<[u8; 32]>, CodecError> {
@@ -644,10 +581,6 @@ fn seq_from_merkle_path(
     let items: Vec<stratum_core::binary_sv2::U256<'static>> =
         path.into_iter().map(Into::into).collect();
     items.try_into().map_err(CodecError::from_conv)
-}
-
-fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255<'static>, CodecError> {
-    s.try_into().map_err(CodecError::from_conv)
 }
 
 #[cfg(test)]

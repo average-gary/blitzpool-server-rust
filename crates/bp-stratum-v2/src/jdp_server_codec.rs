@@ -5,8 +5,8 @@
 //!
 //! Maps `stratum_core::parsers_sv2::AnyMessage::JobDeclaration(...)`
 //! variants ↔ the owned `Input` / `JdpOutboundFrame` shapes from
-//! [`crate::jdp::client`]. Reuses [`crate::server_codec::CodecError`]
-//! for error handling.
+//! [`crate::jdp::client`]. Reuses [`crate::codec_common::CodecError`]
+//! and the shared wire primitives next to it.
 //!
 //! ## Scope
 //!
@@ -49,13 +49,12 @@ use stratum_core::parsers_sv2::{
     AnyMessage, CommonMessages, Extensions, ExtensionsNegotiation, JobDeclaration,
 };
 
+use crate::codec_common::{bytes_to_32, str0255, token_from_bytes, utf8_from_bytes, CodecError};
 use crate::extensions::RequestExtensions as LocalRequestExtensions;
 use crate::jdp::client::{
     AllocateMiningJobTokenInput, DeclareMiningJobInput, JdpOutboundFrame,
     ProvideMissingTransactionsSuccessInput, PushSolutionInput, SetupConnectionInput,
 };
-use crate::server_codec::CodecError;
-use crate::tokens::Token;
 
 // ── InboundJdpFrame ─────────────────────────────────────────────────
 
@@ -107,7 +106,7 @@ fn decode_job_declaration(m: JobDeclaration<'static>) -> Result<InboundJdpFrame,
         JobDeclaration::PushSolution(m) => {
             Ok(InboundJdpFrame::PushSolution(decode_push_solution(m)?))
         }
-        other => Err(CodecError::NotMiningRelated(jdp_variant_name(&other))),
+        other => Err(CodecError::NotForThisSubProtocol(jdp_variant_name(&other))),
     }
 }
 
@@ -232,7 +231,9 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsSuccess(
                 Sv2ReqExtSuccess {
                     request_id,
-                    supported_extensions: supported_extensions.try_into().map_err(conv)?,
+                    supported_extensions: supported_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -245,8 +246,12 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsError(
                 Sv2ReqExtError {
                     request_id,
-                    unsupported_extensions: unsupported_extensions.try_into().map_err(conv)?,
-                    required_extensions: required_extensions.try_into().map_err(conv)?,
+                    unsupported_extensions: unsupported_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
+                    required_extensions: required_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -259,8 +264,12 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
             JobDeclaration::AllocateMiningJobTokenSuccess(
                 Sv2AllocateMiningJobTokenSuccess {
                     request_id,
-                    mining_job_token: mining_job_token.0.to_vec().try_into().map_err(conv)?,
-                    coinbase_outputs: coinbase_outputs.try_into().map_err(conv)?,
+                    mining_job_token: mining_job_token
+                        .0
+                        .to_vec()
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
+                    coinbase_outputs: coinbase_outputs.try_into().map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -276,7 +285,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                         .0
                         .to_vec()
                         .try_into()
-                        .map_err(conv)?,
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -290,7 +299,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                 Sv2DeclareMiningJobError {
                     request_id,
                     error_code: str0255(error_code)?,
-                    error_details: error_details.try_into().map_err(conv)?,
+                    error_details: error_details.try_into().map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -310,7 +319,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                         .map(|x| x as u16)
                         .collect::<Vec<u16>>()
                         .try_into()
-                        .map_err(conv)?,
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -342,50 +351,12 @@ pub fn encode_jdp_outbound_ext_0x0003(frame: &JdpOutboundFrame) -> Option<(u8, V
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-fn utf8_from_bytes(b: &[u8]) -> Result<String, CodecError> {
-    std::str::from_utf8(b)
-        .map(|s| s.to_string())
-        .map_err(|e| CodecError::InvalidUtf8(e.to_string()))
-}
-
-fn bytes_to_32(b: &[u8]) -> Result<[u8; 32], CodecError> {
-    if b.len() != 32 {
-        return Err(CodecError::Conversion(format!(
-            "expected 32-byte field, got {}",
-            b.len()
-        )));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(b);
-    Ok(arr)
-}
-
-fn token_from_bytes(b: &[u8]) -> Result<Token, CodecError> {
-    if b.len() != crate::tokens::TOKEN_LEN {
-        return Err(CodecError::Conversion(format!(
-            "expected {}-byte token, got {}",
-            crate::tokens::TOKEN_LEN,
-            b.len()
-        )));
-    }
-    let mut arr = [0u8; crate::tokens::TOKEN_LEN];
-    arr.copy_from_slice(b);
-    Ok(Token(arr))
-}
-
-fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255<'static>, CodecError> {
-    s.try_into().map_err(conv)
-}
-
-fn conv<E: core::fmt::Debug>(e: E) -> CodecError {
-    CodecError::Conversion(format!("{e:?}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Named only here: the production path reaches `Token` through
+    // `codec_common::token_from_bytes` without spelling the type.
+    use crate::tokens::Token;
     use stratum_core::binary_sv2::{Seq064K, U256};
     use stratum_core::common_messages_sv2::Protocol;
 

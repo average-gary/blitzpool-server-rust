@@ -1523,9 +1523,7 @@ async fn write_outbound_frames(
                 any_message
                     .try_into()
                     .map_err(|e: stratum_core::parsers_sv2::ParserError| {
-                        WriteError::Codec(crate::server_codec::CodecError::Conversion(format!(
-                            "{e:?}"
-                        )))
+                        WriteError::Codec(crate::codec_common::CodecError::from_conv(e))
                     })?;
             writer
                 .write_frame(Frame::Sv2(sv2_frame))
@@ -1578,7 +1576,7 @@ async fn run_vardiff_check(
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
     #[error("codec: {0}")]
-    Codec(#[from] crate::server_codec::CodecError),
+    Codec(#[from] crate::codec_common::CodecError),
     #[error("noise io: {0:?}")]
     Io(crate::noise::NoiseError),
 }

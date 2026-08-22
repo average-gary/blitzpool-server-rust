@@ -63,6 +63,7 @@ use crate::bridge::{
     AllocatedTokenRef, AllocationKind, DistributionAcceptance, DistributionAccounting,
     DistributionScope, JdpDeclaredJobRegistry, PayoutDistributionEntry, RegisteredDeclaredJob,
 };
+use crate::codec_common::CodecError;
 use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
@@ -79,7 +80,6 @@ use crate::jdp_server_codec::{
     decode_jdp_inbound, encode_jdp_outbound, encode_jdp_outbound_ext_0x0003, InboundJdpFrame,
 };
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
-use crate::server_codec::CodecError;
 use crate::tokens::Token;
 
 // ── JDP-server hooks ────────────────────────────────────────────────
@@ -1892,7 +1892,7 @@ async fn write_jdp_outbound_frames(
             any_message
                 .try_into()
                 .map_err(|e: stratum_core::parsers_sv2::ParserError| {
-                    WriteError::Codec(CodecError::Conversion(format!("{e:?}")))
+                    WriteError::Codec(CodecError::from_conv(e))
                 })?;
         writer
             .write_frame(Frame::Sv2(sv2_frame))
