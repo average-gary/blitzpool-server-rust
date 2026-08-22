@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Production coinbase payout resolver — Phase 7.4d.
+//! Production coinbase payout resolver.
 //!
 //! Cross-cutting wiring that gives BOTH SV1 + SV2 the correct
 //! per-mode coinbase output distribution at every template-broadcast
@@ -374,8 +374,9 @@ impl ProductionPayoutResolver {
                          stands, a block found on it cannot be booked automatically"
                     );
                 }
-                // The §4 evaluation at this template's revenue — the
-                // same formula a JDC runs with its own template value.
+                // The ext 0x0003/Payout Computation evaluation at this
+                // template's revenue — the same formula a JDC runs with its
+                // own template value.
                 match result.distribution.payout_entries_at(reward_sats) {
                     Ok(entries) => (
                         ResolvedPayouts {
@@ -395,7 +396,7 @@ impl ProductionPayoutResolver {
                             %err,
                             miner_address,
                             reward_sats,
-                            "PPLNS §4 evaluation failed; serving NO JOB"
+                            "PPLNS ext 0x0003/Payout Computation evaluation failed; serving NO JOB"
                         );
                         (ResolvedPayouts::none(), false)
                     }
@@ -513,7 +514,8 @@ impl ProductionPayoutResolver {
                          coinbase stands, a block found on it cannot be booked automatically"
                     );
                 }
-                // The §4 evaluation at this template's revenue.
+                // The ext 0x0003/Payout Computation evaluation at this
+                // template's revenue.
                 match result.distribution.payout_entries_at(reward_sats) {
                     Ok(entries) => (
                         ResolvedPayouts {
@@ -534,7 +536,7 @@ impl ProductionPayoutResolver {
                             miner_address,
                             %group_id,
                             reward_sats,
-                            "Group-Solo §4 evaluation failed; serving NO JOB"
+                            "Group-Solo ext 0x0003/Payout Computation evaluation failed; serving NO JOB"
                         );
                         (ResolvedPayouts::none(), false)
                     }
@@ -601,12 +603,12 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
 
 // ─── Ext 0x0003 distribution source (push model) ──────────────────
 
-/// Production [`bp_stratum_v2::jdp_server::PayoutDistributionSource`]:
-/// builds the pool-wide PPLNS distribution for the publisher and
-/// tailored distributions (Solo or Group-Solo — see
-/// [`jdp_distribution_for`]) once an allocate reveals a session's
-/// identity, and allocates the §3.1 strictly-increasing
-/// `distribution_id` via Redis.
+/// Production [`bp_stratum_v2::jdp_server::PayoutDistributionSource`]: builds
+/// the pool-wide PPLNS distribution for the publisher and tailored
+/// distributions (Solo or Group-Solo — see [`jdp_distribution_for`]) once an
+/// allocate reveals a session's identity, and allocates the
+/// ext 0x0003/SetPayoutDistribution strictly-increasing `distribution_id` via
+/// Redis.
 pub(crate) struct ProductionDistributionSource {
     pub(crate) resolver: Arc<ProductionPayoutResolver>,
     /// What the pool's current template pays out. The same seam the other two
@@ -647,8 +649,9 @@ impl ProductionDistributionSource {
         let mut payouts = Vec::new();
         let mut dust_limits = Vec::new();
         for entry in d.published() {
-            // A published entry whose script fails to derive would shift
-            // every §4 position — fail the whole build instead.
+            // A published entry whose script fails to derive would shift every
+            // ext 0x0003/Payout Computation position — fail the whole build
+            // instead.
             let script = self.script_of(entry.address.as_str())?;
             payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
                 script_pubkey: script,
@@ -670,10 +673,10 @@ impl ProductionDistributionSource {
         })
     }
 
-    /// Sats-at-reference as weights, for Solo — the one mode JDP serves
-    /// that has its own exact allocator and settles by recompute rather
-    /// than from a snapshot. `entries` in §4 order WITHOUT a pool output;
-    /// the pool output script comes from `pool_addr`.
+    /// Sats-at-reference as weights, for Solo — the one mode JDP serves that
+    /// has its own exact allocator and settles by recompute rather than from a
+    /// snapshot. `entries` in ext 0x0003/Payout Computation order WITHOUT a
+    /// pool output; the pool output script comes from `pool_addr`.
     fn lower_exact_entries(
         &self,
         pool_addr: &str,
@@ -814,8 +817,9 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                         .map(|p| (p.address, p.sats))
                         .collect();
                 // The dev-fee output doubles as pool_payout when set;
-                // otherwise the configured pool fee address anchors
-                // `weight_P` (weight 1 ≈ dust dilution, §4 residual).
+                // otherwise the configured pool fee address anchors `weight_P`
+                // (weight 1 ≈ dust dilution, ext 0x0003/Payout Computation
+                // residual).
                 match self.resolver.solo_fee.dev_fee_address.clone() {
                     Some(dev) => {
                         let dev_weight = entries
@@ -868,8 +872,9 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
     async fn next_distribution_id(&self) -> Option<u64> {
         let mut conn = self.redis.clone()?;
         // Atomic floor-to-wallclock + INCR: strictly increasing across
-        // restarts, Redis wipes and concurrent fronts (§3.1). Two calls
-        // in the same millisecond still differ (the INCR).
+        // restarts, Redis wipes and concurrent fronts
+        // (ext 0x0003/SetPayoutDistribution). Two calls in the same
+        // millisecond still differ (the INCR).
         const LUA: &str = r#"
             local v = redis.call('GET', KEYS[1])
             if (not v) or (tonumber(v) < tonumber(ARGV[1])) then

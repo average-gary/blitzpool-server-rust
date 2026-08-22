@@ -16,15 +16,18 @@
 //! 1. **[`ProductionJdpAllocateResolver`]** — parses the JDC's
 //!    `user_identifier` as a BTC address and answers with the token's
 //!    coinbase outputs, which differ per payout regime:
-//!    - **ext 0x0003 negotiated** → empty, per spec §2; the pushed
-//!      payout distribution replaces them and §7.1 validates the job.
-//!    - **base protocol** → the single §6.4.3 designated payout output
+//!    - **ext 0x0003 negotiated** → empty, per ext 0x0003/Negotiation; the
+//!      pushed payout distribution replaces them and
+//!      ext 0x0003/Output Verification validates the job.
+//!    - **base protocol** → the single
+//!      SV2 JDP/AllocateMiningJobToken.Success designated payout output
 //!      at 0 sats, paying the miner itself, consensus-serialised through
 //!      [`bp_stratum_v2::jdp::dynamic_outputs::encode_coinbase_outputs`].
 //!      Only a Solo miner gets one, and two independent checks say so:
 //!      the miner's stream must be Solo (which is what the mining side
 //!      will serve a base custom job on), and its payout list must fit
-//!      the single output §6.4.3 designates — the JD-client writes the
+//!      the single output SV2 JDP/AllocateMiningJobToken.Success
+//!      designates — the JD-client writes the
 //!      whole template revenue into that one, so a shared list cannot be
 //!      expressed. Either failing refuses the allocate. The list is
 //!      resolved at the pool's CURRENT template revenue
@@ -58,7 +61,7 @@
 //!    both things that want it. First the **orphan-protection
 //!    redundancy** resubmit via [`BitcoinRpc::submit_block`]: the JDC
 //!    also submits via its own TDP connection, so the pool-side submit
-//!    is the pool's half of the redundancy §6.4.9 asks for ("JDS MUST
+//!    is the pool's half of the redundancy SV2 JDP/PushSolution asks for ("JDS MUST
 //!    attempt to reconstruct and propagate the block" — a MUST, not a
 //!    SHOULD). Then the payout ledger, which
 //!    books the block only once its header proves work against the
@@ -123,14 +126,14 @@ pub(crate) fn build_jdp_hooks(
     let propagator: Option<Arc<dyn BlockPropagator>> = if orphan_submitblock_enabled {
         info!(
             "jdp: pool-side block propagation ENABLED (submitblock RPC) — \
-             the pool's half of the §6.4.9 redundancy"
+             the pool's half of the SV2 JDP/PushSolution redundancy"
         );
         Some(Arc::new(bitcoin_rpc))
     } else {
         info!(
             "jdp: pool-side block propagation DISABLED \
              (`[sv2].jdp_orphan_submitblock = false`) — the JDC is the sole \
-             propagator, so the pool does not do what §6.4.9 asks of a JDS"
+             propagator, so the pool does not do what SV2 JDP/PushSolution asks of a JDS"
         );
         None
     };
@@ -167,25 +170,26 @@ pub(crate) fn build_jdp_hooks(
 
 /// Answers `AllocateMiningJobToken`. It asks the same
 /// [`crate::payout_resolver::ProductionPayoutResolver`] the SV1/SV2 mining
-/// paths ask — not for the amounts, which §6.4.3 leaves to the JDC, but
-/// because the payout list is the only thing that knows who this miner's
-/// block is owed to, including the guards (pending Blockparty routes, mode
-/// fallbacks) layered into it. Typed as the trait so the hook can be tested
-/// without engines or a database.
+/// paths ask — not for the amounts, which
+/// SV2 JDP/AllocateMiningJobToken.Success leaves to the JDC, but because the
+/// payout list is the only thing that knows who this miner's block is owed to,
+/// including the guards (pending Blockparty routes, mode fallbacks) layered
+/// into it. Typed as the trait so the hook can be tested without engines or a
+/// database.
 ///
 /// ## Why it needs the live template revenue
 ///
-/// §6.4.3 leaves the amounts to the JDC, so it is tempting to ask the
-/// resolver with any plausible number and throw the sats away. That reads
-/// the resolver as a query, and it is not one: for PPLNS it runs
-/// `build_distribution`, which writes the block's SETTLEMENT INPUTS to
+/// SV2 JDP/AllocateMiningJobToken.Success leaves the amounts to the JDC, so it
+/// is tempting to ask the resolver with any plausible number and throw the
+/// sats away. That reads the resolver as a query, and it is not one: for PPLNS
+/// it runs `build_distribution`, which writes the block's SETTLEMENT INPUTS to
 /// Redis under `pplns:snapshot:fp:<fingerprint>` — and the fingerprint is
 /// revenue-independent by design (`bp_pplns::weights`,
 /// `fingerprint_ignores_reference_revenue`). So the reward handed in here
-/// lands verbatim in `referenceRevenueSats` on the very key the mining
-/// path's build uses, and settlement re-projects every ledger promise from
-/// it (`StoredWeightSnapshot::extras_total`). A made-up number silently
-/// rewrites the projection base of a real coinbase.
+/// lands verbatim in `referenceRevenueSats` on the very key the mining path's
+/// build uses, and settlement re-projects every ledger promise from it
+/// (`StoredWeightSnapshot::extras_total`). A made-up number silently rewrites
+/// the projection base of a real coinbase.
 ///
 /// Hence [`ChainView::reference_revenue`], the same value the mining path
 /// and the distribution publisher resolve against. There is no estimate
@@ -212,9 +216,10 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             return AllocateOutcome::Ignored;
         };
 
-        // ext 0x0003 negotiated ⇒ the published payout distribution
-        // replaces the base §6.4.3 output semantics and §2 REQUIRES
-        // `coinbase_tx_outputs` to be empty — don't build outputs at all.
+        // ext 0x0003 negotiated ⇒ the published payout distribution replaces
+        // the base SV2 JDP/AllocateMiningJobToken.Success output semantics and
+        // ext 0x0003/Negotiation REQUIRES `coinbase_tx_outputs` to be empty —
+        // don't build outputs at all.
         if payout_distribution_negotiated {
             return AllocateOutcome::Granted(AllocateTokenContext {
                 miner_address,
@@ -224,14 +229,14 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
 
         // ── Base protocol from here on ──────────────────────────────
         //
-        // §6.4.3 gives a pool exactly ONE payout output to designate, and
-        // requires it to go out with a 0 amount: "JDS MUST reserve the
-        // first output with a locking script where the pool payout will
-        // go. While this output is initially set with a 0 amount of sats,
-        // this convention designates this locking script as the pool
-        // payout output." Any further output the JDS adds MUST also be
-        // 0-value; the JDC then allocates the template's revenue into the
-        // designated one.
+        // SV2 JDP/AllocateMiningJobToken.Success gives a pool exactly ONE
+        // payout output to designate, and requires it to go out with a 0
+        // amount: "JDS MUST reserve the first output with a locking script
+        // where the pool payout will go. While this output is initially set
+        // with a 0 amount of sats, this convention designates this locking
+        // script as the pool payout output." Any further output the JDS adds
+        // MUST also be 0-value; the JDC then allocates the template's revenue
+        // into the designated one.
         //
         // TWO questions, in this order, and they are not the same one.
         //
@@ -249,15 +254,17 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         //   the pool output unconditionally, so such a list never holds
         //   exactly one entry that is the miner) — but Blockparty falls back
         //   to `solo_payouts` on four error paths, and with no dev fee
-        //   configured that is exactly the shape §6.4.3 can carry, on a
-        //   stream that will refuse it.
+        //   configured that is exactly the shape
+        //   SV2 JDP/AllocateMiningJobToken.Success can carry, on a stream that
+        //   will refuse it.
         // - The call below is not free and not a query: for PPLNS it runs
         //   `build_distribution`, which WRITES the settlement snapshot (see
         //   the struct doc). A refusal closes the connection and an SRI
         //   jd-client reconnects, so an allocate that was never going to be
         //   servable would repeat that write once per reconnect, forever —
-        //   the §6.4.2 rate limit cannot throttle it, because it lives in
-        //   `TokenStore::allocate`, which such an allocate never reaches.
+        //   the SV2 JDP/AllocateMiningJobToken rate limit cannot throttle it,
+        //   because it lives in `TokenStore::allocate`, which such an allocate
+        //   never reaches.
         //
         // ⚠️ A FIRST line, and it cannot be more than that — because the mode
         // is not always known here. The gate learns an address from the PORT a
@@ -311,7 +318,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             warn!(
                 user_identifier,
                 "JDP allocate: base protocol is Solo-only (a shared window needs every payout \
-                 slot pinned, and §6.4.3 expresses one output) — refusing the token rather than \
+                 slot pinned, and SV2 JDP/AllocateMiningJobToken.Success expresses one output) — refusing the token rather than \
                  issuing one every SetCustomMiningJob would be refused with; use ext 0x0003"
             );
             return AllocateOutcome::Refused {
@@ -352,22 +359,23 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         .await;
 
         let designated = match payouts.entries.as_slice() {
-            // The one shape §6.4.3 can carry: a single payee who IS this
-            // miner. The JD-client writes the whole template revenue into
-            // the designated output, so the pool's only enforcement is
-            // "some sats went to that script" — which is enough precisely
-            // because shorting it shorts the miner itself.
+            // The one shape SV2 JDP/AllocateMiningJobToken.Success can carry:
+            // a single payee who IS this miner. The JD-client writes the whole
+            // template revenue into the designated output, so the pool's only
+            // enforcement is "some sats went to that script" — which is enough
+            // precisely because shorting it shorts the miner itself.
             [only] if only.address == miner_address.as_str() => only.address.clone(),
             // A single payee who is SOMEBODY ELSE. The resolver routing the
             // block away from the miner is a guard — today the pending
             // Blockparty route, which sends 100 % to the pool fee address so
-            // an admin cannot pocket a block before the members confirm
-            // their splits — and the base protocol cannot enforce it. The
-            // pool would designate the fee script, and a JDC honours that
-            // with one satoshi: `pays_designated_output` can only ask
-            // whether the script was paid, never how much, because §6.4.3
-            // answers the shortfall economically and names no threshold.
-            // Designating it anyway is the guard in name only.
+            // an admin cannot pocket a block before the members confirm their
+            // splits — and the base protocol cannot enforce it. The pool would
+            // designate the fee script, and a JDC honours that with one
+            // satoshi: `pays_designated_output` can only ask whether the
+            // script was paid, never how much, because
+            // SV2 JDP/AllocateMiningJobToken.Success answers the shortfall
+            // economically and names no threshold. Designating it anyway is
+            // the guard in name only.
             [only] => {
                 warn!(
                     user_identifier,
@@ -391,7 +399,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
                     user_identifier,
                     payees = entries.len(),
                     "JDP allocate: base-protocol JDC whose payout needs more than one output — \
-                     refusing the token (§6.4.3 designates exactly one; use ext 0x0003)"
+                     refusing the token (SV2 JDP/AllocateMiningJobToken.Success designates exactly one; use ext 0x0003)"
                 );
                 return AllocateOutcome::Refused {
                     reason: "base-protocol JDP cannot express this miner's payout split",
@@ -408,7 +416,8 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
                 reason: "payout address unusable",
             };
         };
-        // 0 sats per §6.4.3 — the amount is the JDC's to fill in.
+        // 0 sats per SV2 JDP/AllocateMiningJobToken.Success — the amount is
+        // the JDC's to fill in.
         let outputs = [DynamicOutput {
             address: designated,
             sats: Sats(0),
@@ -819,10 +828,11 @@ pub(crate) struct ProductionJdpBlockSink {
     /// Address-display network for decomposing the block's coinbase into
     /// per-address payments (the weight-model settlement input).
     network: BitcoinNetwork,
-    /// ext 0x0003 §10 settlement hook, filled in by `jdp::spawn` once the
-    /// JDP server exists (the sink is built first). A booked block settles
-    /// the distribution its coinbase paid — every published distribution
-    /// is then invalidated and a fresh one force-published.
+    /// ext 0x0003/Implementation Notes settlement hook, filled in by
+    /// `jdp::spawn` once the JDP server exists (the sink is built first). A
+    /// booked block settles the distribution its coinbase paid — every
+    /// published distribution is then invalidated and a fresh one
+    /// force-published.
     settle: crate::settlement::SettlementSignal,
 }
 
@@ -935,7 +945,7 @@ impl ProductionJdpBlockSink {
             // 1. The client claimed a block it did not find. That is what the
             //    check exists for.
             // 2. WE reassembled the wrong block. `PushSolution` carries no
-            //    token (§6.4.9), so `DeclaredJobStore::match_for_solution`
+            //    token (SV2 JDP/PushSolution), so `DeclaredJobStore::match_for_solution`
             //    picks the most recently declared job on this tip — and a JDC
             //    re-declares per template, so several share a tip. If the
             //    solution belongs to an older one, the merkle root we compute
@@ -968,11 +978,12 @@ impl ProductionJdpBlockSink {
             );
             return;
         }
-        // §10 for the one backing whose settle nobody else will fire. A
-        // `Bookable` candidate is deliberately NOT settled here: its booking
-        // is confirmation-gated and the watcher settles after the apply,
-        // which is the only moment the forced republish reads a ledger that
-        // has actually moved. See this method's doc.
+        // ext 0x0003/Implementation Notes for the one backing whose settle
+        // nobody else will fire. A `Bookable` candidate is deliberately NOT
+        // settled here: its booking is confirmation-gated and the watcher
+        // settles after the apply, which is the only moment the forced
+        // republish reads a ledger that has actually moved. See this method's
+        // doc.
         if backing.settles_here() {
             self.settle.settle().await;
         }
@@ -1086,8 +1097,9 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
         // deployment with the resubmit off and no ledger wired is the JDC
         // propagating alone, and reassembly would be work for a log line.
         //
-        // The §10 settle counts as "wants it": it needs the assembled block
-        // to check the solution is real before invalidating anything.
+        // The ext 0x0003/Implementation Notes settle counts as "wants it": it
+        // needs the assembled block to check the solution is real before
+        // invalidating anything.
         if self.propagator.is_none()
             && to_book.is_none()
             && !backing.paid_a_published_distribution()
@@ -1163,9 +1175,9 @@ fn declaration_session_id(token: &Token) -> String {
 ///
 /// The distinction it draws is the one that decides whether anything is
 /// booked: a block whose declared coinbase was validated positionally against
-/// a published payout distribution (ext 0x0003 §7.1) can be settled from that
-/// distribution's snapshot, while one without that proof must not be booked
-/// from anything.
+/// a published payout distribution (ext 0x0003/Output Verification) can be
+/// settled from that distribution's snapshot, while one without that proof
+/// must not be booked from anything.
 fn log_booking_status(miner_address: &AddressId, backing: CandidateBacking) {
     match backing {
         CandidateBacking::Bookable(b) => info!(
@@ -1193,7 +1205,8 @@ fn log_booking_status(miner_address: &AddressId, backing: CandidateBacking) {
     }
 }
 
-// ─── 6. ProductionJobValidator (SV2 §6.1, node-side validation) ───────
+// ─── 6. ProductionJobValidator (SV2 JDP/Job Declarator Server, node-side
+// validation) ───────
 //
 // SRI's own JDS library owns the hard part: a dedicated thread running the
 // !Send Cap'n-Proto client against bitcoin-core's `job_declaration_protocol`
@@ -1301,7 +1314,7 @@ impl ProductionJobValidator {
             Ok(engine) => {
                 info!(
                     socket = %socket_path.display(),
-                    "jdp: declared jobs are validated against bitcoin-core (SV2 §6.1)"
+                    "jdp: declared jobs are validated against bitcoin-core (SV2 JDP/Job Declarator Server)"
                 );
                 Ok(Some(Arc::new(Self {
                     engine: Arc::new(engine),
@@ -1461,9 +1474,9 @@ mod session_id_fits_the_column {
 mod jdp_validation_regtest {
     use super::*;
 
-    /// The §6.1 validator must reach a REAL bitcoin-core over its
-    /// job-declaration IPC. Everything this asserts is a deployment fact that
-    /// unit tests cannot see: that the socket really is
+    /// The SV2 JDP/Job Declarator Server validator must reach a REAL
+    /// bitcoin-core over its job-declaration IPC. Everything this asserts is a
+    /// deployment fact that unit tests cannot see: that the socket really is
     /// `<data_dir>/regtest/node.sock` (upstream derives it, we only hand over
     /// the data dir), that `BitcoinCoreVersion::V31X` matches the node we run,
     /// and that our network mapping lands on the right subdirectory.
@@ -1514,8 +1527,9 @@ mod jdp_validation_regtest {
 
 #[cfg(test)]
 mod base_allocate_tests {
-    //! The §6.4.3 base-protocol allocate: which miners get a token at
-    //! all, and what the pool designates when they do.
+    //! The SV2 JDP/AllocateMiningJobToken.Success base-protocol allocate:
+    //! which miners get a token at all, and what the pool designates when they
+    //! do.
     use super::*;
 
     const MINER: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
@@ -1645,11 +1659,15 @@ mod base_allocate_tests {
     fn designated_script(ctx: &AllocateTokenContext) -> bitcoin::ScriptBuf {
         let outputs: Vec<bitcoin::TxOut> =
             bitcoin::consensus::deserialize(&ctx.coinbase_outputs).expect("outputs must decode");
-        assert_eq!(outputs.len(), 1, "§6.4.3 designates exactly ONE output");
+        assert_eq!(
+            outputs.len(),
+            1,
+            "SV2 JDP/AllocateMiningJobToken.Success designates exactly ONE output"
+        );
         assert_eq!(
             outputs[0].value,
             bitcoin::Amount::ZERO,
-            "§6.4.3: the designated output goes out with a 0 amount — a conformant \
+            "SV2 JDP/AllocateMiningJobToken.Success: the designated output goes out with a 0 amount — a conformant \
              JD-client overwrites it with its own template revenue, and any OTHER \
              valued output would then push the coinbase past what the block pays"
         );
@@ -1682,11 +1700,11 @@ mod base_allocate_tests {
     /// list would hand the admin its own address — which is why the allocate
     /// goes through the resolver at all, and this test is what pins that.
     ///
-    /// Designating the fee script is NOT enough, though, and that was the
-    /// bug: §6.4.3 lets the pool check only that the script was paid, never
-    /// how much (it names no threshold and answers a shortfall
-    /// economically), so the admin's JDC satisfies it with one satoshi and
-    /// keeps the block. The guard survives only by refusing.
+    /// Designating the fee script is NOT enough, though, and that was the bug:
+    /// SV2 JDP/AllocateMiningJobToken.Success lets the pool check only that
+    /// the script was paid, never how much (it names no threshold and answers
+    /// a shortfall economically), so the admin's JDC satisfies it with one
+    /// satoshi and keeps the block. The guard survives only by refusing.
     #[tokio::test]
     async fn a_block_routed_away_from_the_miner_is_refused_on_the_base_protocol() {
         let outcome = pays(&[(OTHER, 312_500_000)])
@@ -1699,11 +1717,12 @@ mod base_allocate_tests {
         );
     }
 
-    /// The counterpart, so the rule above is a routing test and not "the
-    /// base protocol is off": the very same shape — one payee, whole block —
-    /// is served when that payee IS the miner. This is the case §6.4.3's
-    /// pay-something check actually covers, because shorting the designated
-    /// output then shorts the miner itself.
+    /// The counterpart, so the rule above is a routing test and not "the base
+    /// protocol is off": the very same shape — one payee, whole block — is
+    /// served when that payee IS the miner. This is the case
+    /// SV2 JDP/AllocateMiningJobToken.Success's pay-something check actually
+    /// covers, because shorting the designated output then shorts the miner
+    /// itself.
     #[tokio::test]
     async fn the_same_single_payee_shape_is_served_when_it_is_the_miner() {
         let ctx = granted(
@@ -1717,9 +1736,10 @@ mod base_allocate_tests {
         );
     }
 
-    /// ext 0x0003 is the way out: it expresses the routed payout the base
-    /// path has to refuse, and §7.1 recomputes the coinbase against it — so
-    /// the admin's own JDC is held to paying the fee address in full.
+    /// ext 0x0003 is the way out: it expresses the routed payout the base path
+    /// has to refuse, and ext 0x0003/Output Verification recomputes the
+    /// coinbase against it — so the admin's own JDC is held to paying the fee
+    /// address in full.
     #[tokio::test]
     async fn a_negotiated_session_still_serves_a_routed_payout() {
         let ctx = granted(
@@ -1730,11 +1750,12 @@ mod base_allocate_tests {
         assert!(ctx.coinbase_outputs.is_empty());
     }
 
-    /// A split needs more than one valued output, which §6.4.3 cannot
-    /// express — refuse rather than serve a token whose block silently pays
-    /// only the first payee. This is what makes a configured solo fee take
-    /// effect instead of evaporating, and it covers every shared-payout
-    /// mode (PPLNS, Group-Solo) for the same reason.
+    /// A split needs more than one valued output, which
+    /// SV2 JDP/AllocateMiningJobToken.Success cannot express — refuse rather
+    /// than serve a token whose block silently pays only the first payee. This
+    /// is what makes a configured solo fee take effect instead of evaporating,
+    /// and it covers every shared-payout mode (PPLNS, Group-Solo) for the same
+    /// reason.
     #[tokio::test]
     async fn a_split_payout_is_refused_rather_than_silently_dropped() {
         let outcome = pays(&[(OTHER, 3_125_000), (MINER, 309_375_000)])
@@ -1757,8 +1778,9 @@ mod base_allocate_tests {
     }
 
     /// With ext 0x0003 negotiated the base convention does not apply at all:
-    /// §2 requires empty outputs, and the pushed distribution carries the
-    /// payouts — including the splits the base path has to refuse.
+    /// ext 0x0003/Negotiation requires empty outputs, and the pushed
+    /// distribution carries the payouts — including the splits the base path
+    /// has to refuse.
     #[tokio::test]
     async fn a_negotiated_session_gets_no_outputs_and_is_served_on_any_split() {
         let ctx = granted(
@@ -1768,7 +1790,7 @@ mod base_allocate_tests {
         );
         assert!(
             ctx.coinbase_outputs.is_empty(),
-            "§2 requires empty coinbase_tx_outputs when 0x0003 is negotiated"
+            "ext 0x0003/Negotiation requires empty coinbase_tx_outputs when 0x0003 is negotiated"
         );
     }
 
@@ -1789,13 +1811,14 @@ mod base_allocate_tests {
     /// MONEY: the payout list must be resolved at the pool's LIVE template
     /// revenue, not at a stand-in.
     ///
-    /// It reads like a number nobody uses — §6.4.3 leaves the amounts to
-    /// the JDC and the sats here are thrown away. But `resolve_payouts` is
-    /// not a query: for PPLNS it runs `build_distribution`, which writes
-    /// this very number into `referenceRevenueSats` of the settlement
-    /// snapshot at `pplns:snapshot:fp:<fingerprint>` — and the fingerprint
-    /// is revenue-independent (`fingerprint_ignores_reference_revenue`), so
-    /// it is the SAME key the mining path's build writes. Settlement then
+    /// It reads like a number nobody uses —
+    /// SV2 JDP/AllocateMiningJobToken.Success leaves the amounts to the JDC
+    /// and the sats here are thrown away. But `resolve_payouts` is not a
+    /// query: for PPLNS it runs `build_distribution`, which writes this very
+    /// number into `referenceRevenueSats` of the settlement snapshot at
+    /// `pplns:snapshot:fp:<fingerprint>` — and the fingerprint is
+    /// revenue-independent (`fingerprint_ignores_reference_revenue`), so it is
+    /// the SAME key the mining path's build writes. Settlement then
     /// re-projects every ledger promise from it
     /// (`StoredWeightSnapshot::extras_total`), which is what makes a
     /// fabricated revenue here a wrong `claim − paid` on a real block.
@@ -1845,10 +1868,10 @@ mod base_allocate_tests {
         );
     }
 
-    /// A negotiated session needs no revenue: §2 empties the outputs, so
-    /// nothing is resolved and nothing is written. It must therefore still
-    /// be served before the first template — the refusal above belongs to
-    /// the base path alone.
+    /// A negotiated session needs no revenue: ext 0x0003/Negotiation empties
+    /// the outputs, so nothing is resolved and nothing is written. It must
+    /// therefore still be served before the first template — the refusal above
+    /// belongs to the base path alone.
     #[tokio::test]
     async fn a_negotiated_session_is_served_before_the_first_template() {
         let (resolver, payouts) = resolver_with(&[(MINER, 1)], None);
@@ -1869,11 +1892,12 @@ mod base_allocate_tests {
     /// jd-client, so a token issued off Solo is a token every job built on it
     /// dies with.
     ///
-    /// The payout list is deliberately the ONE shape §6.4.3 can carry: a
-    /// single payee who is the miner. That is what a Blockparty group falls
-    /// back to on its four `solo_payouts` error paths when no dev fee is
-    /// configured — i.e. the list agrees while the stream does not, which is
-    /// exactly why the list cannot answer this question.
+    /// The payout list is deliberately the ONE shape
+    /// SV2 JDP/AllocateMiningJobToken.Success can carry: a single payee who is
+    /// the miner. That is what a Blockparty group falls back to on its four
+    /// `solo_payouts` error paths when no dev fee is configured — i.e. the
+    /// list agrees while the stream does not, which is exactly why the list
+    /// cannot answer this question.
     #[tokio::test]
     async fn a_shared_stream_is_refused_a_base_protocol_token() {
         for stream in [
@@ -1894,8 +1918,8 @@ mod base_allocate_tests {
             // `resolve_payouts` WRITES the PPLNS settlement snapshot, and a
             // refusal closes the connection — an SRI jd-client reconnects, so
             // a resolve here would repeat that write per reconnect with no
-            // rate limit in reach (§6.4.2 lives in `TokenStore::allocate`,
-            // which a refused allocate never reaches).
+            // rate limit in reach (SV2 JDP/AllocateMiningJobToken lives in
+            // `TokenStore::allocate`, which a refused allocate never reaches).
             assert!(
                 payouts.asked_at.lock().unwrap().is_empty(),
                 "{stream:?}: a refused allocate must not resolve — the call itself is the write"
@@ -1937,7 +1961,7 @@ mod base_allocate_tests {
         assert_eq!(
             designated_script(&ctx),
             bp_mining_job::address_to_script(BitcoinNetwork::Regtest, MINER).unwrap(),
-            "the designated output is the miner's own — §6.4.3 has one to give"
+            "the designated output is the miner's own — SV2 JDP/AllocateMiningJobToken.Success has one to give"
         );
         assert_eq!(
             payouts.asked_at.lock().unwrap().as_slice(),
@@ -1973,10 +1997,11 @@ mod base_allocate_tests {
     }
 
     /// The stream gate must not swallow the payout-list guard it now sits in
-    /// front of. A Blockparty admin whose party is still DRAFT resolves to
-    /// the Solo *stream*, so it passes the gate — and `resolve_payouts` then
-    /// routes 100 % of the block to the pool fee address, which §6.4.3 cannot
-    /// enforce. Both checks have to fire, in that order.
+    /// front of. A Blockparty admin whose party is still DRAFT resolves to the
+    /// Solo *stream*, so it passes the gate — and `resolve_payouts` then
+    /// routes 100 % of the block to the pool fee address, which
+    /// SV2 JDP/AllocateMiningJobToken.Success cannot enforce. Both checks have
+    /// to fire, in that order.
     #[tokio::test]
     async fn a_solo_stream_routed_away_from_the_miner_is_still_refused() {
         let (resolver, payouts) = resolver_on(
@@ -1999,9 +2024,10 @@ mod base_allocate_tests {
         );
     }
 
-    /// A negotiated session is unaffected: §2 empties the outputs, the pool's
-    /// published distribution carries the payouts, and every stream is served
-    /// — the Solo-only rule belongs to the base path alone.
+    /// A negotiated session is unaffected: ext 0x0003/Negotiation empties the
+    /// outputs, the pool's published distribution carries the payouts, and
+    /// every stream is served — the Solo-only rule belongs to the base path
+    /// alone.
     #[tokio::test]
     async fn a_negotiated_session_is_served_on_a_shared_stream() {
         let (resolver, payouts) = resolver_on(
@@ -2176,9 +2202,10 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     /// which does not fail loudly: the real marker is then read as an input
     /// count of ZERO, rust-bitcoin decodes a 21-byte transaction with no
     /// inputs and one output, and the other 213 bytes are dropped. The
-    /// assembled block went out at 102 bytes and bitcoin-core answered
-    /// `Block decode failed` — 62 of 62 submits against the reference client.
-    /// The pool's whole half of the §6.4.9 anti-orphan redundancy was dead.
+    /// assembled block went out at 102 bytes and bitcoin-core answered `Block
+    /// decode failed` — 62 of 62 submits against the reference client. The
+    /// pool's whole half of the SV2 JDP/PushSolution anti-orphan redundancy
+    /// was dead.
     ///
     /// The assertions pin the transaction, not just "something parsed": one
     /// input, two outputs, and a byte-identical round trip. A prefix-decode
@@ -2571,7 +2598,8 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         }
     }
 
-    // ── §10 settle: separate from the booking, on purpose ──────────
+    // ── ext 0x0003/Implementation Notes settle: separate from the booking, on
+    // purpose ──────────
     //
     // Settling means "these published weights are spent". Booking means
     // "write the ledger deltas". The first is owed the moment a proven block

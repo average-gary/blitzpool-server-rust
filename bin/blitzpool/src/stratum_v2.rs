@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV2 mining-server composition — Phase 7.4c.
+//! SV2 mining-server composition.
 //!
 //! Builds one [`StratumV2MiningServer`] per port (mirrors the SV1
 //! per-port-server topology in [`crate::stratum_v1`]). The shared
@@ -9,11 +9,11 @@
 //! SV2 server clone so `SetCustomMiningJob` routing works across
 //! ports.
 //!
-//! ## Scope of Phase 7.4c → 7.4d
+//! ## What the caller supplies
 //!
 //! - [`PayoutResolver`] is supplied by the caller from
-//!   [`crate::payout_resolver::ProductionPayoutResolver`] (Phase
-//!   7.4d). Pre-7.4d this module shipped a solo-only stub; the
+//!   [`crate::payout_resolver::ProductionPayoutResolver`]. This module
+//!   once shipped a solo-only stub instead; the
 //!   production resolver now consults the mode-gate + PPLNS /
 //!   Group-Solo engine round state to assemble the real per-mode
 //!   coinbase distribution.
@@ -199,7 +199,7 @@ pub(crate) fn build_per_port_servers(
     let sv1_port_configs = stratum_v1::build_port_configs(cfg);
     let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
     let mode_gate = engines.mode_gate.clone();
-    // Phase 7.4d + 7.7: TDP submit + (engine ledger + dispatcher notification)
+    // TDP submit + (engine ledger + dispatcher notification)
     // fan-out. The SV2 ShareAccept now carries the per-job pinned
     // `coinbase_tx_value_remaining`, so the engine ledger-write fires for
     // SV2-found blocks just like SV1; the dispatcher notification fires too.
@@ -229,7 +229,7 @@ pub(crate) fn build_per_port_servers(
     }
     let block_sink: Arc<dyn Sv2BlockSink> = sink.into_sv2_arc();
 
-    // Phase 7.7: device-status sink. Forwards ChannelOpened / ChannelClosed.
+    // Device-status sink. Forwards ChannelOpened / ChannelClosed.
     // With an in-process dispatcher (a front co-located with the `notify` role)
     // it fires directly; without one the front publishes to the `device:status`
     // stream so the Satellite fans it out — never a silent drop. (Stratum only

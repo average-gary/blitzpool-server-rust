@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `BlockSubmissionSink` implementations — Phase 7.4a (SV1 path).
+//! `BlockSubmissionSink` implementations.
 //!
 //! When a Stratum share's submission difficulty meets / exceeds the
 //! network difficulty derived from the template's `n_bits`, the
@@ -30,7 +30,7 @@
 //! by the time this hook fires; failing to forward to core only
 //! means we lose the block reward, not the share count).
 //!
-//! ## SV2 wiring (Phase 7.4c)
+//! ## SV2 wiring
 //!
 //! SV2's `ShareAccept` doesn't yet carry the `MiningJob` snapshot +
 //! extranonce bytes the same way SV1 does (the Standard-channel job
@@ -136,7 +136,7 @@ pub(crate) struct BlockFoundEvent {
 }
 
 /// `BlockSubmissionSink` for both SV1 + SV2. Forwards every
-/// block-candidate share to bitcoin-core via TDP **and** (Phase 7.7)
+/// block-candidate share to bitcoin-core via TDP **and**
 /// fans the event out to the per-mode engine ledger
 /// (`PplnsEngine::on_block_found` / `GroupSoloEngine::on_block_found`)
 /// plus the [`NotificationDispatcher`] for subscriber notifications.
@@ -214,7 +214,8 @@ pub(crate) struct BlockFoundApplier {
     /// reaches `confirmation_depth`. When absent (or no block hash), the
     /// PPLNS arm falls back to the immediate `on_block_found` apply.
     redis: Option<ConnectionManager>,
-    /// ext 0x0003 §10 settlement fan-out — see [`crate::settlement`].
+    /// ext 0x0003/Implementation Notes settlement fan-out — see
+    /// [`crate::settlement`].
     ///
     /// A settlement from ANY source invalidates every published payout
     /// distribution: the published weights encode the pre-settlement
@@ -240,9 +241,9 @@ impl TdpBlockSubmissionSink {
         }
     }
 
-    /// Wire the ext 0x0003 §10 settlement hook onto this sink's applier,
-    /// so a block booked through the Stratum path invalidates the
-    /// published payout distributions exactly like a JDP-declared one.
+    /// Wire the ext 0x0003/Implementation Notes settlement hook onto this
+    /// sink's applier, so a block booked through the Stratum path invalidates
+    /// the published payout distributions exactly like a JDP-declared one.
     pub(crate) fn with_settle_handle(
         mut self,
         signal: crate::settlement::SettlementSignal,
@@ -322,7 +323,7 @@ impl TdpBlockSubmissionSink {
         self
     }
 
-    /// Attach the Phase 7.7 fan-out dependencies. Returns `Self` so
+    /// Attach the fan-out dependencies. Returns `Self` so
     /// the caller can chain at construction. Passing `None` for the
     /// dispatcher (no transport adapters wired) keeps the engine
     /// ledger-write live but skips notifications; passing `None` for
@@ -483,7 +484,7 @@ impl TdpBlockSubmissionSink {
         let Some(mode_gate) = self.mode_gate.as_ref() else {
             info!(
                 address = %address,
-                "block-found: SKIPPED (no mode-gate wired — Phase 7.4 transitional path)"
+                "block-found: SKIPPED (no mode-gate wired)"
             );
             return false;
         };
@@ -745,9 +746,10 @@ impl BlockFoundApplier {
         }
     }
 
-    /// §10: a ledger settlement just happened. Invalidate every
-    /// published payout distribution and force a fresh publish, so no
-    /// JDC keeps declaring against weights this block already settled.
+    /// ext 0x0003/Implementation Notes: a ledger settlement just happened.
+    /// Invalidate every published payout distribution and force a fresh
+    /// publish, so no JDC keeps declaring against weights this block already
+    /// settled.
     async fn settle_distributions(&self) {
         if let Some(signal) = self.settle.as_ref() {
             signal.settle().await;
@@ -1317,10 +1319,10 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
         //
         // Who records it is `ExtendedJob::jdp_claims_the_block`, and only
         // that: the JDP `PushSolution` path matches a solution against a
-        // DECLARED job, so it never sees a Coinbase-only one (§6.3.1 — that
-        // mode never declares), whether or not a distribution backs it.
-        // Deciding on the distribution instead left every Coinbase-only
-        // 0x0003 block unrecorded AND unsettled.
+        // DECLARED job, so it never sees a Coinbase-only one
+        // (SV2 JDP/Coinbase-only Mode — that mode never declares), whether or
+        // not a distribution backs it. Deciding on the distribution instead
+        // left every Coinbase-only 0x0003 block unrecorded AND unsettled.
         //
         // Recording a claimed block here too would write the
         // `blocks_entity` row twice — the insert has no `ON CONFLICT` — and
@@ -1485,9 +1487,9 @@ mod tests {
     use bp_stratum_v1::ActiveSV1Template;
     use bp_template_distribution::TdpConfig;
 
-    /// ext 0x0003 §10: a block booked through a Stratum sink's IMMEDIATE
-    /// (ungated) apply must invalidate every published payout distribution,
-    /// exactly like a JDP-declared one does.
+    /// ext 0x0003/Implementation Notes: a block booked through a Stratum
+    /// sink's IMMEDIATE (ungated) apply must invalidate every published payout
+    /// distribution, exactly like a JDP-declared one does.
     ///
     /// This was wired for the confirmation-gated path and the JDP sink only.
     /// The published weights encode the pre-settlement balances, so a 0x0003
