@@ -46,10 +46,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bp_common::AddressId;
+use bp_vardiff::{Clock, SystemClock};
 use stratum_core::codec_sv2::StandardSv2Frame;
 use stratum_core::framing_sv2::framing::Frame;
 use stratum_core::job_declaration_sv2::MESSAGE_TYPE_DECLARE_MINING_JOB;
@@ -622,7 +623,7 @@ impl StratumV2JdpServer {
                     built,
                     DistributionAccounting::PoolWide,
                     None,
-                    now_ms(),
+                    SystemClock.now_ms(),
                 );
                 inner
                     .bridge
@@ -1025,7 +1026,7 @@ async fn republish_tailored(
         built,
         accounting.clone(),
         Some(session_id),
-        now_ms(),
+        SystemClock.now_ms(),
     );
     let wire = wire_from_entry(&entry);
     {
@@ -1176,8 +1177,8 @@ async fn run_jdp_connection(
                     )
                     .await;
                     served = next;
-                    last_rebuild_ms = now_ms();
-                    awaiting.observe(&served, &session_id_hex, &miner, now_ms());
+                    last_rebuild_ms = SystemClock.now_ms();
+                    awaiting.observe(&served, &session_id_hex, &miner, SystemClock.now_ms());
                     continue;
                 }
                 let current = bridge
@@ -1298,7 +1299,7 @@ async fn run_jdp_connection(
                     &bridge,
                     session_id,
                     &remote_addr,
-                    now_ms(),
+                    SystemClock.now_ms(),
                 )
                 .await;
                 // ext 0x0003/SetPayoutDistribution first-message guarantee:
@@ -1414,8 +1415,8 @@ async fn run_jdp_connection(
                         )
                         .await;
                         served = next;
-                        last_rebuild_ms = now_ms();
-                        awaiting.observe(&served, &session_id_hex, miner_address, now_ms());
+                        last_rebuild_ms = SystemClock.now_ms();
+                        awaiting.observe(&served, &session_id_hex, miner_address, SystemClock.now_ms());
                     }
 
                     // Re-decide on the session's OWN frames, not only on the
@@ -1443,7 +1444,7 @@ async fn run_jdp_connection(
                     // the mode read before the dispatch.
                     if let (Some(miner), true) = (
                         &identity,
-                        rebuild_due(&served, current_mode, now_ms(), last_rebuild_ms),
+                        rebuild_due(&served, current_mode, SystemClock.now_ms(), last_rebuild_ms),
                     ) {
                         let miner = miner.clone();
                         let was = served.clone();
@@ -1487,8 +1488,8 @@ async fn run_jdp_connection(
                                  nothing rather than a coinbase paying the wrong miners"
                             );
                         }
-                        last_rebuild_ms = now_ms();
-                        awaiting.observe(&served, &session_id_hex, &miner, now_ms());
+                        last_rebuild_ms = SystemClock.now_ms();
+                        awaiting.observe(&served, &session_id_hex, &miner, SystemClock.now_ms());
                     }
                 }
                 fan_out_events(outcome.events, &hooks).await;
@@ -2031,7 +2032,7 @@ pub(crate) fn register_bridge_entries(
                             jdp_session_id,
                             expires_at_ms: *expires_at_ms,
                         },
-                        now_ms(),
+                        SystemClock.now_ms(),
                     );
                 }
                 AllocationDisposition::JudgedByTheDistribution => {
@@ -2043,7 +2044,7 @@ pub(crate) fn register_bridge_entries(
                             jdp_session_id,
                             expires_at_ms: *expires_at_ms,
                         },
-                        now_ms(),
+                        SystemClock.now_ms(),
                     );
                 }
                 AllocationDisposition::LeftToTheDeclaration => {}
@@ -2063,13 +2064,6 @@ pub(crate) fn register_bridge_entries(
             | JdpSessionEvent::Disconnect { .. } => {}
         }
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

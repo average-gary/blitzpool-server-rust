@@ -79,13 +79,13 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bitcoin::Network;
 use bp_common::{AddressId, StreamKind};
 use bp_mining_job::{MiningJobCache, MiningJobError};
 use bp_template_distribution::TemplateUpdate;
-use bp_vardiff::SystemClock;
+use bp_vardiff::{Clock, SystemClock};
 use stratum_core::binary_sv2::GetSize;
 use stratum_core::codec_sv2::StandardSv2Frame;
 use stratum_core::framing_sv2::framing::Frame;
@@ -763,7 +763,7 @@ async fn run_mining_connection(
                     inbound,
                     &extranonce_allocator,
                     &bridge,
-                    now_ms(),
+                    SystemClock.now_ms(),
                 );
                 // SV2 Overview/SetupConnection.Error: `SetupConnection.Error`
                 // is sent "prior to closing the connection". Read the request
@@ -938,7 +938,7 @@ async fn run_mining_connection(
                                 &mut state,
                                 &synthetic_broadcast,
                                 &mining_job_inputs,
-                                now_ms(),
+                                SystemClock.now_ms(),
                                 Some(channel_id),
                             );
                             if let Err(err) = write_outbound_frames(
@@ -1058,7 +1058,7 @@ async fn run_mining_connection(
                     &mut state,
                     &payload,
                     &mining_job_inputs,
-                    now_ms(),
+                    SystemClock.now_ms(),
                     None,
                 );
                 // SV2 Mining/SetExtranoncePrefix must precede the job it
@@ -1856,13 +1856,6 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             }
         }
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
