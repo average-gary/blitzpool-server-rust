@@ -71,8 +71,8 @@ use crate::extensions::{
 use crate::jdp::client::{
     handle_allocate_token, handle_declare_mining_job, handle_provide_missing_transactions_success,
     handle_push_solution, handle_request_extensions, handle_setup_connection,
-    parse_user_identifier_as_address, AllocateTokenContext, DeclarationContext, JdpHandlerOutcome,
-    JdpOutboundFrame, JdpSessionEvent, JdpSessionState, SolutionHeader,
+    parse_user_identifier_as_address, AllocateTokenContext, DeclarationContext, DeclarationRef,
+    JdpHandlerOutcome, JdpOutboundFrame, JdpSessionEvent, JdpSessionState, SolutionHeader,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::payout_distribution::WeightedOutput;
@@ -299,7 +299,7 @@ pub trait JdpBlockSubmissionSink: Send + Sync {
     async fn submit_block_candidate(
         &self,
         miner_address: AddressId,
-        new_token: Token,
+        declaration: DeclarationRef,
         backing: CandidateBacking,
         coinbase_raw: Vec<u8>,
         transactions: Vec<Vec<u8>>,
@@ -456,7 +456,7 @@ impl JdpBlockSubmissionSink for NoOpJdpHooks {
     async fn submit_block_candidate(
         &self,
         _: AddressId,
-        _: Token,
+        _: DeclarationRef,
         _: CandidateBacking,
         _: Vec<u8>,
         _: Vec<Vec<u8>>,
@@ -904,7 +904,6 @@ impl SessionPlan {
 /// condition is "was serving a plan, now serves none", which the other two
 /// callers reach under circumstances where the old entry is either already
 /// settlement-invalidated or still the right one.
-#[allow(clippy::too_many_arguments)]
 async fn republish_tailored(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -1153,9 +1152,11 @@ async fn run_jdp_connection(
     let (mut reader, mut writer) = noise.into_split();
 
     let mut state = JdpSessionState::new(session_id);
-    // What this session is being served. Once an identity is known, a session
-    // that is NOT on the pool-wide distribution must not receive the pool-wide
-    // push — ext 0x0003/Payout Computation makes the newest received
+    // Everything about what this session is served and when it was last
+    // re-decided — see [`SessionPlan`], which documents the four fields and
+    // why they move together. The headline: once an identity is known, a
+    // session that is NOT on the pool-wide distribution must not receive the
+    // pool-wide push — ext 0x0003/Payout Computation makes the newest received
     // distribution "the basis for all subsequently declared jobs", so its own
     // stream is authoritative, and for a Solo or Group-Solo miner the
     // pool-wide one is the PPLNS window's, not theirs.
@@ -1166,14 +1167,6 @@ async fn run_jdp_connection(
     // can be re-asked — the publisher only ever republishes the pool-wide one,
     // which this session is (correctly) not listening for.
     let mut identity: Option<AddressId> = None;
-    // When the pool last tried to build this session a distribution, so the
-    // refused case can be retried on the session's own frames without
-    // rebuilding once per frame. Stamped after every attempt, whatever it
-    // returned.
-    // The pool-wide distribution id last written to this client, so a session
-    // arriving on that stream can be told whether it is behind. `None` while
-    // it is holding something else (nothing yet, or a tailored push).
-
     loop {
         tokio::select! {
             biased;
@@ -1897,7 +1890,7 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
             JdpSessionEvent::JobDeclared { .. } => {}
             JdpSessionEvent::BlockSubmissionCandidate {
                 miner_address,
-                new_token,
+                declaration,
                 backing,
                 coinbase_raw,
                 transactions,
@@ -1907,7 +1900,7 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
                     .block_submission_sink
                     .submit_block_candidate(
                         miner_address,
-                        new_token,
+                        declaration,
                         backing,
                         coinbase_raw,
                         transactions,

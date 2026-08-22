@@ -83,7 +83,7 @@ use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
 use bp_common::{AddressId, Sats, StreamKind};
 use bp_stratum_v2::jdp::client::{
-    parse_user_identifier_as_address, AllocateTokenContext, SolutionHeader,
+    parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
     encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
@@ -93,7 +93,6 @@ use bp_stratum_v2::jdp_server::{
     JdpServerHooks, PayoutDistributionSource, TemplateTxProvider,
 };
 use bp_stratum_v2::mining::submit::assemble_witness_coinbase;
-use bp_stratum_v2::tokens::Token;
 use bp_template_distribution::{TdpHandle, TemplateTxCache};
 use tracing::{debug, info, warn};
 
@@ -934,7 +933,7 @@ impl ProductionJdpBlockSink {
         to_book: Option<(PayoutBooking, &dyn DeclaredBlockBooker)>,
         backing: CandidateBacking,
         miner_address: &AddressId,
-        new_token: Token,
+        declaration: DeclarationRef,
         block: &Block,
         demands_on_arrival: Option<ChainDemands>,
     ) {
@@ -1003,7 +1002,7 @@ impl ProductionJdpBlockSink {
                 let recorded = recorder
                     .record_unbookable(FoundBlockRecord {
                         miner_address: miner_address.as_str().to_string(),
-                        session_id: declaration_session_id(&new_token),
+                        session_id: declaration_session_id(declaration.jdp_session_id),
                         block_hash: hash.to_string(),
                         block_data: serialize_hex(&block.header),
                     })
@@ -1041,7 +1040,7 @@ impl ProductionJdpBlockSink {
             .book(
                 FoundBlockRecord {
                     miner_address: miner_address.as_str().to_string(),
-                    session_id: declaration_session_id(&new_token),
+                    session_id: declaration_session_id(declaration.jdp_session_id),
                     block_hash: hash.to_string(),
                     block_data: serialize_hex(&block.header),
                 },
@@ -1068,7 +1067,7 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
     async fn submit_block_candidate(
         &self,
         miner_address: AddressId,
-        new_token: Token,
+        declaration: DeclarationRef,
         backing: CandidateBacking,
         coinbase_raw: Vec<u8>,
         transactions: Vec<Vec<u8>>,
@@ -1076,7 +1075,10 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
     ) {
         info!(
             miner = miner_address.as_str(),
-            token = ?new_token,
+            token = ?declaration.new_token,
+            // The id the durable row carries and the connection logs — what an
+            // operator joins a found block back to its session on.
+            session = %declaration_session_id(declaration.jdp_session_id),
             tx_count = transactions.len(),
             coinbase_len = coinbase_raw.len(),
             ?backing,
@@ -1133,7 +1135,7 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
                 to_book.map(|(booking, booker)| (booking, booker.as_ref())),
                 backing,
                 &miner_address,
-                new_token,
+                declaration,
                 &block,
                 demands_on_arrival,
             )
@@ -1142,33 +1144,29 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
     }
 }
 
-/// How many characters `blocks_entity."sessionId"` holds.
+/// The `blocks_entity."sessionId"` for a block found on a JDP session.
 ///
-/// Read off the schema in the test below rather than trusted here — the point
-/// is that the number is the COLUMN's, not one someone typed.
-const SESSION_ID_CHARS: usize = 8;
-
-/// What identifies a JDC-found block's session in `blocks_entity`.
+/// The JDP connection's own id, in the eight hex characters SV1 and SV2
+/// already put in that column (`random_session_id_hex`,
+/// `format!("{session_id:08x}")`) — the width the column was sized for, and
+/// eight by construction rather than by cutting something longer down.
 ///
-/// The declaration token is 16 bytes, so its full hex is 32 characters and the
-/// insert does not truncate — Postgres answers `value too long for type
-/// character varying(8)` and `emit_block_found` logs one `warn!` and carries
-/// on. Every JDC-found block therefore lost its durable row: the ledger
-/// booking still happened, but the record the ledger is meant to be
-/// reconcilable against did not, and `record_unbookable` — which exists for
-/// nothing else than writing that row — did nothing at all.
+/// It used to be the declaration TOKEN's full hex: 32 characters into a
+/// `character varying(8)`, which Postgres refuses outright rather than
+/// truncating. The insert is best-effort, so every JDC-found block lost its
+/// durable row behind one `warn!` — the ledger booking still happened, but the
+/// record it is meant to be reconcilable against did not.
 ///
-/// Eight hex characters is what the column was sized for: SV1 puts
-/// `random_session_id_hex` there and SV2 `format!("{session_id:08x}")`, both
-/// exactly that wide.
-///
-/// The TAIL of the token, never the head. `Token`'s first four bytes are the
-/// per-connection counter (see `bp_stratum_v2::tokens`), so the leading eight
-/// hex characters read `00000001` on the first declaration of every
-/// connection — an identifier that identifies nothing. Bytes 12..16 are
-/// CSPRNG.
-fn declaration_session_id(token: &Token) -> String {
-    hex::encode(&token.0[bp_stratum_v2::tokens::TOKEN_LEN - SESSION_ID_CHARS / 2..])
+/// Two reasons it is the session and not a slice of the token. `sessionId` is
+/// served to the public (`FoundBlockRow` → `/api/info`, `/api/pool`), and the
+/// token's own `Debug` redacts all but four bytes because whoever holds it can
+/// act as the JDC — publishing a slice of it forever is the wrong trade for an
+/// identifier. And `run_jdp_connection` logs this same id as
+/// `jdp-{id:08x}`, so an operator reconciling a found block has something to
+/// join on; a token slice appears in no log at all, since the `Debug` impl
+/// prints the other end of it.
+fn declaration_session_id(jdp_session_id: u32) -> String {
+    format!("{jdp_session_id:08x}")
 }
 
 /// Report what the pool can say about a JDC-found block's payouts.
@@ -1395,78 +1393,47 @@ impl DeclaredJobValidator for ProductionJobValidator {
 }
 
 #[cfg(test)]
-mod session_id_fits_the_column {
+mod session_id_for_blocks_entity {
     use super::*;
 
-    /// The width this module assumes is the width the SCHEMA declares.
+    /// Eight characters, for every session id there is.
     ///
-    /// Parsed out of `db/schema.sql` rather than restated, so a migration that
-    /// widens or narrows the column fails here instead of at the next found
-    /// block — which is where it failed last time, silently, behind one
-    /// `warn!`.
+    /// `blocks_entity."sessionId"` is `character varying(8)` and Postgres
+    /// refuses a longer value on INSERT rather than truncating it. This is
+    /// eight BY CONSTRUCTION — `{:08x}` of a `u32` cannot be anything else —
+    /// which is why the width is asserted here and not read out of a schema
+    /// file: `db/schema.sql` is not kept in step with
+    /// `crates/bp-db/migrations/` (migration 0011's `rejectedStale*` columns
+    /// are missing from it), so a test that consulted it would promise a
+    /// guard it cannot give.
     #[test]
-    fn the_assumed_column_width_is_the_one_the_schema_declares() {
-        const SCHEMA: &str = include_str!("../../../db/schema.sql");
-        let table = SCHEMA
-            .split("CREATE TABLE public.blocks_entity (")
-            .nth(1)
-            .expect("db/schema.sql must declare blocks_entity");
-        let column = table
-            .split(");")
-            .next()
-            .expect("unterminated CREATE TABLE")
-            .lines()
-            .find(|l| l.contains(r#""sessionId""#))
-            .expect(r#"blocks_entity must have a "sessionId" column"#);
-        let declared: usize = column
-            .rsplit_once('(')
-            .and_then(|(_, rest)| rest.split(')').next())
-            .and_then(|n| n.trim().parse().ok())
-            .unwrap_or_else(|| panic!("cannot read a width from {column:?}"));
+    fn a_session_id_is_always_eight_characters() {
+        for id in [0u32, 1, 0xFFFF, u32::MAX, 0x1234_5678] {
+            let s = declaration_session_id(id);
+            assert_eq!(s.len(), 8, "session id {s:?} for id {id}");
+            assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    /// It is the id the connection logs, so a found block joins back to its
+    /// session. `run_jdp_connection` formats `jdp-{session_id:08x}`.
+    #[test]
+    fn a_session_id_joins_a_found_block_to_its_connection_log() {
+        let id = 0x0000_002au32;
         assert_eq!(
-            declared, SESSION_ID_CHARS,
-            r#"blocks_entity."sessionId" is varchar({declared}), but this module builds                {SESSION_ID_CHARS} characters. Postgres does not truncate on INSERT."#
+            format!("jdp-{}", declaration_session_id(id)),
+            format!("jdp-{id:08x}"),
+            "the durable row and the connection log must name the same session"
         );
     }
 
-    /// A declaration's session id fits the column.
-    ///
-    /// It did not: the full 16-byte token hex is 32 characters, and every
-    /// JDC-found block's `blocks_entity` row was refused by Postgres.
+    /// Distinct sessions get distinct ids — the property a truncated token
+    /// slice would NOT have had: `Token`'s first four bytes are a
+    /// per-connection counter, so a leading cut reads `00000001` on the first
+    /// declaration of every connection.
     #[test]
-    fn a_declaration_session_id_fits() {
-        let id = declaration_session_id(&Token([0xAB; 16]));
-        assert_eq!(
-            id.len(),
-            SESSION_ID_CHARS,
-            "session id {id:?} is {} characters, the column holds {SESSION_ID_CHARS}",
-            id.len()
-        );
-    }
-
-    /// It comes from the CSPRNG tail, not the counter prefix.
-    ///
-    /// Two tokens from the same connection share the first four bytes — the
-    /// per-connection counter. Taking the leading eight hex characters would
-    /// make every first declaration on every connection read `00000001`, so a
-    /// shortening that fits the column would still identify nothing.
-    #[test]
-    fn a_declaration_session_id_distinguishes_tokens_of_one_connection() {
-        let mut first = [0u8; 16];
-        first[..4].copy_from_slice(&7u32.to_be_bytes());
-        first[12..].copy_from_slice(&[0xAA; 4]);
-        let mut second = first;
-        second[12..].copy_from_slice(&[0xBB; 4]);
-
-        let (a, b) = (
-            declaration_session_id(&Token(first)),
-            declaration_session_id(&Token(second)),
-        );
-        assert_ne!(
-            a, b,
-            "two tokens of one connection collapsed to the same session id — \
-             the counter prefix was taken instead of the random tail"
-        );
+    fn distinct_sessions_get_distinct_ids() {
+        assert_ne!(declaration_session_id(1), declaration_session_id(2));
     }
 }
 
@@ -2416,6 +2383,11 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         /// Blocks recorded WITHOUT a ledger entry — kept apart from `booked`
         /// so the two outcomes cannot be confused by an assertion.
         recorded: StdMutex<Vec<String>>,
+        /// What actually reached `blocks_entity."sessionId"`, from BOTH
+        /// paths. Recorded because the helper's own tests say nothing about
+        /// whether the production path calls it — reverting the call site to
+        /// the token hex would otherwise leave every test green.
+        session_ids: StdMutex<Vec<String>>,
     }
     impl RecordingBooker {
         fn that_writes_nothing() -> Self {
@@ -2435,6 +2407,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
             _: Option<bp_coinbase_snapshot::ActualCoinbase>,
         ) -> bool {
             self.booked.lock().unwrap().push((reward, fp));
+            self.session_ids.lock().unwrap().push(record.session_id);
             self.hashes.lock().unwrap().push(record.block_hash);
             !self.wrote_nothing
         }
@@ -2443,9 +2416,39 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
             // Recorded in its OWN list, not in `booked` — a test that cannot
             // tell "wrote the row" from "wrote the ledger" would pass on
             // either, which is the whole distinction being built here.
+            self.session_ids.lock().unwrap().push(record.session_id);
             self.recorded.lock().unwrap().push(record.block_hash);
             !self.wrote_nothing
         }
+    }
+
+    /// The id the booking path puts in `blocks_entity."sessionId"` is the
+    /// JDP session's, in the eight hex characters the column holds.
+    ///
+    /// This is the end-to-end half the helper's own tests cannot give: they
+    /// exercise `declaration_session_id` in isolation, so putting the token
+    /// hex back at the call site — the exact regression this fixes — would
+    /// leave them all green.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_booking_path_records_the_jdp_session_id() {
+        let booker = Arc::new(RecordingBooker::default());
+        let (sink, _bridge, _server) =
+            sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
+
+        push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
+
+        assert_eq!(
+            booker.booked.lock().unwrap().len(),
+            1,
+            "precondition: the booking WAS attempted — otherwise this proves nothing"
+        );
+        let ids = booker.session_ids.lock().unwrap().clone();
+        assert_eq!(
+            ids,
+            vec![format!("{TEST_JDP_SESSION_ID:08x}")],
+            "the durable row must carry the JDP session id, eight characters wide"
+        );
+        assert_eq!(ids[0].len(), 8, "blocks_entity.\"sessionId\" is varchar(8)");
     }
 
     /// Carries a tip and nothing else. `reference_revenue` is `None` and
@@ -2572,10 +2575,17 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         )
     }
 
+    /// The JDP session every pushed candidate in these tests belongs to.
+    /// Its `{:08x}` form is what must reach `blocks_entity."sessionId"`.
+    const TEST_JDP_SESSION_ID: u32 = 0x00c0_ffee;
+
     async fn push(sink: &ProductionJdpBlockSink, backing: CandidateBacking, nonce: u32) {
         sink.submit_block_candidate(
             AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
-            Token([9u8; 16]),
+            DeclarationRef {
+                new_token: bp_stratum_v2::tokens::Token([9u8; 16]),
+                jdp_session_id: TEST_JDP_SESSION_ID,
+            },
             backing,
             coinbase_bytes(),
             vec![],

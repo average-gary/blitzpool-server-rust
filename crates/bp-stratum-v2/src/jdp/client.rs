@@ -199,7 +199,7 @@ pub struct ProvideMissingTransactionsSuccessInput {
 ///
 /// No `merkle_root`: it is not the JDC's to send, it falls out of the
 /// reassembled transaction set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct SolutionHeader {
     /// Tip the solution was mined on.
     pub prev_hash: [u8; 32],
@@ -212,6 +212,26 @@ pub struct SolutionHeader {
     /// Block-header `nBits` field, as the JDC sent it. Never used as a
     /// threshold — the pool checks work against its OWN target.
     pub n_bits: u32,
+}
+
+/// Which declaration a pushed solution came from, and on which JDP session.
+///
+/// Together because the two answer one question — WHICH declaration this is —
+/// and because the block-found path needs both: the session id is what
+/// `blocks_entity."sessionId"` records, the token is what the diagnostics name.
+/// Loose, they would put two more scalars on a signature this module narrowed
+/// on purpose.
+#[derive(Clone, Copy, Debug)]
+pub struct DeclarationRef {
+    /// The `new_mining_job_token` the JDS issued in `DeclareMiningJobSuccess`.
+    pub new_token: Token,
+    /// The JDP connection the declaration was accepted on.
+    ///
+    /// This is what the durable block record stores, as `{:08x}` — the same
+    /// eight hex characters SV1 and SV2 put in that column, and the same id
+    /// `run_jdp_connection` logs as `jdp-{id:08x}`, so a found block can be
+    /// joined back to its connection.
+    pub jdp_session_id: u32,
 }
 
 /// Inputs from a deserialized `PushSolution` frame (SV2 JDP/PushSolution).
@@ -352,7 +372,9 @@ pub enum JdpSessionEvent {
     /// solution fields; reconstruct from there".
     BlockSubmissionCandidate {
         miner_address: AddressId,
-        new_token: Token,
+        /// Which declaration this solution belongs to — see
+        /// [`DeclarationRef`].
+        declaration: DeclarationRef,
         /// Reconstructed non-witness coinbase (prefix + extranonce +
         /// suffix). IO layer parses this back into a
         /// `bitcoin::Transaction` for merkle-root computation.
@@ -620,7 +642,10 @@ pub fn handle_request_extensions(
 /// - Pre-setup → silently dropped.
 /// - Rate-limited → silently dropped. The [`TokenStore::allocate`]
 ///   call already enforces this; we map the `RateLimited` error into a
-///   no-op outcome.
+///   no-op outcome. Silence here means the rate limit and nothing else.
+/// - Entropy failure or a saturated counter → dropped too, but logged at
+///   `error!`. Both are pool-side faults the JDC can neither act on nor see,
+///   and SV2 defines no answer for them, so the allocate goes unanswered.
 /// - Token allocation success → `AllocateMiningJobTokenSuccess` +
 ///   [`JdpSessionEvent::TokenAllocated`].
 pub fn handle_allocate_token(
@@ -1298,7 +1323,10 @@ pub fn handle_push_solution(
         outbound: Vec::new(),
         events: vec![JdpSessionEvent::BlockSubmissionCandidate {
             miner_address,
-            new_token,
+            declaration: DeclarationRef {
+                new_token,
+                jdp_session_id: state.session_id,
+            },
             backing,
             coinbase_raw,
             transactions,

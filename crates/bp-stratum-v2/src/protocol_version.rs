@@ -60,6 +60,15 @@ fn negotiate_against(
     serve_min: u16,
     serve_max: u16,
 ) -> Option<u16> {
+    // A client that names a minimum above its own maximum has named no range
+    // at all. Without this the two comparisons below can both pass — take
+    // `client 4–2` against `serve 2–4` — and the result is `2`, a version the
+    // client said was beneath it. The old inline `if` had the same hole; it
+    // only became worth naming once the rule got a name and a sweep test that
+    // claims `used >= client_min`.
+    if client_min > client_max {
+        return None;
+    }
     if client_min > serve_max || client_max < serve_min {
         return None;
     }
@@ -115,12 +124,26 @@ mod tests {
 
     /// Whatever comes back is a version BOTH sides named. Swept over every
     /// client range in and around the served one.
+    /// A range whose minimum sits above its maximum is no range. It used to
+    /// negotiate: `4–2` against `2–4` passed both comparisons and answered
+    /// `2`, under the client's own minimum.
+    #[test]
+    fn an_inverted_range_negotiates_nothing() {
+        assert_eq!(negotiate_against(4, 2, SERVE_MIN, SERVE_MAX), None);
+        assert_eq!(negotiate_against(9, 0, SERVE_MIN, SERVE_MAX), None);
+        assert_eq!(negotiate_version(4, 2), None);
+    }
+
     #[test]
     fn a_negotiated_version_is_one_both_sides_named() {
+        // Every ordered pair, INVERTED ONES INCLUDED — the sweep used to start
+        // `client_max` at `client_min`, so the `used >= client_min` assertion
+        // below never met the case that breaks it.
         for client_min in 0u16..8 {
-            for client_max in client_min..8 {
+            for client_max in 0u16..8 {
                 let got = negotiate(client_min, client_max);
-                let overlaps = client_min <= SERVE_MAX && client_max >= SERVE_MIN;
+                let overlaps =
+                    client_min <= client_max && client_min <= SERVE_MAX && client_max >= SERVE_MIN;
                 assert_eq!(
                     got.is_some(),
                     overlaps,

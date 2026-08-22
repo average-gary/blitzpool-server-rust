@@ -54,7 +54,7 @@ use bp_stratum_v2::extensions::{
     encode_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
 use bp_stratum_v2::jdp::client::{
-    parse_user_identifier_as_address, AllocateTokenContext, SolutionHeader,
+    parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
     ERR_INVALID_PAYOUT_DISTRIBUTION, ERR_STALE_PAYOUT_DISTRIBUTION, FLAG_DECLARE_TX_DATA,
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
@@ -235,7 +235,7 @@ impl JdpBlockSubmissionSink for RecordingSink {
     async fn submit_block_candidate(
         &self,
         miner_address: AddressId,
-        _new_token: Token,
+        _declaration: DeclarationRef,
         backing: CandidateBacking,
         coinbase_raw: Vec<u8>,
         _transactions: Vec<Vec<u8>>,

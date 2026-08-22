@@ -135,6 +135,26 @@ pub(crate) struct BlockFoundEvent {
     pub actual_coinbase: Option<ActualCoinbase>,
 }
 
+/// What identifies a JDC-found block in `blocks_entity`.
+///
+/// The four used to travel as four consecutive `String` parameters through two
+/// signatures — trait method and the concrete one it forwards to — where any
+/// two could be exchanged in silence. They were, deliberately, in a check:
+/// `cargo check` and 175 `blitzpool` tests stayed green with the session id in
+/// the address column and the header in the hash column.
+///
+/// ⚠️ `session_id` lands in `blocks_entity."sessionId"`, which is
+/// `varchar(8)`. Postgres does not truncate on INSERT, it errors.
+#[derive(Clone, Debug)]
+pub(crate) struct FoundBlockRecord {
+    pub(crate) miner_address: String,
+    pub(crate) session_id: String,
+    /// Block hash, display form.
+    pub(crate) block_hash: String,
+    /// The 80-byte header as hex.
+    pub(crate) block_data: String,
+}
+
 /// `BlockSubmissionSink` for both SV1 + SV2. Forwards every
 /// block-candidate share to bitcoin-core via TDP **and**
 /// fans the event out to the per-mode engine ledger
@@ -146,26 +166,6 @@ pub(crate) struct BlockFoundEvent {
 /// step logs at INFO and continues. The TDP submit is the
 /// authoritative block-propagation path; engine + dispatcher are
 /// observability + accounting.
-/// What identifies a JDC-found block in `blocks_entity`.
-///
-/// The four used to travel as four consecutive `String` parameters through two
-/// signatures — trait method and the concrete one it forwards to — where any
-/// two could be exchanged in silence. They were, deliberately, in a check:
-/// `cargo check` and 175 `blitzpool` tests stayed green with the session id in
-/// the address column and the header in the hash column.
-///
-/// ⚠️ `session_id` lands in `blocks_entity."sessionId"`, which is
-/// `varchar(8)`. Postgres does not truncate on INSERT, it errors.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FoundBlockRecord {
-    pub(crate) miner_address: String,
-    pub(crate) session_id: String,
-    /// Block hash, display form.
-    pub(crate) block_hash: String,
-    /// The 80-byte header as hex.
-    pub(crate) block_data: String,
-}
-
 pub(crate) struct TdpBlockSubmissionSink {
     /// Default stream handle (PPLNS-autoscaled). Submission target for every
     /// PPLNS job, and the fallback when an alt stream isn't wired.
