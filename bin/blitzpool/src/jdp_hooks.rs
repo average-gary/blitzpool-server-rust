@@ -358,6 +358,37 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         .await;
 
         let designated = match payouts.entries.as_slice() {
+            // NO list at all. `ResolvedPayouts::none()` is a verdict, not a
+            // shape: "a mode whose distribution could not be built — serve no
+            // job". It reaches this match despite the stream gate above
+            // because the gate and the resolver read the mode SEPARATELY.
+            // `resolve_stream_known` is `lookup_known`, and lets Solo and
+            // not-yet-known through; `resolve_payouts` re-reads the same gate
+            // as `lookup_mode`, i.e. `lookup_known().unwrap_or(Solo)`. A JDC
+            // allocates ~8 s before its mining channel opens, and `cache_sync`
+            // flips a live address between Solo and Group-Solo without a
+            // reconnect — so the second read can answer PPLNS or Group-Solo
+            // where the first answered Solo or nothing, and those are the two
+            // modes with an explicit `serving NO JOB` exit.
+            //
+            // Refusing is right, for the same reason the no-template guard
+            // above refuses: the pool is serving this miner no job either way.
+            // What must not happen is dressing the verdict up as a payout
+            // SHAPE — the split arm below swallowed it until this arm existed,
+            // and sent the operator looking for a payout split that does not
+            // exist instead of at the distribution build that failed.
+            [] => {
+                warn!(
+                    user_identifier,
+                    "JDP allocate: the resolver produced no payout list at all — that is its \
+                     `serving NO JOB` verdict, not a payout shape. Refusing rather than \
+                     designating nobody; the cause is the failed distribution build logged \
+                     above, and the JDC's reconnect gets a token once it succeeds"
+                );
+                return AllocateOutcome::Refused {
+                    reason: "no payout list for this miner — the pool is serving it no job",
+                };
+            }
             // The one shape SV2 JDP/AllocateMiningJobToken.Success can carry:
             // a single payee who IS this miner. The JD-client writes the whole
             // template revenue into the designated output, so the pool's only
@@ -393,7 +424,12 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             // the other payees would silently receive nothing. Refusing is
             // the honest answer, and it is what makes a configured solo fee
             // take effect rather than evaporate.
-            entries => {
+            //
+            // Two or more, spelled out rather than left a catch-all, which is
+            // what makes this match exhaustive: delete the empty arm above and
+            // it stops COMPILING instead of quietly folding "no list at all"
+            // back in here, which is how it read before.
+            entries @ [_, _, ..] => {
                 warn!(
                     user_identifier,
                     payees = entries.len(),
@@ -1736,12 +1772,46 @@ mod base_allocate_tests {
 
     /// An empty list means the resolver could not say who the block belongs
     /// to. Serving a token then would designate nobody.
+    ///
+    /// The verdict was never the risk — a refusal is right either way, which
+    /// is exactly why asserting only `Refused { .. }` proved nothing. What is
+    /// asserted here is the DIAGNOSIS: an absent list must not be reported as
+    /// a payout split. It read as one for as long as the split arm was a
+    /// catch-all, and the operator then went looking for a split that does not
+    /// exist instead of at the distribution build that failed.
+    ///
+    /// The split case rides along as the negative control. Pinning one reason
+    /// alone would still pass if the two collapsed back into each other, which
+    /// is the failure being guarded against.
     #[tokio::test]
-    async fn an_empty_payout_list_is_refused() {
-        let outcome = pays(&[])
+    async fn an_empty_payout_list_is_refused_as_an_absent_list_not_as_a_split() {
+        let AllocateOutcome::Refused { reason: absent } = pays(&[])
             .resolve_allocate_context(MINER, "127.0.0.1:1", false)
-            .await;
-        assert!(matches!(outcome, AllocateOutcome::Refused { .. }));
+            .await
+        else {
+            panic!("an empty payout list must be refused");
+        };
+        let AllocateOutcome::Refused { reason: split } =
+            pays(&[(OTHER, 3_125_000), (MINER, 309_375_000)])
+                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+                .await
+        else {
+            panic!("a two-payee split must be refused");
+        };
+
+        assert_eq!(
+            absent, "no payout list for this miner — the pool is serving it no job",
+            "an absent list has to be named as one"
+        );
+        assert_eq!(
+            split, "base-protocol JDP cannot express this miner's payout split",
+            "a real split still has to be named a split"
+        );
+        assert_ne!(
+            absent, split,
+            "\"no list at all\" and \"too many payees\" are opposite causes and must not \
+             share a verdict text"
+        );
     }
 
     /// With ext 0x0003 negotiated the base convention does not apply at all:
