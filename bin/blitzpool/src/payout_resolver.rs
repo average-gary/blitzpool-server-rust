@@ -609,7 +609,13 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
 /// `distribution_id` via Redis.
 pub(crate) struct ProductionDistributionSource {
     pub(crate) resolver: Arc<ProductionPayoutResolver>,
-    pub(crate) tdp: bp_template_distribution::TdpHandle,
+    /// What the pool's current template pays out. The same seam the other two
+    /// production JDP hooks take (`ProductionJdpAllocateResolver`,
+    /// `ProductionJdpBlockSink`), so all three resolve their reward against
+    /// one implementation — this one used to re-derive it from a raw
+    /// `TdpHandle`, and `ChainView::reference_revenue`'s own doc says the two
+    /// must be the same number.
+    pub(crate) chain: std::sync::Arc<dyn crate::jdp_hooks::ChainView>,
     pub(crate) redis: Option<redis::aio::ConnectionManager>,
     pub(crate) network: bitcoin::Network,
     /// Pool-output recipient for tailored distributions whose own
@@ -618,12 +624,16 @@ pub(crate) struct ProductionDistributionSource {
 }
 
 impl ProductionDistributionSource {
-    fn reference_revenue(&self) -> Option<u64> {
-        self.tdp
-            .current_snapshot()
-            .new_template
-            .as_ref()
-            .map(|t| t.coinbase_tx_value_remaining)
+    /// A payout address as its locking script on the pool's network.
+    ///
+    /// `None` for an address that does not parse or does not belong to this
+    /// network. Both lowering paths refuse the whole build on that rather than
+    /// skipping the entry: a dropped payout would shift every later position
+    /// in the coinbase vector.
+    fn script_of(&self, addr: &str) -> Option<Vec<u8>> {
+        bp_mining_job::address_to_script(self.network, addr)
+            .ok()
+            .map(|s| s.to_bytes())
     }
 
     /// Lower a weight-native engine distribution into the wire shape.
@@ -633,18 +643,13 @@ impl ProductionDistributionSource {
         fingerprint: Option<[u8; 32]>,
         bookable: bool,
     ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
-        let script_of = |addr: &str| -> Option<Vec<u8>> {
-            bp_mining_job::address_to_script(self.network, addr)
-                .ok()
-                .map(|s| s.to_bytes())
-        };
-        let pool_script = script_of(d.fee_address.as_str())?;
+        let pool_script = self.script_of(d.fee_address.as_str())?;
         let mut payouts = Vec::new();
         let mut dust_limits = Vec::new();
         for entry in d.published() {
             // A published entry whose script fails to derive would shift
             // every §4 position — fail the whole build instead.
-            let script = script_of(entry.address.as_str())?;
+            let script = self.script_of(entry.address.as_str())?;
             payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
                 script_pubkey: script,
                 weight: entry.wire_weight,
@@ -676,12 +681,7 @@ impl ProductionDistributionSource {
         entries: &[(String, u64)],
         reference_reward_sats: u64,
     ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
-        let script_of = |addr: &str| -> Option<Vec<u8>> {
-            bp_mining_job::address_to_script(self.network, addr)
-                .ok()
-                .map(|s| s.to_bytes())
-        };
-        let pool_script = script_of(pool_addr)?;
+        let pool_script = self.script_of(pool_addr)?;
         let mut payouts = Vec::new();
         let mut dust_limits = Vec::new();
         for (addr, sats) in entries {
@@ -689,7 +689,7 @@ impl ProductionDistributionSource {
                 continue;
             }
             payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
-                script_pubkey: script_of(addr)?,
+                script_pubkey: self.script_of(addr)?,
                 weight: *sats,
             });
             dust_limits.push(bp_pplns::DUST_LIMIT_SATS as u32);
@@ -713,7 +713,7 @@ impl ProductionDistributionSource {
 #[async_trait]
 impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistributionSource {
     async fn build_pool_wide(&self) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
-        let t_ref = self.reference_revenue()?;
+        let t_ref = self.chain.reference_revenue()?;
         let pplns = self.resolver.pplns.as_ref()?;
         let result = match pplns.build_distribution(t_ref).await {
             Ok(r) => r,
@@ -765,7 +765,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
             }
             JdpDistributionFor::Tailored(kind) => kind,
         };
-        let Some(t_ref) = self.reference_revenue() else {
+        let Some(t_ref) = self.chain.reference_revenue() else {
             warn!(
                 miner = miner_address.as_str(),
                 "jdp distribution source: no reference revenue yet — no tailored distribution"

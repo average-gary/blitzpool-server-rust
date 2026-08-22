@@ -154,7 +154,7 @@ pub(crate) async fn spawn(
         .and_then(|p| AddressId::new(p.fee_address.clone()).ok());
     let distribution_source = Arc::new(ProductionDistributionSource {
         resolver: payout_resolver.clone(),
-        tdp: tdp.clone(),
+        chain: Arc::new(tdp.clone()),
         redis: Some(redis),
         network,
         fee_address,

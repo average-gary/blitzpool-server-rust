@@ -1760,15 +1760,30 @@ fn entry_from_built(
     jdp_session_id: Option<u32>,
     published_at_ms: u64,
 ) -> PayoutDistributionEntry {
+    // Destructured rather than read field by field, so a field added to
+    // `BuiltPayoutDistribution` fails to compile HERE instead of being dropped
+    // on the way into the registry. The compiler only forces the producers to
+    // fill a new field in; nothing would have said it never arrives, and what
+    // the registry holds is what the declare-time payout check and the
+    // block-found booking read.
+    let BuiltPayoutDistribution {
+        pool_payout,
+        payouts,
+        dust_limits,
+        additional_outputs,
+        reference_reward_sats,
+        payouts_fingerprint,
+        bookable,
+    } = built;
     PayoutDistributionEntry {
         distribution_id,
-        pool_payout: built.pool_payout,
-        payouts: built.payouts,
-        dust_limits: built.dust_limits,
-        additional_outputs: built.additional_outputs,
-        reference_reward_sats: built.reference_reward_sats,
-        payouts_fingerprint: built.payouts_fingerprint,
-        bookable: built.bookable,
+        pool_payout,
+        payouts,
+        dust_limits,
+        additional_outputs,
+        reference_reward_sats,
+        payouts_fingerprint,
+        bookable,
         accounting,
         jdp_session_id,
         published_at_ms,
