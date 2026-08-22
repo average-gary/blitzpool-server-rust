@@ -48,7 +48,20 @@ use crate::state::SharedState;
 const CHALLENGE_TTL_MINUTES: i64 = 15;
 
 /// Top bytes the SV1/SV2 extranonce allocators own. See the module doc.
-const RESERVED_TOP_BYTE_MAX: u32 = 1;
+///
+/// Derived from the allocator's own worker ids rather than restated as a
+/// literal: the rule is "everything up to and including the highest assigned
+/// worker partition", and a third allocator claiming worker 2 must widen this
+/// gate in the same edit. The DB carries the same bound as
+/// `pplns_custom_extranonce_prefix_unreserved` (migration 0012) — SQL cannot
+/// import a Rust constant, so that copy is unavoidable and named here so a
+/// change to one goes looking for the other.
+const RESERVED_TOP_BYTE_MAX: u32 =
+    if bp_common::extranonce::SV1_WORKER_ID > bp_common::extranonce::SV2_WORKER_ID {
+        bp_common::extranonce::SV1_WORKER_ID
+    } else {
+        bp_common::extranonce::SV2_WORKER_ID
+    };
 
 pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
 where

@@ -71,3 +71,46 @@ CREATE TABLE IF NOT EXISTS pplns_custom_extranonce (
 
 CREATE INDEX IF NOT EXISTS "IDX_pplns_extranonce_challenge_expiresAt"
     ON pplns_extranonce_challenge USING btree ("expiresAt");
+
+-- The reserved-prefix rule, at the data instead of only in the handler.
+--
+-- `0x00……` is the SV2 extranonce allocator's worker partition and `0x01……` is
+-- SV1's (`bp_common::extranonce::{SV2_WORKER_ID, SV1_WORKER_ID}`). A
+-- customer-set prefix inside one of them can later be handed to another
+-- channel by the allocator. That only costs work when the two hash the SAME
+-- coinbase — same address, both Solo, i.e. one customer running several rigs
+-- of which one has an override — but then both search one space and one of
+-- them mines for nothing. Workers 2..=255 are unowned and no allocator ever
+-- emits into them, which is exactly what makes a hand-set prefix safe to hold
+-- indefinitely.
+--
+-- `bp_api::controllers::custom_extranonce::parse_prefix` has always rejected
+-- these, and it is the only writer in the code. But the table is hand-writable,
+-- `bin/blitzpool/src/custom_extranonce.rs` loads every row without re-checking,
+-- and rows HAVE been set by hand on the test server. That left the rule with
+-- exactly one enforcement point, and not the one closest to the data.
+--
+-- 33554432 = 0x02000000, the first prefix above SV1's partition.
+--
+-- Deliberately NOT folded into the CREATE TABLE above: on a database where the
+-- table already exists that statement no-ops, so the constraint would never
+-- reach it. As its own guarded ALTER it applies to both a fresh database and an
+-- existing one, and re-running the migration is a no-op either way.
+--
+-- ⚠️ This FAILS if a row already violates it, and that failure is the point:
+-- such a row is the collision this constraint exists to prevent and wants
+-- looking at, not migrating around. Find offenders with
+--   SELECT address, worker, to_hex(prefix) FROM pplns_custom_extranonce
+--    WHERE prefix < 33554432;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'pplns_custom_extranonce_prefix_unreserved'
+    ) THEN
+        ALTER TABLE pplns_custom_extranonce
+            ADD CONSTRAINT pplns_custom_extranonce_prefix_unreserved
+            CHECK (prefix >= 33554432);
+    END IF;
+END
+$$;

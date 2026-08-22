@@ -1686,7 +1686,8 @@ CREATE TABLE public.pplns_custom_extranonce (
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     CONSTRAINT pplns_custom_extranonce_pkey PRIMARY KEY (address, worker),
     CONSTRAINT pplns_custom_extranonce_address_prefix_key UNIQUE (address, prefix) DEFERRABLE INITIALLY IMMEDIATE,
-    CONSTRAINT pplns_custom_extranonce_prefix_u32 CHECK (prefix >= 0 AND prefix <= 4294967295)
+    CONSTRAINT pplns_custom_extranonce_prefix_u32 CHECK (prefix >= 0 AND prefix <= 4294967295),
+    CONSTRAINT pplns_custom_extranonce_prefix_unreserved CHECK (prefix >= 33554432)
 );
 
 CREATE INDEX IF NOT EXISTS "IDX_pplns_extranonce_challenge_expiresAt"
