@@ -992,7 +992,7 @@ impl ProductionJdpBlockSink {
                 let recorded = recorder
                     .record_unbookable(FoundBlockRecord {
                         miner_address: miner_address.as_str().to_string(),
-                        session_id: hex::encode(new_token.0),
+                        session_id: declaration_session_id(&new_token),
                         block_hash: hash.to_string(),
                         block_data: serialize_hex(&block.header),
                     })
@@ -1030,7 +1030,7 @@ impl ProductionJdpBlockSink {
             .book(
                 FoundBlockRecord {
                     miner_address: miner_address.as_str().to_string(),
-                    session_id: hex::encode(new_token.0),
+                    session_id: declaration_session_id(&new_token),
                     block_hash: hash.to_string(),
                     block_data: serialize_hex(&block.header),
                 },
@@ -1128,6 +1128,35 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
             .await;
         }
     }
+}
+
+/// How many characters `blocks_entity."sessionId"` holds.
+///
+/// Read off the schema in the test below rather than trusted here — the point
+/// is that the number is the COLUMN's, not one someone typed.
+const SESSION_ID_CHARS: usize = 8;
+
+/// What identifies a JDC-found block's session in `blocks_entity`.
+///
+/// The declaration token is 16 bytes, so its full hex is 32 characters and the
+/// insert does not truncate — Postgres answers `value too long for type
+/// character varying(8)` and `emit_block_found` logs one `warn!` and carries
+/// on. Every JDC-found block therefore lost its durable row: the ledger
+/// booking still happened, but the record the ledger is meant to be
+/// reconcilable against did not, and `record_unbookable` — which exists for
+/// nothing else than writing that row — did nothing at all.
+///
+/// Eight hex characters is what the column was sized for: SV1 puts
+/// `random_session_id_hex` there and SV2 `format!("{session_id:08x}")`, both
+/// exactly that wide.
+///
+/// The TAIL of the token, never the head. `Token`'s first four bytes are the
+/// per-connection counter (see `bp_stratum_v2::tokens`), so the leading eight
+/// hex characters read `00000001` on the first declaration of every
+/// connection — an identifier that identifies nothing. Bytes 12..16 are
+/// CSPRNG.
+fn declaration_session_id(token: &Token) -> String {
+    hex::encode(&token.0[bp_stratum_v2::tokens::TOKEN_LEN - SESSION_ID_CHARS / 2..])
 }
 
 /// Report what the pool can say about a JDC-found block's payouts.
@@ -1349,6 +1378,82 @@ impl DeclaredJobValidator for ProductionJobValidator {
             // from the JDC; the second leg asks again with the full set.
             DeclareMiningJobResult::MissingTransactions(_) => JobVerdict::NeedsTransactions,
         }
+    }
+}
+
+#[cfg(test)]
+mod session_id_fits_the_column {
+    use super::*;
+
+    /// The width this module assumes is the width the SCHEMA declares.
+    ///
+    /// Parsed out of `db/schema.sql` rather than restated, so a migration that
+    /// widens or narrows the column fails here instead of at the next found
+    /// block — which is where it failed last time, silently, behind one
+    /// `warn!`.
+    #[test]
+    fn the_assumed_column_width_is_the_one_the_schema_declares() {
+        const SCHEMA: &str = include_str!("../../../db/schema.sql");
+        let table = SCHEMA
+            .split("CREATE TABLE public.blocks_entity (")
+            .nth(1)
+            .expect("db/schema.sql must declare blocks_entity");
+        let column = table
+            .split(");")
+            .next()
+            .expect("unterminated CREATE TABLE")
+            .lines()
+            .find(|l| l.contains(r#""sessionId""#))
+            .expect(r#"blocks_entity must have a "sessionId" column"#);
+        let declared: usize = column
+            .rsplit_once('(')
+            .and_then(|(_, rest)| rest.split(')').next())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("cannot read a width from {column:?}"));
+        assert_eq!(
+            declared, SESSION_ID_CHARS,
+            r#"blocks_entity."sessionId" is varchar({declared}), but this module builds                {SESSION_ID_CHARS} characters. Postgres does not truncate on INSERT."#
+        );
+    }
+
+    /// A declaration's session id fits the column.
+    ///
+    /// It did not: the full 16-byte token hex is 32 characters, and every
+    /// JDC-found block's `blocks_entity` row was refused by Postgres.
+    #[test]
+    fn a_declaration_session_id_fits() {
+        let id = declaration_session_id(&Token([0xAB; 16]));
+        assert_eq!(
+            id.len(),
+            SESSION_ID_CHARS,
+            "session id {id:?} is {} characters, the column holds {SESSION_ID_CHARS}",
+            id.len()
+        );
+    }
+
+    /// It comes from the CSPRNG tail, not the counter prefix.
+    ///
+    /// Two tokens from the same connection share the first four bytes — the
+    /// per-connection counter. Taking the leading eight hex characters would
+    /// make every first declaration on every connection read `00000001`, so a
+    /// shortening that fits the column would still identify nothing.
+    #[test]
+    fn a_declaration_session_id_distinguishes_tokens_of_one_connection() {
+        let mut first = [0u8; 16];
+        first[..4].copy_from_slice(&7u32.to_be_bytes());
+        first[12..].copy_from_slice(&[0xAA; 4]);
+        let mut second = first;
+        second[12..].copy_from_slice(&[0xBB; 4]);
+
+        let (a, b) = (
+            declaration_session_id(&Token(first)),
+            declaration_session_id(&Token(second)),
+        );
+        assert_ne!(
+            a, b,
+            "two tokens of one connection collapsed to the same session id — \
+             the counter prefix was taken instead of the random tail"
+        );
     }
 }
 
