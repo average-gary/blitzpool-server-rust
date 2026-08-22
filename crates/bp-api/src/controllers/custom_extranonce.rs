@@ -113,7 +113,7 @@ where
     // sign for a token that could never set a (Solo-only) override.
     ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
 
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     let expires_at = now + CHALLENGE_TTL_MINUTES * 60 * 1000;
     let message = challenge_message(address.as_str(), &random_nonce(), now, expires_at);
     bp_db::upsert_extranonce_challenge(&state.pool, &address, &message, now, expires_at).await?;
@@ -161,7 +161,7 @@ where
     let pending = bp_db::find_extranonce_challenge(&state.pool, &address)
         .await?
         .ok_or_else(|| en_error("no-challenge", StatusCode::NOT_FOUND))?;
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     if pending.expires_at < now {
         bp_db::delete_extranonce_challenge(&state.pool, &address).await?;
         return Err(en_error("challenge-expired", StatusCode::GONE));
@@ -288,7 +288,7 @@ where
     ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
     verify_token(&state.pool, &address, &bearer_token(&headers)).await?;
 
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     let saved = bp_db::upsert_custom_extranonces_batch(&state.pool, &address, &entries, now)
         .await
         .map_err(map_prefix_conflict)?;

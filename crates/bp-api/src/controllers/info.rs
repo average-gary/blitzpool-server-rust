@@ -969,7 +969,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::Chart, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
@@ -1004,7 +1004,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Accepted, async move {
-            let since = crate::time_range::now_ms() - range.window_ms();
+            let since = bp_common::now_ms() - range.window_ms();
             let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
             let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
             let mut buckets: BTreeMap<i64, f64> = boundaries.iter().map(|&b| (b, 0.0)).collect();
@@ -1054,7 +1054,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Workers, async move {
-            let since = crate::time_range::now_ms() - range.window_ms();
+            let since = bp_common::now_ms() - range.window_ms();
             // Skinny projection (slot time + address + worker only) — the
             // distinct counting stays in-process; we just avoid shipping the
             // full 17-column stats row for every session in the window.
@@ -1157,7 +1157,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Rejected, async move {
-            let since = crate::time_range::now_ms() - range.window_ms();
+            let since = bp_common::now_ms() - range.window_ms();
             let rows = bp_db::find_pool_rejected_statistics_since(&s.pool, since).await?;
             let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
             let mut buckets: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
@@ -1230,7 +1230,7 @@ where
             "POOL_SHARE_TOTALS".to_string(),
             TtlKind::Shares,
             async move {
-                let now = crate::time_range::now_ms();
+                let now = bp_common::now_ms();
                 const DAY: i64 = 24 * 60 * 60 * 1000;
                 let day_rows = bp_db::find_pool_share_statistics_since(&s.pool, now - DAY).await?;
                 let fortnight_rows =
@@ -1420,7 +1420,7 @@ where
         "3d" => (3 * 24 * 60 * 60 * 1000_i64, 600_000_i64),
         _ => (7 * 24 * 60 * 60 * 1000_i64, 600_000_i64),
     };
-    let since = crate::time_range::now_ms() - window_ms;
+    let since = bp_common::now_ms() - window_ms;
     let cutoff_slot = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
     let rows = find_pool_mode_hashrate_since(&state.pool, mode, since).await?;
     Ok(Json(

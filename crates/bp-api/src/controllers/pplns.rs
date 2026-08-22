@@ -62,7 +62,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::PplnsChart, async move {
-            let now_ms = crate::time_range::now_ms();
+            let now_ms = bp_common::now_ms();
             let since = now_ms - range.window_ms();
             let rows =
                 bp_db::find_pool_mode_hashrate_since(&s.pool, MiningMode::Pplns, since).await?;

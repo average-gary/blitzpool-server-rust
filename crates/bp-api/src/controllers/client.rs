@@ -87,7 +87,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::ClientChart, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
             let rows =
@@ -128,7 +128,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientAccepted, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
@@ -180,7 +180,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientWorkers, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
@@ -236,7 +236,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<RejectedResponse, _, ApiError>(key, TtlKind::ClientRejected, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_rejected_statistics_since_for_address(&s.pool, &addr, since)
@@ -529,7 +529,7 @@ where
                 .fold(0.0_f64, f64::max)
                 .floor() as i64;
 
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let rows = find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
@@ -607,7 +607,7 @@ where
                     .await?
                     .ok_or(ApiError::NotFound)?;
 
-                let now = crate::time_range::now_ms();
+                let now = bp_common::now_ms();
                 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
                 let since = now - DAY_MS;
                 let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
@@ -849,7 +849,7 @@ where
                 _ => 24,
             };
             let one_hour_ms: i64 = 60 * 60 * 1000;
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - hours * one_hour_ms;
             let start_slot = (since / one_hour_ms) * one_hour_ms;
             let end_slot = (now / one_hour_ms) * one_hour_ms;

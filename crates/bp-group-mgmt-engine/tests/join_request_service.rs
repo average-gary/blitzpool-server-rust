@@ -5,6 +5,7 @@
 
 //! Integration tests for `bp_group_mgmt_engine::JoinRequestService`.
 
+use bp_common::now_ms;
 use std::sync::Arc;
 
 use bp_db::PatchField;
@@ -362,12 +363,4 @@ async fn expire_join_requests_once_flips_stale_pending() {
     assert_eq!(after.status, "expired");
     cleanup_group(&pool, group_id).await;
     delete_email_for(&pool, &requester).await;
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

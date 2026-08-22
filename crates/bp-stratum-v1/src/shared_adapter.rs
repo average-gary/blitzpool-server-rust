@@ -56,7 +56,7 @@ impl<S: SharedAcceptedShareSink + ?Sized> AcceptedShareSink for Sv1AcceptedShare
                 hash_rate,
                 // SV1 is one device per connection — never bundled.
                 channel_count: 1,
-                ts_ms: bp_share_hook::now_ms(),
+                ts_ms: bp_common::now_ms(),
                 // Producer-assigned downstream at the single fan-out point;
                 // the per-protocol adapter has no global share sequence and
                 // no mode-gate, so it leaves share_id/mode/group_id blank.
@@ -289,7 +289,7 @@ mod tests {
             }
         }
 
-        let before = bp_share_hook::now_ms();
+        let before = bp_common::now_ms();
         let inner = Arc::new(TsSink {
             ts: Mutex::new(None),
         });
@@ -298,7 +298,7 @@ mod tests {
         adapter
             .record_accepted("a", "w", "s", None, &accept, 0.0)
             .await;
-        let after = bp_share_hook::now_ms();
+        let after = bp_common::now_ms();
 
         let ts = inner.ts.lock().unwrap().expect("share recorded");
         assert!(

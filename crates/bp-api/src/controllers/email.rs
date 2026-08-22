@@ -110,7 +110,7 @@ where
     bp_db::delete_email_verifications_for_address(&state.pool, &address).await?;
 
     let token = generate_token();
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     let expires_at = now + VERIFICATION_TTL_HOURS * 60 * 60 * 1000;
     bp_db::insert_email_verification(&state.pool, &token, &address, &email, now, expires_at)
         .await?;
@@ -152,7 +152,7 @@ where
     let pending = bp_db::find_email_verification(&state.pool, &token)
         .await?
         .ok_or_else(|| email_error("not-found", StatusCode::NOT_FOUND))?;
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     if pending.expires_at < now {
         bp_db::delete_email_verification_by_token(&state.pool, &token).await?;
         return Err(email_error("expired", StatusCode::GONE));

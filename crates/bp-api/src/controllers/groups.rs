@@ -2017,7 +2017,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::GroupChart, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let addrs = collect_group_member_addresses(&s, id).await?;
@@ -2060,7 +2060,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::GroupAccepted, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let addrs = collect_group_member_addresses(&s, id).await?;
@@ -2144,7 +2144,7 @@ where
             key,
             TtlKind::GroupRejected,
             async move {
-                let now = crate::time_range::now_ms();
+                let now = bp_common::now_ms();
                 let since = now - range.window_ms();
                 let addrs = collect_group_member_addresses(&s, id).await?;
                 let mut buckets: std::collections::BTreeMap<

@@ -94,7 +94,7 @@ where
     let address = parse_supported_address(&body.address, state.network)?;
     let addr_str = address.as_str().to_string();
 
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     let expires_at = now + CHALLENGE_TTL_MINUTES * 60 * 1000;
     let nonce = random_nonce();
     // Human-readable + bound to the address, a nonce and an expiry so a captured
@@ -153,7 +153,7 @@ where
     let pending = bp_db::find_ownership_challenge(&state.pool, &address)
         .await?
         .ok_or_else(|| ownership_error("no-challenge", StatusCode::NOT_FOUND))?;
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     if pending.expires_at < now {
         bp_db::delete_ownership_challenge(&state.pool, &address).await?;
         return Err(ownership_error("challenge-expired", StatusCode::GONE));

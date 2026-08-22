@@ -336,6 +336,43 @@ impl fmt::Display for MiningMode {
 pub struct UnknownMiningModeError(pub String);
 
 // ---------------------------------------------------------------------------
+// now_ms — the pool's epoch-millisecond wall clock
+// ---------------------------------------------------------------------------
+
+/// Milliseconds since the UNIX epoch, as `i64`.
+///
+/// `i64` and not `u64` because this is the width the values are stored and
+/// compared at: Postgres `bigint` columns, and [`LogThrottle::allow`] below.
+/// Converting at every boundary is what five separate crates were doing.
+///
+/// It was five byte-identical copies (`bp-api`, `bp-blockparty-engine`,
+/// `bp-group-mgmt-engine`, `bp-session-persistence`, `bp-share-hook`) plus two
+/// more in tests. Identical copies do not announce themselves when one of them
+/// changes, which is the whole reason they are one function now.
+///
+/// **This is not a clock abstraction and must not become one.** It reads the
+/// system clock at the call site and cannot be substituted in a test. The pool
+/// has two injectable clocks and they stay where they are: `bp_vardiff::Clock`
+/// for epoch-ms `u64` (Stratum session state, vardiff, the JDP server) and
+/// `bp_cron_utils::Clock` for `chrono::DateTime<Utc>` (calendar-aligned
+/// scheduling). A caller that needs to control time in a test wants one of
+/// those, not this.
+///
+/// Note also what the code around here does instead wherever it can: it takes
+/// the timestamp that travelled WITH the data. The one production caller of
+/// [`LogThrottle::allow`] passes a share's own `ts_ms`, not a reading of now.
+///
+/// Saturates to 0 if the system clock is before the epoch, which is the same
+/// answer every copy gave.
+pub fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // LogThrottle — rate-limit hot-path log lines
 // ---------------------------------------------------------------------------
 

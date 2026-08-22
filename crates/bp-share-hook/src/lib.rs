@@ -185,21 +185,6 @@ impl ShareSequencer {
     }
 }
 
-/// Stamp the current Core wall-clock time in epoch milliseconds.
-///
-/// Used by the SV1/SV2 adapters to fill [`SharedAcceptedShare::ts_ms`] at
-/// the moment a share enters the protocol-agnostic business layer. Uses
-/// `std::time` so the lean wire-protocol crates don't pull in `chrono`.
-/// A pre-1970 clock (impossible in practice) saturates to `0` rather than
-/// panicking.
-pub fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Hook for accepted shares. Engines implement this once and the
 /// Stratum-server adapters dispatch every accepted share through it.
 /// Mode-blind by design — a mode-specific engine gates on the

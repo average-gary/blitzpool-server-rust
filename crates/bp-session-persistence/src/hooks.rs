@@ -18,8 +18,8 @@
 //! authorize and hang up never reach Postgres at all. Deregister
 //! soft-deletes only sessions that were actually born.
 
+use bp_common::now_ms;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink, SharedSessionPersistence};
@@ -214,14 +214,4 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
             now_ms,
         );
     }
-}
-
-/// Wall-clock milliseconds since the Unix epoch — the stamp for
-/// `startTime`/`updatedAt`-family columns. `0` on a pre-1970 clock,
-/// matching what the synchronous register path always did.
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

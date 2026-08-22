@@ -37,16 +37,6 @@ pub(crate) fn normalize_address(raw: &str) -> Result<AddressId, BlockpartyServic
     AddressId::new(normalized).map_err(|_| BlockpartyServiceError::InvalidAddress)
 }
 
-/// Current UTC wall-clock in epoch-ms. Wrapped so a future test-clock
-/// hook can swap implementations without touching every call site.
-pub(crate) fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::normalize_address;
