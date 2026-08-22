@@ -155,6 +155,47 @@ pub(crate) struct FoundBlockRecord {
     pub(crate) block_data: String,
 }
 
+/// What the FINDER of a block knows about it: the caller-supplied half of
+/// [`BlockFoundEvent`], against the half [`TdpBlockSubmissionSink::emit_block_found`]
+/// resolves on the Core (`mode`, `group_id`, `height`, `weight_snapshot`).
+///
+/// A struct because these travelled as eight positional parameters through
+/// that one signature, four of them `String` and one `Option<String>`.
+/// Measured 2026-08-22: exchanging `worker` and `session_id` — writing the
+/// literal `"jdp"` into `blocks_entity."sessionId"` and the session id into
+/// `"worker"` — compiled and left all 179 `blitzpool` tests green. The one
+/// pairing that IS caught, address against session id, is caught by
+/// `varchar(8)` refusing the longer value rather than by any test, and only
+/// when a database is reachable at all.
+///
+/// Named fields do not make the exchange impossible — `address:
+/// session_id.clone()` still compiles. They make it visible AT THE CALL SITE
+/// instead of only in the signature, which is the whole distance between a
+/// reviewable mistake and an invisible one. Making it impossible needs a
+/// newtype per string; that reaches far past this boundary and was weighed
+/// against it deliberately.
+struct BlockFoundInputs {
+    /// Miner-authorized payout address. Also what the mode gate is asked, so
+    /// a wrong value here does not merely mis-record a column: it books the
+    /// block against another mode, or against `lookup_mode`'s Solo default,
+    /// which writes no ledger at all.
+    address: String,
+    worker: String,
+    /// ⚠️ Lands in `blocks_entity."sessionId"`, which is `varchar(8)`.
+    /// Postgres does not truncate on INSERT, it errors.
+    session_id: String,
+    reward_sats: Option<u64>,
+    /// Big-endian block-hash hex. Not an `Option` here even though
+    /// [`BlockFoundEvent::block_hash`] is one: every caller has the hash. The
+    /// event keeps its `Option` because it is deserialized off a stream that
+    /// other processes replay, so events predating the field still arrive.
+    block_hash: String,
+    /// The 80-byte header as hex (LE), for `blocks_entity.blockData`.
+    block_data: String,
+    pplns_payouts_fingerprint: Option<[u8; 32]>,
+    actual_coinbase: Option<ActualCoinbase>,
+}
+
 /// `BlockSubmissionSink` for both SV1 + SV2. Forwards every
 /// block-candidate share to bitcoin-core via TDP **and**
 /// fans the event out to the per-mode engine ledger
@@ -359,16 +400,16 @@ impl TdpBlockSubmissionSink {
         payouts_fingerprint: [u8; 32],
         actual_coinbase: Option<ActualCoinbase>,
     ) -> bool {
-        self.emit_block_found(
-            record.miner_address,
-            "jdp".to_string(),
-            record.session_id,
-            Some(reward_sats),
-            Some(record.block_hash),
-            record.block_data,
-            Some(payouts_fingerprint),
+        self.emit_block_found(BlockFoundInputs {
+            address: record.miner_address,
+            worker: "jdp".to_string(),
+            session_id: record.session_id,
+            reward_sats: Some(reward_sats),
+            block_hash: record.block_hash,
+            block_data: record.block_data,
+            pplns_payouts_fingerprint: Some(payouts_fingerprint),
             actual_coinbase,
-        )
+        })
         .await
     }
 
@@ -389,16 +430,16 @@ impl TdpBlockSubmissionSink {
         &self,
         record: FoundBlockRecord,
     ) -> bool {
-        self.emit_block_found(
-            record.miner_address,
-            "jdp".to_string(),
-            record.session_id,
-            None,
-            Some(record.block_hash),
-            record.block_data,
-            None,
-            None,
-        )
+        self.emit_block_found(BlockFoundInputs {
+            address: record.miner_address,
+            worker: "jdp".to_string(),
+            session_id: record.session_id,
+            reward_sats: None,
+            block_hash: record.block_hash,
+            block_data: record.block_data,
+            pplns_payouts_fingerprint: None,
+            actual_coinbase: None,
+        })
         .await
     }
 
@@ -457,7 +498,6 @@ impl TdpBlockSubmissionSink {
     /// self-contained [`BlockFoundEvent`] and publishes it onto the stream for
     /// the payout Satellite to apply (falling back to an in-process
     /// [`BlockFoundApplier`] apply if the publish fails).
-    #[allow(clippy::too_many_arguments)]
     /// Returns whether the block-found reached the fan-out — i.e. an event was
     /// built and either published or applied in-process. `false` means one of
     /// the preconditions below was missing and **nothing at all was written**,
@@ -468,17 +508,17 @@ impl TdpBlockSubmissionSink {
     /// It does not promise the ledger row itself landed. Past the fan-out every
     /// step is best-effort and PG-idempotent, so a redelivery finishes the job;
     /// before it, there is nothing to redeliver.
-    async fn emit_block_found(
-        &self,
-        address: String,
-        worker: String,
-        session_id: String,
-        reward_sats: Option<u64>,
-        block_hash: Option<String>,
-        block_data: String,
-        pplns_payouts_fingerprint: Option<[u8; 32]>,
-        actual_coinbase: Option<ActualCoinbase>,
-    ) -> bool {
+    async fn emit_block_found(&self, found: BlockFoundInputs) -> bool {
+        let BlockFoundInputs {
+            address,
+            worker,
+            session_id,
+            reward_sats,
+            block_hash,
+            block_data,
+            pplns_payouts_fingerprint,
+            actual_coinbase,
+        } = found;
         // Resolve the payout mode on the Core (the only side with the gate)
         // and stamp it onto the event so the apply side needs no gate.
         let Some(mode_gate) = self.mode_gate.as_ref() else {
@@ -550,7 +590,7 @@ impl TdpBlockSubmissionSink {
             session_id,
             pplns_payouts_fingerprint,
             reward_sats,
-            block_hash,
+            block_hash: Some(block_hash),
             block_data,
             mode: resolved.mode,
             group_id: resolved.group_id,
@@ -1282,18 +1322,18 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
         // fees after the JDC's `coinbase_outputs` for JDP-declared jobs);
         // for pool-built SV1 jobs it equals the full block reward.
         let actual = decode_actual_coinbase(&coinbase_bytes, self.network);
-        self.emit_block_found(
-            address.to_string(),
-            worker.to_string(),
-            session_id.to_string(),
-            Some(accept.template.coinbase_tx_value_remaining),
-            Some(block_hash_display(&accept.header)),
-            hex::encode(accept.header),
+        self.emit_block_found(BlockFoundInputs {
+            address: address.to_string(),
+            worker: worker.to_string(),
+            session_id: session_id.to_string(),
+            reward_sats: Some(accept.template.coinbase_tx_value_remaining),
+            block_hash: block_hash_display(&accept.header),
+            block_data: hex::encode(accept.header),
             // The job the winning share was built on — so the PPLNS apply
             // books the distribution this coinbase actually pays.
-            Some(*accept.mining_job.payouts_fingerprint()),
-            actual,
-        )
+            pplns_payouts_fingerprint: Some(*accept.mining_job.payouts_fingerprint()),
+            actual_coinbase: actual,
+        })
         .await;
     }
 }
@@ -1362,16 +1402,16 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
                  propagates it through its own node, the pool records it here (no template_id \
                  to submit with)"
             );
-            self.emit_block_found(
-                address.to_string(),
-                worker.to_string(),
-                session_id_hex.to_string(),
+            self.emit_block_found(BlockFoundInputs {
+                address: address.to_string(),
+                worker: worker.to_string(),
+                session_id: session_id_hex.to_string(),
                 reward_sats,
-                Some(block_hash_display(&accept.header)),
-                hex::encode(accept.header),
-                Some(fingerprint),
-                actual,
-            )
+                block_hash: block_hash_display(&accept.header),
+                block_data: hex::encode(accept.header),
+                pplns_payouts_fingerprint: Some(fingerprint),
+                actual_coinbase: actual,
+            })
             .await;
             return;
         }
@@ -1421,16 +1461,16 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
         // NewExtendedMiningJob send-time), so the per-mode engine ledger-write
         // fires for SV2-found blocks exactly as it does for SV1.
         let actual = decode_actual_coinbase(&accept.witness_coinbase, self.network);
-        self.emit_block_found(
-            address.to_string(),
-            worker.to_string(),
-            session_id_hex.to_string(),
-            Some(accept.coinbase_tx_value_remaining),
-            Some(block_hash_display(&accept.header)),
-            hex::encode(accept.header),
-            Some(accept.payouts_fingerprint),
-            actual,
-        )
+        self.emit_block_found(BlockFoundInputs {
+            address: address.to_string(),
+            worker: worker.to_string(),
+            session_id: session_id_hex.to_string(),
+            reward_sats: Some(accept.coinbase_tx_value_remaining),
+            block_hash: block_hash_display(&accept.header),
+            block_data: hex::encode(accept.header),
+            pplns_payouts_fingerprint: Some(accept.payouts_fingerprint),
+            actual_coinbase: actual,
+        })
         .await;
     }
 }
