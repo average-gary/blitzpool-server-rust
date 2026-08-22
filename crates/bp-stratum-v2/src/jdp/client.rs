@@ -186,15 +186,39 @@ pub struct ProvideMissingTransactionsSuccessInput {
     pub transaction_list: Vec<Vec<u8>>,
 }
 
+/// The block-header fields a `PushSolution` carries.
+///
+/// Together rather than loose, because four of the five are `u32` and they
+/// travel from here to the block reassembly through two more signatures. As
+/// separate arguments any two of them could be swapped at a call site and
+/// nothing would object — not the compiler, and not the suite: `ntime` and
+/// `nonce` were once exchanged deliberately and 2191 tests stayed green,
+/// bitcoin-core regtests included. The result in production would be a header
+/// that hashes to nothing: `submitblock` rejects it, `solution_is_evidence`
+/// reads it as insufficient work, and the log blames the JD-client.
+///
+/// No `merkle_root`: it is not the JDC's to send, it falls out of the
+/// reassembled transaction set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SolutionHeader {
+    /// Tip the solution was mined on.
+    pub prev_hash: [u8; 32],
+    /// Block-header `version` field (BIP-320 version-rolled).
+    pub version: u32,
+    /// Block-header `ntime` field.
+    pub ntime: u32,
+    /// Block-header `nonce` field.
+    pub nonce: u32,
+    /// Block-header `nBits` field, as the JDC sent it. Never used as a
+    /// threshold — the pool checks work against its OWN target.
+    pub n_bits: u32,
+}
+
 /// Inputs from a deserialized `PushSolution` frame (SV2 JDP/PushSolution).
 #[derive(Clone, Debug)]
 pub struct PushSolutionInput {
     pub extranonce: Vec<u8>,
-    pub prev_hash: [u8; 32],
-    pub ntime: u32,
-    pub nonce: u32,
-    pub n_bits: u32,
-    pub version: u32,
+    pub header: SolutionHeader,
 }
 
 // ── Pre-resolved hook arguments (caller-supplied) ───────────────────
@@ -338,16 +362,9 @@ pub enum JdpSessionEvent {
         /// include witness data; the IO layer strips for merkle-root
         /// computation if needed.
         transactions: Vec<Vec<u8>>,
-        /// 32-byte prev hash from the solution.
-        prev_hash: [u8; 32],
-        /// Block-header `version` field (BIP-320 version-rolled).
-        version: u32,
-        /// Block-header `ntime` field.
-        ntime: u32,
-        /// Block-header `nonce` field.
-        nonce: u32,
-        /// Block-header `n_bits` field.
-        n_bits: u32,
+        /// The header fields the JDC solved with, as one value — see
+        /// [`SolutionHeader`].
+        header: SolutionHeader,
         /// What the declaration behind this solution was backed by, carried
         /// from the declare-time ext 0x0003/Output Verification proof. Decides
         /// BOTH whether the block is booked and whether the
@@ -1169,17 +1186,20 @@ pub fn handle_push_solution(
     // (`ExtendedJob::jdp_claims_the_block`).
     if !state.full_template_mode {
         tracing::info!(
-            prev_hash = %hash_hex(&input.prev_hash),
+            prev_hash = %hash_hex(&input.header.prev_hash),
             "jdp: PushSolution from a Coinbase-only session — no declaration to reassemble the \
              block from; the JDC propagates it and the mining side records it"
         );
         return JdpHandlerOutcome::default();
     }
-    let job = match state.declared_jobs.match_for_solution(&input.prev_hash) {
+    let job = match state
+        .declared_jobs
+        .match_for_solution(&input.header.prev_hash)
+    {
         Some(j) => j,
         None => {
             tracing::warn!(
-                prev_hash = %hash_hex(&input.prev_hash),
+                prev_hash = %hash_hex(&input.header.prev_hash),
                 "jdp: PushSolution dropped — no matching declared job (reconnect gap or stale solution)"
             );
             return JdpHandlerOutcome::default();
@@ -1217,7 +1237,7 @@ pub fn handle_push_solution(
         // ext 0x0003/Implementation Notes settle. See `CandidateBacking`.
         (None, Some(distribution_id)) => {
             tracing::error!(
-                prev_hash = %hash_hex(&input.prev_hash),
+                prev_hash = %hash_hex(&input.header.prev_hash),
                 distribution_id,
                 "jdp: BLOCK FOUND on a validated distribution that was never bookable — \
                  its coinbase pays miners on-chain but this block gets NO ledger entry, \
@@ -1240,7 +1260,7 @@ pub fn handle_push_solution(
             Some(raw) => transactions.push(raw.clone()),
             None => {
                 tracing::warn!(
-                    prev_hash = %hash_hex(&input.prev_hash),
+                    prev_hash = %hash_hex(&input.header.prev_hash),
                     position = i,
                     "jdp: PushSolution dropped — declared job is missing raw tx data"
                 );
@@ -1264,11 +1284,7 @@ pub fn handle_push_solution(
             backing,
             coinbase_raw,
             transactions,
-            prev_hash: input.prev_hash,
-            version: input.version,
-            ntime: input.ntime,
-            nonce: input.nonce,
-            n_bits: input.n_bits,
+            header: input.header,
         }],
     }
 }
@@ -2769,11 +2785,13 @@ mod tests {
         handle_setup_connection(&mut s, &setup);
         let solution = PushSolutionInput {
             extranonce: vec![0; 8],
-            prev_hash: [0xAB; 32],
-            ntime: 0,
-            nonce: 0,
-            n_bits: 0,
-            version: 0,
+            header: SolutionHeader {
+                prev_hash: [0xAB; 32],
+                version: 0,
+                ntime: 0,
+                nonce: 0,
+                n_bits: 0,
+            },
         };
         let out = handle_push_solution(&mut s, &solution);
         assert!(out.outbound.is_empty());
@@ -2786,11 +2804,13 @@ mod tests {
         handle_setup_connection(&mut s, &good_setup());
         let solution = PushSolutionInput {
             extranonce: vec![0; 8],
-            prev_hash: [0xAB; 32],
-            ntime: 0,
-            nonce: 0,
-            n_bits: 0,
-            version: 0,
+            header: SolutionHeader {
+                prev_hash: [0xAB; 32],
+                version: 0,
+                ntime: 0,
+                nonce: 0,
+                n_bits: 0,
+            },
         };
         let out = handle_push_solution(&mut s, &solution);
         assert!(out.events.is_empty());
@@ -2823,11 +2843,13 @@ mod tests {
 
         let solution = PushSolutionInput {
             extranonce: vec![0xEE; 8],
-            prev_hash: [0xAB; 32],
-            ntime: 0x6500_0001,
-            nonce: 0x1234_5678,
-            n_bits: 0x1d00_ffff,
-            version: 0x2000_0000,
+            header: SolutionHeader {
+                prev_hash: [0xAB; 32],
+                version: 0x2000_0000,
+                ntime: 0x6500_0001,
+                nonce: 0x1234_5678,
+                n_bits: 0x1d00_ffff,
+            },
         };
         let out = handle_push_solution(&mut s, &solution);
         match &out.events[0] {
@@ -2862,11 +2884,13 @@ mod tests {
         let extranonce = vec![0xEE; 8];
         let solution = PushSolutionInput {
             extranonce: extranonce.clone(),
-            prev_hash: [0xAB; 32],
-            ntime: 0x6500_0001,
-            nonce: 0x1234_5678,
-            n_bits: 0x1d00_ffff,
-            version: 0x2000_0000,
+            header: SolutionHeader {
+                prev_hash: [0xAB; 32],
+                version: 0x2000_0000,
+                ntime: 0x6500_0001,
+                nonce: 0x1234_5678,
+                n_bits: 0x1d00_ffff,
+            },
         };
         let out = handle_push_solution(&mut s, &solution);
         assert!(out.outbound.is_empty());
@@ -2874,8 +2898,7 @@ mod tests {
             JdpSessionEvent::BlockSubmissionCandidate {
                 coinbase_raw,
                 transactions,
-                prev_hash,
-                ntime,
+                header,
                 ..
             } => {
                 // The candidate is the declared prefix + the miner's extranonce
@@ -2890,8 +2913,8 @@ mod tests {
                 );
                 assert_eq!(transactions.len(), 1, "1 non-coinbase tx");
                 assert_eq!(transactions[0], vec![0xCA; 8]);
-                assert_eq!(*prev_hash, [0xAB; 32]);
-                assert_eq!(*ntime, 0x6500_0001);
+                assert_eq!(header.prev_hash, [0xAB; 32]);
+                assert_eq!(header.ntime, 0x6500_0001);
             }
             _ => panic!("expected BlockSubmissionCandidate"),
         }
@@ -2915,11 +2938,13 @@ mod tests {
         assert_eq!(s.declared_jobs.len(), 0);
         let solution = PushSolutionInput {
             extranonce: vec![0; 8],
-            prev_hash: [0xAB; 32],
-            ntime: 0,
-            nonce: 0,
-            n_bits: 0,
-            version: 0,
+            header: SolutionHeader {
+                prev_hash: [0xAB; 32],
+                version: 0,
+                ntime: 0,
+                nonce: 0,
+                n_bits: 0,
+            },
         };
         let out = handle_push_solution(&mut s, &solution);
         assert!(out.events.is_empty());

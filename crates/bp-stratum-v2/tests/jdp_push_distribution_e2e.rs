@@ -54,8 +54,8 @@ use bp_stratum_v2::extensions::{
     encode_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
 use bp_stratum_v2::jdp::client::{
-    parse_user_identifier_as_address, AllocateTokenContext, ERR_INVALID_PAYOUT_DISTRIBUTION,
-    ERR_STALE_PAYOUT_DISTRIBUTION, FLAG_DECLARE_TX_DATA,
+    parse_user_identifier_as_address, AllocateTokenContext, SolutionHeader,
+    ERR_INVALID_PAYOUT_DISTRIBUTION, ERR_STALE_PAYOUT_DISTRIBUTION, FLAG_DECLARE_TX_DATA,
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
     encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
@@ -232,7 +232,6 @@ struct RecordingSink {
 
 #[async_trait]
 impl JdpBlockSubmissionSink for RecordingSink {
-    #[allow(clippy::too_many_arguments)]
     async fn submit_block_candidate(
         &self,
         miner_address: AddressId,
@@ -240,17 +239,13 @@ impl JdpBlockSubmissionSink for RecordingSink {
         backing: CandidateBacking,
         coinbase_raw: Vec<u8>,
         _transactions: Vec<Vec<u8>>,
-        prev_hash: [u8; 32],
-        _version: u32,
-        _ntime: u32,
-        _nonce: u32,
-        _n_bits: u32,
+        header: SolutionHeader,
     ) {
         self.candidates.lock().unwrap().push(RecordedCandidate {
             miner_address: miner_address.as_str().to_string(),
             backing,
             coinbase_raw,
-            prev_hash,
+            prev_hash: header.prev_hash,
         });
     }
 }

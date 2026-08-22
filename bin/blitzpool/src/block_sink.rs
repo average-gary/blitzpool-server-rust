@@ -146,6 +146,26 @@ pub(crate) struct BlockFoundEvent {
 /// step logs at INFO and continues. The TDP submit is the
 /// authoritative block-propagation path; engine + dispatcher are
 /// observability + accounting.
+/// What identifies a JDC-found block in `blocks_entity`.
+///
+/// The four used to travel as four consecutive `String` parameters through two
+/// signatures — trait method and the concrete one it forwards to — where any
+/// two could be exchanged in silence. They were, deliberately, in a check:
+/// `cargo check` and 175 `blitzpool` tests stayed green with the session id in
+/// the address column and the header in the hash column.
+///
+/// ⚠️ `session_id` lands in `blocks_entity."sessionId"`, which is
+/// `varchar(8)`. Postgres does not truncate on INSERT, it errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FoundBlockRecord {
+    pub(crate) miner_address: String,
+    pub(crate) session_id: String,
+    /// Block hash, display form.
+    pub(crate) block_hash: String,
+    /// The 80-byte header as hex.
+    pub(crate) block_data: String,
+}
+
 pub(crate) struct TdpBlockSubmissionSink {
     /// Default stream handle (PPLNS-autoscaled). Submission target for every
     /// PPLNS job, and the fallback when an alt stream isn't wired.
@@ -331,24 +351,20 @@ impl TdpBlockSubmissionSink {
     /// distribution the block actually paid rather than a rebuilt guess.
     ///
     /// `worker` is fixed to `jdp` — a declared job has no Stratum worker name.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn book_declared_block_found(
         &self,
-        miner_address: String,
-        session_id: String,
+        record: FoundBlockRecord,
         reward_sats: u64,
-        block_hash: String,
-        block_data: String,
         payouts_fingerprint: [u8; 32],
         actual_coinbase: Option<ActualCoinbase>,
     ) -> bool {
         self.emit_block_found(
-            miner_address,
+            record.miner_address,
             "jdp".to_string(),
-            session_id,
+            record.session_id,
             Some(reward_sats),
-            Some(block_hash),
-            block_data,
+            Some(record.block_hash),
+            record.block_data,
             Some(payouts_fingerprint),
             actual_coinbase,
         )
@@ -370,18 +386,15 @@ impl TdpBlockSubmissionSink {
     /// is no distribution to resolve and nothing may be settled from a guess.
     pub(crate) async fn record_declared_block_without_booking(
         &self,
-        miner_address: String,
-        session_id: String,
-        block_hash: String,
-        block_data: String,
+        record: FoundBlockRecord,
     ) -> bool {
         self.emit_block_found(
-            miner_address,
+            record.miner_address,
             "jdp".to_string(),
-            session_id,
+            record.session_id,
             None,
-            Some(block_hash),
-            block_data,
+            Some(record.block_hash),
+            record.block_data,
             None,
             None,
         )

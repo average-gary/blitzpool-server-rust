@@ -54,6 +54,7 @@ use crate::extensions::RequestExtensions as LocalRequestExtensions;
 use crate::jdp::client::{
     AllocateMiningJobTokenInput, DeclareMiningJobInput, JdpOutboundFrame,
     ProvideMissingTransactionsSuccessInput, PushSolutionInput, SetupConnectionInput,
+    SolutionHeader,
 };
 
 // ── InboundJdpFrame ─────────────────────────────────────────────────
@@ -194,11 +195,13 @@ fn decode_provide_success(
 fn decode_push_solution(m: Sv2PushSolution<'static>) -> Result<PushSolutionInput, CodecError> {
     Ok(PushSolutionInput {
         extranonce: m.extranonce.as_bytes().to_vec(),
-        prev_hash: bytes_to_32(m.prev_hash.as_bytes())?,
-        ntime: m.ntime,
-        nonce: m.nonce,
-        n_bits: m.nbits,
-        version: m.version,
+        header: SolutionHeader {
+            prev_hash: bytes_to_32(m.prev_hash.as_bytes())?,
+            version: m.version,
+            ntime: m.ntime,
+            nonce: m.nonce,
+            n_bits: m.nbits,
+        },
     })
 }
 
@@ -447,8 +450,10 @@ mod tests {
         match out {
             InboundJdpFrame::PushSolution(i) => {
                 assert_eq!(i.extranonce, vec![0xEE; 8]);
-                assert_eq!(i.prev_hash, [0xAB; 32]);
-                assert_eq!(i.nonce, 0xdeadbeef);
+                assert_eq!(i.header.prev_hash, [0xAB; 32]);
+                assert_eq!(i.header.nonce, 0xdeadbeef);
+                assert_eq!(i.header.n_bits, 0x1d00_ffff);
+                assert_eq!(i.header.version, 0x2000_0000);
             }
             _ => panic!("expected PushSolution"),
         }

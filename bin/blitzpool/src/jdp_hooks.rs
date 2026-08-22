@@ -79,7 +79,9 @@ use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
 use bp_common::{AddressId, Sats, StreamKind};
-use bp_stratum_v2::jdp::client::{parse_user_identifier_as_address, AllocateTokenContext};
+use bp_stratum_v2::jdp::client::{
+    parse_user_identifier_as_address, AllocateTokenContext, SolutionHeader,
+};
 use bp_stratum_v2::jdp::dynamic_outputs::{
     encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
 };
@@ -92,6 +94,7 @@ use bp_stratum_v2::tokens::Token;
 use bp_template_distribution::{TdpHandle, TemplateTxCache};
 use tracing::{debug, info, warn};
 
+use crate::block_sink::FoundBlockRecord;
 use crate::payout_resolver::ProductionPayoutResolver;
 
 /// Build the production `JdpServerHooks` aggregate. The four hooks
@@ -637,14 +640,10 @@ impl ChainView for TdpHandle {
 /// it in-process, gets discarded as a duplicate.
 #[async_trait]
 pub(crate) trait DeclaredBlockBooker: Send + Sync {
-    #[allow(clippy::too_many_arguments)]
     async fn book(
         &self,
-        miner_address: String,
-        session_id: String,
+        record: FoundBlockRecord,
         reward_sats: u64,
-        block_hash: String,
-        block_data: String,
         payouts_fingerprint: [u8; 32],
         actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
     ) -> bool;
@@ -661,53 +660,24 @@ pub(crate) trait DeclaredBlockBooker: Send + Sync {
     /// Separate from [`Self::book`] rather than a flag on it, because the
     /// difference is not a parameter: `book` promises a ledger write and
     /// returns whether it happened, this one promises the opposite.
-    async fn record_unbookable(
-        &self,
-        miner_address: String,
-        session_id: String,
-        block_hash: String,
-        block_data: String,
-    ) -> bool;
+    async fn record_unbookable(&self, record: FoundBlockRecord) -> bool;
 }
 
 #[async_trait]
 impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
     async fn book(
         &self,
-        miner_address: String,
-        session_id: String,
+        record: FoundBlockRecord,
         reward_sats: u64,
-        block_hash: String,
-        block_data: String,
         payouts_fingerprint: [u8; 32],
         actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
     ) -> bool {
-        self.book_declared_block_found(
-            miner_address,
-            session_id,
-            reward_sats,
-            block_hash,
-            block_data,
-            payouts_fingerprint,
-            actual_coinbase,
-        )
-        .await
+        self.book_declared_block_found(record, reward_sats, payouts_fingerprint, actual_coinbase)
+            .await
     }
 
-    async fn record_unbookable(
-        &self,
-        miner_address: String,
-        session_id: String,
-        block_hash: String,
-        block_data: String,
-    ) -> bool {
-        self.record_declared_block_without_booking(
-            miner_address,
-            session_id,
-            block_hash,
-            block_data,
-        )
-        .await
+    async fn record_unbookable(&self, record: FoundBlockRecord) -> bool {
+        self.record_declared_block_without_booking(record).await
     }
 }
 
@@ -742,15 +712,10 @@ fn decode_whole_tx(bytes: &[u8]) -> Option<Transaction> {
 /// booking, which needs the header to name the block — are served from one
 /// call. Returns `None` when the JDC's bytes don't parse; the caller logs and
 /// moves on, because the JDC submits through its own node regardless.
-#[allow(clippy::too_many_arguments)]
 fn assemble_declared_block(
     coinbase_raw: &[u8],
     transactions: &[Vec<u8>],
-    prev_hash: [u8; 32],
-    version: u32,
-    ntime: u32,
-    nonce: u32,
-    n_bits: u32,
+    solution: SolutionHeader,
 ) -> Option<Block> {
     // These bytes come off the wire from the JDC. `assemble_witness_coinbase`
     // indexes from the tail (version + locktime), so anything shorter than
@@ -810,12 +775,12 @@ fn assemble_declared_block(
         }
     }
     let mut header = Header {
-        version: BlockVersion::from_consensus(version as i32),
-        prev_blockhash: BlockHash::from_byte_array(prev_hash),
+        version: BlockVersion::from_consensus(solution.version as i32),
+        prev_blockhash: BlockHash::from_byte_array(solution.prev_hash),
         merkle_root: TxMerkleNode::all_zeros(),
-        time: ntime,
-        bits: CompactTarget::from_consensus(n_bits),
-        nonce,
+        time: solution.ntime,
+        bits: CompactTarget::from_consensus(solution.n_bits),
+        nonce: solution.nonce,
     };
     let mut block = Block { header, txdata };
     let merkle_root = block.compute_merkle_root().unwrap_or_else(|| {
@@ -1025,12 +990,12 @@ impl ProductionJdpBlockSink {
                 (backing, self.booker.as_ref())
             {
                 let recorded = recorder
-                    .record_unbookable(
-                        miner_address.as_str().to_string(),
-                        hex::encode(new_token.0),
-                        hash.to_string(),
-                        serialize_hex(&block.header),
-                    )
+                    .record_unbookable(FoundBlockRecord {
+                        miner_address: miner_address.as_str().to_string(),
+                        session_id: hex::encode(new_token.0),
+                        block_hash: hash.to_string(),
+                        block_data: serialize_hex(&block.header),
+                    })
                     .await;
                 if recorded {
                     self.remember_booked(hash.to_byte_array());
@@ -1063,11 +1028,13 @@ impl ProductionJdpBlockSink {
             .unwrap_or(booking.reference_reward_sats);
         let booked = booker
             .book(
-                miner_address.as_str().to_string(),
-                hex::encode(new_token.0),
+                FoundBlockRecord {
+                    miner_address: miner_address.as_str().to_string(),
+                    session_id: hex::encode(new_token.0),
+                    block_hash: hash.to_string(),
+                    block_data: serialize_hex(&block.header),
+                },
                 reward_sats,
-                hash.to_string(),
-                serialize_hex(&block.header),
                 booking.payouts_fingerprint,
                 actual,
             )
@@ -1094,11 +1061,7 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
         backing: CandidateBacking,
         coinbase_raw: Vec<u8>,
         transactions: Vec<Vec<u8>>,
-        prev_hash: [u8; 32],
-        version: u32,
-        ntime: u32,
-        nonce: u32,
-        n_bits: u32,
+        solution: SolutionHeader,
     ) {
         info!(
             miner = miner_address.as_str(),
@@ -1131,15 +1094,7 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
         {
             return;
         }
-        let Some(block) = assemble_declared_block(
-            &coinbase_raw,
-            &transactions,
-            prev_hash,
-            version,
-            ntime,
-            nonce,
-            n_bits,
-        ) else {
+        let Some(block) = assemble_declared_block(&coinbase_raw, &transactions, solution) else {
             warn!(
                 miner = miner_address.as_str(),
                 "JDP block: reassembly failed — the block can be neither resubmitted nor booked"
@@ -2036,11 +1991,13 @@ mod tests {
         assert!(assemble_declared_block(
             &[0xFF, 0xFF, 0xFF],
             &[],
-            [0u8; 32],
-            0x2000_0000,
-            1_700_000_000,
-            42,
-            0x1d00_ffff,
+            SolutionHeader {
+                prev_hash: [0u8; 32],
+                version: 0x2000_0000,
+                ntime: 1_700_000_000,
+                nonce: 42,
+                n_bits: 0x1d00_ffff,
+            },
         )
         .is_none());
     }
@@ -2077,11 +2034,13 @@ mod tests {
         let block = assemble_declared_block(
             &raw,
             &[],
-            [0xABu8; 32],
-            0x2000_0000,
-            1_700_000_000,
-            42,
-            0x1d00_ffff,
+            SolutionHeader {
+                prev_hash: [0xABu8; 32],
+                version: 0x2000_0000,
+                ntime: 1_700_000_000,
+                nonce: 42,
+                n_bits: 0x1d00_ffff,
+            },
         )
         .expect("a well-formed coinbase must reassemble");
         assert_ne!(
@@ -2127,11 +2086,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let block = assemble_declared_block(
             &raw,
             &[],
-            [0xABu8; 32],
-            0x2000_0000,
-            1_700_000_000,
-            42,
-            0x1d00_ffff,
+            SolutionHeader {
+                prev_hash: [0xABu8; 32],
+                version: 0x2000_0000,
+                ntime: 1_700_000_000,
+                nonce: 42,
+                n_bits: 0x1d00_ffff,
+            },
         )
         .expect("the reference client's own coinbase must reassemble");
 
@@ -2175,11 +2136,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let block = assemble_declared_block(
             &raw,
             &[],
-            [0xABu8; 32],
-            0x2000_0000,
-            1_700_000_000,
-            42,
-            0x1d00_ffff,
+            SolutionHeader {
+                prev_hash: [0xABu8; 32],
+                version: 0x2000_0000,
+                ntime: 1_700_000_000,
+                nonce: 42,
+                n_bits: 0x1d00_ffff,
+            },
         )
         .expect("a non-witness coinbase must still reassemble");
         assert_eq!(block.txdata[0].input.len(), 1);
@@ -2244,11 +2207,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         assert!(assemble_declared_block(
             &garbage,
             &[],
-            [0u8; 32],
-            0x2000_0000,
-            1_700_000_000,
-            42,
-            0x1d00_ffff,
+            SolutionHeader {
+                prev_hash: [0u8; 32],
+                version: 0x2000_0000,
+                ntime: 1_700_000_000,
+                nonce: 42,
+                n_bits: 0x1d00_ffff,
+            },
         )
         .is_none());
     }
@@ -2282,11 +2247,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         assert!(assemble_declared_block(
             &raw,
             &[vec![0xFFu8; 40]],
-            [0u8; 32],
-            0x2000_0000,
-            1_700_000_000,
-            42,
-            0x1d00_ffff,
+            SolutionHeader {
+                prev_hash: [0u8; 32],
+                version: 0x2000_0000,
+                ntime: 1_700_000_000,
+                nonce: 42,
+                n_bits: 0x1d00_ffff,
+            },
         )
         .is_none());
     }
@@ -2330,30 +2297,21 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     impl DeclaredBlockBooker for RecordingBooker {
         async fn book(
             &self,
-            _: String,
-            _: String,
+            record: FoundBlockRecord,
             reward: u64,
-            block_hash: String,
-            _: String,
             fp: [u8; 32],
             _: Option<bp_coinbase_snapshot::ActualCoinbase>,
         ) -> bool {
             self.booked.lock().unwrap().push((reward, fp));
-            self.hashes.lock().unwrap().push(block_hash);
+            self.hashes.lock().unwrap().push(record.block_hash);
             !self.wrote_nothing
         }
 
-        async fn record_unbookable(
-            &self,
-            _: String,
-            _: String,
-            block_hash: String,
-            _: String,
-        ) -> bool {
+        async fn record_unbookable(&self, record: FoundBlockRecord) -> bool {
             // Recorded in its OWN list, not in `booked` — a test that cannot
             // tell "wrote the row" from "wrote the ledger" would pass on
             // either, which is the whole distinction being built here.
-            self.recorded.lock().unwrap().push(block_hash);
+            self.recorded.lock().unwrap().push(record.block_hash);
             !self.wrote_nothing
         }
     }
@@ -2413,11 +2371,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         assemble_declared_block(
             &coinbase_bytes(),
             &[],
-            [0u8; 32],
-            0x2000_0000,
-            1_700_000_000,
-            nonce,
-            0x1d00_ffff,
+            SolutionHeader {
+                prev_hash: [0u8; 32],
+                version: 0x2000_0000,
+                ntime: 1_700_000_000,
+                nonce,
+                n_bits: 0x1d00_ffff,
+            },
         )
         .expect("fixture coinbase reassembles")
     }
@@ -2487,11 +2447,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
             backing,
             coinbase_bytes(),
             vec![],
-            [0u8; 32],
-            0x2000_0000,
-            1_700_000_000,
-            nonce,
-            0x1d00_ffff,
+            SolutionHeader {
+                prev_hash: [0u8; 32],
+                version: 0x2000_0000,
+                ntime: 1_700_000_000,
+                nonce,
+                n_bits: 0x1d00_ffff,
+            },
         )
         .await;
     }

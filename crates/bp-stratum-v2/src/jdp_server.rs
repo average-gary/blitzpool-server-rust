@@ -72,7 +72,7 @@ use crate::jdp::client::{
     handle_allocate_token, handle_declare_mining_job, handle_provide_missing_transactions_success,
     handle_push_solution, handle_request_extensions, handle_setup_connection,
     parse_user_identifier_as_address, AllocateTokenContext, DeclarationContext, JdpHandlerOutcome,
-    JdpOutboundFrame, JdpSessionEvent, JdpSessionState,
+    JdpOutboundFrame, JdpSessionEvent, JdpSessionState, SolutionHeader,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::payout_distribution::WeightedOutput;
@@ -296,7 +296,6 @@ pub trait PayoutDistributionSource: Send + Sync {
 /// cannot say what this block paid it — report it, book nothing.
 #[async_trait]
 pub trait JdpBlockSubmissionSink: Send + Sync {
-    #[allow(clippy::too_many_arguments)]
     async fn submit_block_candidate(
         &self,
         miner_address: AddressId,
@@ -304,11 +303,7 @@ pub trait JdpBlockSubmissionSink: Send + Sync {
         backing: CandidateBacking,
         coinbase_raw: Vec<u8>,
         transactions: Vec<Vec<u8>>,
-        prev_hash: [u8; 32],
-        version: u32,
-        ntime: u32,
-        nonce: u32,
-        n_bits: u32,
+        header: SolutionHeader,
     );
 }
 
@@ -465,11 +460,7 @@ impl JdpBlockSubmissionSink for NoOpJdpHooks {
         _: CandidateBacking,
         _: Vec<u8>,
         _: Vec<Vec<u8>>,
-        _: [u8; 32],
-        _: u32,
-        _: u32,
-        _: u32,
-        _: u32,
+        _: SolutionHeader,
     ) {
     }
 }
@@ -1910,11 +1901,7 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
                 backing,
                 coinbase_raw,
                 transactions,
-                prev_hash,
-                version,
-                ntime,
-                nonce,
-                n_bits,
+                header,
             } => {
                 hooks
                     .block_submission_sink
@@ -1924,11 +1911,7 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
                         backing,
                         coinbase_raw,
                         transactions,
-                        prev_hash,
-                        version,
-                        ntime,
-                        nonce,
-                        n_bits,
+                        header,
                     )
                     .await;
             }
