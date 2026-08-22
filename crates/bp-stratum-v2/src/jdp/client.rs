@@ -372,10 +372,20 @@ pub struct JdpHandlerOutcome {
 }
 
 impl JdpHandlerOutcome {
-    /// One outbound frame, no events. Public twin of [`Self::with_frame`] for
-    /// the IO layer, which rejects a declaration before the pure handler runs.
-    pub fn with_frame_pub(frame: JdpOutboundFrame) -> Self {
-        Self::with_frame(frame)
+    /// A `DeclareMiningJob.Error` and nothing else.
+    ///
+    /// Ten refusal paths build this frame, and every one of them is a return.
+    /// Sharing the construction keeps them to the part that differs — the code
+    /// and the detail bytes — so a reader compares reasons instead of
+    /// boilerplate. Deliberately NOT collapsing the paths themselves: two of
+    /// them answer the identical code and detail and differ only in what they
+    /// log, and that difference is the point.
+    pub(crate) fn declare_error(request_id: u32, error_code: &str, error_details: &[u8]) -> Self {
+        Self::with_frame(JdpOutboundFrame::DeclareMiningJobError {
+            request_id,
+            error_code: error_code.to_string(),
+            error_details: error_details.to_vec(),
+        })
     }
 
     fn with_frame(frame: JdpOutboundFrame) -> Self {
@@ -739,19 +749,18 @@ pub fn handle_declare_mining_job(
             .negotiated_extensions
             .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
     {
-        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-            request_id: input.request_id,
-            error_code: ERR_INVALID_PAYOUT_DISTRIBUTION.to_string(),
-            error_details: b"distribution_id TLV requires negotiated ext 0x0003".to_vec(),
-        });
+        return JdpHandlerOutcome::declare_error(
+            input.request_id,
+            ERR_INVALID_PAYOUT_DISTRIBUTION,
+            b"distribution_id TLV requires negotiated ext 0x0003",
+        );
     }
     if !state.full_template_mode {
-        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-            request_id: input.request_id,
-            error_code: ERR_UNSUPPORTED_FEATURE_FLAGS.to_string(),
-            error_details: b"DeclareMiningJob requires Full-Template mode (DECLARE_TX_DATA flag)"
-                .to_vec(),
-        });
+        return JdpHandlerOutcome::declare_error(
+            input.request_id,
+            ERR_UNSUPPORTED_FEATURE_FLAGS,
+            b"DeclareMiningJob requires Full-Template mode (DECLARE_TX_DATA flag)",
+        );
     }
 
     let allocated = match state
@@ -760,11 +769,11 @@ pub fn handle_declare_mining_job(
     {
         Some(entry) => entry.clone(),
         None => {
-            return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-                request_id: input.request_id,
-                error_code: ERR_INVALID_MINING_JOB_TOKEN.to_string(),
-                error_details: b"Token not found or expired".to_vec(),
-            });
+            return JdpHandlerOutcome::declare_error(
+                input.request_id,
+                ERR_INVALID_MINING_JOB_TOKEN,
+                b"Token not found or expired",
+            );
         }
     };
 
@@ -846,12 +855,11 @@ pub fn handle_provide_missing_transactions_success(
     // template) instead of accepting a job stamped with a tip it was never
     // built for.
     if pending.prev_hash_at_declare != ctx.current_prev_hash {
-        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-            request_id: input.request_id,
-            error_code: ERR_STALE_CHAIN_TIP.to_string(),
-            error_details: b"chain tip advanced during the missing-transactions round-trip"
-                .to_vec(),
-        });
+        return JdpHandlerOutcome::declare_error(
+            input.request_id,
+            ERR_STALE_CHAIN_TIP,
+            b"chain tip advanced during the missing-transactions round-trip",
+        );
     }
     let merged = match merge_provided_with_known(pending.pending, input.transaction_list.clone()) {
         Ok(m) => m,
@@ -899,12 +907,11 @@ fn accept_declaration(
             request_id = input.request_id,
             "jdp: declared coinbase cannot be reconstructed — rejecting the declaration"
         );
-        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-            request_id: input.request_id,
-            error_code: ERR_INVALID_JOB_PARAM_COINBASE.to_string(),
-            error_details: b"declared coinbase does not rebuild from prefix + slot + suffix"
-                .to_vec(),
-        });
+        return JdpHandlerOutcome::declare_error(
+            input.request_id,
+            ERR_INVALID_JOB_PARAM_COINBASE,
+            b"declared coinbase does not rebuild from prefix + slot + suffix",
+        );
     };
 
     // ext 0x0003/Validation (push model). When the JDC negotiated
@@ -933,11 +940,11 @@ fn accept_declaration(
                 request_id = input.request_id,
                 "jdp: 0x0003 negotiated but DeclareMiningJob carries no distribution_id TLV — rejecting"
             );
-            return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-                request_id: input.request_id,
-                error_code: ERR_INVALID_PAYOUT_DISTRIBUTION.to_string(),
-                error_details: b"missing distribution_id TLV (ext 0x0003 is negotiated)".to_vec(),
-            });
+            return JdpHandlerOutcome::declare_error(
+                input.request_id,
+                ERR_INVALID_PAYOUT_DISTRIBUTION,
+                b"missing distribution_id TLV (ext 0x0003 is negotiated)",
+            );
         }
         let entry = match ctx.distribution {
             Some(DistributionAcceptance::Accepted(entry)) => entry,
@@ -951,11 +958,11 @@ fn accept_declaration(
                     distribution_id = input.distribution_id,
                     "jdp: declared distribution_id outside the acceptance window — rejecting"
                 );
-                return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-                    request_id: input.request_id,
-                    error_code: ERR_STALE_PAYOUT_DISTRIBUTION.to_string(),
-                    error_details: b"distribution_id not accepted (superseded or unknown)".to_vec(),
-                });
+                return JdpHandlerOutcome::declare_error(
+                    input.request_id,
+                    ERR_STALE_PAYOUT_DISTRIBUTION,
+                    b"distribution_id not accepted (superseded or unknown)",
+                );
             }
             None => {
                 // IO-layer contract breach: a negotiated declare must
@@ -964,11 +971,11 @@ fn accept_declaration(
                     request_id = input.request_id,
                     "jdp: negotiated declare arrived without a resolved distribution acceptance — rejecting"
                 );
-                return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-                    request_id: input.request_id,
-                    error_code: ERR_STALE_PAYOUT_DISTRIBUTION.to_string(),
-                    error_details: b"distribution_id not accepted (superseded or unknown)".to_vec(),
-                });
+                return JdpHandlerOutcome::declare_error(
+                    input.request_id,
+                    ERR_STALE_PAYOUT_DISTRIBUTION,
+                    b"distribution_id not accepted (superseded or unknown)",
+                );
             }
         };
         // The plan must belong to the accounting this address is on RIGHT
@@ -998,11 +1005,11 @@ fn accept_declaration(
                  this address is on now — its mode moved mid-session; rejecting rather than \
                  blessing a coinbase that pays the wrong set of miners"
             );
-            return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-                request_id: input.request_id,
-                error_code: ERR_STALE_PAYOUT_DISTRIBUTION.to_string(),
-                error_details: b"distribution was built for a different payout mode".to_vec(),
-            });
+            return JdpHandlerOutcome::declare_error(
+                input.request_id,
+                ERR_STALE_PAYOUT_DISTRIBUTION,
+                b"distribution was built for a different payout mode",
+            );
         }
         match validate_coinbase_outputs_against_distribution(
             &declared_coinbase.tx.output,
@@ -1040,12 +1047,11 @@ fn accept_declaration(
                     ?violation,
                     "jdp: declared coinbase violates ext 0x0003/Payout Computation against the referenced distribution — rejecting"
                 );
-                return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-                    request_id: input.request_id,
-                    error_code: ERR_INVALID_PAYOUT_DISTRIBUTION.to_string(),
-                    error_details: b"declared coinbase does not match the referenced distribution"
-                        .to_vec(),
-                });
+                return JdpHandlerOutcome::declare_error(
+                    input.request_id,
+                    ERR_INVALID_PAYOUT_DISTRIBUTION,
+                    b"declared coinbase does not match the referenced distribution",
+                );
             }
         }
     }
