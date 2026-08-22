@@ -61,9 +61,6 @@ pub const TOKEN_LEN: usize = 16;
 /// Counter-prefix length (big-endian u32).
 pub const TOKEN_COUNTER_LEN: usize = 4;
 
-/// CSPRNG-suffix length.
-pub const TOKEN_RANDOM_LEN: usize = TOKEN_LEN - TOKEN_COUNTER_LEN;
-
 /// Default token TTL: 1 hour (3600000 milliseconds).
 pub const DEFAULT_TOKEN_TTL_MS: u64 = 3_600_000;
 
@@ -79,31 +76,6 @@ pub const DEFAULT_RATE_LIMIT_MS: u64 = 1_000;
 /// tokens into logs verbatim.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Token(pub [u8; TOKEN_LEN]);
-
-impl Token {
-    pub fn as_bytes(&self) -> &[u8; TOKEN_LEN] {
-        &self.0
-    }
-
-    /// Lowercase hex of the full 16 bytes — a stable, log-safe-ish
-    /// string form of the token (used in diagnostics).
-    pub fn to_hex(&self) -> String {
-        let mut out = String::with_capacity(TOKEN_LEN * 2);
-        for byte in &self.0 {
-            out.push(hex_digit((byte >> 4) & 0xF));
-            out.push(hex_digit(byte & 0xF));
-        }
-        out
-    }
-}
-
-fn hex_digit(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => unreachable!(),
-    }
-}
 
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -335,8 +307,16 @@ impl TokenStore {
     }
 
     /// Look up a token without expiry-check. Returns the entry
-    /// regardless of `expires_at_ms`. Use when the caller will check
-    /// expiry separately or when introspecting for diagnostics.
+    /// regardless of `expires_at_ms`.
+    ///
+    /// No production caller, and none is wanted: every path that resolves a
+    /// token a JDC presented must honour expiry, which is
+    /// [`Self::lookup_active`]. What needs this is the TESTS — it is the only
+    /// expiry-blind window into the map, so it is what tells "the entry was
+    /// pruned" apart from "the entry is there but expired". `lookup_active`
+    /// answers `None` to both, which is exactly the distinction
+    /// `lookup_active_self_prunes_expired` and the `cleanup_expired` tests
+    /// are making.
     pub fn lookup(&self, token: &Token) -> Option<&AllocatedToken> {
         self.allocated.get(token)
     }
@@ -418,20 +398,6 @@ mod tests {
         assert_eq!(t1.0[0..4], [0, 0, 0, 1]);
         assert_eq!(t2.0[0..4], [0, 0, 0, 2]);
         assert_eq!(t3.0[0..4], [0, 0, 0, 3]);
-    }
-
-    /// `to_hex` produces lowercase 32-char hex of the full 16 bytes.
-    #[test]
-    fn token_to_hex_is_lowercase_32_chars() {
-        let mut s = fresh_store_with_rng(0xCD);
-        let token = s.allocate(0, addr(), vec![]).unwrap().token;
-        let hex = token.to_hex();
-        assert_eq!(hex.len(), 32);
-        assert!(hex
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
-        assert!(hex.starts_with("00000001"));
-        assert!(hex.ends_with("cdcdcdcdcdcdcdcdcdcdcdcd"));
     }
 
     /// Debug impl truncates to first 4 bytes — never leaks the full

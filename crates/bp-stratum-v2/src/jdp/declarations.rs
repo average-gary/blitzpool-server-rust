@@ -191,17 +191,6 @@ impl DeclaredJobStore {
         self.jobs.get(new_token)
     }
 
-    /// Remove a job. Idempotent for unknown tokens.
-    pub fn remove(&mut self, new_token: &Token) -> Option<DeclaredJob> {
-        let removed = self.jobs.remove(new_token)?;
-        // Drop the matching entry from the FIFO. Linear scan over at
-        // most `capacity` entries → trivial for `MAX_DECLARED_JOBS=3`.
-        if let Some(pos) = self.order.iter().position(|t| t == new_token) {
-            self.order.remove(pos);
-        }
-        Some(removed)
-    }
-
     /// Find the job a `PushSolution` belongs to.
     ///
     /// 1. Prefer a job whose stored `prev_hash` matches the
@@ -236,8 +225,13 @@ impl DeclaredJobStore {
     }
 
     /// Iterate stored jobs in **insertion order** (oldest first).
-    /// Exposed for diagnostics + the JDP-server's per-connection
-    /// teardown path (drop all declared-job state on disconnect).
+    ///
+    /// No production caller: a JDP session's store is dropped with the
+    /// session, and the disconnect path clears the BRIDGE by session id
+    /// (`evict_for_jdp_session`) rather than walking this one. What needs it
+    /// is the handler tests — `accept_declaration` keys a job under a token
+    /// the JDS mints itself, so a caller that did not see the outbound
+    /// `DeclareMiningJobSuccess` has no key to `get` by.
     pub fn iter(&self) -> impl Iterator<Item = &DeclaredJob> {
         self.order.iter().filter_map(|t| self.jobs.get(t))
     }
@@ -340,30 +334,6 @@ mod tests {
         // Next insert evicts 0x01 (still at the front), not 0x02.
         let evicted = s.insert(job(0x03, 3_000, None));
         assert_eq!(evicted.unwrap().new_token, tok(0x01));
-    }
-
-    // ── remove ─────────────────────────────────────────────────────
-
-    #[test]
-    fn remove_drops_and_compacts_order() {
-        let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, None));
-        s.insert(job(0x02, 2_000, None));
-        s.insert(job(0x03, 3_000, None));
-        let removed = s.remove(&tok(0x02));
-        assert!(removed.is_some());
-        assert_eq!(s.len(), 2);
-        // Insertion order after remove: [0x01, 0x03]. Next insert
-        // brings us to cap; 4th insert evicts 0x01.
-        s.insert(job(0x04, 4_000, None));
-        let evicted = s.insert(job(0x05, 5_000, None));
-        assert_eq!(evicted.unwrap().new_token, tok(0x01));
-    }
-
-    #[test]
-    fn remove_unknown_is_idempotent() {
-        let mut s = DeclaredJobStore::new();
-        assert!(s.remove(&tok(0xAA)).is_none());
     }
 
     // ── match_for_solution ─────────────────────────────────────────
