@@ -8,7 +8,7 @@
 //! Declaration Clients (JDCs) speak the JDP sub-protocol straight
 //! after the Noise handshake.
 //!
-//! Phase 7.4d.4 replaced [`JdpServerHooks::no_op`] with
+//! Phase 7.4d.4 replaced [`bp_stratum_v2::jdp_server::JdpServerHooks::no_op`] with
 //! [`crate::jdp_hooks::build_jdp_hooks`] — full production
 //! `AllocateResolver` (PayoutResolver-backed), `CurrentPrevHashProvider`
 //! (TDP snapshot), and `JdpBlockSubmissionSink` (`submitblock` RPC for

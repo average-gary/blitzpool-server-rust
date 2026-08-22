@@ -6,7 +6,7 @@
 //! [`crate::jdp::declarations`], [`crate::jdp::tx_validation`],
 //! [`crate::jdp::dynamic_outputs`]) plus the [`crate::extensions`]
 //! codecs into a connection-scoped state struct + a set of
-//! [`handle_*`] functions. Mirrors the design of
+//! `handle_*` functions. Mirrors the design of
 //! [`crate::mining::client`]: pure-state, pure-handlers,
 //! [`JdpHandlerOutcome`] + [`JdpSessionEvent`] for hook fan-out — no
 //! I/O, no broadcasting, no DB writes.
@@ -29,8 +29,7 @@
 //! [`JdpSessionEvent`] to the configured hooks (block submission,
 //! job-declared notification, etc.).
 //!
-//! Pure handler-layer for JDP per-connection state management. The handlers
-//! follow these design principles:
+//! ## Design principles
 //!
 //! - **Async hooks resolved by the caller**. Our handlers stay pure by
 //!   accepting the resolved payload as an argument (caller pre-fetches

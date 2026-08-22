@@ -11,7 +11,7 @@
 //!
 //! They used to be written out per codec, and the copies had already drifted:
 //! `str0255` reached the same `CodecError::Conversion(format!("{e:?}"))` through
-//! [`CodecError::from_conv`] on one side and through a locally re-declared
+//! `CodecError::from_conv` on one side and through a locally re-declared
 //! `conv` on the other, because `from_conv` was private to the mining codec and
 //! the JDP codec could not see it. Counting the write paths, that one function
 //! existed in four spellings.

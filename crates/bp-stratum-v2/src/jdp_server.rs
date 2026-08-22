@@ -876,7 +876,7 @@ impl AwaitingModeWatch {
 ///
 /// It rebuilds from the mode gate every time, so it needs to be told nothing
 /// about WHY it was called. What the mode-moved caller has to do on top is
-/// drop the plan on file first — see [`SessionDistribution::is_serving_a_plan`].
+/// drop the plan on file first — see [`SessionDistribution::accounting`].
 #[allow(clippy::too_many_arguments)]
 async fn republish_tailored(
     hooks: &JdpServerHooks,

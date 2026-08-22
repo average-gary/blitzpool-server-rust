@@ -41,19 +41,21 @@ use std::collections::HashMap;
 
 use bp_common::AddressId;
 
-/// Test-side RNG hook signature. The store holds an `Option<Box<…>>`
-/// of this so production code uses `getrandom::getrandom` and tests
-/// can inject a deterministic byte-stream. Returning the `String`
-/// error matches what `getrandom::Error::to_string` would produce.
-/// Boxed RNG closure type used by [`TokenStore::set_rng`]. Public so
-/// callers wrapping `TokenStore` (e.g. `jdp::client::JdpSessionState`)
-/// can expose a deterministic-RNG hook without re-declaring the
-/// `dyn FnMut` shape and tripping `clippy::type_complexity`.
+/// Boxed RNG closure type used by [`TokenStore::set_rng`].
+///
+/// The store holds an `Option<Box<…>>` of this so production code uses
+/// `getrandom::getrandom` while tests inject a deterministic byte-stream.
+/// The `String` error matches what `getrandom::Error::to_string` produces.
+///
+/// Public so callers wrapping `TokenStore` (e.g.
+/// `jdp::client::JdpSessionState`) can expose a deterministic-RNG hook
+/// without re-declaring the `dyn FnMut` shape and tripping
+/// `clippy::type_complexity`.
 pub type RngFn = dyn FnMut(&mut [u8]) -> Result<(), String> + Send + 'static;
 
 /// Token length in bytes. SV2 spec doesn't pin a specific length;
-/// 16 bytes provides sufficient collision-resistance with 12 random
-/// bits of entropy.
+/// 16 bytes leaves 12 random bytes (96 bits) after the counter prefix,
+/// which is collision-resistant enough for a per-connection identifier.
 pub const TOKEN_LEN: usize = 16;
 
 /// Counter-prefix length (big-endian u32).
