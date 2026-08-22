@@ -39,6 +39,7 @@ mod address_ownership;
 mod block;
 mod blockparty;
 mod client;
+mod custom_extranonce;
 mod email;
 mod external;
 mod group;
@@ -101,6 +102,12 @@ pub use client::{
     upsert_client, ClientDifficultyStatisticsRow, ClientRejectedStatisticsRow, ClientRow,
     ClientStatisticsRow, ClientUpsert, DeviceFirstSeenRow, PoolWorkerRow, UserAgentAggRow,
     WorkerSharesRow,
+};
+pub use custom_extranonce::{
+    all_custom_extranonces, delete_extranonce_challenge, find_custom_extranonces_for_address,
+    find_extranonce_challenge, find_extranonce_token, upsert_custom_extranonces_batch,
+    upsert_extranonce_challenge, upsert_extranonce_token, CustomExtranonceRow,
+    ExtranonceChallengeRow, ExtranonceTokenRow,
 };
 pub use email::{
     delete_email_verification_by_token, delete_email_verifications_for_address,

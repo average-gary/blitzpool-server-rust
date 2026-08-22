@@ -47,6 +47,7 @@ mod boot;
 mod cache_sync;
 mod coinbase_autoscaler;
 mod crons;
+mod custom_extranonce;
 mod device_status;
 mod device_status_consumer;
 mod device_status_gate;

@@ -333,6 +333,13 @@ struct WorkerEntry {
     channel_count: i32,
     start_time: String,
     last_seen: String,
+    /// The custom extranonce prefix stored for this worker (8 hex chars), or
+    /// `null` when it runs on the pool-allocated one. This is the **stored
+    /// configuration** from `pplns_custom_extranonce`, not proof that the
+    /// prefix is in effect: whether a live connection carries it depends on
+    /// the stratum core's Solo / Extended / primary-channel gates, which live
+    /// in another process and leave no trace in this table.
+    extranonce: Option<String>,
 }
 
 async fn by_address<H, M>(
@@ -354,6 +361,16 @@ where
             let settings = find_address_settings(&s.pool, &addr).await?;
             let best_difficulty = settings.as_ref().map(|x| x.best_difficulty.floor() as u64);
             let total_shares = settings.map(|x| x.shares).unwrap_or(0.0);
+            // Custom extranonce overrides, keyed by worker. One query for the
+            // address (a handful of rows at most), then a map lookup per
+            // worker — the same worker on two sessions gets the same prefix,
+            // which is exactly what the override means.
+            let overrides: BTreeMap<String, String> =
+                bp_db::find_custom_extranonces_for_address(&s.pool, &addr)
+                    .await?
+                    .into_iter()
+                    .map(|r| (r.worker, format!("{:08x}", r.prefix)))
+                    .collect();
             Ok(ClientResponse {
                 best_difficulty,
                 workers_count: clients.len(),
@@ -363,6 +380,7 @@ where
                     .into_iter()
                     .map(|c| WorkerEntry {
                         session_id: c.session_id,
+                        extranonce: overrides.get(&c.client_name).cloned(),
                         name: c.client_name,
                         best_difficulty: format!("{:.2}", c.best_difficulty as f64),
                         hash_rate: c.hash_rate,

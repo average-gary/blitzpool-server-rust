@@ -46,7 +46,7 @@ def main() -> int:
     ap.add_argument(
         "--expect-regtest-binaries",
         type=int,
-        default=23,
+        default=24,
         help="how many regtest_* binaries must appear (0 disables the check)",
     )
     args = ap.parse_args()

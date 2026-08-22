@@ -176,6 +176,7 @@ pub(crate) fn build_per_port_servers(
     noise_config: NoiseConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
+    custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
@@ -254,6 +255,7 @@ pub(crate) fn build_per_port_servers(
             mode_gate.clone(),
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
+            custom_extranonce.clone(),
         );
 
         // Subscribe + snapshot — broadcast catches future updates,
@@ -331,6 +333,7 @@ fn build_port_hooks(
     mode_gate: Arc<BlitzpoolModeGate>,
     device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
+    custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
 ) -> MiningServerHooks {
     // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
@@ -369,6 +372,7 @@ fn build_port_hooks(
         rejected_sink: rejected,
         session_persistence: session,
         device_status_sink,
+        custom_extranonce,
     }
 }
 

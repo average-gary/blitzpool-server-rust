@@ -1650,6 +1650,50 @@ CREATE INDEX redis_state_backup_captured_at_idx ON public.redis_state_backup USI
 
 
 --
+-- Name: pplns_extranonce_challenge; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_extranonce_challenge (
+    address character varying(62) NOT NULL,
+    message text NOT NULL,
+    "createdAt" bigint NOT NULL,
+    "expiresAt" bigint NOT NULL,
+    CONSTRAINT pplns_extranonce_challenge_pkey PRIMARY KEY (address)
+);
+
+
+--
+-- Name: pplns_extranonce_token; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_extranonce_token (
+    address character varying(62) NOT NULL,
+    "tokenHash" character varying(64) NOT NULL,
+    "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    CONSTRAINT pplns_extranonce_token_pkey PRIMARY KEY (address)
+);
+
+
+--
+-- Name: pplns_custom_extranonce; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_custom_extranonce (
+    address character varying(62) NOT NULL,
+    worker character varying NOT NULL,
+    prefix bigint NOT NULL,
+    "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    CONSTRAINT pplns_custom_extranonce_pkey PRIMARY KEY (address, worker),
+    CONSTRAINT pplns_custom_extranonce_address_prefix_key UNIQUE (address, prefix) DEFERRABLE INITIALLY IMMEDIATE,
+    CONSTRAINT pplns_custom_extranonce_prefix_u32 CHECK (prefix >= 0 AND prefix <= 4294967295)
+);
+
+CREATE INDEX IF NOT EXISTS "IDX_pplns_extranonce_challenge_expiresAt"
+    ON public.pplns_extranonce_challenge USING btree ("expiresAt");
+
+
+--
 -- PostgreSQL database dump complete
 --
 
