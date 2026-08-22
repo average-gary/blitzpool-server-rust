@@ -54,6 +54,7 @@ use bp_common::AddressId;
 use bp_mining_job::normalize_btc_address;
 
 use crate::extensions::{RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS};
+use crate::protocol_version::{negotiate_version, MIN_PROTOCOL_VERSION};
 use crate::tokens::{Token, TokenAllocError, TokenStore};
 
 use crate::bridge::DistributionAcceptance;
@@ -70,11 +71,6 @@ use super::tx_validation::{
 /// SV2 protocol code for the Job-Declaration sub-protocol — the
 /// `protocol` field of SV2 Overview/SetupConnection, not a JDP flag.
 pub const PROTOCOL_JOB_DECLARATION: u8 = 1;
-
-/// Minimum supported SV2 protocol version. JDP spec pins v2.
-pub const MIN_PROTOCOL_VERSION: u16 = 2;
-/// Maximum supported SV2 protocol version.
-pub const MAX_PROTOCOL_VERSION: u16 = 2;
 
 /// `DECLARE_TX_DATA` flag (bit 0 of `SetupConnection.flags`). When
 /// set, the JDC sends a full `DeclareMiningJob` before any
@@ -495,7 +491,7 @@ pub fn handle_setup_connection(
         });
         return outcome;
     }
-    if input.min_version > MAX_PROTOCOL_VERSION || input.max_version < MIN_PROTOCOL_VERSION {
+    let Some(used_version) = negotiate_version(input.min_version, input.max_version) else {
         let mut outcome = JdpHandlerOutcome::with_frame(JdpOutboundFrame::SetupConnectionError {
             flags: input.flags,
             error_code: ERR_UNSUPPORTED_VERSION.to_string(),
@@ -507,13 +503,13 @@ pub fn handle_setup_connection(
             ),
         });
         return outcome;
-    }
+    };
 
     let negotiated_flags = input.flags & FLAG_DECLARE_TX_DATA;
     let full_template_mode = negotiated_flags != 0;
     state.setup_complete = true;
     state.full_template_mode = full_template_mode;
-    state.used_version = input.max_version.min(MAX_PROTOCOL_VERSION);
+    state.used_version = used_version;
     state.vendor = input.vendor.clone();
 
     JdpHandlerOutcome {

@@ -46,6 +46,7 @@ pub mod hooks;
 pub mod jdp_server;
 pub mod jdp_server_codec;
 pub mod noise;
+pub mod protocol_version;
 pub mod server;
 pub mod server_codec;
 pub mod shared_adapter;

@@ -61,6 +61,7 @@ use bp_vardiff::{Clock, VarDiffEngine};
 use crate::extensions::{
     RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS, SV2_EXTENSION_TYPE_WORKER_ID,
 };
+use crate::protocol_version::{negotiate_version, MIN_PROTOCOL_VERSION};
 
 use super::channel::{ChannelKind, ChannelState};
 use super::groups::GroupChannelRegistry;
@@ -148,13 +149,6 @@ pub const FLAG_SUCCESS_REQUIRES_EXTENDED_CHANNELS: u32 = 1 << 1;
 /// this in `OpenExtendedMiningChannel.min_extranonce_size` is rejected with
 /// [`ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE`] rather than silently under-granted.
 pub const MAX_EXTENDED_ROLLABLE: usize = 16;
-
-/// Minimum supported SV2 protocol version (currently 2 per the spec
-/// finalisation).
-pub const MIN_PROTOCOL_VERSION: u16 = 2;
-/// Maximum supported SV2 protocol version. Bump when the spec adds a
-/// new revision we support.
-pub const MAX_PROTOCOL_VERSION: u16 = 2;
 
 // ── Wire error codes (SV2 spec setup/open-channel error strings) ────
 
@@ -890,8 +884,7 @@ pub fn handle_setup_connection<C: Clock>(
     state: &mut MiningSessionState<C>,
     input: &SetupConnectionInput,
 ) -> HandlerOutcome {
-    // Version range intersection check.
-    if input.min_version > MAX_PROTOCOL_VERSION || input.max_version < MIN_PROTOCOL_VERSION {
+    let Some(used_version) = negotiate_version(input.min_version, input.max_version) else {
         return setup_rejected(
             ERR_PROTOCOL_VERSION_MISMATCH,
             format!(
@@ -899,7 +892,7 @@ pub fn handle_setup_connection<C: Clock>(
                 input.min_version, input.max_version
             ),
         );
-    }
+    };
 
     // Sub-protocol gate. We accept Mining (0) and TDP-only (2). TDP
     // sessions don't open mining channels — they just want to drive
@@ -920,7 +913,6 @@ pub fn handle_setup_connection<C: Clock>(
         }
     }
 
-    let used_version = input.max_version.min(MAX_PROTOCOL_VERSION);
     state.setup_complete = true;
     state.used_version = used_version;
     state.vendor = input.vendor.clone();
