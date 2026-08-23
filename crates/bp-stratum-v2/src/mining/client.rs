@@ -738,8 +738,7 @@ pub struct MiningSessionState<C: Clock> {
     pub uses_custom_extranonce: bool,
 }
 
-/// Per-port config slice passed at construction. The full
-/// [`crate::config`] layer will wrap this for the I/O layer.
+/// Per-port config slice passed at construction.
 #[derive(Clone, Copy, Debug)]
 pub struct PortConfig {
     pub network: Network,

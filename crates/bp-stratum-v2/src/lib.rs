@@ -38,8 +38,6 @@
 
 pub mod bridge;
 pub mod codec_common;
-pub mod config;
-pub mod error;
 pub mod extensions;
 pub mod extranonce;
 pub mod hooks;
