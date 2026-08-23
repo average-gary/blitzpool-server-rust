@@ -69,6 +69,8 @@ impl ClientRejectedAccumulator {
     /// Hot-path: record a rejected share. `count` defaults to 1.0 per
     /// share; `diff` is the diff-1 weight that's also written to
     /// `client_statistics` via [`ClientStatisticsAccumulator`].
+    ///
+    /// [`ClientStatisticsAccumulator`]: crate::accumulator::client_statistics::ClientStatisticsAccumulator
     pub fn add(&self, key: ClientRejectedKey, count: f64, diff: f64) {
         if !count.is_finite() || !diff.is_finite() {
             return;

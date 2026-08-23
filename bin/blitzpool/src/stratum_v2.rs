@@ -18,7 +18,7 @@
 //!   Group-Solo engine round state to assemble the real per-mode
 //!   coinbase distribution.
 //!
-//! - [`BlockSubmissionSink`] is [`crate::block_sink::TdpBlockSubmissionSink`].
+//! - `BlockSubmissionSink` is [`crate::block_sink::TdpBlockSubmissionSink`].
 //!   The SV2 `ShareAccept` carries the assembled witness coinbase, the
 //!   `template_id`, and the per-job pinned `coinbase_tx_value_remaining`, so
 //!   the block-found path submits the solution via TDP AND writes the per-mode
@@ -72,7 +72,7 @@ use crate::stratum_v1::{
 };
 
 /// Per-port SV2 mining server bundle. One entry per port (mirrors
-/// [`crate::stratum_v1::Sv1PortServer`]). Carries the SV2 [`PortConfig`]
+/// [`crate::stratum_v1::Sv1PortServer`]). Carries the SV2 `PortConfig`
 /// (different shape from SV1's) so the unified accept-loop can hand it
 /// in to `accept_connection`.
 pub(crate) struct Sv2PortServer {

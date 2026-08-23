@@ -4,19 +4,19 @@
 //! flusher.
 //!
 //! Nothing here writes a statement per event any more. The connection
-//! path (authorize/disconnect) is debounced — see [`RowDebounce`]: a
+//! path (authorize/disconnect) is debounced — see `RowDebounce`: a
 //! session's row is born only once it has survived `row_debounce`, so
 //! probe connections never reach Postgres. Everything on the SHARE path
 //! is buffered, because at ~250 shares/s a statement per share dominates
 //! the DB write budget:
 //!
-//! - [`RowDebounce`] → one bulk `INSERT … ON CONFLICT` for the due row
+//! - `RowDebounce` → one bulk `INSERT … ON CONFLICT` for the due row
 //!   births every `row_flush_interval` (default 5 s).
-//! - [`TouchBuffer`] → one bulk `UPDATE client_entity … FROM unnest(...)`
+//! - `TouchBuffer` → one bulk `UPDATE client_entity … FROM unnest(...)`
 //!   every `touch_flush_interval` (default 30 s).
-//! - [`HashrateSampler`] → one bulk `UPDATE client_entity` per
+//! - `HashrateSampler` → one bulk `UPDATE client_entity` per
 //!   `hashrate_sample_interval` (default 60 s).
-//! - [`DiffStatBuffer`] → one bulk upsert into
+//! - `DiffStatBuffer` → one bulk upsert into
 //!   `client_difficulty_statistics_entity` every
 //!   `diff_stat_flush_interval` (default 30 s). Batched since 2026-08-05;
 //!   the inline version burst at every restart and hour rollover.

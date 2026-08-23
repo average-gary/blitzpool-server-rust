@@ -72,7 +72,7 @@ use bp_vardiff::{Clock, SystemClock};
 ///
 /// Cheap to clone (both fields are `Arc`). Each connection calls
 /// [`allocate`](Self::allocate) exactly once at accept time; the returned
-/// [`PrefixGuard`] releases the prefix back to the pool when the
+/// `PrefixGuard` releases the prefix back to the pool when the
 /// connection task ends (any exit path — EOF, cancel, IO error).
 #[derive(Clone)]
 pub struct SharedExtranonce {
@@ -98,7 +98,7 @@ impl SharedExtranonce {
 
     /// Allocate a pool-wide-unique 4-byte extranonce1. The returned guard
     /// releases the prefix on drop, covering every connection-exit path.
-    /// [`PrefixGuard::prefix`] is `None` only when the (16.7M-slot) space
+    /// `PrefixGuard::prefix` is `None` only when the (16.7M-slot) space
     /// is exhausted — the caller then keeps the session-id-derived
     /// extranonce1, i.e. the pre-unification random behaviour.
     pub fn allocate(&self) -> PrefixGuard {
@@ -193,7 +193,7 @@ const TEMPLATE_BROADCAST_CAPACITY: usize = 32;
 
 /// Public handle for the server. Cheap to clone (internal `Arc`); the
 /// last clone holds the translator task's `JoinHandle`. Calling
-/// [`shutdown`] is the only way to stop the translator cleanly.
+/// [`Self::shutdown`] is the only way to stop the translator cleanly.
 #[derive(Clone)]
 pub struct StratumV1Server {
     inner: Arc<Inner>,

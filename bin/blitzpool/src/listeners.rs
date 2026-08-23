@@ -78,7 +78,7 @@ impl ListenerHandles {
     }
 
     /// Clone of the outbound ntfy adapter, when configured. Same use
-    /// as [`telegram_adapter`].
+    /// as [`Self::telegram_adapter`].
     pub(crate) fn ntfy_adapter(&self) -> Option<Arc<NtfyAdapter>> {
         self.inner.as_ref().and_then(|i| i.ntfy_adapter.clone())
     }

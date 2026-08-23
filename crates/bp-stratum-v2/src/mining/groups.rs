@@ -151,7 +151,7 @@ impl GroupChannelRegistry {
     /// Create an empty group with a caller-supplied `group_id` (drawn from
     /// the session's channel-id namespace so it can never collide with a
     /// channel id) and the full extranonce size that defines it. Channels
-    /// are added via [`add_channel`].
+    /// are added via [`Self::add_channel`].
     pub fn create(&mut self, group_id: u32, full_extranonce_size: usize) {
         self.groups.insert(
             group_id,

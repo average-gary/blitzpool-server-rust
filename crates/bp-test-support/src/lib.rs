@@ -387,7 +387,7 @@ pub async fn cleanup_blockparty_rows(pool: &PgPool, addrs: &[&str]) {
 /// a test green alone and red in the suite, twice, for two different
 /// neighbours.
 ///
-/// So each test binary owns [`RANGE`] consecutive databases and keeps its
+/// So each test binary owns `RANGE` consecutive databases and keeps its
 /// own 0-based numbering inside them. A binary needs a distinct base
 /// here; a test needs a number no sibling in the SAME binary uses.
 pub mod redis_db {

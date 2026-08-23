@@ -13,7 +13,7 @@
 //! `bp_share_hook::SharedSessionPersistence` impl. Fires on every
 //! authorize (register) and disconnect (deregister). Mode-blind. A
 //! register writes NO statement — it only pends the session in the
-//! [`RowDebounce`]; the row is born by the engine's birth flush once the
+//! `RowDebounce`; the row is born by the engine's birth flush once the
 //! session has survived the debounce window, so probe connections that
 //! authorize and hang up never reach Postgres at all. Deregister
 //! soft-deletes only sessions that were actually born.
@@ -93,13 +93,13 @@ impl SharedSessionPersistence for SessionPersistenceHook {
 /// Without this, the `/api/info/workers`, `/api/info`, and
 /// `/api/client/:address` endpoints all return zero for active sessions.
 ///
-/// Buffered: writes land in a shared [`TouchBuffer`] keyed by
+/// Buffered: writes land in a shared `TouchBuffer` keyed by
 /// `(address, clientName, sessionId)` and are flushed every 30s by the
 /// engine's background task in one bulk UPDATE statement. At ~250
 /// shares/s on a busy pool this collapses ~250 individual DB UPDATEs/s
 /// to ≈ N_active_sessions per 30 s.
 ///
-/// The same share also feeds the [`HashrateSampler`], which owns the
+/// The same share also feeds the `HashrateSampler`, which owns the
 /// `hashRate` column: it accumulates the share's credited difficulty and
 /// writes a self-zeroing 2-min moving average on its own 60 s cadence.
 /// The touch buffer above deliberately does not write `hashRate` — two
@@ -166,7 +166,7 @@ const DIFF_STAT_SLOT_MS: i64 = 60 * 60 * 1000;
 /// `client_difficulty_statistics_entity` (feeds `/api/client/:address/diff-scores`).
 ///
 /// Coalesces in memory and writes in BATCHES: the share hot path merges the
-/// per-slot max into [`DiffStatBuffer`], and one flush loop upserts the whole
+/// per-slot max into `DiffStatBuffer`, and one flush loop upserts the whole
 /// window in a single statement.
 ///
 /// It used to upsert inline on every new max, which is cheap mid-slot and a

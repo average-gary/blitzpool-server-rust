@@ -69,7 +69,7 @@ pub struct ActiveSV1Template {
     /// template alongside `merkle_branch_hex`. These are identical for every
     /// connection on a template, so `mining.notify` borrows them instead of
     /// re-hex-encoding for each of ~600 per-client broadcasts. Kept in sync by
-    /// [`ActiveSV1Template::recompute_notify_header_hex`] (construction +
+    /// `ActiveSV1Template::recompute_notify_header_hex` (construction +
     /// mempool refresh — the only paths that change the source fields).
     pub prev_hash_hex: String,
     pub version_hex: String,

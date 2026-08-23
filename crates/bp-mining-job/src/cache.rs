@@ -427,7 +427,7 @@ pub struct MiningJobCacheStats {
 
 /// Pool-wide `MiningJob` memoization — see the module docs. Cheap to
 /// share via `Arc`; all methods take `&self`. Both levels are
-/// [`CoalescingSlotMap`]s; this type only wires them together (payouts
+/// `CoalescingSlotMap`s; this type only wires them together (payouts
 /// Arc sharing, error precedence) and tallies stats.
 pub struct MiningJobCache {
     jobs: CoalescingSlotMap<JobKey, MiningJob>,
@@ -613,8 +613,8 @@ impl MiningJobCache {
             .touch(hash, now, |k| k.as_tuple() == lookup, |k| k.payouts.clone())
     }
 
-    /// Drop entries unused for [`ENTRY_TTL`], rate-limited to one sweep
-    /// per [`PRUNE_INTERVAL`] per level. Piggybacked on every lookup AND
+    /// Drop entries unused for `ENTRY_TTL`, rate-limited to one sweep
+    /// per `PRUNE_INTERVAL` per level. Piggybacked on every lookup AND
     /// driven by the stratum translator tasks on each template update,
     /// so memory is reclaimed even when no miner is connected (no
     /// lookups).

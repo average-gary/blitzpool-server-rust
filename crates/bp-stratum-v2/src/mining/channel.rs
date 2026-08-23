@@ -205,7 +205,7 @@ impl ChannelState {
     }
 
     /// Record an accepted share. Bumps the per-channel counters; the
-    /// dedup-cache write happens via [`SubmissionCache::insert_*`] at
+    /// dedup-cache write happens via `SubmissionCache::insert_*` at
     /// the call site (the validator already produced the dedup key).
     pub fn record_accepted_share(&mut self, share_difficulty: Difficulty) {
         self.accepted_share_count = self.accepted_share_count.saturating_add(1);

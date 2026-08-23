@@ -116,7 +116,7 @@ fn staggered_interval(period: Duration, stagger: Duration) -> tokio::time::Inter
 }
 
 /// Aggregate of every Phase 7.5 cron handle. Each cron exposes its
-/// own shutdown signal; [`shutdown`] fires them all and awaits the
+/// own shutdown signal; [`Self::shutdown`] fires them all and awaits the
 /// kill-dead-clients loop's `JoinHandle` (the other 3 crons run
 /// detached on the tokio runtime).
 pub(crate) struct CronHandles {

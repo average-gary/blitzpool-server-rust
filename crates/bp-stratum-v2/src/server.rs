@@ -3,7 +3,7 @@
 //! Mining-port server: handle + translator task + per-connection task
 //! topology.
 //!
-//! Mirrors [`bp_stratum_v1::server`]'s shape (clone-able handle wrapping
+//! Mirrors `bp_stratum_v1::server`'s shape (clone-able handle wrapping
 //! an `Arc<Inner>`, translator-task fanning TDP updates to per-connection
 //! `broadcast::Receiver<TemplateBroadcast>`s, per-connection task driven
 //! by `tokio::select!` over four sources). What's different:

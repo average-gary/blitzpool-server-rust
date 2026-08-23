@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bridges the SV1-specific [`AcceptedShareSink`](crate::hooks::AcceptedShareSink)
+//! Bridges the SV1-specific [`AcceptedShareSink`]
 //! trait to the protocol-agnostic
-//! [`SharedAcceptedShareSink`](bp_share_hook::SharedAcceptedShareSink).
+//! [`SharedAcceptedShareSink`].
 //!
 //! Engines (PPLNS, group-solo, share-stats-sink, session-persistence)
 //! implement `SharedAcceptedShareSink` once and the SV1 server uses
-//! this adapter to project its native [`ShareAccept`](crate::ShareAccept)
+//! this adapter to project its native [`ShareAccept`]
 //! into the shared view. The SV2 server provides a symmetric adapter
 //! in `bp-stratum-v2`. See the `bp-share-hook` crate-level docs for
 //! the full picture.

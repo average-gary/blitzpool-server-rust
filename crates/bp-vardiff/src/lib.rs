@@ -2,7 +2,7 @@
 
 //! Per-session VarDiff engine + ckpool-style race-window clamp.
 //!
-//! Pure-math leaf crate, std-only. Shared between [`bp-stratum-v1`] (which
+//! Pure-math leaf crate, std-only. Shared between `bp-stratum-v1` (which
 //! sends the result as `mining.set_difficulty` JSON) and `bp-stratum-v2`
 //! (which sends the result as a binary `SetTarget` frame on Standard /
 //! Extended channels). The vardiff math is wire-format-agnostic — only
@@ -659,7 +659,7 @@ impl<C: Clock> VarDiffEngine<C> {
     }
 
     /// `shares` accumulator for the current time slot — exposed for tests.
-    /// Production callers should use [`hash_rate`] instead.
+    /// Production callers should use `hash_rate` instead.
     pub fn current_shares(&self) -> f64 {
         self.shares
     }
@@ -774,7 +774,7 @@ impl<C: Clock> VarDiffEngine<C> {
     ///   with no accepted share at all yet, or samples present but inside the
     ///   2× clamp).
     /// - `Some(diff)` — a freshly-rounded power-of-2 target. Always
-    ///   ≥ [`min_difficulty`]; never NaN / Infinity.
+    ///   ≥ `min_difficulty`; never NaN / Infinity.
     ///
     /// Both branches funnel through `nearest_difficulty_step` (which floors
     /// at `min_difficulty`).
@@ -1064,7 +1064,7 @@ impl<C: Clock> VarDiffEngine<C> {
         }
     }
 
-    /// Round UP to a power of two. Floors at [`min_difficulty`].
+    /// Round UP to a power of two. Floors at `min_difficulty`.
     /// Returns `None` for `val == 0`, guarding against `log2(0) = -Infinity`.
     ///
     /// **Powers of two only, and always upward.** Both halves were measured on

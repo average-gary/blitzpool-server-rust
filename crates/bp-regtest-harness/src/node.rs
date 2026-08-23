@@ -26,7 +26,8 @@ const DEFAULT_WALLET_NAME: &str = "bp_regtest";
 /// `&RegtestNode` around if multiple tasks need access.
 pub struct RegtestNode {
     /// The bitcoin-node child. Wrapped in `Option` so we can take it out in
-    /// [`shutdown`] without leaving an invalid `Child` behind for `Drop`.
+    /// [`RegtestNode::shutdown`] without leaving an invalid `Child` behind
+    /// for `Drop`.
     child: Option<Child>,
     /// Owned tempdir backing `<datadir>` — `Some` only when the node
     /// created its own datadir (deleted on shutdown/drop). `None` when an
@@ -251,8 +252,8 @@ impl RegtestNode {
     }
 
     /// Make sure a default wallet exists and is loaded. Called automatically
-    /// by [`generate_to_self`]; exposed publicly for tests that drive the
-    /// wallet directly.
+    /// by [`RegtestNode::generate_to_self`]; exposed publicly for tests
+    /// that drive the wallet directly.
     pub async fn ensure_wallet(&self) -> Result<(), RegtestError> {
         match self
             .rpc

@@ -2685,7 +2685,7 @@ pub struct SetCustomMiningJobInput {
 /// where ext 0x0003/distribution_id TLV Field puts the TLV on
 /// `DeclareMiningJob` instead), via
 /// [`crate::bridge::resolve_distribution_reference`] — against the bridge registry
-/// and passes the [`DistributionAcceptance`]. The submitted
+/// and passes the [`crate::bridge::DistributionAcceptance`]. The submitted
 /// `coinbase_tx_outputs` MUST match the ext 0x0003/Payout Computation
 /// recompute positionally (ext 0x0003/Output Verification), and for a tailored
 /// distribution the channel address MUST match its owner (the sole

@@ -80,7 +80,7 @@ pub fn detect(first_byte: u8) -> Detected {
 
 /// Look at the start of `chunk`. Returns `None` if the chunk is empty
 /// (TCP can deliver a 0-byte read in pathological cases — caller waits
-/// for more data); otherwise [`Some(Detected::*)`].
+/// for more data); otherwise `Some(Detected::*)`.
 pub fn detect_chunk(chunk: &[u8]) -> Option<Detected> {
     chunk.first().copied().map(detect)
 }

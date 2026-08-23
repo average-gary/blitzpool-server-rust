@@ -676,7 +676,7 @@ where
     Ok(result.rows_affected())
 }
 
-/// Single-row convenience over [`upsert_clients_stmt`]. Executor-generic
+/// Single-row convenience over `upsert_clients_stmt`. Executor-generic
 /// so a test can run it inside its rollback transaction; production
 /// writes go through [`bulk_upsert_clients`], which takes the bulk-write
 /// lock.
@@ -689,7 +689,7 @@ where
 
 /// Insert / upsert N client rows in one statement — the row-birth flush
 /// of the session-persistence debounce. Runs in its own transaction and
-/// takes [`CLIENT_ENTITY_BULK_WRITE_LOCK`] first: the INSERT takes
+/// takes `CLIENT_ENTITY_BULK_WRITE_LOCK` first: the INSERT takes
 /// unique-index locks on the same PK space the other bulk writers
 /// UPDATE over, and disjoint columns do not prevent a deadlock.
 pub async fn bulk_upsert_clients(pool: &PgPool, rows: &[ClientUpsert]) -> Result<u64, DbError> {
@@ -1070,7 +1070,7 @@ async fn take_client_entity_bulk_write_lock(
 /// (a buffered flusher keeps only the latest sample per key).
 ///
 /// Serialised against the other bulk writer via
-/// [`CLIENT_ENTITY_BULK_WRITE_LOCK`] — disjoint COLUMNS do not prevent a
+/// `CLIENT_ENTITY_BULK_WRITE_LOCK` — disjoint COLUMNS do not prevent a
 /// deadlock, because row locks are per row.
 #[allow(clippy::too_many_arguments)]
 pub async fn bulk_touch_clients_for_share(
@@ -1132,7 +1132,7 @@ pub async fn bulk_touch_clients_for_share(
 /// per `(address, clientName, sessionId)`.
 ///
 /// Serialised against [`bulk_touch_clients_for_share`] via
-/// [`CLIENT_ENTITY_BULK_WRITE_LOCK`].
+/// `CLIENT_ENTITY_BULK_WRITE_LOCK`.
 pub async fn bulk_set_client_hashrate(
     pool: &PgPool,
     addresses: &[String],

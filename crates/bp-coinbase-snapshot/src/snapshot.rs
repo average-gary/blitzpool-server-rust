@@ -197,7 +197,7 @@ pub async fn write_weight_snapshot(
 }
 
 /// `DEL` + `HSET` + `EXPIRE` as ONE indivisible step.
-/// KEYS[1] = the snapshot key. ARGV[1] = TTL seconds, then alternating
+/// `KEYS[1]` = the snapshot key. `ARGV[1]` = TTL seconds, then alternating
 /// field/value pairs.
 ///
 /// Three separate round trips is what this replaces, and it was wrong twice

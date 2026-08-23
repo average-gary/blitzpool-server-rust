@@ -437,7 +437,7 @@ impl GroupSoloEngine {
     /// re-reads it from Postgres. Call this after a settings edit that changes
     /// the round-reset cadence: the cadence is reinterpreted as the window
     /// length, so a stale cache would keep the record-path trim using the OLD
-    /// length for up to [`MODE_CACHE_TTL`]. On a window *grow* that stale-small
+    /// length for up to `MODE_CACHE_TTL`. On a window *grow* that stale-small
     /// length would over-trim and permanently drop a bucket the new (larger)
     /// window should keep, so we invalidate eagerly. (The mode itself is
     /// immutable; only the window length can move.)

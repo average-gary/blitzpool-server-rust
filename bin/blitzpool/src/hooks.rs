@@ -84,10 +84,12 @@ pub(crate) struct ProductionHooks {
     pub(crate) group_service: Arc<ProductionGroupServiceHooks>,
     /// Concrete FCM adapter, exposed so the Phase 7.5 cron-wiring
     /// (`bin/blitzpool::crons`) can hand it to
-    /// [`bp_notifications::cron::spawn_network_difficulty_cron`]
-    /// without re-building the adapter. `None` when `[notifications.fcm]`
-    /// is not configured — the network-difficulty cron will still spawn
-    /// and keep the tracker row fresh, just without push fan-out.
+    /// [`spawn_network_difficulty_cron`] without re-building the adapter.
+    /// `None` when `[notifications.fcm]` is not configured — the
+    /// network-difficulty cron will still spawn and keep the tracker row
+    /// fresh, just without push fan-out.
+    ///
+    /// [`spawn_network_difficulty_cron`]: bp_notifications::cron::network_difficulty::spawn_network_difficulty_cron
     pub(crate) fcm: Option<Arc<FcmAdapter>>,
     /// Concrete Web-Push adapter, exposed so Phase 7.7's dispatcher
     /// builder can wire it into `NotificationDispatcher::new` without

@@ -127,7 +127,7 @@ pub struct MiningJob {
     coinbase_prefix_hex: String,
     coinbase_suffix_hex: String,
     /// Identity of the payout list this coinbase pays — see
-    /// [`payouts_fingerprint`]. Carried on the job so a block found on it
+    /// `payouts_fingerprint`. Carried on the job so a block found on it
     /// can look up the exact distribution the pool must book, instead of
     /// whatever the shared snapshot key holds by then. 32 inline bytes, no
     /// allocation, computed once per job build.
@@ -672,7 +672,7 @@ fn encode_varint(buf: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// [`bp_stratum_v1::client::solo_payouts`]'s inputs).
+/// `bp_stratum_v1::client::solo_payouts`'s inputs).
 #[derive(Clone, Debug)]
 pub struct SoloFeeConfig {
     /// Bitcoin address that receives the dev fee on solo payouts.

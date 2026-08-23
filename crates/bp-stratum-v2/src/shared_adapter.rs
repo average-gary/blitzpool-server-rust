@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Bridges the SV2-specific
-//! [`AcceptedShareSink`](crate::hooks::AcceptedShareSink) trait to the
+//! [`AcceptedShareSink`] trait to the
 //! protocol-agnostic
-//! [`SharedAcceptedShareSink`](bp_share_hook::SharedAcceptedShareSink).
+//! [`SharedAcceptedShareSink`].
 //!
 //! Symmetric counterpart to `bp_stratum_v1::Sv1AcceptedShareAdapter`.
 //! See the `bp-share-hook` crate-level docs for the architecture.

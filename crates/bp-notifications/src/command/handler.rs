@@ -14,7 +14,7 @@
 //!   lifetime, shared with the hourly-stats cron).
 //!
 //! The two listener loops (`listener::telegram`, `listener::ntfy`)
-//! parse incoming text via [`parse_command`] and call
+//! parse incoming text via [`crate::command::parser::parse_command`] and call
 //! [`CommandHandler::dispatch`] with the matching [`Transport`].
 
 use std::collections::HashMap;

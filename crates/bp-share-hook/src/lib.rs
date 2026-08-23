@@ -122,8 +122,9 @@ pub struct SharedAcceptedShare<'a> {
 
     /// Core wall-clock time (epoch milliseconds) at which this share was
     /// accepted, stamped **once** at the protocol-agnostic projection
-    /// boundary (the SV1/SV2 adapters) via [`now_ms`]. Every downstream
-    /// sink MUST window / time-bucket on this value and never re-stamp
+    /// boundary (the SV1/SV2 adapters) via [`bp_common::now_ms`]. Every
+    /// downstream sink MUST window / time-bucket on this value and never
+    /// re-stamp
     /// `now()` at the sink. In a single process the two are microseconds
     /// apart, but once the share path and the accounting sinks can live in
     /// separate processes (Core/Satellite), a sink that re-stamps `now()`

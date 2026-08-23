@@ -3,7 +3,8 @@
 //! Satellite-side accepted-share stream consumer.
 //!
 //! In `satellite` mode the process holds no Stratum listeners; accepted
-//! shares arrive over the Redis stream the Core's [`ProducingSink`] writes
+//! shares arrive over the Redis stream the Core's
+//! [`bp_share_stream::ProducingSink`] writes
 //! to. This task drains that stream into the **same**
 //! [`SharedAcceptedShareSink`] impls the engines expose — the shares are
 //! already `share_id`-/mode-stamped by the Core, so the consumer never

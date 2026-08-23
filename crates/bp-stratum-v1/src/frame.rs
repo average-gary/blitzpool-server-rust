@@ -220,7 +220,7 @@ pub struct SuggestDifficultyRequest {
 /// is borrow-only). No DOM, no per-field `String` — see [`parse_request`].
 ///
 /// The borrow-only claim holds because `worker` is deserialized through
-/// [`CowStr`], **not** the blanket `Deserialize for Cow` (which always
+/// `CowStr`, **not** the blanket `Deserialize for Cow` (which always
 /// allocates). Pinned by `parse_submit_plain_worker_is_borrowed_not_allocated`;
 /// swapping the deserializer back would silently reintroduce a per-share
 /// allocation while leaving this comment looking correct.

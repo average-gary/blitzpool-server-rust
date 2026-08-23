@@ -2,7 +2,7 @@
 
 //! Async-trait boundaries for production wiring.
 //!
-//! Mirrors the design of [`bp_stratum_v1::hooks`] (`Arc<dyn Trait>`-
+//! Mirrors the design of `bp_stratum_v1::hooks` (`Arc<dyn Trait>`-
 //! dispatched aggregator + a [`NoOpHooks`] default + a
 //! [`test_support::RecordingHooks`] tester) and extends it for the
 //! SV2-specific extras:

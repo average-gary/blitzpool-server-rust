@@ -7,7 +7,7 @@
 //! 1. Fetch all Telegram + ntfy subscriptions with either
 //!    `hourlyStatsEnabled` or `hourlyWorkersEnabled` set.
 //! 2. For each: reuse the existing read-command builders
-//!    ([`build_stats`] / [`build_show_workers`]) to render per-language
+//!    (`build_stats` / `build_show_workers`) to render per-language
 //!    text, then push via the matching adapter.
 //!
 //! Language resolution:

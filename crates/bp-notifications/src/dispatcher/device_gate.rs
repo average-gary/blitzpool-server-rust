@@ -101,7 +101,7 @@ pub type DeviceKey = (String, String);
 /// the polling entry is dropped.
 const EVICT_AFTER: Duration = Duration::from_secs(60 * 60);
 
-/// Timing knobs. Defaults match [`bp_config`]'s serde defaults; the
+/// Timing knobs. Defaults match `bp_config`'s serde defaults; the
 /// binary passes the configured values through.
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceGateConfig {

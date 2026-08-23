@@ -94,7 +94,7 @@ pub async fn find_telegram_subscriptions_by_address(
 
 /// All Telegram subscriptions where the hourly cron should fire —
 /// either `hourlyStatsEnabled` OR `hourlyWorkersEnabled` is true.
-/// Used by [`crate::cron::hourly_stats`] to drive the per-chat
+/// Used by `crate::cron::hourly_stats` to drive the per-chat
 /// per-address hourly update loop.
 pub async fn find_telegram_subscriptions_with_hourly_enabled(
     pool: &PgPool,

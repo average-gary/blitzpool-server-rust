@@ -6,7 +6,7 @@
 //! (runtime-dep) — we do **not** re-implement the Noise state machine
 //! or the underlying handshake protocol. The `stratum-apps` crate owns the
 //! wire format; this module owns the **pool's config + the "12h cert
-//! validity" convention** that [`bp-stratum-v2`] commits to in production
+//! validity" convention** that `bp-stratum-v2` commits to in production
 //! wiring.
 //!
 //! ## "12h cert rotation"

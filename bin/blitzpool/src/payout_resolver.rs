@@ -61,7 +61,7 @@ use uuid::Uuid;
 
 use crate::engines::BlitzpoolModeGate;
 
-/// The single production [`PayoutResolver`] impl. Holds clones of the
+/// The single production `PayoutResolver` impl. Holds clones of the
 /// engines + the mode gate; cheap to clone (each field is internally
 /// `Arc` or already-clone-friendly).
 #[derive(Clone)]
