@@ -2,6 +2,7 @@ name: CI
 
 # Every push to main and every PR runs the full gate set:
 #   - fmt / clippy / check       — compile + lint, no infra needed
+#   - doc                        — rustdoc links, likewise no infra
 #   - test                       — the actual suite, with Postgres + Redis
 #                                  service containers (see the `test` job).
 #
@@ -62,6 +63,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--document-private-items` is not optional here: without it rustdoc
+      # only resolves links reachable from the public API and misses roughly
+      # two thirds of the broken ones. `-D warnings` rather than the single
+      # broken-link lint, so the private-item links, the redundant link
+      # targets and the unbalanced HTML tags are gated too.
+      - run: cargo doc --workspace --no-deps --document-private-items --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: cargo test (Postgres + Redis)
