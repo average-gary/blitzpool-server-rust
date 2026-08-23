@@ -50,10 +50,24 @@ const PAIRS: &[(&str, &str, &str)] = &[
         common::ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_PROTOCOL,
         "Mining SetupConnection.Error / unsupported-protocol",
     ),
+    // Cross-message ON PURPOSE, and the only row in this table that is.
+    // The pool raises this on `DeclareMiningJob.Error`, but pairs it with a
+    // `SetupConnection` constant, because `job_declaration_sv2` ships no code
+    // for the condition: a `DeclareMiningJob` arriving on a session that never
+    // negotiated the `DECLARE_TX_DATA` flag. Of the seven codes it does ship,
+    // only `invalid-job` would fit at all, and it says strictly less to
+    // whoever reads the log — SV2 JDP/DeclareMiningJob.Error asks for a
+    // "human-readable error code", and names no list to choose from.
+    //
+    // Still pinned here rather than dropped: the pairing is what stops a
+    // dependency bump from changing the STRING under us without anyone
+    // looking. Compare `mining_client::ERR_INVALID_JOB_ID` further down, which
+    // is absent because upstream ships nothing to pair it with at all.
     (
         jdp_client::ERR_UNSUPPORTED_FEATURE_FLAGS,
         common::ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_FEATURE_FLAGS,
-        "JDP DeclareMiningJob.Error / unsupported-feature-flags",
+        "JDP DeclareMiningJob.Error / unsupported-feature-flags \
+         (a SetupConnection code, borrowed — see the comment above)",
     ),
     // ── DeclareMiningJob (job declaration) ──────────────────────────
     (

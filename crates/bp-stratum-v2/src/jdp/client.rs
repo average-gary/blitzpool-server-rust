@@ -97,6 +97,20 @@ pub const ERR_UNSUPPORTED_VERSION: &str = "unsupported-version";
 
 /// `unsupported-feature-flags` — JDC sent `DeclareMiningJob` without
 /// negotiating `DECLARE_TX_DATA` (Full-Template mode).
+///
+/// Borrowed from `SetupConnection.Error`, deliberately: the job-declaration
+/// message crate ships no code for "the flag was never negotiated", and of the
+/// seven it does ship for this message only `invalid-job` would fit, saying
+/// strictly less. SV2 JDP/DeclareMiningJob.Error defines `error_code` as a
+/// "human-readable error code" and enumerates nothing, so the borrow is a
+/// choice between diagnostics rather than a conformance question. The pairing
+/// is pinned in `tests/wire_error_parity.rs`, with the reasoning.
+///
+/// It costs a connected client nothing either way: every
+/// `DeclareMiningJob.Error` except `stale-chain-tip` ends the session, so all
+/// the candidates are equally final. ⚠️ `stale-chain-tip` would be the one
+/// actively wrong answer here — it invites a retry against a condition that
+/// cannot resolve without a new connection.
 pub const ERR_UNSUPPORTED_FEATURE_FLAGS: &str = "unsupported-feature-flags";
 
 /// `invalid-mining-job-token` — the token referenced was never issued, has
