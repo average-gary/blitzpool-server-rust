@@ -710,7 +710,8 @@ pub(crate) fn payout_script(
 
 /// **Can a coinbase pay this identity at all?**
 ///
-/// The same question [`payout_script`] answers by succeeding, asked where there
+/// The same question the crate-private `payout_script` renderer answers by
+/// succeeding, asked where there
 /// is no height yet: the distribution build, which decides *whose* rows survive
 /// into a snapshot that is height-invariant by construction (Decision 8).
 ///

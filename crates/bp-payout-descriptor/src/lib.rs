@@ -18,7 +18,8 @@
 //!    a fixed margin. Miner-selectable script types would make the real
 //!    per-output weight a function of which members are paid in *this* block —
 //!    a ceiling that moves block to block, which that design has no answer for.
-//! 2. **One descriptor per xpub, therefore one [`payout_id`] per xpub.** The
+//! 2. **One descriptor per xpub, therefore one [`RotatingPayout::payout_id`]
+//!    per xpub.** The
 //!    same xpub at `/0/*` and at `/1/*` is two identities a miner reasonably
 //!    believes is one, and PPLNS would carry two balance rows for them.
 //! 3. **A miner can verify a payout without asking us.** One sentence conveys
@@ -276,8 +277,10 @@ impl RotatingPayout {
 
     /// The height-invariant ledger key. Safe to store in any identity column —
     /// they are `character varying(90)` since
-    /// `0015_widen_identity_columns.sql`, and a `payout_id` is 47 characters.
-    /// See [`PAYOUT_ID_PREFIX`].
+    /// `0015_widen_identity_columns.sql`, and a `payout_id` is 47 characters:
+    /// the crate-private `xpb` prefix plus a base58 sha256 digest. The prefix
+    /// keeps the id out of the address namespace — no base58 hash can be
+    /// mistaken for an address that anything would try to pay.
     ///
     /// This is **not** a payout script and cannot be spent to. The
     /// `PayoutIdentity` sum type is what keeps that confusion inexpressible:
