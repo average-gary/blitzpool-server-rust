@@ -39,6 +39,7 @@ mod address_ownership;
 mod block;
 mod blockparty;
 mod client;
+mod custom_extranonce;
 mod email;
 mod external;
 mod group;
@@ -89,19 +90,24 @@ pub use blockparty::{
     BlockpartyGroupRow, BlockpartyJoinLinkRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
 };
 pub use client::{
-    bulk_set_client_hashrate, bulk_touch_clients_for_share,
     bulk_upsert_client_difficulty_statistics, bulk_upsert_clients, delete_client_for_session,
     delete_old_client_difficulty_statistics, delete_old_client_rejected_statistics,
     delete_old_client_statistics, delete_old_clients, delete_old_pool_mode_hashrate,
-    device_first_seen, device_watch_seed, find_client, find_client_difficulty_statistics,
+    device_first_seen, device_watch_seed, find_active_session_keys,
+    find_active_sessions_for_addresses, find_client, find_client_difficulty_statistics,
     find_client_rejected_statistics, find_client_rejected_statistics_since_for_address,
     find_client_statistics, find_client_statistics_since, find_client_statistics_since_for_address,
-    find_clients_by_address, find_pool_worker_rows_since, find_user_agents, find_worker_shares,
-    kill_dead_clients, reset_all_client_hashrate, sum_active_pool_hashrate,
-    sum_hashrate_for_addresses, touch_client_for_share, update_sv2_user_agent_by_address,
-    upsert_client, ClientDifficultyStatisticsRow, ClientRejectedStatisticsRow, ClientRow,
-    ClientStatisticsRow, ClientUpsert, DeviceFirstSeenRow, PoolWorkerRow, UserAgentAggRow,
-    WorkerSharesRow,
+    find_clients_by_address, find_pool_worker_rows_since, find_recently_deleted_sessions,
+    find_stale_active_sessions, find_worker_shares, revive_sessions, soft_delete_sessions,
+    update_sv2_user_agent_by_address, upsert_client, ClientDifficultyStatisticsRow,
+    ClientRejectedStatisticsRow, ClientRow, ClientStatisticsRow, ClientUpsert, DeletedSessionRow,
+    DeviceFirstSeenRow, PoolWorkerRow, WorkerSharesRow,
+};
+pub use custom_extranonce::{
+    all_custom_extranonces, delete_extranonce_challenge, find_custom_extranonces_for_address,
+    find_extranonce_challenge, find_extranonce_token, upsert_custom_extranonces_batch,
+    upsert_extranonce_challenge, upsert_extranonce_token, CustomExtranonceRow,
+    ExtranonceChallengeRow, ExtranonceTokenRow,
 };
 pub use email::{
     delete_email_verification_by_token, delete_email_verifications_for_address,

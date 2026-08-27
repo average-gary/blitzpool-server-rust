@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/bp-common",
+    "crates/bp-client-live",
     "crates/bp-payout-descriptor",
     "crates/bp-config",
     "crates/bp-db",
@@ -42,7 +43,7 @@ members = [
 [workspace.package]
 # Tracks the pool semver so /api/info/version returns the same v<semver>
 # the UI compares against.
-version = "2.3.1"
+version = "2.3.2"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Blitzpool contributors"]
@@ -237,6 +238,7 @@ tempfile = "3"
 #   bp-common = { workspace = true }
 # without repeating the path.
 bp-common = { path = "crates/bp-common" }
+bp-client-live = { path = "crates/bp-client-live" }
 bp-payout-descriptor = { path = "crates/bp-payout-descriptor" }
 bp-config = { path = "crates/bp-config" }
 bp-db = { path = "crates/bp-db" }

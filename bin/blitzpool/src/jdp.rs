@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! JDP server wiring — Phase 7.4c + 7.4d.4.
+//! JDP server wiring.
 //!
 //! Binds a single listener on `[sv2].jdp_port` and dispatches each
 //! socket into [`StratumV2JdpServer::accept_connection`]. Unlike the
@@ -8,11 +8,12 @@
 //! Declaration Clients (JDCs) speak the JDP sub-protocol straight
 //! after the Noise handshake.
 //!
-//! Phase 7.4d.4 replaced [`JdpServerHooks::no_op`] with
+//! Production wiring replaces
+//! [`bp_stratum_v2::jdp_server::JdpServerHooks::no_op`] with
 //! [`crate::jdp_hooks::build_jdp_hooks`] — full production
 //! `AllocateResolver` (PayoutResolver-backed), `CurrentPrevHashProvider`
 //! (TDP snapshot), and `JdpBlockSubmissionSink` (`submitblock` RPC for
-//! orphan-protection redundancy). Phase 7.4d.5.a adds the
+//! orphan-protection redundancy), plus the
 //! [`TemplateTxCache`]-backed `TemplateTxProvider`, gated on
 //! `[sv2].jdp_orphan_submitblock = true`: when the pool resubmits
 //! blocks itself, the cache cuts JDC-side `ProvideMissingTransactions`
@@ -121,13 +122,14 @@ pub(crate) async fn spawn(
     // such a block is then reported but not booked.
     ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
     // Allocator backing for the strictly-increasing ext 0x0003
-    // `distribution_id` (spec §3.1).
+    // `distribution_id` (ext 0x0003/SetPayoutDistribution).
     redis: redis::aio::ConnectionManager,
-    // §10 settlement fan-out, created by the caller because the block
-    // sinks are built before this server exists and must reach the SAME
-    // registry: a settlement from any source invalidates the published
-    // distributions, not just a JDP-declared one. This is also where the
-    // registry handle gets attached, so the signal can reach it locally.
+    // ext 0x0003/Implementation Notes settlement fan-out, created by the
+    // caller because the block sinks are built before this server exists and
+    // must reach the SAME registry: a settlement from any source invalidates
+    // the published distributions, not just a JDP-declared one. This is also
+    // where the registry handle gets attached, so the signal can reach it
+    // locally.
     settle: crate::settlement::SettlementSignal,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
@@ -147,16 +149,17 @@ pub(crate) async fn spawn(
         .and_then(|p| AddressId::new(p.fee_address.clone()).ok());
     let distribution_source = Arc::new(ProductionDistributionSource {
         resolver: payout_resolver.clone(),
-        tdp: tdp.clone(),
+        chain: Arc::new(tdp.clone()),
         redis: Some(redis),
         network,
         fee_address,
     });
 
-    // SV2 §6.1: hand declared jobs to bitcoin-core for a real verdict when the
-    // operator points us at the node's IPC socket. Unset → trusted, as before.
-    // A configured-but-unusable socket stops boot: a pool that logs "validation
-    // on" while validating nothing is worse than one that refuses to start.
+    // SV2 JDP/Job Declarator Server: hand declared jobs to bitcoin-core for a
+    // real verdict when the operator points us at the node's IPC socket. Unset
+    // → trusted, as before. A configured-but-unusable socket stops boot: a
+    // pool that logs "validation on" while validating nothing is worse than
+    // one that refuses to start.
     let job_validator = match cfg.sv2.jdp_validation_socket_path.clone() {
         Some(socket_path) => crate::jdp_hooks::ProductionJobValidator::connect(
             socket_path,
@@ -168,7 +171,7 @@ pub(crate) async fn spawn(
         None => {
             info!(
                 "jdp: declared jobs are NOT validated against bitcoin-core \
-                 (set `[sv2].jdp_validation_socket_path` to enable, SV2 §6.1)"
+                 (set `[sv2].jdp_validation_socket_path` to enable, SV2 JDP/Job Declarator Server)"
             );
             None
         }

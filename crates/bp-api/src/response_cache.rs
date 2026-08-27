@@ -155,8 +155,9 @@ impl ResponseCache {
             .await
     }
 
-    /// Like [`get_or_fetch`] but takes an explicit TTL in seconds instead of
-    /// a `TtlKind`. Use this when the TTL varies by runtime parameter (e.g.
+    /// Like [`Self::get_or_fetch`] but takes an explicit TTL in seconds
+    /// instead of a `TtlKind`. Use this when the TTL varies by runtime
+    /// parameter (e.g.
     /// per-range diff-scores queries where longer ranges warrant longer caches).
     pub async fn get_or_fetch_secs<T, F, E>(
         &self,

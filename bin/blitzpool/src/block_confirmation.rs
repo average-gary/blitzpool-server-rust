@@ -814,11 +814,14 @@ mod declared_block_booking_regtest {
         ) -> bool {
             self.sink()
                 .book_declared_block_found(
-                    self.miners[0].clone(),
-                    "a1b2c3d4".to_string(), // blocks_entity."sessionId" is varchar(8)
+                    crate::block_sink::FoundBlockRecord {
+                        miner_address: self.miners[0].clone(),
+                        // blocks_entity."sessionId" is varchar(8)
+                        session_id: "a1b2c3d4".to_string(),
+                        block_hash: block_hash.to_string(),
+                        block_data: self.block_hex.clone(),
+                    },
                     self.actual.total_value_sats,
-                    block_hash.to_string(),
-                    self.block_hex.clone(),
                     self.fingerprint,
                     actual,
                 )
@@ -1407,11 +1410,14 @@ mod declared_block_booking_regtest {
         ) -> bool {
             self.sink()
                 .book_declared_block_found(
-                    self.members[0].clone(),
-                    "b1c2d3e4".to_string(),
+                    crate::block_sink::FoundBlockRecord {
+                        miner_address: self.members[0].clone(),
+                        // blocks_entity."sessionId" is varchar(8)
+                        session_id: "b1c2d3e4".to_string(),
+                        block_hash: block_hash.to_string(),
+                        block_data: self.block_hex.clone(),
+                    },
                     self.actual.total_value_sats,
-                    block_hash.to_string(),
-                    self.block_hex.clone(),
                     self.fingerprint,
                     actual,
                 )

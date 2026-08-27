@@ -2,7 +2,7 @@
 
 //! Async-trait boundaries for production wiring.
 //!
-//! Mirrors the design of [`bp_stratum_v1::hooks`] (`Arc<dyn Trait>`-
+//! Mirrors the design of `bp_stratum_v1::hooks` (`Arc<dyn Trait>`-
 //! dispatched aggregator + a [`NoOpHooks`] default + a
 //! [`test_support::RecordingHooks`] tester) and extends it for the
 //! SV2-specific extras:
@@ -38,11 +38,11 @@
 //!   miner-address; that's caller-supplied state inside
 //!   `MiningServerContext`, not an async hook (it's a sync registry
 //!   lookup, see [`crate::bridge::JdpDeclaredJobRegistry`]).
-//! - `MempoolValidator` was never built, and nothing is waiting for
-//!   it: a declared job gets its node-side verdict from
+//! - `MempoolValidator` was never built, and nothing is waiting for it: a
+//!   declared job gets its node-side verdict from
 //!   [`crate::jdp_server::DeclaredJobValidator`] over bitcoin-core's
-//!   job-declaration IPC (SV2 §6.1) — a consensus answer, not a
-//!   mempool guess.
+//!   job-declaration IPC (SV2 JDP/Job Declarator Server) — a consensus answer,
+//!   not a mempool guess.
 
 use std::sync::Arc;
 
@@ -61,11 +61,10 @@ use crate::mining::submit::{RejectReason, ShareAccept};
 /// [`crate::mining::client::apply_template_broadcast`].
 ///
 /// Production impl runs the service-layer mode-resolver
-/// ([`bp_mining_mode::ModeResolver`]) + evaluates the per-mode
-/// distribution (PPLNS/Group-Solo: the SV2 ext 0x0003 §4 weight
-/// formula at this reward; Blockparty / single-output solo: their own
-/// exact allocators). Tests use [`NoOpHooks`] returning a single
-/// 100%-to-self entry.
+/// ([`bp_mining_mode::ModeResolver`]) + evaluates the per-mode distribution
+/// (PPLNS/Group-Solo: the SV2 ext 0x0003/Payout Computation weight formula at
+/// this reward; Blockparty / single-output solo: their own exact allocators).
+/// Tests use [`NoOpHooks`] returning a single 100%-to-self entry.
 #[async_trait::async_trait]
 pub trait PayoutResolver: Send + Sync {
     /// Resolve the payout list for a given connection's locked
@@ -207,6 +206,23 @@ pub trait DeviceStatusSink: Send + Sync {
     );
 }
 
+// ── CustomExtranonceSource ──────────────────────────────────────────
+
+/// Look up a customer-set extranonce prefix for a `(address, worker)`.
+///
+/// Backs the custom-extranonce override: an address that proved control of
+/// its key (via the ownership signature) may pin its own 4-byte prefix per
+/// worker through the API. The stratum server consults this at channel-open
+/// to swap the pool-allocated prefix for the customer's chosen one.
+///
+/// Sync on purpose — the production impl reads an in-memory cache the core
+/// refreshes off PG periodically (never a per-lookup DB round-trip), mirroring
+/// how the mode-gate lookup is a plain map hit. Returns `None` for the
+/// overwhelming majority of workers, which have no override.
+pub trait CustomExtranonceSource: Send + Sync {
+    fn lookup(&self, address: &str, worker: &str) -> Option<[u8; 4]>;
+}
+
 // ── ServerHooks aggregator ──────────────────────────────────────────
 
 /// Composite hook handle for the SV2 mining server. Cheap to clone
@@ -221,6 +237,9 @@ pub struct MiningServerHooks {
     pub rejected_sink: Arc<dyn RejectedShareSink>,
     pub session_persistence: Arc<dyn SessionPersistence>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
+    /// Customer extranonce overrides. [`NoOpHooks`] returns `None` for every
+    /// worker, so a deployment without the feature behaves exactly as before.
+    pub custom_extranonce: Arc<dyn CustomExtranonceSource>,
     /// The pool's rotating-identity intake, consulted once per
     /// `OpenMiningChannel`. **The same `Arc` SV1's
     /// `ServerHooks::rotating_intake` carries** — see that field for why an
@@ -247,7 +266,8 @@ impl MiningServerHooks {
             accepted_sink: no_op.clone(),
             rejected_sink: no_op.clone(),
             session_persistence: no_op.clone(),
-            device_status_sink: no_op,
+            device_status_sink: no_op.clone(),
+            custom_extranonce: no_op,
             // See SV1's `no_op`: no intake means the static path, unchanged,
             // and `NoOpHooks` gets no stub impl of the trait.
             rotating_intake: None,
@@ -319,6 +339,12 @@ impl DeviceStatusSink for NoOpHooks {
 impl SessionPersistence for NoOpHooks {
     async fn register_session(&self, _: &str, _: &str, _: &str, _: u32, _: Option<&str>) {}
     async fn deregister_session(&self, _: &str) {}
+}
+
+impl CustomExtranonceSource for NoOpHooks {
+    fn lookup(&self, _: &str, _: &str) -> Option<[u8; 4]> {
+        None
+    }
 }
 
 // ── test_support ────────────────────────────────────────────────────
@@ -401,6 +427,8 @@ pub mod test_support {
                 rejected_sink: arc.clone(),
                 session_persistence: arc.clone(),
                 device_status_sink: arc,
+                // RecordingHooks doesn't record EN lookups — no override in tests.
+                custom_extranonce: Arc::new(NoOpHooks),
                 rotating_intake: None,
             }
         }

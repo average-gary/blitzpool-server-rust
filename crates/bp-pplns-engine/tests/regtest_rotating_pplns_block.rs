@@ -89,7 +89,9 @@ use sqlx::PgPool;
 const XPUB: &str = "tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp";
 
 /// This test's logical DB inside the binary's range.
-const REDIS_TEST_DB: u8 = 0;
+// Index 20 inside `redis_db::RT_ROTATING_PPLNS_BLOCK`, which shares its base
+// with `SESSION_PERSISTENCE` — see that constant for the occupied indices.
+const REDIS_TEST_DB: u8 = 20;
 
 /// The resolver `bin/blitzpool` installs, reduced to what a test can hold: a
 /// map of the rotating identities it knows.

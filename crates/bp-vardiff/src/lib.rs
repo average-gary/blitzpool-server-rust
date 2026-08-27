@@ -2,7 +2,7 @@
 
 //! Per-session VarDiff engine + ckpool-style race-window clamp.
 //!
-//! Pure-math leaf crate, std-only. Shared between [`bp-stratum-v1`] (which
+//! Pure-math leaf crate, std-only. Shared between `bp-stratum-v1` (which
 //! sends the result as `mining.set_difficulty` JSON) and `bp-stratum-v2`
 //! (which sends the result as a binary `SetTarget` frame on Standard /
 //! Extended channels). The vardiff math is wire-format-agnostic — only
@@ -193,6 +193,35 @@ pub const VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR: f64 = 256.0;
 
 /// Monotonic-ish millisecond clock. Real-world impl wraps `SystemTime`;
 /// tests use [`TestClock`] for deterministic advance.
+///
+/// # Why the pool's epoch-ms clock lives in the vardiff crate
+///
+/// It reads oddly — the JDP server and the Stratum session state are not
+/// vardiff — and it has been proposed for `bp-common` more than once. Decided
+/// 2026-08-23 to keep it here, on these grounds:
+///
+/// - **The move would remove no dependency.** Exactly two crates take this
+///   one: `bp-stratum-v1` and `bp-stratum-v2`, and both run `VarDiffEngine`
+///   anyway. Nothing depends on this crate ONLY for the clock, so nothing gets
+///   lighter.
+/// - **There is a second `Clock` in the workspace, deliberately.**
+///   `bp_cron_utils::Clock` returns `chrono::DateTime<Utc>` because
+///   calendar-aligned scheduling needs date-time math. Putting this one in the
+///   shared-vocabulary crate would make `bp_common::Clock` read as THE pool
+///   clock while covering only half the pool's time.
+/// - **`bp-common` takes time, it does not source it.** `LogThrottle::allow`
+///   receives a `now_ms`, and its one production caller passes a share's own
+///   `ts_ms` — the stamp that travelled with the data. A clock there would
+///   make that crate a time source for the first time.
+/// - This crate is a zero-dependency std-only leaf; `bp-common` carries four.
+///
+/// What was NOT the argument, because measuring did not support it:
+/// injectability. It is a call-site choice, not a crate-location one — 54 uses
+/// here are injected through a type parameter and 24 call `SystemClock.now_ms()`
+/// directly, and moving the trait changes neither number.
+///
+/// Not to be confused with `bp_common::now_ms`, which is `i64` for Postgres,
+/// reads the system clock at the call site and is deliberately NOT injectable.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
@@ -630,7 +659,7 @@ impl<C: Clock> VarDiffEngine<C> {
     }
 
     /// `shares` accumulator for the current time slot — exposed for tests.
-    /// Production callers should use [`hash_rate`] instead.
+    /// Production callers should use `hash_rate` instead.
     pub fn current_shares(&self) -> f64 {
         self.shares
     }
@@ -745,7 +774,7 @@ impl<C: Clock> VarDiffEngine<C> {
     ///   with no accepted share at all yet, or samples present but inside the
     ///   2× clamp).
     /// - `Some(diff)` — a freshly-rounded power-of-2 target. Always
-    ///   ≥ [`min_difficulty`]; never NaN / Infinity.
+    ///   ≥ `min_difficulty`; never NaN / Infinity.
     ///
     /// Both branches funnel through `nearest_difficulty_step` (which floors
     /// at `min_difficulty`).
@@ -1035,7 +1064,7 @@ impl<C: Clock> VarDiffEngine<C> {
         }
     }
 
-    /// Round UP to a power of two. Floors at [`min_difficulty`].
+    /// Round UP to a power of two. Floors at `min_difficulty`.
     /// Returns `None` for `val == 0`, guarding against `log2(0) = -Infinity`.
     ///
     /// **Powers of two only, and always upward.** Both halves were measured on

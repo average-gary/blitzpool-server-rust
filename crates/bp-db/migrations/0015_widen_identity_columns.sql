@@ -3,7 +3,7 @@
 -- **This is a pre-existing break and has nothing to do with xpubs.** It is
 -- Phase 5 of the payout-identity plan and deliberately NOT part of that
 -- feature's diff: a reviewer looking at a payout-identity change cannot also be
--- evaluating a 29-column width migration.
+-- evaluating a 32-column width migration.
 --
 -- Measured: a **regtest P2TR address (`bcrt1p…`) is 64 characters** against a
 -- 62-character cap, in these columns and in `bp_common`'s
@@ -34,7 +34,7 @@
 -- `worker_shares_entity` and `client_statistics_entity`, the two large ones.
 -- Each statement takes a brief ACCESS EXCLUSIVE lock on its own table; there is
 -- no long-running scan to wait behind. sqlx runs the whole file in one
--- transaction, so all 29 land or none do.
+-- transaction, so all 32 land or none do.
 --
 -- **Rollback story.** Reverting is `TYPE character varying(62)`, which is NOT
 -- free: narrowing scans the table and fails outright if any row has grown past
@@ -81,3 +81,15 @@ ALTER TABLE blockparty_member ALTER COLUMN address TYPE character varying(90);
 ALTER TABLE blockparty_invitation ALTER COLUMN address TYPE character varying(90);
 ALTER TABLE miner_identity ALTER COLUMN "payoutId" TYPE character varying(90);
 ALTER TABLE miner_identity ALTER COLUMN address TYPE character varying(90);
+
+-- The three tables `0012_add_custom_extranonce.sql` added. They were written
+-- with the same `character varying(62)` the rest of the schema had, so they
+-- carry the identical latent break — a 64-character regtest `bcrt1p…` cannot be
+-- stored. They are widened here rather than in 0012 because this migration is
+-- the one place the identity width is decided; `identity_column_width.rs` asks
+-- `information_schema` rather than a name list precisely so a table added
+-- between the two shows up as a failing test instead of a silent gap, and that
+-- is how these three were found.
+ALTER TABLE pplns_extranonce_challenge ALTER COLUMN address TYPE character varying(90);
+ALTER TABLE pplns_extranonce_token ALTER COLUMN address TYPE character varying(90);
+ALTER TABLE pplns_custom_extranonce ALTER COLUMN address TYPE character varying(90);

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Bridges the SV2-specific
-//! [`AcceptedShareSink`](crate::hooks::AcceptedShareSink) trait to the
+//! [`AcceptedShareSink`] trait to the
 //! protocol-agnostic
-//! [`SharedAcceptedShareSink`](bp_share_hook::SharedAcceptedShareSink).
+//! [`SharedAcceptedShareSink`].
 //!
 //! Symmetric counterpart to `bp_stratum_v1::Sv1AcceptedShareAdapter`.
 //! See the `bp-share-hook` crate-level docs for the architecture.
@@ -54,7 +54,7 @@ impl<S: SharedAcceptedShareSink + ?Sized> AcceptedShareSink for Sv2AcceptedShare
                 is_block_candidate: accept.is_block_candidate,
                 hash_rate,
                 channel_count,
-                ts_ms: bp_share_hook::now_ms(),
+                ts_ms: bp_common::now_ms(),
                 // Producer-assigned downstream at the single fan-out point;
                 // the per-protocol adapter has no global share sequence and
                 // no mode-gate, so it leaves share_id/mode/group_id blank.
@@ -258,7 +258,7 @@ mod tests {
             }
         }
 
-        let before = bp_share_hook::now_ms();
+        let before = bp_common::now_ms();
         let inner = Arc::new(TsSink {
             ts: Mutex::new(None),
         });
@@ -267,7 +267,7 @@ mod tests {
         adapter
             .record_accepted("a", "w", "s", None, &accept, 0.0, 1)
             .await;
-        let after = bp_share_hook::now_ms();
+        let after = bp_common::now_ms();
 
         let ts = inner.ts.lock().unwrap().expect("share recorded");
         assert!(

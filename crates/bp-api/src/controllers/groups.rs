@@ -948,11 +948,28 @@ where
                 } else {
                     &[][..]
                 };
-                let mut items = Vec::with_capacity(slice.len());
+                // Roster first, then ONE live-hashrate read for the whole
+                // page: each read is a cursor-complete SCAN of the Redis
+                // keyspace, so per-group calls would multiply a full walk
+                // by the page size (up to 100).
+                let mut rosters = Vec::with_capacity(slice.len());
                 for g in slice {
-                    let members = svc.list_members(g.id).await?;
-                    let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-                    let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
+                    rosters.push((g, svc.list_members(g.id).await?));
+                }
+                let everyone: Vec<AddressId> = rosters
+                    .iter()
+                    .flat_map(|(_, members)| members.iter().map(|m| m.address.clone()))
+                    .collect();
+                let by_address = crate::error::or_degraded(
+                    bp_client_live::hashrate_by_address(s.redis.as_ref(), &everyone).await,
+                    || zeroed(&everyone),
+                )?;
+                let mut items = Vec::with_capacity(rosters.len());
+                for (g, members) in rosters {
+                    let total_hashrate: f64 = members
+                        .iter()
+                        .map(|m| by_address.get(m.address.as_str()).copied().unwrap_or(0.0))
+                        .sum();
                     let mut summary = GroupSummary::from(g.clone());
                     summary.creator_address = None; // never expose the creator publicly
                     items.push(PublicGroupEntry {
@@ -1027,7 +1044,10 @@ where
                 }
                 let members = svc.list_members(id).await?;
                 let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-                let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
+                let total_hashrate = crate::error::or_degraded(
+                    bp_client_live::hashrate_for_addresses(s.redis.as_ref(), &addrs).await,
+                    || 0.0,
+                )?;
                 let history = bp_db::find_recent_group_block_history(&s.pool, id, 20).await?;
                 let mut summary = GroupSummary::from(group);
                 summary.creator_address = None; // never expose the creator publicly
@@ -1226,8 +1246,11 @@ where
             let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
             let members = svc.list_members(id).await?;
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-            let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
-            let per_addr_hashrate = per_address_hashrate(&s.pool, &addrs).await?;
+            let per_addr_hashrate = crate::error::or_degraded(
+                bp_client_live::hashrate_by_address(s.redis.as_ref(), &addrs).await,
+                || zeroed(&addrs),
+            )?;
+            let total_hashrate: f64 = per_addr_hashrate.values().sum();
             let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
             // Batch the signature-ownership lookup (admin-only, for the
@@ -1238,6 +1261,31 @@ where
             } else {
                 std::collections::HashSet::new()
             };
+
+            // Roster-wide session stats in two round trips instead of two
+            // per member: the loop below used to issue one PG query and
+            // one Redis pipeline each, awaited in sequence.
+            let sessions =
+                bp_db::find_active_sessions_for_addresses(&s.pool, &addr_strings).await?;
+            let live = crate::error::or_degraded(
+                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &sessions).await,
+                || vec![None; sessions.len()],
+            )?;
+            let mut start_times: HashMap<&str, i64> = HashMap::new();
+            let mut last_seen_by_address: HashMap<&str, i64> = HashMap::new();
+            for (c, lf) in sessions.iter().zip(&live) {
+                let addr = c.address.as_str();
+                start_times
+                    .entry(addr)
+                    .and_modify(|t| *t = (*t).min(c.start_time))
+                    .or_insert(c.start_time);
+                if let Some(ts) = lf.as_ref().and_then(|lf| lf.updated_at_ms) {
+                    last_seen_by_address
+                        .entry(addr)
+                        .and_modify(|t| *t = (*t).max(ts))
+                        .or_insert(ts);
+                }
+            }
 
             let mut entries = Vec::with_capacity(members.len());
             for m in members {
@@ -1271,9 +1319,8 @@ where
                 // Per-member worker stats folded in server-side (best-diff /
                 // uptime / last-seen) so the UI no longer fetches per-member
                 // client info by full address.
-                let clients = bp_db::find_clients_by_address(&s.pool, &m.address).await?;
-                let start_time = clients.iter().map(|c| c.start_time).min();
-                let last_seen = clients.iter().map(|c| c.updated_at).max();
+                let start_time = start_times.get(addr_str).copied();
+                let last_seen = last_seen_by_address.get(addr_str).copied().or(start_time);
                 let best_difficulty = bp_db::find_address_settings(&s.pool, &m.address)
                     .await?
                     .map(|x| x.best_difficulty)
@@ -1317,19 +1364,13 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// Compute hashrate per address for the supplied list. We currently
-/// fetch them one-by-one — fine for typical group sizes (<50 members);
-/// follow-up bp-db helper for a bulk-fetch could replace this.
-async fn per_address_hashrate(
-    pool: &sqlx::PgPool,
-    addrs: &[AddressId],
-) -> Result<HashMap<String, f64>, ApiError> {
-    let mut out = HashMap::with_capacity(addrs.len());
-    for a in addrs {
-        let hr = bp_db::sum_hashrate_for_addresses(pool, std::slice::from_ref(a)).await?;
-        out.insert(a.as_str().to_string(), hr);
-    }
-    Ok(out)
+/// Every requested address at zero — the shape `hashrate_by_address`
+/// returns when nothing is live, used as the degraded fallback.
+fn zeroed(addrs: &[AddressId]) -> HashMap<String, f64> {
+    addrs
+        .iter()
+        .map(|a| (a.as_str().to_string(), 0.0))
+        .collect()
 }
 
 // ─── GET /api/groups/by-address/:address ─────────────────────────
@@ -1392,8 +1433,11 @@ where
             let _ = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
             let members = svc.list_members(id).await?;
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-            let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
-            let per_addr = per_address_hashrate(&s.pool, &addrs).await?;
+            let per_addr = crate::error::or_degraded(
+                bp_client_live::hashrate_by_address(s.redis.as_ref(), &addrs).await,
+                || zeroed(&addrs),
+            )?;
+            let total_hashrate: f64 = per_addr.values().sum();
             let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
             Ok(HashrateResponse {
@@ -2017,7 +2061,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::GroupChart, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let addrs = collect_group_member_addresses(&s, id).await?;
@@ -2060,7 +2104,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::GroupAccepted, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let addrs = collect_group_member_addresses(&s, id).await?;
@@ -2144,7 +2188,7 @@ where
             key,
             TtlKind::GroupRejected,
             async move {
-                let now = crate::time_range::now_ms();
+                let now = bp_common::now_ms();
                 let since = now - range.window_ms();
                 let addrs = collect_group_member_addresses(&s, id).await?;
                 let mut buckets: std::collections::BTreeMap<

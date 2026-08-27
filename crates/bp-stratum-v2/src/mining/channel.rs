@@ -205,7 +205,7 @@ impl ChannelState {
     }
 
     /// Record an accepted share. Bumps the per-channel counters; the
-    /// dedup-cache write happens via [`SubmissionCache::insert_*`] at
+    /// dedup-cache write happens via `SubmissionCache::insert_*` at
     /// the call site (the validator already produced the dedup key).
     pub fn record_accepted_share(&mut self, share_difficulty: Difficulty) {
         self.accepted_share_count = self.accepted_share_count.saturating_add(1);
@@ -519,9 +519,11 @@ mod tests {
 
     // ── full_extranonce_size invariant ─────────────────────────────
 
-    /// `full_extranonce_size = prefix.len + extranonce_size`. Should
-    /// stay ≤ 12 by SV2 spec (caller responsibility, not enforced
-    /// here — Standard always 4+0, Extended typically 4+8).
+    /// `full_extranonce_size = prefix.len + extranonce_size`. The SV2 cap is
+    /// **32** (`extranonce_prefix` is `B0_32`); 12 is only this pool's
+    /// layout — Standard always 4+0, Extended typically 4+8. Neither bound is
+    /// enforced here; the 32-byte one is enforced at channel-open in
+    /// `handle_open_extended_mining_channel`.
     #[test]
     fn full_extranonce_size_is_sum_of_prefix_and_rollable() {
         let ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());

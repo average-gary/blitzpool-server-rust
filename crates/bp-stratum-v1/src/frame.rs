@@ -48,6 +48,9 @@ pub const REJECT_LOW_DIFF: &str = "Difficulty too low";
 pub const REJECT_STALE: &str = "stale";
 pub const REJECT_UNAUTHORIZED: &str = "Unauthorized worker";
 pub const REJECT_NOT_SUBSCRIBED: &str = "Not subscribed";
+/// Emitted when a miner changes version bits outside the mask it negotiated
+/// (BIP-310). New string — no historical tooling parses it yet.
+pub const REJECT_VERSION_ROLLING: &str = "Version rolling not allowed";
 pub const REJECT_SUGGEST_DISABLED: &str = "Suggest difficulty is disabled for this connection";
 pub const REJECT_INVALID_ADDR: &str = "Invalid Bitcoin address";
 
@@ -127,14 +130,65 @@ pub struct SubscribeRequest {
     pub user_agent: String,
 }
 
+/// What a `mining.configure` carried in `version-rolling.mask`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestedMask {
+    /// A readable mask.
+    Requested(u32),
+    /// No `version-rolling.mask` field. BIP-310 reads this as `ffffffff`.
+    Absent,
+    /// The field was present but unreadable. **Not** the same as absent.
+    Malformed,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConfigureRequest {
     pub id: RpcId,
-    /// The full `params` array, preserved verbatim. The current pool
-    /// implementation ignores its contents and always returns a fixed
-    /// `{version-rolling: true, mask}` result, but keeping the raw value
-    /// lets downstream tooling inspect what the miner asked for.
+    /// The full `params` array, preserved verbatim.
+    /// [`Self::requested_version_rolling_mask`] reads the one BIP-310 field
+    /// `handle_configure` needs; the raw value is kept so downstream tooling
+    /// can inspect anything else the miner asked for.
     pub params: serde_json::Value,
+}
+
+impl ConfigureRequest {
+    /// The `version-rolling.mask` the miner asked for, per BIP-310.
+    ///
+    /// `Absent` carries BIP-310's default: the field is OPTIONAL with
+    /// default `"ffffffff"` — "A miner doesn't have to send the mask, in
+    /// this case a default full mask is used" — so an absent field means
+    /// *everything*, never *nothing*.
+    ///
+    /// `Malformed` is kept apart from it on purpose. The BIP's default is
+    /// defined for a field that is not there; a field that IS there and
+    /// unreadable (`"1fffe0000"`, `"zzzz"`, a non-string) says the miner
+    /// meant something the pool could not read, and silently upgrading that
+    /// to "grant everything" hands it bits it never asked for.
+    pub fn requested_version_rolling_mask(&self) -> RequestedMask {
+        let Some(field) = self
+            .params
+            .get(1)
+            .and_then(|p| p.get("version-rolling.mask"))
+        else {
+            return RequestedMask::Absent;
+        };
+        let Some(text) = field.as_str() else {
+            return RequestedMask::Malformed;
+        };
+        // Exactly one optional `0x`, case-insensitively; `from_str_radix`
+        // would otherwise also accept a leading `+`.
+        let digits = text
+            .strip_prefix("0x")
+            .or_else(|| text.strip_prefix("0X"))
+            .unwrap_or(text);
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+            return RequestedMask::Malformed;
+        }
+        match u32::from_str_radix(digits, 16) {
+            Ok(mask) => RequestedMask::Requested(mask),
+            Err(_) => RequestedMask::Malformed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,7 +220,7 @@ pub struct SuggestDifficultyRequest {
 /// is borrow-only). No DOM, no per-field `String` — see [`parse_request`].
 ///
 /// The borrow-only claim holds because `worker` is deserialized through
-/// [`CowStr`], **not** the blanket `Deserialize for Cow` (which always
+/// `CowStr`, **not** the blanket `Deserialize for Cow` (which always
 /// allocates). Pinned by `parse_submit_plain_worker_is_borrowed_not_allocated`;
 /// swapping the deserializer back would silently reintroduce a per-share
 /// allocation while leaving this comment looking correct.
@@ -505,17 +559,27 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 });
             }
             let raw_username = arr[0].as_str().unwrap().to_string();
-            // The shared split — one implementation across the four protocol
-            // paths that read a `user_identity` (see
-            // `bp_common::split_identity_and_worker`). SV1's own convention, that
-            // a missing dot means worker `"worker"` while a trailing dot leaves it
-            // empty, stays here: it is SV1's default, not part of the rule, which
-            // is why the shared function returns `Option` instead of a defaulted
-            // string.
+            // The shared split — one implementation across the protocol paths
+            // that read a `user_identity` (see
+            // `bp_common::split_identity_and_worker`). SV1's own default stays
+            // here rather than in the shared function, which is why that one
+            // returns `Option` instead of a defaulted string.
+            //
+            // A trailing dot ("addr.") gets the same default as no dot at all:
+            // an empty worker name is not a name. Letting "" through birthed the
+            // `client_entity` row under clientName "" while every share-path
+            // write targets a non-empty name — the touch UPDATE then matches 0
+            // rows, `updatedAt` freezes, and `kill_dead_clients` sweeps an
+            // actively-hashing session. The shared split returns `Some("")` for
+            // a trailing dot, so the emptiness check has to live at this call
+            // site; the SV2 reader in `bp_stratum_v2::extensions` makes the same
+            // check for the same reason.
             let (address, worker) = bp_common::split_identity_and_worker(&raw_username);
             let (address, worker) = (
                 address.to_string(),
-                worker.map_or_else(|| "worker".to_string(), str::to_string),
+                worker
+                    .filter(|w| !w.is_empty())
+                    .map_or_else(|| "worker".to_string(), str::to_string),
             );
             let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
             Ok(SV1Request::Authorize(AuthorizeRequest {
@@ -893,6 +957,25 @@ mod tests {
             SV1Request::Authorize(a) => {
                 assert_eq!(a.address, "bc1qjustaddress");
                 assert_eq!(a.worker, "worker"); // defaults to 'worker' if missing
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// A trailing dot must never yield an empty worker name: the session
+    /// would register under clientName "" while every share-path write
+    /// targets a non-empty name, so its touches match 0 rows and
+    /// `kill_dead_clients` sweeps the live session after 5 minutes.
+    #[test]
+    fn parse_authorize_with_trailing_dot_gets_the_default_worker_name() {
+        let req = parse_request(
+            r#"{"id":3,"method":"mining.authorize","params":["bc1qjustaddress.","x"]}"#,
+        )
+        .expect("ok");
+        match req {
+            SV1Request::Authorize(a) => {
+                assert_eq!(a.address, "bc1qjustaddress");
+                assert_eq!(a.worker, "worker", "empty worker takes the no-dot default");
             }
             _ => unreachable!(),
         }

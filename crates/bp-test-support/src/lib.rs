@@ -119,7 +119,6 @@ pub fn brute_force_nonce(
     for nonce in 0..1_000_000u32 {
         let header = build_block_header(
             version as i32,
-            0,
             prev_hash,
             merkle_root,
             timestamp,
@@ -253,7 +252,6 @@ pub async fn mine_and_submit_payouts(
 
     let header_bytes = build_block_header(
         template.version as i32,
-        0,
         &prev_hash.prev_hash,
         &merkle_root,
         prev_hash.header_timestamp,
@@ -389,7 +387,7 @@ pub async fn cleanup_blockparty_rows(pool: &PgPool, addrs: &[&str]) {
 /// a test green alone and red in the suite, twice, for two different
 /// neighbours.
 ///
-/// So each test binary owns [`RANGE`] consecutive databases and keeps its
+/// So each test binary owns `RANGE` consecutive databases and keeps its
 /// own 0-based numbering inside them. A binary needs a distinct base
 /// here; a test needs a number no sibling in the SAME binary uses.
 pub mod redis_db {
@@ -422,17 +420,43 @@ pub mod redis_db {
     pub const RT_SPLIT_E2E: u16 = 12 * RANGE;
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
     pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
-    /// `bp-pplns-engine`'s `regtest_rotating_pplns_block` — a rotating miner
-    /// through the whole PPLNS path, twice, so it owns its own range rather
-    /// than sharing a window with a sibling that flushes.
+
+    /// `bp-session-persistence`'s `live_store_integration`. ⚠️ This is
+    /// the LAST free 32-slice of the 512-DB test container
+    /// (`15 * 32 + 31 = 511`) — the next binary that needs a base must
+    /// recreate `bp-test-redis` with `--databases` raised past 512.
     ///
-    /// **15 is the last usable base.** `redis_db_in_range` is
-    /// `(base + test_db) % redis_database_count()`, so with `RANGE = 32` a
-    /// sixteenth base would be `16 * 32 = 512`, which folds straight back onto
-    /// `BLITZPOOL_BIN = 0` even on the 512-database container. A new binary
-    /// past this one needs `RANGE` reduced or the container widened — not the
-    /// next multiple.
-    pub const RT_ROTATING_PPLNS_BLOCK: u16 = 15 * RANGE;
+    /// ⚠️ Index **31** of this range is lent to TWO `bp-api` test
+    /// binaries — `smoke.rs` and `custom_extranonce_guard.rs` — both
+    /// NO-FLUSH and write-free, since their endpoints now need a live
+    /// store to answer at all. Don't claim it for a session-persistence
+    /// test, and don't add a write to either borrower without moving
+    /// them apart first.
+    ///
+    /// Occupied indices in this range: 0-6 and 8 (`live_store_integration`
+    /// plus `live_store.rs`'s own test), 20 ([`RT_ROTATING_PPLNS_BLOCK`]),
+    /// 31 (the two `bp-api` borrowers above).
+    pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
+
+    /// `bp-pplns-engine`'s `regtest_rotating_pplns_block` — a rotating miner
+    /// through the whole PPLNS path, twice.
+    ///
+    /// **A lodger in [`SESSION_PERSISTENCE`]'s range, not a base of its own.**
+    /// 15 is the last usable base: `redis_db_in_range` is
+    /// `(base + test_db) % redis_database_count()`, so a sixteenth base would
+    /// be `16 * 32 = 512`, which folds straight back onto `BLITZPOOL_BIN = 0`
+    /// on the 512-database container — silently, and onto a range that
+    /// flushes.
+    ///
+    /// Sharing the base is safe because the two never share a *database*:
+    /// this binary owns index 20 alone, and `FLUSHDB` wipes only the database
+    /// it is issued against. That holds under `cargo-nextest`'s concurrent
+    /// binaries too, which is the runner the note above this block says the
+    /// serial-binary assumption does not survive.
+    ///
+    /// A binary that needs a whole 32-slice of its own is the one that has to
+    /// recreate `bp-test-redis` with `--databases` past 512.
+    pub const RT_ROTATING_PPLNS_BLOCK: u16 = SESSION_PERSISTENCE;
 }
 
 /// How many logical databases this Redis actually has.

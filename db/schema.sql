@@ -139,11 +139,7 @@ CREATE TABLE public.client_entity (
     "sessionId" character varying(8) NOT NULL,
     "userAgent" character varying(128),
     "startTime" bigint NOT NULL,
-    "firstSeen" bigint,
-    "bestDifficulty" real DEFAULT '0'::real NOT NULL,
-    "hashRate" double precision DEFAULT '0'::double precision NOT NULL,
-    "currentDifficulty" real,
-    "channelCount" integer DEFAULT 1 NOT NULL
+    "firstSeen" bigint
 );
 
 
@@ -205,7 +201,9 @@ CREATE TABLE public.client_statistics_entity (
     "rejectedDuplicateShareCount" integer DEFAULT 0 NOT NULL,
     "rejectedDuplicateShareDiff1" real DEFAULT '0'::real NOT NULL,
     "rejectedLowDifficultyShareCount" integer DEFAULT 0 CONSTRAINT "client_statistics_entity_rejectedLowDifficultyShareCou_not_null" NOT NULL,
-    "rejectedLowDifficultyShareDiff1" real DEFAULT '0'::real CONSTRAINT "client_statistics_entity_rejectedLowDifficultyShareDif_not_null" NOT NULL
+    "rejectedLowDifficultyShareDiff1" real DEFAULT '0'::real CONSTRAINT "client_statistics_entity_rejectedLowDifficultyShareDif_not_null" NOT NULL,
+    "rejectedVersionRollingCount" integer DEFAULT 0 NOT NULL,
+    "rejectedVersionRollingDiff1" real DEFAULT '0'::real NOT NULL
 );
 
 
@@ -1648,16 +1646,60 @@ CREATE INDEX redis_state_backup_captured_at_idx ON public.redis_state_backup USI
 
 
 --
+-- Name: pplns_extranonce_challenge; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_extranonce_challenge (
+    address character varying(62) NOT NULL,
+    message text NOT NULL,
+    "createdAt" bigint NOT NULL,
+    "expiresAt" bigint NOT NULL,
+    CONSTRAINT pplns_extranonce_challenge_pkey PRIMARY KEY (address)
+);
+
+
+--
+-- Name: pplns_extranonce_token; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_extranonce_token (
+    address character varying(62) NOT NULL,
+    "tokenHash" character varying(64) NOT NULL,
+    "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    CONSTRAINT pplns_extranonce_token_pkey PRIMARY KEY (address)
+);
+
+
+--
+-- Name: pplns_custom_extranonce; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_custom_extranonce (
+    address character varying(62) NOT NULL,
+    worker character varying NOT NULL,
+    prefix bigint NOT NULL,
+    "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    CONSTRAINT pplns_custom_extranonce_pkey PRIMARY KEY (address, worker),
+    CONSTRAINT pplns_custom_extranonce_address_prefix_key UNIQUE (address, prefix) DEFERRABLE INITIALLY IMMEDIATE,
+    CONSTRAINT pplns_custom_extranonce_prefix_u32 CHECK (prefix >= 0 AND prefix <= 4294967295),
+    CONSTRAINT pplns_custom_extranonce_prefix_unreserved CHECK (prefix >= 33554432)
+);
+
+CREATE INDEX IF NOT EXISTS "IDX_pplns_extranonce_challenge_expiresAt"
+    ON public.pplns_extranonce_challenge USING btree ("expiresAt");
+
+--
 -- Name: miner_identity; Type: TABLE; Schema: public; Owner: -
 --
 -- Payout identity: one row per miner, either a fixed address ('static') or a
 -- rotating xpub-derived descriptor ('rotating'). The database half of
--- `bp_common::PayoutIdentity`. See crates/bp-db/migrations/0010_add_miner_identity.sql
+-- `bp_common::PayoutIdentity`. See crates/bp-db/migrations/0014_add_miner_identity.sql
 -- for the full reasoning, including why there is no `addr(<address>)` sentinel.
 -- The ledger key is base58: hex would not have fit the varchar(62) these columns
 -- were when 0010 was written, and it is frozen there now for a better reason —
 -- a payout_id is content-addressed, so changing the encoding orphans every
--- balance already keyed by it. 0011_widen_identity_columns.sql took every
+-- balance already keyed by it. 0015_widen_identity_columns.sql took every
 -- identity column to varchar(90); see it for why 90.
 --
 
@@ -1684,7 +1726,6 @@ CREATE INDEX "IDX_miner_identity_descriptor"
  WHERE descriptor IS NOT NULL;
 
 CREATE INDEX "IDX_miner_identity_kind" ON public.miner_identity (kind);
-
 
 --
 -- PostgreSQL database dump complete

@@ -181,10 +181,7 @@ pub(crate) async fn spawn(
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
     let stats = spawn_stats(cfg, handles).await?;
-    // Only the Front role feeds + writes hashRate, so only it reconciles
-    // stale hashRate on boot (see run_sample_loop); a non-writing role
-    // zeroing the column would wipe the Front's live values.
-    let session_persistence = spawn_session_persistence(handles, cfg.has_role(Role::Front)).await?;
+    let session_persistence = spawn_session_persistence(handles).await?;
 
     // Only the front builds the Stratum fan-out sinks, and it always produces
     // to the Redis streams (the Satellite consumes them). A pure back / api
@@ -450,17 +447,31 @@ async fn spawn_stats(
 
 async fn spawn_session_persistence(
     handles: &FoundationHandles,
-    reconcile_hashrate_on_boot: bool,
 ) -> Result<SessionPersistenceEngineHandle, EngineError> {
     let cfg = SessionPersistenceConfig {
-        reconcile_hashrate_on_boot,
+        // Same duration as the sweep's staleness cutoff, but NOT the
+        // same instant: the cutoff runs from the row's birth (updatedAt
+        // is only stamped at birth / re-register / soft-delete), while
+        // this TTL runs from the last touch flush and is refreshed every
+        // 30 s. For a session mining all day the two are hours apart —
+        // by design, since the age is only a birth grace and the key is
+        // the actual liveness signal. Tuning one does not move the other.
+        live_ttl: crate::crons::STALE_CLIENT_TTL,
         ..SessionPersistenceConfig::default()
     };
     info!(
-        reconcile_hashrate_on_boot,
+        live_ttl_secs = cfg.live_ttl.as_secs(),
         "session-persistence: spawning engine"
     );
-    let handle = SessionPersistenceEngine::spawn(cfg, handles.db.pool().clone()).await?;
+    // The shared multiplexed manager, not a dedicated connection — the
+    // live-hash scripts are short non-blocking commands; dedicated
+    // connections are reserved for blocking XREAD consumers.
+    let handle = SessionPersistenceEngine::spawn(
+        cfg,
+        handles.db.pool().clone(),
+        Some(handles.redis.clone()),
+    )
+    .await?;
     Ok(handle)
 }
 

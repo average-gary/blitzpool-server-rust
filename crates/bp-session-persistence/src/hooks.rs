@@ -13,13 +13,13 @@
 //! `bp_share_hook::SharedSessionPersistence` impl. Fires on every
 //! authorize (register) and disconnect (deregister). Mode-blind. A
 //! register writes NO statement — it only pends the session in the
-//! [`RowDebounce`]; the row is born by the engine's birth flush once the
+//! `RowDebounce`; the row is born by the engine's birth flush once the
 //! session has survived the debounce window, so probe connections that
 //! authorize and hang up never reach Postgres at all. Deregister
 //! soft-deletes only sessions that were actually born.
 
+use bp_common::now_ms;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink, SharedSessionPersistence};
@@ -86,24 +86,24 @@ impl SharedSessionPersistence for SessionPersistenceHook {
 }
 
 /// `SharedAcceptedShareSink` impl that bumps the per-session
-/// `client_entity` row on every accepted share — `updatedAt` (so
-/// `kill_dead_clients` doesn't sweep), `firstSeen` (COALESCE safety
-/// net in case the register INSERT raced), `bestDifficulty` (GREATEST),
-/// `currentDifficulty` (latest vardiff target), and `channelCount`.
-/// Without this, the `/api/info/workers`, `/api/info`, and
-/// `/api/client/:address` endpoints all return zero for active sessions.
+/// `client:live:*` hash on every accepted share — `updated_at_ms` and
+/// the TTL (so the dead-session sweep doesn't reap it),
+/// `best_difficulty` (max-merged), `current_difficulty` (latest vardiff
+/// target), and `channel_count`. Without this, the live half of
+/// `/api/client/:address` and the hashrate sums read zero for active
+/// sessions.
 ///
-/// Buffered: writes land in a shared [`TouchBuffer`] keyed by
+/// Buffered: writes land in a shared `TouchBuffer` keyed by
 /// `(address, clientName, sessionId)` and are flushed every 30s by the
-/// engine's background task in one bulk UPDATE statement. At ~250
-/// shares/s on a busy pool this collapses ~250 individual DB UPDATEs/s
-/// to ≈ N_active_sessions per 30 s.
+/// engine's background task in one batched script. At ~250 shares/s on
+/// a busy pool this collapses ~250 individual writes/s to
+/// ≈ N_active_sessions per 30 s.
 ///
-/// The same share also feeds the [`HashrateSampler`], which owns the
-/// `hashRate` column: it accumulates the share's credited difficulty and
+/// The same share also feeds the `HashrateSampler`, which owns the
+/// `hash_rate` field: it accumulates the share's credited difficulty and
 /// writes a self-zeroing 2-min moving average on its own 60 s cadence.
-/// The touch buffer above deliberately does not write `hashRate` — two
-/// writers on one column would fight.
+/// The touch buffer above deliberately does not write `hash_rate` — two
+/// writers on one field would fight.
 #[derive(Clone)]
 pub struct ClientRowTouchSink {
     buffer: Arc<TouchBuffer>,
@@ -121,9 +121,12 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
         let now_ms = now_ms();
         // Worker can be empty in some SV2 paths (no `.<name>` suffix in
-        // user_identity). The session row was registered with the
-        // matching default ("default" in SV2, "" in SV1), so use the
-        // same fallback here for the PK match.
+        // user_identity); the SV2 session row was registered under the
+        // same "default", so the fallback preserves the PK match. SV1
+        // never sends an empty worker any more — its authorize parse
+        // defaults a trailing dot to "worker" (letting "" through birthed
+        // a row no touch could ever hit, and kill_dead_clients swept the
+        // live session).
         let worker = if share.worker.is_empty() {
             "default"
         } else {
@@ -139,7 +142,7 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
         };
         // `effective_difficulty` is the vardiff target this share was
         // credited at = the difficulty currently assigned to the
-        // session, so it keeps `currentDifficulty` fresh as vardiff
+        // session, so it keeps `current_difficulty` fresh as vardiff
         // ratchets (for both SV1 + SV2 — this sink is protocol-blind).
         self.buffer.record(
             key,
@@ -149,7 +152,7 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
             now_ms,
         );
         // Live hashrate: accumulate the same credited difficulty into the
-        // sampler's current window. It owns `client_entity.hashRate` and
+        // sampler's current window. It owns the live hash's `hash_rate` and
         // writes a self-zeroing moving average — see [`HashrateSampler`].
         self.sampler.record(key, share.effective_difficulty);
     }
@@ -166,7 +169,7 @@ const DIFF_STAT_SLOT_MS: i64 = 60 * 60 * 1000;
 /// `client_difficulty_statistics_entity` (feeds `/api/client/:address/diff-scores`).
 ///
 /// Coalesces in memory and writes in BATCHES: the share hot path merges the
-/// per-slot max into [`DiffStatBuffer`], and one flush loop upserts the whole
+/// per-slot max into `DiffStatBuffer`, and one flush loop upserts the whole
 /// window in a single statement.
 ///
 /// It used to upsert inline on every new max, which is cheap mid-slot and a
@@ -214,14 +217,4 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
             now_ms,
         );
     }
-}
-
-/// Wall-clock milliseconds since the Unix epoch — the stamp for
-/// `startTime`/`updatedAt`-family columns. `0` on a pre-1970 clock,
-/// matching what the synchronous register path always did.
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

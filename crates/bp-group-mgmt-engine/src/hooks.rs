@@ -35,7 +35,7 @@ pub trait GroupServiceHooks: Send + Sync {
     );
 
     /// Best-effort Redis + scheduler cleanup on group dissolve. Same
-    /// no-op-on-failure semantics as [`on_member_removed`].
+    /// no-op-on-failure semantics as [`Self::on_member_removed`].
     async fn on_group_dissolved(&self, group_id: Uuid);
 
     /// (Re-)apply the group's round-reset cron config. Idempotent —

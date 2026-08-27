@@ -161,15 +161,6 @@ pub const DIFFICULTY_1: f64 = 4_294_967_296.0;
 /// 10-minute slot duration in seconds; divisor in hashrate conversion.
 pub const SLOT_SECONDS: f64 = 600.0;
 
-/// Current Unix time in milliseconds.
-pub fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 // ─── shared response shapes ────────────────────────────────────────
 
 /// Serialize an `f64` as a JSON integer when the value has no

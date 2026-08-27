@@ -2,7 +2,7 @@
 
 //! Per-connection group-channel registry for SV2 mining channels.
 //!
-//! ## What is a group channel? (SV2 spec §5.2.3 / §5.3.16)
+//! ## What is a group channel? (SV2 Mining/Group Channel / SV2 Mining/NewExtendedMiningJob)
 //!
 //! A **group channel** lets the pool broadcast ONE `NewExtendedMiningJob`
 //! (and one `SetNewPrevHash`) addressed to a `group_channel_id` instead of
@@ -14,11 +14,11 @@
 //! ## Grouping invariant
 //!
 //! Every channel in a group MUST share the EXACT SAME full extranonce size
-//! (spec §5.2.3 line 187 / §5.1.2.1 line 104): the group's single
-//! `coinbase_tx_prefix` carries a fixed scriptSig-length varint, so the
-//! coinbase slot size must be identical for every member. We therefore key
-//! one group per `(connection, full_extranonce_size)` and reject a member
-//! whose size disagrees.
+//! (SV2 Mining/Group Channel / SV2 Mining/Extended Extranonce): the group's
+//! single `coinbase_tx_prefix` carries a fixed scriptSig-length varint, so the
+//! coinbase slot size must be identical for every member. We therefore key one
+//! group per `(connection, full_extranonce_size)` and reject a member whose
+//! size disagrees.
 //!
 //! ## Shared job id
 //!
@@ -31,10 +31,11 @@
 //! ## Scope: per-connection, group id from the channel-id namespace
 //!
 //! [`GroupChannelRegistry`] is embedded in `MiningSessionState`
-//! (per-connection). The `group_channel_id` MUST live in the SAME namespace
-//! as `channel_id` and never collide (spec §5.2.3 line 185), so the **caller**
-//! allocates the id from the session's `next_channel_id` counter and passes
-//! it to [`GroupChannelRegistry::create`] — the registry never invents ids.
+//! (per-connection). The `group_channel_id` MUST live in the SAME namespace as
+//! `channel_id` and never collide (SV2 Mining/Group Channel), so the
+//! **caller** allocates the id from the session's `next_channel_id` counter
+//! and passes it to [`GroupChannelRegistry::create`] — the registry never
+//! invents ids.
 
 use std::collections::{HashMap, HashSet};
 
@@ -49,7 +50,7 @@ pub enum GroupError {
     #[error("unknown group channel {0}")]
     UnknownGroup(u32),
     /// A channel's full extranonce size disagrees with its group's fixed
-    /// size — spec §5.2.3 forbids mixing sizes in one group.
+    /// size — SV2 Mining/Group Channel forbids mixing sizes in one group.
     #[error("group {group_id} expects full extranonce size {expected}, got {got}")]
     FullExtranonceSizeMismatch {
         group_id: u32,
@@ -150,7 +151,7 @@ impl GroupChannelRegistry {
     /// Create an empty group with a caller-supplied `group_id` (drawn from
     /// the session's channel-id namespace so it can never collide with a
     /// channel id) and the full extranonce size that defines it. Channels
-    /// are added via [`add_channel`].
+    /// are added via [`Self::add_channel`].
     pub fn create(&mut self, group_id: u32, full_extranonce_size: usize) {
         self.groups.insert(
             group_id,
@@ -392,6 +393,7 @@ mod tests {
             coinbase_prefix: vec![0xAA],
             coinbase_suffix: vec![0xBB],
             merkle_path: vec![],
+            extranonce_prefix: Vec::new(),
             version: 0x2000_0000,
             prev_hash: [0u8; 32],
             n_bits: 0x1d00_ffff,

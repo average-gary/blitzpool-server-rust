@@ -53,8 +53,8 @@ pub const KEY_BUCKETS: &str = "pplns:buckets";
 /// Coinbase distribution snapshot. See [`mod@snapshot`].
 pub const KEY_SNAPSHOT: &str = "pplns:snapshot";
 /// Dedup zset `share_id → counter` for exactly-once `record_share`. Capped
-/// to the newest [`DEDUP_KEEP`] entries by rank. A redelivered share whose
-/// id is still in this set is a no-op. See [`RECORD_SHARE_LUA`].
+/// to the newest `DEDUP_KEEP` entries by rank. A redelivered share whose
+/// id is still in this set is a no-op. See `RECORD_SHARE_LUA`.
 pub const KEY_APPLIED: &str = "pplns:applied";
 
 /// Bucket hash key for a given bucket id.
@@ -71,9 +71,9 @@ pub const DEFAULT_BUCKET_SHARES: u64 = 10_000;
 /// more than any realistic consumer backlog, at negligible cost.
 const DEDUP_KEEP: i64 = 100_000;
 
-/// Drop the single oldest bucket when the window is over size. KEYS[1] =
-/// window:total, KEYS[2] = by-address, KEYS[3] = buckets index zset.
-/// ARGV[1] = window_size. The bucket hash key is built inside the script
+/// Drop the single oldest bucket when the window is over size. `KEYS[1]` =
+/// window:total, `KEYS[2]` = by-address, `KEYS[3]` = buckets index zset.
+/// `ARGV[1]` = window_size. The bucket hash key is built inside the script
 /// (`pplns:bucket:<id>`) — single-instance Valkey, not cluster.
 ///
 /// Never drops the newest (currently-filling) bucket: stops when only one
@@ -137,10 +137,11 @@ return {1, underflowed}
 "#;
 
 /// Atomic, optionally-idempotent append of one accepted share into its count
-/// bucket. KEYS[1] = counter, KEYS[2] = window:total, KEYS[3] = by-address,
-/// KEYS[4] = applied (dedup) zset, KEYS[5] = buckets index zset. ARGV[1] =
-/// difficulty (string), ARGV[2] = address, ARGV[3] = share_id (empty ⇒ no
-/// dedup), ARGV[4] = dedup keep-count, ARGV[5] = bucket_shares.
+/// bucket. `KEYS[1]` = counter, `KEYS[2]` = window:total,
+/// `KEYS[3]` = by-address, `KEYS[4]` = applied (dedup) zset,
+/// `KEYS[5]` = buckets index zset. `ARGV[1]` =
+/// difficulty (string), `ARGV[2]` = address, `ARGV[3]` = share_id (empty ⇒ no
+/// dedup), `ARGV[4]` = dedup keep-count, `ARGV[5]` = bucket_shares.
 ///
 /// Computes the bucket id from the post-INCR counter (`floor(counter /
 /// bucket_shares)`), aggregates the share into `pplns:bucket:<id>` per
@@ -189,7 +190,7 @@ pub enum WindowError {
 ///
 /// **Who writes it, and why it is not the TDP stream.** This value is read
 /// by exactly one thing: [`WindowStore::window_size`], which only
-/// [`WindowStore::trim_window`] calls, which only
+/// `WindowStore::trim_window` calls, which only
 /// [`WindowStore::record_share`] calls. That path runs on the process that
 /// consumes the accepted-share stream — the `payout` role — and that
 /// process has no TDP feed at all. So it is seeded from `getmininginfo` at
@@ -303,7 +304,7 @@ impl WindowStore {
     /// Append one accepted share to the window, optionally exactly-once.
     ///
     /// The append (counter INCR + zset ZADD + both aggregate increments)
-    /// runs as one indivisible Lua script ([`RECORD_SHARE_LUA`]) — same
+    /// runs as one indivisible Lua script (`RECORD_SHARE_LUA`) — same
     /// atomicity the old `MULTI/EXEC` gave, so a snapshot taken mid-write
     /// can't see a partial update. When `share_id` is `Some`, the script
     /// also makes the write **idempotent**: a redelivered share whose id is

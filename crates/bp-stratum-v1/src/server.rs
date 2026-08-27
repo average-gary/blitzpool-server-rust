@@ -33,7 +33,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bp_common::ExtranonceAllocator;
 use bp_common::StreamKind;
@@ -64,7 +63,7 @@ use crate::hooks::ServerHooks;
 use crate::jobs::JobRegistry;
 use crate::notify::{ActiveSV1Template, SV1TemplateAssembler, TemplateChange};
 use bp_mining_job::{MiningJobCache, ResolvedPayouts};
-use bp_vardiff::SystemClock;
+use bp_vardiff::{Clock, SystemClock};
 
 /// Pool-wide (across every SV1 port) collision-free extranonce1 allocator
 /// plus its per-connection key counter. Constructed once by the binary
@@ -73,7 +72,7 @@ use bp_vardiff::SystemClock;
 ///
 /// Cheap to clone (both fields are `Arc`). Each connection calls
 /// [`allocate`](Self::allocate) exactly once at accept time; the returned
-/// [`PrefixGuard`] releases the prefix back to the pool when the
+/// `PrefixGuard` releases the prefix back to the pool when the
 /// connection task ends (any exit path — EOF, cancel, IO error).
 #[derive(Clone)]
 pub struct SharedExtranonce {
@@ -99,7 +98,7 @@ impl SharedExtranonce {
 
     /// Allocate a pool-wide-unique 4-byte extranonce1. The returned guard
     /// releases the prefix on drop, covering every connection-exit path.
-    /// [`PrefixGuard::prefix`] is `None` only when the (16.7M-slot) space
+    /// `PrefixGuard::prefix` is `None` only when the (16.7M-slot) space
     /// is exhausted — the caller then keeps the session-id-derived
     /// extranonce1, i.e. the pre-unification random behaviour.
     pub fn allocate(&self) -> PrefixGuard {
@@ -194,7 +193,7 @@ const TEMPLATE_BROADCAST_CAPACITY: usize = 32;
 
 /// Public handle for the server. Cheap to clone (internal `Arc`); the
 /// last clone holds the translator task's `JoinHandle`. Calling
-/// [`shutdown`] is the only way to stop the translator cleanly.
+/// [`Self::shutdown`] is the only way to stop the translator cleanly.
 #[derive(Clone)]
 pub struct StratumV1Server {
     inner: Arc<Inner>,
@@ -482,7 +481,7 @@ async fn run_translator(
         }
         // Registry lifecycle (no-op on the empty boot registry; kept for
         // symmetry with the loop below).
-        registry.cleanup_for_tip(&active.prev_hash, now_ms());
+        registry.cleanup_for_tip(&active.prev_hash, SystemClock.now_ms());
         let _ = template_tx.send(TemplateBroadcast {
             template: active,
             change,
@@ -533,7 +532,7 @@ async fn run_translator(
                         // entries out past retention. Without this the
                         // registry grows without bound — entries were
                         // never retired OR pruned.
-                        registry.cleanup_for_tip(&active.prev_hash, now_ms());
+                        registry.cleanup_for_tip(&active.prev_hash, SystemClock.now_ms());
                         // Job-cache aging heartbeat: prune piggybacks
                         // on lookups too, but the translator fires even
                         // when NO miner is connected — without this,
@@ -683,7 +682,7 @@ async fn run_connection(
                                 "📨 RX: {line}"
                             );
                         }
-                        let now = now_ms();
+                        let now = SystemClock.now_ms();
                         let outcome = dispatch(
                             &mut state,
                             &server_config,
@@ -884,7 +883,7 @@ async fn run_connection(
                     &payload.template,
                     &payouts,
                     clean_jobs,
-                    now_ms(),
+                    SystemClock.now_ms(),
                 );
                 if !apply_outcome(
                     outcome,
@@ -920,7 +919,7 @@ async fn run_connection(
                     &job_cache,
                     current_template.as_ref(),
                     &payouts,
-                    now_ms(),
+                    SystemClock.now_ms(),
                 );
                 if !apply_outcome(
                     outcome,
@@ -1015,7 +1014,7 @@ async fn apply_outcome(
                     template,
                     &payouts,
                     true,
-                    now_ms(),
+                    SystemClock.now_ms(),
                 );
                 for frame in &post.outbound_frames {
                     if server_config.protocol_debug {
@@ -1180,13 +1179,6 @@ pub(crate) async fn process_event_generic<C: bp_vardiff::Clock>(
             false
         }
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Strip the trailing `\n` (and stray `\r`) from a JSON-RPC wire
@@ -1463,10 +1455,13 @@ mod tests {
                 .await
                 .expect("first pair must broadcast")
                 .unwrap();
-        let tid1 = registry.add_template_shared(payload1.template.clone(), now_ms());
-        let jid1 = registry.add_job(dummy_mining_job(), tid1, now_ms());
+        let tid1 = registry.add_template_shared(payload1.template.clone(), SystemClock.now_ms());
+        let jid1 = registry.add_job(dummy_mining_job(), tid1, SystemClock.now_ms());
         assert_eq!(
-            registry.classify(&jid1, now_ms()).unwrap().classification,
+            registry
+                .classify(&jid1, SystemClock.now_ms())
+                .unwrap()
+                .classification,
             JobClassification::Active
         );
 
@@ -1480,18 +1475,24 @@ mod tests {
                 .expect("second pair must broadcast")
                 .unwrap();
         assert_eq!(
-            registry.classify(&jid1, now_ms()).unwrap().classification,
+            registry
+                .classify(&jid1, SystemClock.now_ms())
+                .unwrap()
+                .classification,
             JobClassification::StaleCreditable,
             "previous-tip job must be retired by the block-change broadcast"
         );
 
         // A fresh job on the new tip survives a LATER same-tip pass (the
         // race an unconditional retire would lose against alt streams).
-        let tid2 = registry.add_template_shared(payload2.template.clone(), now_ms());
-        let jid2 = registry.add_job(dummy_mining_job(), tid2, now_ms());
-        registry.cleanup_for_tip(&payload2.template.prev_hash, now_ms());
+        let tid2 = registry.add_template_shared(payload2.template.clone(), SystemClock.now_ms());
+        let jid2 = registry.add_job(dummy_mining_job(), tid2, SystemClock.now_ms());
+        registry.cleanup_for_tip(&payload2.template.prev_hash, SystemClock.now_ms());
         assert_eq!(
-            registry.classify(&jid2, now_ms()).unwrap().classification,
+            registry
+                .classify(&jid2, SystemClock.now_ms())
+                .unwrap()
+                .classification,
             JobClassification::Active,
             "a later same-tip pass must not retire fresh new-tip jobs"
         );

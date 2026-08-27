@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Shared retire-not-clear job lifecycle math used by both
-//! [`bp-stratum-v1`] (`JobRegistry` — global, hex-string keys, with
-//! template-indirection) and [`bp-stratum-v2`] (per-channel
+//! `bp-stratum-v1` (`JobRegistry` — global, hex-string keys, with
+//! template-indirection) and `bp-stratum-v2` (per-channel
 //! `extended_jobs: HashMap<u32, ExtendedJob>`).
 //!
 //! The pattern is the same in both protocols, the storage shapes are
@@ -12,7 +12,7 @@
 //!
 //! Originally lived in `bp-stratum-v1::jobs` and was duplicated in
 //! `bp-stratum-v2::mining::jobs`; extracted 2026-05-16 (the same week
-//! [`bp-vardiff`] was extracted) so both protocols keep their lifecycle
+//! `bp-vardiff` was extracted) so both protocols keep their lifecycle
 //! constants in lock-step. The default values are:
 //!
 //! | Field | Set by | Default | Reason |

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Fan-out of an SV2 ext-0x0003 §10 settlement.
+//! Fan-out of an ext 0x0003/Implementation Notes settlement.
 //!
-//! When a block is booked, every payout distribution the pool has
-//! published becomes stale at once: its weights encode the ledger
-//! balances as they stood BEFORE the booking, so a job-declaring client
-//! still declaring against them would pay those balances a second time.
-//! §10 therefore requires the acceptance window to close on a settlement
-//! rather than expire on its own.
+//! When a block is booked, every payout distribution the pool has published
+//! becomes stale at once: its weights encode the ledger balances as they stood
+//! BEFORE the booking, so a job-declaring client still declaring against them
+//! would pay those balances a second time. ext 0x0003/Implementation Notes
+//! therefore requires the acceptance window to close on a settlement rather
+//! than expire on its own.
 //!
 //! The registry that has to hear it is
 //! [`bp_stratum_v2::jdp_server::StratumV2JdpServer`]'s, and it lives on
@@ -33,14 +33,14 @@
 //! harmless, the second epoch bump invalidates an already-invalid set and
 //! the publisher's `Notify` coalesces the forced republish.
 //!
-//! There is deliberately NO periodic backstop, unlike the membership
-//! rebuilds on the same stream: "settle again just in case" would bump
-//! the epoch and force a republish on a timer forever. A missed event
-//! instead self-heals within one `[sv2].jdp_payout_distribution_interval_secs`
-//! (60 s by default), because the next scheduled publish rebuilds from
-//! the post-settlement ledger anyway. §10 is about closing the window
-//! immediately; the interval bounds how long it can stay open if the
-//! signal is lost.
+//! There is deliberately NO periodic backstop, unlike the membership rebuilds
+//! on the same stream: "settle again just in case" would bump the epoch and
+//! force a republish on a timer forever. A missed event instead self-heals
+//! within one `[sv2].jdp_payout_distribution_interval_secs` (60 s by default),
+//! because the next scheduled publish rebuilds from the post-settlement ledger
+//! anyway. ext 0x0003/Implementation Notes is about closing the window
+//! immediately; the interval bounds how long it can stay open if the signal is
+//! lost.
 
 use std::sync::{Arc, OnceLock};
 
@@ -126,7 +126,7 @@ impl SettlementSignal {
         if let Err(err) = producer.publish(&event).await {
             warn!(
                 %err,
-                "settlement: could not broadcast the §10 invalidation — a job-declaring \
+                "settlement: could not broadcast the ext 0x0003/Implementation Notes invalidation — a job-declaring \
                  client may keep declaring against pre-settlement weights until the next \
                  scheduled republish"
             );

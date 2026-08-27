@@ -81,7 +81,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     let accepted = report.miners.len();
     let key = report.jdc_user_identity.clone();
     // Refine the matching client_entity rows from `<vendor>/sv2` /
@@ -148,7 +148,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let now = crate::time_range::now_ms();
+    let now = bp_common::now_ms();
     let mut store = STORE
         .lock()
         .map_err(|_| ApiError::Internal("downstream store mutex poisoned".into()))?;

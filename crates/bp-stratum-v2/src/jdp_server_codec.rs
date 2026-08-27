@@ -5,8 +5,8 @@
 //!
 //! Maps `stratum_core::parsers_sv2::AnyMessage::JobDeclaration(...)`
 //! variants ↔ the owned `Input` / `JdpOutboundFrame` shapes from
-//! [`crate::jdp::client`]. Reuses [`crate::server_codec::CodecError`]
-//! for error handling.
+//! [`crate::jdp::client`]. Reuses [`crate::codec_common::CodecError`]
+//! and the shared wire primitives next to it.
 //!
 //! ## Scope
 //!
@@ -49,13 +49,13 @@ use stratum_core::parsers_sv2::{
     AnyMessage, CommonMessages, Extensions, ExtensionsNegotiation, JobDeclaration,
 };
 
+use crate::codec_common::{bytes_to_32, str0255, token_from_bytes, utf8_from_bytes, CodecError};
 use crate::extensions::RequestExtensions as LocalRequestExtensions;
 use crate::jdp::client::{
     AllocateMiningJobTokenInput, DeclareMiningJobInput, JdpOutboundFrame,
     ProvideMissingTransactionsSuccessInput, PushSolutionInput, SetupConnectionInput,
+    SolutionHeader,
 };
-use crate::server_codec::CodecError;
-use crate::tokens::Token;
 
 // ── InboundJdpFrame ─────────────────────────────────────────────────
 
@@ -71,10 +71,11 @@ pub enum InboundJdpFrame {
 
 // ── decode_jdp_inbound ──────────────────────────────────────────────
 
-/// ext 0x0003 §8 message type: `SetPayoutDistribution` (JDS → JDC,
-/// channel_msg bit unset). The push model defines no inbound ext-0x0003
-/// frames — the `distribution_id` reference arrives as a §6 TLV on the
-/// base-protocol `DeclareMiningJob` / `SetCustomMiningJob` frames.
+/// ext 0x0003/Message Types: `SetPayoutDistribution` (JDS → JDC, channel_msg
+/// bit unset). The push model defines no inbound ext-0x0003 frames — the
+/// `distribution_id` reference arrives as an
+/// ext 0x0003/distribution_id TLV Field on the base-protocol
+/// `DeclareMiningJob` / `SetCustomMiningJob` frames.
 pub const EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION: u8 = 0x00;
 
 pub fn decode_jdp_inbound(msg: AnyMessage<'static>) -> Result<Option<InboundJdpFrame>, CodecError> {
@@ -106,7 +107,7 @@ fn decode_job_declaration(m: JobDeclaration<'static>) -> Result<InboundJdpFrame,
         JobDeclaration::PushSolution(m) => {
             Ok(InboundJdpFrame::PushSolution(decode_push_solution(m)?))
         }
-        other => Err(CodecError::NotMiningRelated(jdp_variant_name(&other))),
+        other => Err(CodecError::NotForThisSubProtocol(jdp_variant_name(&other))),
     }
 }
 
@@ -164,8 +165,8 @@ fn decode_declare(m: Sv2DeclareMiningJob<'static>) -> Result<DeclareMiningJobInp
         wtxid_list.push(bytes_to_32(b)?);
     }
     Ok(DeclareMiningJobInput {
-        // §6 TLV — extracted by the IO layer from the frame's trailing
-        // TLVs, not part of the base-message decode.
+        // ext 0x0003/distribution_id TLV Field — extracted by the IO layer
+        // from the frame's trailing TLVs, not part of the base-message decode.
         distribution_id: None,
         request_id: m.request_id,
         mining_job_token: token_from_bytes(m.mining_job_token.as_bytes())?,
@@ -194,11 +195,13 @@ fn decode_provide_success(
 fn decode_push_solution(m: Sv2PushSolution<'static>) -> Result<PushSolutionInput, CodecError> {
     Ok(PushSolutionInput {
         extranonce: m.extranonce.as_bytes().to_vec(),
-        prev_hash: bytes_to_32(m.prev_hash.as_bytes())?,
-        ntime: m.ntime,
-        nonce: m.nonce,
-        n_bits: m.nbits,
-        version: m.version,
+        header: SolutionHeader {
+            prev_hash: bytes_to_32(m.prev_hash.as_bytes())?,
+            version: m.version,
+            ntime: m.ntime,
+            nonce: m.nonce,
+            n_bits: m.nbits,
+        },
     })
 }
 
@@ -231,7 +234,9 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsSuccess(
                 Sv2ReqExtSuccess {
                     request_id,
-                    supported_extensions: supported_extensions.try_into().map_err(conv)?,
+                    supported_extensions: supported_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -244,8 +249,12 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsError(
                 Sv2ReqExtError {
                     request_id,
-                    unsupported_extensions: unsupported_extensions.try_into().map_err(conv)?,
-                    required_extensions: required_extensions.try_into().map_err(conv)?,
+                    unsupported_extensions: unsupported_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
+                    required_extensions: required_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -258,8 +267,12 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
             JobDeclaration::AllocateMiningJobTokenSuccess(
                 Sv2AllocateMiningJobTokenSuccess {
                     request_id,
-                    mining_job_token: mining_job_token.0.to_vec().try_into().map_err(conv)?,
-                    coinbase_outputs: coinbase_outputs.try_into().map_err(conv)?,
+                    mining_job_token: mining_job_token
+                        .0
+                        .to_vec()
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
+                    coinbase_outputs: coinbase_outputs.try_into().map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -275,7 +288,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                         .0
                         .to_vec()
                         .try_into()
-                        .map_err(conv)?,
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -289,7 +302,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                 Sv2DeclareMiningJobError {
                     request_id,
                     error_code: str0255(error_code)?,
-                    error_details: error_details.try_into().map_err(conv)?,
+                    error_details: error_details.try_into().map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -309,7 +322,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                         .map(|x| x as u16)
                         .collect::<Vec<u16>>()
                         .try_into()
-                        .map_err(conv)?,
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -341,50 +354,12 @@ pub fn encode_jdp_outbound_ext_0x0003(frame: &JdpOutboundFrame) -> Option<(u8, V
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-fn utf8_from_bytes(b: &[u8]) -> Result<String, CodecError> {
-    std::str::from_utf8(b)
-        .map(|s| s.to_string())
-        .map_err(|e| CodecError::InvalidUtf8(e.to_string()))
-}
-
-fn bytes_to_32(b: &[u8]) -> Result<[u8; 32], CodecError> {
-    if b.len() != 32 {
-        return Err(CodecError::Conversion(format!(
-            "expected 32-byte field, got {}",
-            b.len()
-        )));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(b);
-    Ok(arr)
-}
-
-fn token_from_bytes(b: &[u8]) -> Result<Token, CodecError> {
-    if b.len() != crate::tokens::TOKEN_LEN {
-        return Err(CodecError::Conversion(format!(
-            "expected {}-byte token, got {}",
-            crate::tokens::TOKEN_LEN,
-            b.len()
-        )));
-    }
-    let mut arr = [0u8; crate::tokens::TOKEN_LEN];
-    arr.copy_from_slice(b);
-    Ok(Token(arr))
-}
-
-fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255<'static>, CodecError> {
-    s.try_into().map_err(conv)
-}
-
-fn conv<E: core::fmt::Debug>(e: E) -> CodecError {
-    CodecError::Conversion(format!("{e:?}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Named only here: the production path reaches `Token` through
+    // `codec_common::token_from_bytes` without spelling the type.
+    use crate::tokens::Token;
     use stratum_core::binary_sv2::{Seq064K, U256};
     use stratum_core::common_messages_sv2::Protocol;
 
@@ -475,8 +450,10 @@ mod tests {
         match out {
             InboundJdpFrame::PushSolution(i) => {
                 assert_eq!(i.extranonce, vec![0xEE; 8]);
-                assert_eq!(i.prev_hash, [0xAB; 32]);
-                assert_eq!(i.nonce, 0xdeadbeef);
+                assert_eq!(i.header.prev_hash, [0xAB; 32]);
+                assert_eq!(i.header.nonce, 0xdeadbeef);
+                assert_eq!(i.header.n_bits, 0x1d00_ffff);
+                assert_eq!(i.header.version, 0x2000_0000);
             }
             _ => panic!("expected PushSolution"),
         }

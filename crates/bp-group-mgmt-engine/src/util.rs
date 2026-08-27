@@ -23,17 +23,6 @@ pub(crate) fn normalize_address(raw: &str) -> Result<AddressId, GroupServiceErro
     bp_common::normalized_address_id(raw).map_err(|_| GroupServiceError::InvalidAddress)
 }
 
-/// Current UTC wall-clock in epoch-ms. Wrapped here so a future
-/// test-clock hook is easy (most services accept `now_ms` as a
-/// parameter, but a few cron paths use this directly).
-pub(crate) fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Apply a closure to the `Set` variant of a [`PatchField`], leaving
 /// `Untouched` + `Clear` alone. The default `Iterator::map` shadows this
 /// when called inline, so we expose it through an explicit extension

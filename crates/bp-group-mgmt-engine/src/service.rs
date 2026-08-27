@@ -22,7 +22,8 @@ use uuid::Uuid;
 use crate::cache::AddressCache;
 use crate::error::GroupServiceError;
 use crate::hooks::GroupServiceHooks;
-use crate::util::{normalize_address, now_ms, PatchFieldExt};
+use crate::util::{normalize_address, PatchFieldExt};
+use bp_common::now_ms;
 
 /// Returned by [`GroupService::create_group`]. The plaintext
 /// `admin_token` is the only chance the creator gets to see the

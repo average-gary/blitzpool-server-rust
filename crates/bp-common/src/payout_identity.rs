@@ -227,7 +227,7 @@ pub enum PayoutIdentity {
         /// formula gives 44 for `bcrt1q`, which is what the node hands the
         /// regtests), so narrowing this would have failed passing tests. That
         /// break is fixed — [`crate::MAX_ADDRESS_LEN`] is 90 and migration
-        /// `0011_widen_identity_columns.sql` widened the columns behind it.
+        /// `0015_widen_identity_columns.sql` widened the columns behind it.
         ///
         /// What survives is the weaker but still sufficient reason: this is the
         /// same unconstrained `String` the coinbase seam carries, and
@@ -672,7 +672,7 @@ mod tests {
     /// This pair of assertions used to read the other way round — `AddressId`
     /// rejecting it with `TooLong(64)` as a "negative control" for why `Static`
     /// holds a `String`. That was the latent break; migration
-    /// `0011_widen_identity_columns.sql` and [`crate::MAX_ADDRESS_LEN`] fixed it,
+    /// `0015_widen_identity_columns.sql` and [`crate::MAX_ADDRESS_LEN`] fixed it,
     /// and this is the test that would have failed before them.
     #[test]
     fn a_regtest_p2tr_address_is_64_chars_and_fits_everywhere_now() {

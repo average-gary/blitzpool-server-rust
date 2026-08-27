@@ -22,6 +22,7 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 hashbrown = { workspace = true }
+redis = { workspace = true }
 
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -29,3 +30,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 sqlx = { workspace = true }
+bp-test-support = { workspace = true }
+# The reader half of the client:live:* schema — the integration tests
+# pin that writer and reader agree on one keyspace.
+bp-client-live = { workspace = true }

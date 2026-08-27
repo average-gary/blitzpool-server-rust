@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub mod extranonce;
 pub use extranonce::{ExtranonceAllocator, ExtranonceError};
 
+pub mod live_client_key;
 pub mod payout_identity;
 pub use payout_identity::{
     parse_payout_identity, parse_payout_identity_with, split_identity_and_worker,
@@ -229,7 +230,7 @@ pub fn normalized_address_id(raw: &str) -> Result<AddressId, InvalidAddressError
 /// address with zero spare. A **regtest** taproot address (`bcrt1p…`) is 64, so
 /// the first attempt to pay one met `TooLong(64)` — a latent break with nothing
 /// to do with xpubs, fixed in its own commit with migration
-/// `0011_widen_identity_columns.sql`, which widens the 29 identity columns to
+/// `0015_widen_identity_columns.sql`, which widens the 32 identity columns to
 /// match. The two numbers are one fact and must move together: this cap is what
 /// keeps an over-long value from reaching a column, and the column width is what
 /// makes the cap load-bearing rather than decorative.
@@ -415,6 +416,43 @@ impl fmt::Display for MiningMode {
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 #[error("unknown mining mode: {0:?}")]
 pub struct UnknownMiningModeError(pub String);
+
+// ---------------------------------------------------------------------------
+// now_ms — the pool's epoch-millisecond wall clock
+// ---------------------------------------------------------------------------
+
+/// Milliseconds since the UNIX epoch, as `i64`.
+///
+/// `i64` and not `u64` because this is the width the values are stored and
+/// compared at: Postgres `bigint` columns, and [`LogThrottle::allow`] below.
+/// Converting at every boundary is what five separate crates were doing.
+///
+/// It was five byte-identical copies (`bp-api`, `bp-blockparty-engine`,
+/// `bp-group-mgmt-engine`, `bp-session-persistence`, `bp-share-hook`) plus two
+/// more in tests. Identical copies do not announce themselves when one of them
+/// changes, which is the whole reason they are one function now.
+///
+/// **This is not a clock abstraction and must not become one.** It reads the
+/// system clock at the call site and cannot be substituted in a test. The pool
+/// has two injectable clocks and they stay where they are: `bp_vardiff::Clock`
+/// for epoch-ms `u64` (Stratum session state, vardiff, the JDP server) and
+/// `bp_cron_utils::Clock` for `chrono::DateTime<Utc>` (calendar-aligned
+/// scheduling). A caller that needs to control time in a test wants one of
+/// those, not this.
+///
+/// Note also what the code around here does instead wherever it can: it takes
+/// the timestamp that travelled WITH the data. The one production caller of
+/// [`LogThrottle::allow`] passes a share's own `ts_ms`, not a reading of now.
+///
+/// Saturates to 0 if the system clock is before the epoch, which is the same
+/// answer every copy gave.
+pub fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // LogThrottle — rate-limit hot-path log lines
@@ -882,7 +920,7 @@ mod tests {
     ///
     /// It was 62 until 2026-08-12 — exactly a mainnet `bc1p…` — which made a
     /// **regtest** taproot address (64) unpayable. See [`MAX_ADDRESS_LEN`] and
-    /// migration `0011_widen_identity_columns.sql`. Both assertions below fail
+    /// migration `0015_widen_identity_columns.sql`. Both assertions below fail
     /// against the old cap: the first because 64 > 62, the second because the
     /// arithmetic it states was false.
     #[test]

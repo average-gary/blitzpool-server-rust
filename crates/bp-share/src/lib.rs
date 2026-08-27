@@ -393,7 +393,7 @@ pub fn extras_from_ledger<'a>(
 ///
 /// Two things are enforced, in this order:
 ///
-/// 1. **Solvency.** `X` above [`EXTRA_SOLVENCY_PERCENT`] of the pot
+/// 1. **Solvency.** `X` above `EXTRA_SOLVENCY_PERCENT` of the pot
 ///    scales every extra down pro rata. The divisor `pot − X` has to
 ///    stay positive, and a promise larger than the block cannot be kept
 ///    however the weights are arranged.

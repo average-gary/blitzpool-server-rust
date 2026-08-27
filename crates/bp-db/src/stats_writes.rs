@@ -171,16 +171,20 @@ pub struct ClientStatsUpsert {
     pub rejected_duplicate_share_diff1: f32,
     pub rejected_low_difficulty_share_count: i32,
     pub rejected_low_difficulty_share_diff1: f32,
+    pub rejected_version_rolling_count: i32,
+    pub rejected_version_rolling_diff1: f32,
+    pub rejected_stale_count: i32,
+    pub rejected_stale_diff1: f32,
 }
 
 /// Bulk-upsert client-statistics rows. UNIQUE (address, clientName,
-/// sessionId, "time") drives ON CONFLICT; all 9 numeric fields
+/// sessionId, "time") drives ON CONFLICT; all 11 numeric fields
 /// accumulate via `+ EXCLUDED.col`.
 ///
 /// **Caller responsibility**: batch in chunks ≤ 1000 to stay under
-/// the PG parameter limit (each batch sends 13 arrays of length N;
+/// the PG parameter limit (each batch sends 15 arrays of length N;
 /// the limit is 65 535 parameters but `UNNEST` itself counts each
-/// inner element). 1000 rows = 13 000 conceptual elements; well safe.
+/// inner element). 1000 rows = 15 000 conceptual elements; well safe.
 pub async fn bulk_upsert_client_statistics_entity<'e, E>(
     executor: E,
     rows: &[ClientStatsUpsert],
@@ -222,6 +226,16 @@ where
         .iter()
         .map(|r| r.rejected_low_difficulty_share_diff1)
         .collect();
+    let r_vr_count: Vec<i32> = rows
+        .iter()
+        .map(|r| r.rejected_version_rolling_count)
+        .collect();
+    let r_vr_diff: Vec<f32> = rows
+        .iter()
+        .map(|r| r.rejected_version_rolling_diff1)
+        .collect();
+    let r_stale_count: Vec<i32> = rows.iter().map(|r| r.rejected_stale_count).collect();
+    let r_stale_diff: Vec<f32> = rows.iter().map(|r| r.rejected_stale_diff1).collect();
 
     let result = sqlx::query!(
         r#"INSERT INTO client_statistics_entity
@@ -230,6 +244,8 @@ where
               "rejectedJobNotFoundCount",      "rejectedJobNotFoundDiff1",
               "rejectedDuplicateShareCount",   "rejectedDuplicateShareDiff1",
               "rejectedLowDifficultyShareCount","rejectedLowDifficultyShareDiff1",
+              "rejectedVersionRollingCount",   "rejectedVersionRollingDiff1",
+              "rejectedStaleCount",            "rejectedStaleDiff1",
               "updatedAt")
            SELECT
              u.addr, u.cname, u.sid, u.t, u.sh,
@@ -237,14 +253,18 @@ where
              u.rjc, u.rjd,
              u.rdc, u.rdd,
              u.rlc, u.rld,
+             u.rvc, u.rvd,
+             u.rsc, u.rsd,
              (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
            FROM UNNEST(
              $1::varchar[], $2::varchar[], $3::varchar[], $4::bigint[], $5::real[],
              $6::int[], $7::int[],
              $8::int[], $9::real[],
              $10::int[], $11::real[],
-             $12::int[], $13::real[]
-           ) AS u(addr, cname, sid, t, sh, ac, rc, rjc, rjd, rdc, rdd, rlc, rld)
+             $12::int[], $13::real[],
+             $14::int[], $15::real[],
+             $16::int[], $17::real[]
+           ) AS u(addr, cname, sid, t, sh, ac, rc, rjc, rjd, rdc, rdd, rlc, rld, rvc, rvd, rsc, rsd)
            ON CONFLICT (address, "clientName", "sessionId", "time") DO UPDATE
            SET shares                              = client_statistics_entity.shares                              + EXCLUDED.shares,
                "acceptedCount"                     = client_statistics_entity."acceptedCount"                     + EXCLUDED."acceptedCount",
@@ -255,6 +275,10 @@ where
                "rejectedDuplicateShareDiff1"       = client_statistics_entity."rejectedDuplicateShareDiff1"       + EXCLUDED."rejectedDuplicateShareDiff1",
                "rejectedLowDifficultyShareCount"   = client_statistics_entity."rejectedLowDifficultyShareCount"   + EXCLUDED."rejectedLowDifficultyShareCount",
                "rejectedLowDifficultyShareDiff1"   = client_statistics_entity."rejectedLowDifficultyShareDiff1"   + EXCLUDED."rejectedLowDifficultyShareDiff1",
+               "rejectedVersionRollingCount"       = client_statistics_entity."rejectedVersionRollingCount"       + EXCLUDED."rejectedVersionRollingCount",
+               "rejectedVersionRollingDiff1"       = client_statistics_entity."rejectedVersionRollingDiff1"       + EXCLUDED."rejectedVersionRollingDiff1",
+               "rejectedStaleCount"                = client_statistics_entity."rejectedStaleCount"                + EXCLUDED."rejectedStaleCount",
+               "rejectedStaleDiff1"                = client_statistics_entity."rejectedStaleDiff1"                + EXCLUDED."rejectedStaleDiff1",
                "updatedAt"                         = EXCLUDED."updatedAt""#,
         &addresses,
         &client_names,
@@ -269,6 +293,10 @@ where
         &r_dup_diff,
         &r_low_count,
         &r_low_diff,
+        &r_vr_count,
+        &r_vr_diff,
+        &r_stale_count,
+        &r_stale_diff,
     )
     .execute(executor)
     .await
@@ -474,9 +502,11 @@ where
 /// NOTHING — if rows exist already (concurrent seed by another
 /// instance), the second call is harmless.
 ///
-/// Aggregates `shares` (accepted-diff sum) and the three
-/// `rejected*Diff1` columns into `rejectedShares` (`rejectedShares` is
-/// the diff sum across all reject reasons).
+/// Aggregates `shares` (accepted-diff sum) and EVERY `rejected*Diff1`
+/// column into `rejectedShares` (the diff sum across all reject reasons).
+/// A reason added without a term here under-reports the worker row
+/// silently — the same contract [`bp_stats::ClientStatisticsRecord::
+/// rejected_diff_total`] carries on the in-memory side.
 pub async fn seed_worker_shares_from_client_statistics<'e, E>(executor: E) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -488,7 +518,9 @@ where
                   SUM(shares)::double precision,
                   SUM("rejectedJobNotFoundDiff1"
                       + "rejectedDuplicateShareDiff1"
-                      + "rejectedLowDifficultyShareDiff1")::double precision
+                      + "rejectedLowDifficultyShareDiff1"
+                      + "rejectedVersionRollingDiff1"
+                      + "rejectedStaleDiff1")::double precision
            FROM client_statistics_entity
            GROUP BY address, "clientName"
            ON CONFLICT (address, "clientName") DO NOTHING"#,

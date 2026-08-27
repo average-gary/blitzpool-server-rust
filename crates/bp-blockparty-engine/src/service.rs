@@ -32,7 +32,8 @@ use uuid::Uuid;
 use crate::cache::BlockpartyCache;
 use crate::error::BlockpartyServiceError;
 use crate::hooks::BlockpartyHooks;
-use crate::util::{normalize_address, now_ms};
+use crate::util::normalize_address;
+use bp_common::now_ms;
 
 // ─── Config + result types ─────────────────────────────────────────
 

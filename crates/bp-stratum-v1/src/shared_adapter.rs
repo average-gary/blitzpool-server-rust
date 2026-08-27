@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bridges the SV1-specific [`AcceptedShareSink`](crate::hooks::AcceptedShareSink)
+//! Bridges the SV1-specific [`AcceptedShareSink`]
 //! trait to the protocol-agnostic
-//! [`SharedAcceptedShareSink`](bp_share_hook::SharedAcceptedShareSink).
+//! [`SharedAcceptedShareSink`].
 //!
 //! Engines (PPLNS, group-solo, share-stats-sink, session-persistence)
 //! implement `SharedAcceptedShareSink` once and the SV1 server uses
-//! this adapter to project its native [`ShareAccept`](crate::ShareAccept)
+//! this adapter to project its native [`ShareAccept`]
 //! into the shared view. The SV2 server provides a symmetric adapter
 //! in `bp-stratum-v2`. See the `bp-share-hook` crate-level docs for
 //! the full picture.
@@ -56,7 +56,7 @@ impl<S: SharedAcceptedShareSink + ?Sized> AcceptedShareSink for Sv1AcceptedShare
                 hash_rate,
                 // SV1 is one device per connection — never bundled.
                 channel_count: 1,
-                ts_ms: bp_share_hook::now_ms(),
+                ts_ms: bp_common::now_ms(),
                 // Producer-assigned downstream at the single fan-out point;
                 // the per-protocol adapter has no global share sequence and
                 // no mode-gate, so it leaves share_id/mode/group_id blank.
@@ -89,6 +89,7 @@ fn map_sv1_reject(reason: RejectReason) -> RejectedReason {
         RejectReason::JobNotFound | RejectReason::Stale => RejectedReason::JobNotFound,
         RejectReason::DuplicateShare => RejectedReason::DuplicateShare,
         RejectReason::LowDifficulty => RejectedReason::LowDifficulty,
+        RejectReason::VersionRollingNotAllowed => RejectedReason::VersionRollingNotAllowed,
     }
 }
 
@@ -288,7 +289,7 @@ mod tests {
             }
         }
 
-        let before = bp_share_hook::now_ms();
+        let before = bp_common::now_ms();
         let inner = Arc::new(TsSink {
             ts: Mutex::new(None),
         });
@@ -297,7 +298,7 @@ mod tests {
         adapter
             .record_accepted("a", "w", "s", None, &accept, 0.0)
             .await;
-        let after = bp_share_hook::now_ms();
+        let after = bp_common::now_ms();
 
         let ts = inner.ts.lock().unwrap().expect("share recorded");
         assert!(

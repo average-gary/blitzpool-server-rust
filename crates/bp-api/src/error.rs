@@ -48,6 +48,8 @@ pub enum ApiError {
     },
     #[error("database error: {0}")]
     Db(#[from] bp_db::DbError),
+    #[error("live-state read: {0}")]
+    LiveRead(#[from] bp_client_live::LiveReadError),
     #[error("engine error: {0}")]
     PplnsEngine(#[from] bp_pplns_engine::engine::EngineError),
     #[error("group-solo engine: {0}")]
@@ -72,14 +74,16 @@ impl ApiError {
             | Self::Invitation { code, .. }
             | Self::JoinRequest { code, .. }
             | Self::Blockparty { code, .. } => code,
-            Self::Db(_) | Self::PplnsEngine(_) | Self::GroupSoloEngine(_) | Self::Internal(_) => {
-                "internal-error"
-            }
+            Self::Db(_)
+            | Self::LiveRead(_)
+            | Self::PplnsEngine(_)
+            | Self::GroupSoloEngine(_)
+            | Self::Internal(_) => "internal-error",
             Self::Rpc(_) | Self::Unavailable(_) => "upstream-unavailable",
         }
     }
 
-    fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) | Self::InvalidAddress | Self::InvalidQuery(_) => {
@@ -89,10 +93,44 @@ impl ApiError {
             | Self::Invitation { status, .. }
             | Self::JoinRequest { status, .. }
             | Self::Blockparty { status, .. } => *status,
-            Self::Db(_) | Self::PplnsEngine(_) | Self::GroupSoloEngine(_) | Self::Internal(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Db(_)
+            | Self::LiveRead(_)
+            | Self::PplnsEngine(_)
+            | Self::GroupSoloEngine(_)
+            | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Rpc(_) | Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+/// Serve the durable half of a response when the live store is merely
+/// unreachable.
+///
+/// A Redis blip used to degrade only the mining path; since the live
+/// session fields moved there, every one of these endpoints reads it,
+/// and failing the whole document over one unavailable field would turn
+/// a blip into a full read-API outage. So a transient fault falls back
+/// to "no live data" — the same state an evicted key already produces —
+/// while the rest of the document is served.
+///
+/// [`bp_client_live::LiveReadError::NotConfigured`] is deliberately NOT
+/// degraded: that is a process without a Redis handle, i.e. a
+/// misconfiguration, and it has to fail loudly instead of quietly
+/// reporting a pool with no hashrate.
+pub fn or_degraded<T>(
+    result: Result<T, bp_client_live::LiveReadError>,
+    fallback: impl FnOnce() -> T,
+) -> Result<T, ApiError> {
+    match result {
+        Ok(v) => Ok(v),
+        Err(e @ bp_client_live::LiveReadError::NotConfigured) => Err(ApiError::LiveRead(e)),
+        Err(e) => {
+            tracing::warn!(
+                target: "bp_api",
+                error = %e,
+                "live store unavailable; serving the durable half of the response"
+            );
+            Ok(fallback())
         }
     }
 }
@@ -231,5 +269,47 @@ impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
             B::Db(_) | B::Token(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError::Blockparty { code, status }
+    }
+}
+
+#[cfg(test)]
+mod degrade_tests {
+    use super::*;
+    use bp_client_live::LiveReadError;
+
+    /// A process without a Redis handle is a misconfiguration, not a
+    /// blip: it must fail loudly rather than report a pool with no
+    /// hashrate.
+    #[test]
+    fn a_missing_handle_is_not_degraded() {
+        let out = or_degraded(Err::<f64, _>(LiveReadError::NotConfigured), || 0.0);
+        let err = out.expect_err("must surface");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A transient fault serves the durable half instead of failing the
+    /// whole document — otherwise one unreachable field turns a Redis
+    /// blip into a full read-API outage.
+    #[test]
+    fn transient_faults_serve_the_fallback() {
+        let timeout = LiveReadError::Timeout(std::time::Duration::from_secs(5));
+        assert_eq!(
+            or_degraded(Err::<f64, _>(timeout), || 0.0).expect("degraded"),
+            0.0
+        );
+
+        let redis: redis::RedisError = (redis::ErrorKind::IoError, "connection reset").into();
+        assert_eq!(
+            or_degraded(Err::<f64, _>(LiveReadError::Redis(redis)), || 0.0).expect("degraded"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn success_passes_through_untouched() {
+        assert_eq!(
+            or_degraded(Ok::<f64, LiveReadError>(42.0), || 0.0).unwrap(),
+            42.0
+        );
     }
 }

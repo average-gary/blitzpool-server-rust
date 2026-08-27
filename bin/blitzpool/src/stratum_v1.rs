@@ -8,7 +8,7 @@
 //! `stratum.rs` because it's now protocol-detect-multiplexed (SV1 +
 //! SV2 share the same listening port and dispatch via
 //! [`bp_protocol_detect::detect`]). Each server has its own
-//! [`ServerHooks`](bp_stratum_v1::ServerHooks) clone wired to:
+//! [`ServerHooks`] clone wired to:
 //!
 //! - **block_sink**: [`TdpBlockSubmissionSink`] (shared across all
 //!   ports — it's stateless, holds only a clone of `TdpHandle`).
@@ -17,7 +17,7 @@
 //!   all mode-gated internally).
 //! - **session_persistence**: a [`ModeGatePopulatingPersistence`]
 //!   wrapper that publishes the resolved
-//!   [`MiningModeResult`](bp_mining_mode::MiningModeResult) into the
+//!   [`MiningModeResult`] into the
 //!   shared mode-gate on `register_session`, decrements the refcount
 //!   on `deregister_session`, then forwards to the engine-layer
 //!   [`SessionPersistenceHook`](bp_session_persistence::SessionPersistenceHook).

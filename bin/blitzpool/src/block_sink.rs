@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `BlockSubmissionSink` implementations — Phase 7.4a (SV1 path).
+//! `BlockSubmissionSink` implementations.
 //!
 //! When a Stratum share's submission difficulty meets / exceeds the
 //! network difficulty derived from the template's `n_bits`, the
@@ -30,7 +30,7 @@
 //! by the time this hook fires; failing to forward to core only
 //! means we lose the block reward, not the share count).
 //!
-//! ## SV2 wiring (Phase 7.4c)
+//! ## SV2 wiring
 //!
 //! SV2's `ShareAccept` doesn't yet carry the `MiningJob` snapshot +
 //! extranonce bytes the same way SV1 does (the Standard-channel job
@@ -135,8 +135,69 @@ pub(crate) struct BlockFoundEvent {
     pub actual_coinbase: Option<ActualCoinbase>,
 }
 
+/// What identifies a JDC-found block in `blocks_entity`.
+///
+/// The four used to travel as four consecutive `String` parameters through two
+/// signatures — trait method and the concrete one it forwards to — where any
+/// two could be exchanged in silence. They were, deliberately, in a check:
+/// `cargo check` and 175 `blitzpool` tests stayed green with the session id in
+/// the address column and the header in the hash column.
+///
+/// ⚠️ `session_id` lands in `blocks_entity."sessionId"`, which is
+/// `varchar(8)`. Postgres does not truncate on INSERT, it errors.
+#[derive(Clone, Debug)]
+pub(crate) struct FoundBlockRecord {
+    pub(crate) miner_address: String,
+    pub(crate) session_id: String,
+    /// Block hash, display form.
+    pub(crate) block_hash: String,
+    /// The 80-byte header as hex.
+    pub(crate) block_data: String,
+}
+
+/// What the FINDER of a block knows about it: the caller-supplied half of
+/// [`BlockFoundEvent`], against the half [`TdpBlockSubmissionSink::emit_block_found`]
+/// resolves on the Core (`mode`, `group_id`, `height`, `weight_snapshot`).
+///
+/// A struct because these travelled as eight positional parameters through
+/// that one signature, four of them `String` and one `Option<String>`.
+/// Measured 2026-08-22: exchanging `worker` and `session_id` — writing the
+/// literal `"jdp"` into `blocks_entity."sessionId"` and the session id into
+/// `"worker"` — compiled and left all 179 `blitzpool` tests green. The one
+/// pairing that IS caught, address against session id, is caught by
+/// `varchar(8)` refusing the longer value rather than by any test, and only
+/// when a database is reachable at all.
+///
+/// Named fields do not make the exchange impossible — `address:
+/// session_id.clone()` still compiles. They make it visible AT THE CALL SITE
+/// instead of only in the signature, which is the whole distance between a
+/// reviewable mistake and an invisible one. Making it impossible needs a
+/// newtype per string; that reaches far past this boundary and was weighed
+/// against it deliberately.
+struct BlockFoundInputs {
+    /// Miner-authorized payout address. Also what the mode gate is asked, so
+    /// a wrong value here does not merely mis-record a column: it books the
+    /// block against another mode, or against `lookup_mode`'s Solo default,
+    /// which writes no ledger at all.
+    address: String,
+    worker: String,
+    /// ⚠️ Lands in `blocks_entity."sessionId"`, which is `varchar(8)`.
+    /// Postgres does not truncate on INSERT, it errors.
+    session_id: String,
+    reward_sats: Option<u64>,
+    /// Big-endian block-hash hex. Not an `Option` here even though
+    /// [`BlockFoundEvent::block_hash`] is one: every caller has the hash. The
+    /// event keeps its `Option` because it is deserialized off a stream that
+    /// other processes replay, so events predating the field still arrive.
+    block_hash: String,
+    /// The 80-byte header as hex (LE), for `blocks_entity.blockData`.
+    block_data: String,
+    pplns_payouts_fingerprint: Option<[u8; 32]>,
+    actual_coinbase: Option<ActualCoinbase>,
+}
+
 /// `BlockSubmissionSink` for both SV1 + SV2. Forwards every
-/// block-candidate share to bitcoin-core via TDP **and** (Phase 7.7)
+/// block-candidate share to bitcoin-core via TDP **and**
 /// fans the event out to the per-mode engine ledger
 /// (`PplnsEngine::on_block_found` / `GroupSoloEngine::on_block_found`)
 /// plus the [`NotificationDispatcher`] for subscriber notifications.
@@ -194,7 +255,8 @@ pub(crate) struct BlockFoundApplier {
     /// reaches `confirmation_depth`. When absent (or no block hash), the
     /// PPLNS arm falls back to the immediate `on_block_found` apply.
     redis: Option<ConnectionManager>,
-    /// ext 0x0003 §10 settlement fan-out — see [`crate::settlement`].
+    /// ext 0x0003/Implementation Notes settlement fan-out — see
+    /// [`crate::settlement`].
     ///
     /// A settlement from ANY source invalidates every published payout
     /// distribution: the published weights encode the pre-settlement
@@ -220,9 +282,9 @@ impl TdpBlockSubmissionSink {
         }
     }
 
-    /// Wire the ext 0x0003 §10 settlement hook onto this sink's applier,
-    /// so a block booked through the Stratum path invalidates the
-    /// published payout distributions exactly like a JDP-declared one.
+    /// Wire the ext 0x0003/Implementation Notes settlement hook onto this
+    /// sink's applier, so a block booked through the Stratum path invalidates
+    /// the published payout distributions exactly like a JDP-declared one.
     pub(crate) fn with_settle_handle(
         mut self,
         signal: crate::settlement::SettlementSignal,
@@ -302,7 +364,7 @@ impl TdpBlockSubmissionSink {
         self
     }
 
-    /// Attach the Phase 7.7 fan-out dependencies. Returns `Self` so
+    /// Attach the fan-out dependencies. Returns `Self` so
     /// the caller can chain at construction. Passing `None` for the
     /// dispatcher (no transport adapters wired) keeps the engine
     /// ledger-write live but skips notifications; passing `None` for
@@ -331,27 +393,23 @@ impl TdpBlockSubmissionSink {
     /// distribution the block actually paid rather than a rebuilt guess.
     ///
     /// `worker` is fixed to `jdp` — a declared job has no Stratum worker name.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn book_declared_block_found(
         &self,
-        miner_address: String,
-        session_id: String,
+        record: FoundBlockRecord,
         reward_sats: u64,
-        block_hash: String,
-        block_data: String,
         payouts_fingerprint: [u8; 32],
         actual_coinbase: Option<ActualCoinbase>,
     ) -> bool {
-        self.emit_block_found(
-            miner_address,
-            "jdp".to_string(),
-            session_id,
-            Some(reward_sats),
-            Some(block_hash),
-            block_data,
-            Some(payouts_fingerprint),
+        self.emit_block_found(BlockFoundInputs {
+            address: record.miner_address,
+            worker: "jdp".to_string(),
+            session_id: record.session_id,
+            reward_sats: Some(reward_sats),
+            block_hash: record.block_hash,
+            block_data: record.block_data,
+            pplns_payouts_fingerprint: Some(payouts_fingerprint),
             actual_coinbase,
-        )
+        })
         .await
     }
 
@@ -370,21 +428,18 @@ impl TdpBlockSubmissionSink {
     /// is no distribution to resolve and nothing may be settled from a guess.
     pub(crate) async fn record_declared_block_without_booking(
         &self,
-        miner_address: String,
-        session_id: String,
-        block_hash: String,
-        block_data: String,
+        record: FoundBlockRecord,
     ) -> bool {
-        self.emit_block_found(
-            miner_address,
-            "jdp".to_string(),
-            session_id,
-            None,
-            Some(block_hash),
-            block_data,
-            None,
-            None,
-        )
+        self.emit_block_found(BlockFoundInputs {
+            address: record.miner_address,
+            worker: "jdp".to_string(),
+            session_id: record.session_id,
+            reward_sats: None,
+            block_hash: record.block_hash,
+            block_data: record.block_data,
+            pplns_payouts_fingerprint: None,
+            actual_coinbase: None,
+        })
         .await
     }
 
@@ -443,7 +498,6 @@ impl TdpBlockSubmissionSink {
     /// self-contained [`BlockFoundEvent`] and publishes it onto the stream for
     /// the payout Satellite to apply (falling back to an in-process
     /// [`BlockFoundApplier`] apply if the publish fails).
-    #[allow(clippy::too_many_arguments)]
     /// Returns whether the block-found reached the fan-out — i.e. an event was
     /// built and either published or applied in-process. `false` means one of
     /// the preconditions below was missing and **nothing at all was written**,
@@ -454,23 +508,23 @@ impl TdpBlockSubmissionSink {
     /// It does not promise the ledger row itself landed. Past the fan-out every
     /// step is best-effort and PG-idempotent, so a redelivery finishes the job;
     /// before it, there is nothing to redeliver.
-    async fn emit_block_found(
-        &self,
-        address: String,
-        worker: String,
-        session_id: String,
-        reward_sats: Option<u64>,
-        block_hash: Option<String>,
-        block_data: String,
-        pplns_payouts_fingerprint: Option<[u8; 32]>,
-        actual_coinbase: Option<ActualCoinbase>,
-    ) -> bool {
+    async fn emit_block_found(&self, found: BlockFoundInputs) -> bool {
+        let BlockFoundInputs {
+            address,
+            worker,
+            session_id,
+            reward_sats,
+            block_hash,
+            block_data,
+            pplns_payouts_fingerprint,
+            actual_coinbase,
+        } = found;
         // Resolve the payout mode on the Core (the only side with the gate)
         // and stamp it onto the event so the apply side needs no gate.
         let Some(mode_gate) = self.mode_gate.as_ref() else {
             info!(
                 address = %address,
-                "block-found: SKIPPED (no mode-gate wired — Phase 7.4 transitional path)"
+                "block-found: SKIPPED (no mode-gate wired)"
             );
             return false;
         };
@@ -536,7 +590,7 @@ impl TdpBlockSubmissionSink {
             session_id,
             pplns_payouts_fingerprint,
             reward_sats,
-            block_hash,
+            block_hash: Some(block_hash),
             block_data,
             mode: resolved.mode,
             group_id: resolved.group_id,
@@ -732,9 +786,10 @@ impl BlockFoundApplier {
         }
     }
 
-    /// §10: a ledger settlement just happened. Invalidate every
-    /// published payout distribution and force a fresh publish, so no
-    /// JDC keeps declaring against weights this block already settled.
+    /// ext 0x0003/Implementation Notes: a ledger settlement just happened.
+    /// Invalidate every published payout distribution and force a fresh
+    /// publish, so no JDC keeps declaring against weights this block already
+    /// settled.
     async fn settle_distributions(&self) {
         if let Some(signal) = self.settle.as_ref() {
             signal.settle().await;
@@ -1267,18 +1322,18 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
         // fees after the JDC's `coinbase_outputs` for JDP-declared jobs);
         // for pool-built SV1 jobs it equals the full block reward.
         let actual = decode_actual_coinbase(&coinbase_bytes, self.network);
-        self.emit_block_found(
-            address.to_string(),
-            worker.to_string(),
-            session_id.to_string(),
-            Some(accept.template.coinbase_tx_value_remaining),
-            Some(block_hash_display(&accept.header)),
-            hex::encode(accept.header),
+        self.emit_block_found(BlockFoundInputs {
+            address: address.to_string(),
+            worker: worker.to_string(),
+            session_id: session_id.to_string(),
+            reward_sats: Some(accept.template.coinbase_tx_value_remaining),
+            block_hash: block_hash_display(&accept.header),
+            block_data: hex::encode(accept.header),
             // The job the winning share was built on — so the PPLNS apply
             // books the distribution this coinbase actually pays.
-            Some(*accept.mining_job.payouts_fingerprint()),
-            actual,
-        )
+            pplns_payouts_fingerprint: Some(*accept.mining_job.payouts_fingerprint()),
+            actual_coinbase: actual,
+        })
         .await;
     }
 }
@@ -1304,10 +1359,10 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
         //
         // Who records it is `ExtendedJob::jdp_claims_the_block`, and only
         // that: the JDP `PushSolution` path matches a solution against a
-        // DECLARED job, so it never sees a Coinbase-only one (§6.3.1 — that
-        // mode never declares), whether or not a distribution backs it.
-        // Deciding on the distribution instead left every Coinbase-only
-        // 0x0003 block unrecorded AND unsettled.
+        // DECLARED job, so it never sees a Coinbase-only one
+        // (SV2 JDP/Coinbase-only Mode — that mode never declares), whether or
+        // not a distribution backs it. Deciding on the distribution instead
+        // left every Coinbase-only 0x0003 block unrecorded AND unsettled.
         //
         // Recording a claimed block here too would write the
         // `blocks_entity` row twice — the insert has no `ON CONFLICT` — and
@@ -1347,16 +1402,16 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
                  propagates it through its own node, the pool records it here (no template_id \
                  to submit with)"
             );
-            self.emit_block_found(
-                address.to_string(),
-                worker.to_string(),
-                session_id_hex.to_string(),
+            self.emit_block_found(BlockFoundInputs {
+                address: address.to_string(),
+                worker: worker.to_string(),
+                session_id: session_id_hex.to_string(),
                 reward_sats,
-                Some(block_hash_display(&accept.header)),
-                hex::encode(accept.header),
-                Some(fingerprint),
-                actual,
-            )
+                block_hash: block_hash_display(&accept.header),
+                block_data: hex::encode(accept.header),
+                pplns_payouts_fingerprint: Some(fingerprint),
+                actual_coinbase: actual,
+            })
             .await;
             return;
         }
@@ -1406,16 +1461,16 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
         // NewExtendedMiningJob send-time), so the per-mode engine ledger-write
         // fires for SV2-found blocks exactly as it does for SV1.
         let actual = decode_actual_coinbase(&accept.witness_coinbase, self.network);
-        self.emit_block_found(
-            address.to_string(),
-            worker.to_string(),
-            session_id_hex.to_string(),
-            Some(accept.coinbase_tx_value_remaining),
-            Some(block_hash_display(&accept.header)),
-            hex::encode(accept.header),
-            Some(accept.payouts_fingerprint),
-            actual,
-        )
+        self.emit_block_found(BlockFoundInputs {
+            address: address.to_string(),
+            worker: worker.to_string(),
+            session_id: session_id_hex.to_string(),
+            reward_sats: Some(accept.coinbase_tx_value_remaining),
+            block_hash: block_hash_display(&accept.header),
+            block_data: hex::encode(accept.header),
+            pplns_payouts_fingerprint: Some(accept.payouts_fingerprint),
+            actual_coinbase: actual,
+        })
         .await;
     }
 }
@@ -1472,9 +1527,9 @@ mod tests {
     use bp_stratum_v1::ActiveSV1Template;
     use bp_template_distribution::TdpConfig;
 
-    /// ext 0x0003 §10: a block booked through a Stratum sink's IMMEDIATE
-    /// (ungated) apply must invalidate every published payout distribution,
-    /// exactly like a JDP-declared one does.
+    /// ext 0x0003/Implementation Notes: a block booked through a Stratum
+    /// sink's IMMEDIATE (ungated) apply must invalidate every published payout
+    /// distribution, exactly like a JDP-declared one does.
     ///
     /// This was wired for the confirmation-gated path and the JDP sink only.
     /// The published weights encode the pre-settlement balances, so a 0x0003

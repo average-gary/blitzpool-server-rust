@@ -7,7 +7,7 @@
 //!
 //! The JDC sends a wtxid list as part of `DeclareMiningJob`. The JDS
 //! needs raw transaction bytes for every wtxid so it can later
-//! reconstruct the block on `PushSolution` (spec §6.4.9). What drives
+//! reconstruct the block on `PushSolution` (SV2 JDP/PushSolution). What drives
 //! the response is which of them the JDS already holds: the wtxids it
 //! has raw bytes for in its current template are covered, and the
 //! missing positions are requested from the JDC via
@@ -108,11 +108,15 @@ pub struct PendingDeclaration {
 
 // ── merge_provided_with_known ──────────────────────────────────────
 
-/// Error from [`merge_provided_with_known`]. The Success frame's
-/// `transaction_list` MUST contain exactly one entry per requested
-/// position (SV2 spec §6.4.7). A length mismatch is a JDC
-/// protocol-error — the caller decides whether to silently drop or
-/// reset the connection.
+/// Error from [`merge_provided_with_known`].
+/// SV2 JDP/ProvideMissingTransactions.Success defines `transaction_list` as
+/// the full transactions "as requested by `ProvideMissingTransactions`, in the
+/// order they were requested" — it fixes the order, and one-entry-per-
+/// requested-position follows from that but is not spelled out as a MUST. We
+/// enforce the count, because a shorter list would silently shift every later
+/// position onto the wrong transaction. A mismatch is treated as a JDC
+/// protocol-error — the caller decides whether to silently drop or reset the
+/// connection.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MergeError {
     #[error("expected {expected} transactions, got {got}")]
@@ -187,8 +191,8 @@ mod tests {
         assert_eq!(result.known_raw_txs.get(&0), Some(&vec![0xAA]));
     }
 
-    /// Positions are 0-indexed and preserve order — even when known
-    /// + missing interleave.
+    /// Positions are 0-indexed and preserve order — even when
+    /// known + missing interleave.
     #[test]
     fn partition_template_preserves_position_order() {
         let mut template = HashMap::new();

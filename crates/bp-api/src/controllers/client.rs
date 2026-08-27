@@ -87,7 +87,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::ClientChart, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
             let rows =
@@ -128,7 +128,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientAccepted, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
@@ -180,7 +180,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientWorkers, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
@@ -236,7 +236,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<RejectedResponse, _, ApiError>(key, TtlKind::ClientRejected, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_rejected_statistics_since_for_address(&s.pool, &addr, since)
@@ -333,6 +333,13 @@ struct WorkerEntry {
     channel_count: i32,
     start_time: String,
     last_seen: String,
+    /// The custom extranonce prefix stored for this worker (8 hex chars), or
+    /// `null` when it runs on the pool-allocated one. This is the **stored
+    /// configuration** from `pplns_custom_extranonce`, not proof that the
+    /// prefix is in effect: whether a live connection carries it depends on
+    /// the stratum core's Solo / Extended / primary-channel gates, which live
+    /// in another process and leave no trace in this table.
+    extranonce: Option<String>,
 }
 
 async fn by_address<H, M>(
@@ -350,10 +357,27 @@ where
         .cache
         .get_or_fetch::<ClientResponse, _, ApiError>(key, TtlKind::ClientInfo, async move {
             let clients = find_clients_by_address(&s.pool, &addr).await?;
-            let total_hashrate: f64 = clients.iter().map(|c| c.hash_rate).sum();
+            // Live half from Redis, positionally aligned with `clients`.
+            // A session without a live hash renders as 0/None — it stays
+            // listed while its PG row is active.
+            let live = crate::error::or_degraded(
+                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &clients).await,
+                || vec![None; clients.len()],
+            )?;
+            let total_hashrate: f64 = live.iter().flatten().map(|lf| lf.hash_rate).sum();
             let settings = find_address_settings(&s.pool, &addr).await?;
             let best_difficulty = settings.as_ref().map(|x| x.best_difficulty.floor() as u64);
             let total_shares = settings.map(|x| x.shares).unwrap_or(0.0);
+            // Custom extranonce overrides, keyed by worker. One query for the
+            // address (a handful of rows at most), then a map lookup per
+            // worker — the same worker on two sessions gets the same prefix,
+            // which is exactly what the override means.
+            let overrides: BTreeMap<String, String> =
+                bp_db::find_custom_extranonces_for_address(&s.pool, &addr)
+                    .await?
+                    .into_iter()
+                    .map(|r| (r.worker, format!("{:08x}", r.prefix)))
+                    .collect();
             Ok(ClientResponse {
                 best_difficulty,
                 workers_count: clients.len(),
@@ -361,15 +385,24 @@ where
                 total_hashrate,
                 workers: clients
                     .into_iter()
-                    .map(|c| WorkerEntry {
-                        session_id: c.session_id,
-                        name: c.client_name,
-                        best_difficulty: format!("{:.2}", c.best_difficulty as f64),
-                        hash_rate: c.hash_rate,
-                        current_difficulty: c.current_difficulty.map(|d| d as f64),
-                        channel_count: c.channel_count,
-                        start_time: crate::time_range::format_slot_label(c.start_time),
-                        last_seen: crate::time_range::format_slot_label(c.updated_at),
+                    .zip(live)
+                    .map(|(c, lf)| {
+                        let lf = lf.unwrap_or_default();
+                        WorkerEntry {
+                            session_id: c.session_id,
+                            extranonce: overrides.get(&c.client_name).cloned(),
+                            name: c.client_name,
+                            best_difficulty: format!("{:.2}", lf.best_difficulty),
+                            hash_rate: lf.hash_rate,
+                            current_difficulty: lf.current_difficulty,
+                            channel_count: lf.channel_count.unwrap_or(1),
+                            start_time: crate::time_range::format_slot_label(c.start_time),
+                            // No live hash → the freshest thing known is
+                            // the session's own start.
+                            last_seen: crate::time_range::format_slot_label(
+                                lf.updated_at_ms.unwrap_or(c.start_time),
+                            ),
+                        }
                     })
                     .collect(),
             })
@@ -431,6 +464,13 @@ where
 /// Per-slot chart entry for a worker page. Carries the hashrate
 /// (`data`), the raw accepted-share weight, and the per-reason
 /// rejection breakdowns (count + diff-1) the worker tile renders.
+///
+/// **One field pair per `bp_stats::RejectedReason`, and that is a
+/// contract, not tidiness.** The tile shows these against
+/// `rejectedCount`, so a reason with no pair here is a reject the
+/// operator sees in the total and cannot find in the breakdown — which
+/// is exactly what happened to version rolling between migration 0010
+/// (which gave it a column) and this struct learning to emit it.
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct WorkerChartEntry {
@@ -451,6 +491,14 @@ struct WorkerChartEntry {
     rejected_low_difficulty_share: f64,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     rejected_low_difficulty_share_diff1: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    rejected_version_rolling: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    rejected_version_rolling_diff1: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    rejected_stale: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    rejected_stale_diff1: f64,
 }
 
 #[derive(Serialize)]
@@ -490,13 +538,20 @@ where
             if matching.is_empty() {
                 return Err(ApiError::NotFound);
             }
-            let best_difficulty = matching
+            // Max over the worker's live per-session bests (a session
+            // without a live hash contributes nothing, like a 0 column).
+            let live = crate::error::or_degraded(
+                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &matching).await,
+                || vec![None; matching.len()],
+            )?;
+            let best_difficulty = live
                 .iter()
-                .map(|c| c.best_difficulty as f64)
+                .flatten()
+                .map(|lf| lf.best_difficulty)
                 .fold(0.0_f64, f64::max)
                 .floor() as i64;
 
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let rows = find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
@@ -517,6 +572,10 @@ where
                 entry.rejected_low_difficulty_share += r.rejected_low_difficulty_share_count as f64;
                 entry.rejected_low_difficulty_share_diff1 +=
                     r.rejected_low_difficulty_share_diff1 as f64;
+                entry.rejected_version_rolling += r.rejected_version_rolling_count as f64;
+                entry.rejected_version_rolling_diff1 += r.rejected_version_rolling_diff1 as f64;
+                entry.rejected_stale += r.rejected_stale_count as f64;
+                entry.rejected_stale_diff1 += r.rejected_stale_diff1 as f64;
             }
             for e in grouped.values_mut() {
                 e.data = e.accepted * DIFFICULTY_1 / SLOT_SECONDS;
@@ -569,8 +628,21 @@ where
                 let row = find_client(&s.pool, &addr, &worker, &session)
                     .await?
                     .ok_or(ApiError::NotFound)?;
+                let live = crate::error::or_degraded(
+                    bp_client_live::live_fields_for_sessions(
+                        s.redis.as_ref(),
+                        &[(addr.as_str(), worker.as_str(), session.as_str())],
+                    )
+                    .await,
+                    || vec![None],
+                )?;
+                let live_best = live
+                    .first()
+                    .and_then(|o| o.as_ref())
+                    .map(|lf| lf.best_difficulty)
+                    .unwrap_or(0.0);
 
-                let now = crate::time_range::now_ms();
+                let now = bp_common::now_ms();
                 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
                 let since = now - DAY_MS;
                 let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
@@ -592,7 +664,7 @@ where
                 Ok(SessionResponse {
                     session_id: row.session_id,
                     name: row.client_name,
-                    best_difficulty: (row.best_difficulty as f64).floor() as i64,
+                    best_difficulty: live_best.floor() as i64,
                     chart_data,
                     start_time: crate::time_range::format_slot_label(row.start_time),
                 })
@@ -750,6 +822,11 @@ where
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // Best-effort: drop the live hashes too, or the purged miner keeps
+    // reporting hashrate for up to the TTL. Failure only delays that.
+    if let Err(e) = bp_client_live::delete_address_live_keys(state.redis.as_ref(), &addr).await {
+        tracing::warn!(target: "bp_api", error = %e, address = %addr, "delete_all: live-key purge failed");
+    }
     invalidate_address_cache(&state, &addr).await;
     Ok(Json(StatusResponse {
         status: "all-deleted",
@@ -812,7 +889,7 @@ where
                 _ => 24,
             };
             let one_hour_ms: i64 = 60 * 60 * 1000;
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - hours * one_hour_ms;
             let start_slot = (since / one_hour_ms) * one_hour_ms;
             let end_slot = (now / one_hour_ms) * one_hour_ms;

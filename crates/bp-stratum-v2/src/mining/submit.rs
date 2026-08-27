@@ -17,7 +17,7 @@
 //!   recomputing the merkle root on every share, which is more reliable).
 //!   Extranonce is implicitly zero-filled in the coinbase slot.
 //! - **Extended**: reconstructs the coinbase from
-//!   `extJob.coinbase_prefix + channel.extranonce_prefix +
+//!   `extJob.coinbase_prefix + extJob.extranonce_prefix +
 //!   submission.extranonce + extJob.coinbase_suffix`, walks the
 //!   `extJob.merkle_path` to derive the root, then assembles the
 //!   header. Worker-name override via ext 0x0002 TLV is the caller's
@@ -62,19 +62,25 @@ use super::jobs::{classify_extended_job, ExtendedJob};
 pub const ERR_INVALID_CHANNEL_ID: &str = "invalid-channel-id";
 
 /// Job id is genuinely unknown — past retention GC, or never sent.
-/// SV2 spec §5.3.14 distinguishes this from `stale-share` (job *was*
-/// known, since superseded).
+/// SV2 Mining/SubmitShares.Error distinguishes this from `stale-share` (job
+/// *was* known, since superseded).
 pub const ERR_INVALID_JOB_ID: &str = "invalid-job-id";
 
 /// Job id resolves to a retired entry past
-/// [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`]. Separate from
-/// `ERR_DUPLICATE_SHARE` per SV2 spec — both have their own wire
-/// code.
+/// [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`]. Kept separate from
+/// `ERR_DUPLICATE_SHARE` because they are different faults, not because the
+/// spec separates them — see the note on the code strings below.
 pub const ERR_STALE_SHARE: &str = "stale-share";
 
 /// Duplicate `(job_id, nonce, ntime, version[, extranonce])` tuple
-/// re-submitted on this channel. SV2 spec assigns this its own wire
-/// code, distinct from `ERR_STALE_SHARE`.
+/// re-submitted on this channel.
+///
+/// **None of these strings is spec-assigned.** SV2 Mining/SubmitShares.Error
+/// types `error_code` as a bare `STR0_255` and SV2 Overview/Error Codes says
+/// the list "can differ between implementations" and that a receiver MUST
+/// log-no-op on unknown codes. The vocabulary here is convention shared with
+/// the SRI clients, so it can be extended — but a downstream that treats an
+/// unknown code as fatal is the one breaking the spec, not us.
 pub const ERR_DUPLICATE_SHARE: &str = "duplicate-share";
 
 /// Header hash didn't meet the job-specific target. Includes the case
@@ -142,11 +148,11 @@ pub struct ShareAccept {
     /// `Active` or `StaleCreditable`. Both credit the share; the caller
     /// may want to bookkeep them separately for diagnostics.
     pub classification: JobClassification,
-    /// Difficulty the share is **credited at** — the job-specific
-    /// difficulty stored at send-time (SV2 §5.3.14). Used by both
-    /// PPLNS / group-solo accounting and the `add_accepted_share`
-    /// accumulators. May be lower than the session's current diff when
-    /// the share was issued before a vardiff ratchet.
+    /// Difficulty the share is **credited at** — the job-specific difficulty
+    /// stored at send-time (SV2 Mining/SubmitShares.Error). Used by both PPLNS
+    /// / group-solo accounting and the `add_accepted_share` accumulators. May
+    /// be lower than the session's current diff when the share was issued
+    /// before a vardiff ratchet.
     pub effective_difficulty: Difficulty,
     /// Difficulty the share **actually solved for**, derived from the
     /// header hash. Drives the block-found gate and the personal-best
@@ -194,15 +200,16 @@ pub struct ShareAccept {
     /// coinbase — a `SetCustomMiningJob`-declared job — in which case block-found
     /// surfaces a WARN in the bin block-sink instead of submitting.
     pub witness_coinbase: Vec<u8>,
-    /// Effective per-share worker name. `Some(value)` when ext
-    /// 0x0002 (Worker-Specific Hashrate Tracking) was negotiated
-    /// AND the miner appended a valid Worker-ID TLV to this share
-    /// (spec §1.3). `None` means the caller should fall back to the
-    /// channel-default `user_identity` from `OpenExtendedMiningChannel`.
+    /// Effective per-share worker name. `Some(value)` when ext 0x0002
+    /// (Worker-Specific Hashrate Tracking) was negotiated AND the miner
+    /// appended a valid Worker-ID TLV to this share
+    /// (ext 0x0002/Behavior Based on Negotiation). `None` means the caller
+    /// should fall back to the channel-default `user_identity` from
+    /// `OpenExtendedMiningChannel`.
     ///
-    /// Always `None` for Standard-channel shares (channel-default
-    /// only). Always `None` for Extended-channel shares whose
-    /// connection did not negotiate ext 0x0002 (spec §1.3 — "the
+    /// Always `None` for Standard-channel shares (channel-default only).
+    /// Always `None` for Extended-channel shares whose connection did not
+    /// negotiate ext 0x0002 (ext 0x0002/Behavior Based on Negotiation — "the
     /// server MUST ignore unexpected TLV fields").
     pub effective_worker_name: Option<String>,
     /// Block-reward portion the coinbase claims — the per-job pinned
@@ -272,7 +279,8 @@ pub struct SubmitSharesExtendedInput {
     /// Resolved into [`ShareAccept::effective_worker_name`] by
     /// [`validate_submit_extended`] via
     /// [`crate::extensions::resolve_share_worker_name_from_tlv`] —
-    /// spec §1.3: scan-for-known-TLV semantics, TLV-order-irrelevant.
+    /// ext 0x0002/Behavior Based on Negotiation: scan-for-known-TLV semantics,
+    /// TLV-order-irrelevant.
     pub tail_tlvs: Vec<u8>,
 }
 
@@ -346,7 +354,7 @@ pub struct StandardJobContext<'a> {
 /// 2. Duplicate-check the dedup tuple against the channel's submission
 ///    cache. Hit → [`RejectReason::StaleShare`].
 /// 3. Reject if `classification == StaleRejected`.
-/// 4. Build the 80-byte header from `(version XOR version_mask,
+/// 4. Build the 80-byte header from `(submission.version,
 ///    prev_hash, stored_merkle_root, ntime, n_bits, nonce)`.
 /// 5. Compute `sha256d(header)` and the implied submission difficulty.
 /// 6. Compare against `difficulty_to_target(job_difficulty)`. Miss →
@@ -388,10 +396,13 @@ pub fn validate_submit_standard(
         return ShareValidation::Rejected(RejectReason::StaleShare.into());
     }
 
-    let version_mask = submission.version ^ (job_ctx.template_version as u32);
+    // `submission.version` is the FULL nVersion (SV2 spec:
+    // `SubmitSharesStandard.version` is the "Full nVersion field"), so it
+    // goes into the header as-is. The old code XOR'd it against the
+    // template version and then XOR'd it back, which was an identity
+    // dressed up as version-rolling arithmetic.
     let header = build_block_header(
-        job_ctx.template_version,
-        version_mask,
+        submission.version as i32,
         &job_ctx.prev_hash,
         stored_merkle_root,
         submission.ntime,
@@ -455,9 +466,8 @@ pub fn validate_submit_standard(
 /// per-share clone of the job. Mirrors the SV1 `validate_submit`
 /// projection (`SessionContext` + `&mut share_cache`).
 #[derive(Clone, Copy, Debug)]
-pub struct ExtendedChannelView<'a> {
+pub struct ExtendedChannelView {
     pub kind: ChannelKind,
-    pub extranonce_prefix: &'a [u8],
     pub extranonce_size: u8,
     /// `channel.target_for(job_difficulty)` — precomputed by the caller
     /// so the validator needs no `&mut` access to the channel's memo.
@@ -483,16 +493,17 @@ pub struct ExtendedChannelView<'a> {
 /// see memory `feedback-sv2-bad-extranonce-size-hard-reject`.
 ///
 /// `job_difficulty` is the per-job target the share validates against
-/// (SV2 §5.3.14). Caller resolves it from
-/// `channel.standard_jobs.job_id_to_difficulty` if present, else falls
-/// back to `channel.session_difficulty`. The **network** difficulty for
-/// the block-found gate is read from `ext_job.network_difficulty` (pinned
-/// at send-time, SV2 §5.3.14 strict) — NOT the current template, so a
-/// block-change between job-send and submit can't reclassify the share.
+/// (SV2 Mining/SubmitShares.Error). Caller resolves it from
+/// `channel.standard_jobs.job_id_to_difficulty` if present, else falls back to
+/// `channel.session_difficulty`. The **network** difficulty for the
+/// block-found gate is read from `ext_job.network_difficulty` (pinned at
+/// send-time, SV2 Mining/SubmitShares.Error strict) — NOT the current
+/// template, so a block-change between job-send and submit can't reclassify
+/// the share.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_submit_extended(
     submission_cache: &mut SubmissionCache,
-    view: &ExtendedChannelView<'_>,
+    view: &ExtendedChannelView,
     submission: &SubmitSharesExtendedInput,
     ext_job: &ExtendedJob,
     job_difficulty: Difficulty,
@@ -561,20 +572,25 @@ pub fn validate_submit_extended(
     // 1. Reconstruct the coinbase exactly how the miner does it:
     //
     //   coinbase = ext_job.coinbase_prefix
-    //            + channel.extranonce_prefix
+    //            + ext_job.extranonce_prefix
     //            + submission.extranonce
     //            + ext_job.coinbase_suffix
     //
     // `ext_job.coinbase_prefix` here is the bytes BEFORE the
-    // extranonce slot — `apply_template_to_channel` no longer bakes
-    // `channel.extranonce_prefix` into it (doing so would double-count
-    // the prefix on the miner side, since miners append it themselves
-    // at share-build time). Validator must mirror miner's reconstruction
-    // byte-for-byte or the resulting hash diverges → 100% diff-too-low
-    // rejections.
+    // extranonce slot — the job build no longer bakes the extranonce
+    // prefix into it (doing so would double-count the prefix on the
+    // miner side, since miners append it themselves at share-build
+    // time). Validator must mirror miner's reconstruction byte-for-byte
+    // or the resulting hash diverges → 100% diff-too-low rejections.
+    //
+    // The prefix is read off the JOB, never off the channel:
+    // SV2 Mining/SetExtranoncePrefix is effective only from the next job on,
+    // so a share for an older job was built with that job's prefix. Taking
+    // it from the channel would reject every in-flight share of the old
+    // job after a prefix change.
     let coinbase_parts: [&[u8]; 4] = [
         &ext_job.coinbase_prefix[..],
-        view.extranonce_prefix,
+        &ext_job.extranonce_prefix[..],
         &submission.extranonce[..],
         &ext_job.coinbase_suffix[..],
     ];
@@ -591,13 +607,11 @@ pub fn validate_submit_extended(
     let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &ext_job.merkle_path);
 
     // 4. Assemble the 80-byte header. Version-mask is XOR'd against
-    //    the job's template version (BIP-310). `validate_submit_standard`
-    //    folds the same algebra (version XOR mask == submission.version
-    //    when mask = submission.version ^ template.version).
-    let version_mask = submission.version ^ ext_job.version;
+    //    `submission.version` verbatim — the extended twin of the standard
+    //    path above, and for the same reason: SV2 submits the full nVersion,
+    //    so there is nothing to reconstruct against `ext_job.version`.
     let header = build_block_header(
-        ext_job.version as i32,
-        version_mask,
+        submission.version as i32,
         &ext_job.prev_hash,
         &merkle_root,
         submission.ntime,
@@ -669,8 +683,9 @@ pub fn validate_submit_extended(
 
     submission_cache.insert_extended(dedup_key);
 
-    // Per-job pinned network difficulty (SV2 §5.3.14 strict) — the gate
-    // uses the template the miner hashed against, not the latest one.
+    // Per-job pinned network difficulty (SV2 Mining/SubmitShares.Error strict)
+    // — the gate uses the template the miner hashed against, not the latest
+    // one.
     let is_block_candidate = pow.submission_difficulty >= ext_job.network_difficulty;
     // Witness-form coinbase for the block-found path. Built only for
     // block-candidates to keep the per-share allocation off the hot
@@ -681,11 +696,12 @@ pub fn validate_submit_extended(
     } else {
         Vec::new()
     };
-    // ext 0x0002 Worker-ID TLV resolution (spec §1.3). The validator
-    // operates at the channel layer and doesn't know the
-    // session-level `address` or `channel_worker` — those are
-    // session-state. We pass empty channel defaults so the resolver
-    // either returns a non-empty TLV-derived worker name (TLV present
+    // ext 0x0002 Worker-ID TLV resolution
+    // (ext 0x0002/Behavior Based on Negotiation). The validator operates at
+    // the channel layer and doesn't know the session-level `address` or
+    // `channel_worker` — those are session-state. We pass empty channel
+    // defaults so the resolver either returns a non-empty TLV-derived worker
+    // name (TLV present
     // + valid + spec-compliant) or the empty channel default. The
     // empty string is collapsed to `None` so consumers can rely on
     // `Some(_) ⇒ TLV was present and the caller should override
@@ -735,7 +751,7 @@ pub fn validate_submit_extended(
 /// [`bp_mining_job::MiningJob::witness_coinbase_with_extranonce`] but
 /// operates on already-assembled stratum-coinbase bytes — the SV2
 /// extended-validator path reconstructs them from
-/// `ext_job.coinbase_prefix + channel.extranonce_prefix +
+/// `ext_job.coinbase_prefix + ext_job.extranonce_prefix +
 /// submission.extranonce + ext_job.coinbase_suffix` and has no
 /// `MiningJob` handle. Output is byte-identical to the SV1 path.
 ///
@@ -800,6 +816,9 @@ mod tests {
             prev_hash: prev,
             n_bits,
             min_ntime: 0,
+            // Must match `ext_channel()`'s prefix: these fixtures pair up, and
+            // the validator now reconstructs the coinbase from the JOB's prefix.
+            extranonce_prefix: vec![0u8; 4],
             difficulty: Difficulty(1.0 / 4_294_967_296.0),
             // Unreasonably hard pinned network difficulty → not a block
             // candidate. Tests that exercise the candidate gate set this
@@ -867,7 +886,6 @@ mod tests {
         let job_target = ch.target_for(job_difficulty);
         let view = ExtendedChannelView {
             kind: ch.kind,
-            extranonce_prefix: &ch.extranonce_prefix,
             extranonce_size: ch.extranonce_size,
             job_target,
         };
@@ -1060,28 +1078,50 @@ mod tests {
         assert_eq!(ch.submission_cache.len(), 0);
     }
 
-    /// Header byte-shape: version XOR-mask is applied (BIP-310). The
-    /// submitted-version field is the FINAL header version when
-    /// `submission.version != template.version`. We test by passing
-    /// a submission version with a non-zero rolled bit and verifying
-    /// the header[0..4] matches the submission version (LE).
+    /// The header version is `submission.version`, verbatim.
+    ///
+    /// SV2 submits the full nVersion (spec: `SubmitSharesStandard.version`
+    /// is the "Full nVersion field"), so no reconstruction happens — unlike
+    /// SV1, which submits a masked subset and rebuilds per BIP-310.
+    ///
+    /// Both directions are covered, and the second is the one that pins the
+    /// difference from an OR-based pool: a miner must be able to **clear** a
+    /// bit the template set. ckpool's SV1 path (`*data32 |= version_mask`)
+    /// cannot express that; taking the submitted version verbatim can.
     #[test]
-    fn standard_header_applies_version_rolling_mask() {
-        let mut ch = std_channel();
-        let merkle = [0xDD; 32];
-        let mut sub = std_submission();
-        sub.version = 0x2000_0001; // version-rolled by 1 bit
+    fn standard_header_version_is_the_submitted_version_verbatim() {
         let ctx = std_ctx(JobClassification::Active);
-        let out = validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx);
-        let accept = match out {
+        let merkle = [0xDD; 32];
+
+        // Sets a bit the template (0x2000_0000) does not have.
+        let mut ch = std_channel();
+        let mut sub = std_submission();
+        sub.version = 0x2000_0001;
+        let accept = match validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
             ShareValidation::Accepted(a) => a,
             _ => panic!("expected Accept"),
         };
-        // header[0..4] LE == 0x2000_0001 because the mask propagates the
-        // bit difference: template=0x2000_0000, submitted=0x2000_0001,
-        // mask = 0x0000_0001, applied: 0x2000_0000 XOR 0x0000_0001 = 0x2000_0001.
-        let v = u32::from_le_bytes(accept.header[0..4].try_into().unwrap());
-        assert_eq!(v, 0x2000_0001);
+        assert_eq!(
+            u32::from_le_bytes(accept.header[0..4].try_into().unwrap()),
+            0x2000_0001
+        );
+
+        // Clears a bit the template DOES have. `std_ctx` builds its job at
+        // template version 0x2000_0000, so dropping bit 29 lands on
+        // 0x0000_0000 — which an OR would leave at 0x2000_0000.
+        let mut ch = std_channel();
+        let mut sub = std_submission();
+        sub.version = 0x0000_0000;
+        let accept = match validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
+            ShareValidation::Accepted(a) => a,
+            _ => panic!("expected Accept"),
+        };
+        assert_eq!(
+            u32::from_le_bytes(accept.header[0..4].try_into().unwrap()),
+            0x0000_0000,
+            "a cleared template bit must survive into the header — an OR-based \
+             reconstruction would put it back"
+        );
     }
 
     /// `is_block_candidate` flips to true when submission ≥ network.
@@ -1129,12 +1169,13 @@ mod tests {
         assert_eq!(ch.submission_cache.len(), 1);
     }
 
-    /// 5b (SV2 §5.3.14 strict): the block-candidate gate reads the network
-    /// difficulty **pinned on the job at send-time**, not any current/latest
-    /// template. A job pinned with a trivial network difficulty yields a
-    /// block-candidate for the same easy share that the default (1e15) job
-    /// classifies as non-candidate — proving the gate is per-job, so a
-    /// block-change between send and submit can't reclassify an in-flight share.
+    /// 5b (SV2 Mining/SubmitShares.Error strict): the block-candidate gate
+    /// reads the network difficulty **pinned on the job at send-time**, not
+    /// any current/latest template. A job pinned with a trivial network
+    /// difficulty yields a block-candidate for the same easy share that the
+    /// default (1e15) job classifies as non-candidate — proving the gate is
+    /// per-job, so a block-change between send and submit can't reclassify an
+    /// in-flight share.
     #[test]
     fn extended_block_candidate_uses_per_job_pinned_network_difficulty() {
         let mut ch = ext_channel();
@@ -1362,8 +1403,9 @@ mod tests {
 
     fn worker_id_tlv_bytes(user_identity: &str) -> Vec<u8> {
         // Hand-built wire-form TLV: [ext_type 0x0002 LE][field_type 0x01]
-        // [length LE16][value bytes]. Mirrors ext 0x0002 §1.1 with the
-        // SV2 U16 little-endian convention (§3.4.3).
+        // [length LE16][value bytes]. Mirrors ext 0x0002/TLV Format for user_identity with the
+        // SV2 U16 little-endian convention
+        // (SV2 Overview/Stratum V2 TLV Encoding Model).
         let value = user_identity.as_bytes();
         let mut tlv = Vec::with_capacity(5 + value.len());
         tlv.extend_from_slice(&0x0002u16.to_le_bytes());
@@ -1374,7 +1416,7 @@ mod tests {
     }
 
     /// ext 0x0002 negotiated + valid TLV → `ShareAccept.effective_worker_name`
-    /// carries the TLV value (spec §1.3).
+    /// carries the TLV value (ext 0x0002/Behavior Based on Negotiation).
     #[test]
     fn ext_0x0002_tlv_present_when_negotiated_sets_effective_worker_name() {
         let mut ch = ext_channel();
@@ -1403,9 +1445,10 @@ mod tests {
         }
     }
 
-    /// ext 0x0002 NOT negotiated + TLV present → resolver ignores the
-    /// TLV (spec §1.3 "server MUST ignore unexpected TLV fields") →
-    /// effective_worker_name is None (caller falls back to channel-default).
+    /// ext 0x0002 NOT negotiated + TLV present → resolver ignores the TLV
+    /// (ext 0x0002/Behavior Based on Negotiation "server MUST ignore
+    /// unexpected TLV fields") → effective_worker_name is None (caller falls
+    /// back to channel-default).
     #[test]
     fn ext_0x0002_tlv_present_when_not_negotiated_is_ignored() {
         let mut ch = ext_channel();
@@ -1426,7 +1469,7 @@ mod tests {
             ShareValidation::Accepted(a) => {
                 assert!(
                     a.effective_worker_name.is_none(),
-                    "non-negotiated TLV must be silently dropped (spec §1.3)"
+                    "non-negotiated TLV must be silently dropped (ext 0x0002/Behavior Based on Negotiation)"
                 );
             }
             _ => panic!("expected Accept"),

@@ -13,11 +13,20 @@
 //!    ~1–2 MB of raw tx data — bounded memory).
 //!
 //! Later, when the JDC submits a `PushSolution`, the JDS uses
-//! `match_for_solution(prev_hash)` to find which declared job the
-//! solution belongs to. Spec §6.4.9 says to match by `prev_hash`; we
-//! prefer `prev_hash` matches and fall back to "most recent"
-//! when no match (defensive: declarations that pre-date the JDS
-//! observing the current prev_hash store `prev_hash = None`).
+//! `match_for_solution(prev_hash)` to find which declared job the solution
+//! belongs to.
+//!
+//! **The prev_hash-first order is ours, and it is stricter than the spec.**
+//! SV2 JDP/PushSolution carries a `prev hash` field but does not make it the
+//! matching key: it says JDS "MUST attempt to reconstruct and propagate the
+//! block using the template data associated with its most recently sent
+//! `DeclareMiningJob.Success`", and MAY try other recent ones. So the spec's
+//! rule is most-recent-first. We prefer a `prev_hash` match and fall back to
+//! most-recent, which cannot pick a job the spec would have rejected — it only
+//! declines to reconstruct against a declaration the solution demonstrably
+//! does not belong to. Declarations that pre-date the JDS observing a current
+//! prev_hash store `prev_hash = None` and are reachable through the fallback
+//! alone.
 //!
 //! ## FIFO eviction
 //!
@@ -89,8 +98,9 @@ pub struct DeclaredJob {
     /// declaration, or a connection that never negotiated 0x0003 — and then
     /// a found block is reported but not booked.
     pub booking: Option<PayoutBooking>,
-    /// ext 0x0003 §6: the `distribution_id` this declaration was accepted
-    /// against, whether or not a block found on it can be booked.
+    /// ext 0x0003/distribution_id TLV Field: the `distribution_id` this
+    /// declaration was accepted against, whether or not a block found on it
+    /// can be booked.
     ///
     /// Deliberately NOT read off [`Self::booking`], which is the narrower
     /// claim: `booking` additionally requires the distribution's settlement
@@ -181,17 +191,6 @@ impl DeclaredJobStore {
         self.jobs.get(new_token)
     }
 
-    /// Remove a job. Idempotent for unknown tokens.
-    pub fn remove(&mut self, new_token: &Token) -> Option<DeclaredJob> {
-        let removed = self.jobs.remove(new_token)?;
-        // Drop the matching entry from the FIFO. Linear scan over at
-        // most `capacity` entries → trivial for `MAX_DECLARED_JOBS=3`.
-        if let Some(pos) = self.order.iter().position(|t| t == new_token) {
-            self.order.remove(pos);
-        }
-        Some(removed)
-    }
-
     /// Find the job a `PushSolution` belongs to.
     ///
     /// 1. Prefer a job whose stored `prev_hash` matches the
@@ -199,7 +198,9 @@ impl DeclaredJobStore {
     ///    recently declared.
     /// 2. Fall back to the most-recently-declared job overall when
     ///    no `prev_hash` match exists — defensive for declarations
-    ///    that pre-date the JDS observing a current prev_hash.
+    ///    that pre-date the JDS observing a current prev_hash. This
+    ///    fallback IS the spec's rule (SV2 JDP/PushSolution); step 1 is
+    ///    our narrowing of it.
     ///
     /// Returns `None` only when the store is empty.
     pub fn match_for_solution(&self, solution_prev_hash: &[u8; 32]) -> Option<&DeclaredJob> {
@@ -224,8 +225,13 @@ impl DeclaredJobStore {
     }
 
     /// Iterate stored jobs in **insertion order** (oldest first).
-    /// Exposed for diagnostics + the JDP-server's per-connection
-    /// teardown path (drop all declared-job state on disconnect).
+    ///
+    /// No production caller: a JDP session's store is dropped with the
+    /// session, and the disconnect path clears the BRIDGE by session id
+    /// (`evict_for_jdp_session`) rather than walking this one. What needs it
+    /// is the handler tests — `accept_declaration` keys a job under a token
+    /// the JDS mints itself, so a caller that did not see the outbound
+    /// `DeclareMiningJobSuccess` has no key to `get` by.
     pub fn iter(&self) -> impl Iterator<Item = &DeclaredJob> {
         self.order.iter().filter_map(|t| self.jobs.get(t))
     }
@@ -328,30 +334,6 @@ mod tests {
         // Next insert evicts 0x01 (still at the front), not 0x02.
         let evicted = s.insert(job(0x03, 3_000, None));
         assert_eq!(evicted.unwrap().new_token, tok(0x01));
-    }
-
-    // ── remove ─────────────────────────────────────────────────────
-
-    #[test]
-    fn remove_drops_and_compacts_order() {
-        let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, None));
-        s.insert(job(0x02, 2_000, None));
-        s.insert(job(0x03, 3_000, None));
-        let removed = s.remove(&tok(0x02));
-        assert!(removed.is_some());
-        assert_eq!(s.len(), 2);
-        // Insertion order after remove: [0x01, 0x03]. Next insert
-        // brings us to cap; 4th insert evicts 0x01.
-        s.insert(job(0x04, 4_000, None));
-        let evicted = s.insert(job(0x05, 5_000, None));
-        assert_eq!(evicted.unwrap().new_token, tok(0x01));
-    }
-
-    #[test]
-    fn remove_unknown_is_idempotent() {
-        let mut s = DeclaredJobStore::new();
-        assert!(s.remove(&tok(0xAA)).is_none());
     }
 
     // ── match_for_solution ─────────────────────────────────────────

@@ -88,7 +88,7 @@ const BUDGET: u32 = 50_000;
 ///
 /// **Mainnet HRP** (not regtest): regtest P2TR addresses are 64 chars
 /// long, which exceeded `AddressId`'s DB-column limit when this was written.
-/// That limit is 90 since `0011_widen_identity_columns.sql`, so a regtest HRP
+/// That limit is 90 since `0015_widen_identity_columns.sql`, so a regtest HRP
 /// would work here now — the mainnet spelling is kept because switching it
 /// would change the scripts this test's expectations were measured against, and
 /// it buys nothing. P2WPKH +

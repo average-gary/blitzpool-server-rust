@@ -20,7 +20,8 @@ use uuid::Uuid;
 use crate::error::InvitationServiceError;
 use crate::hooks::GroupServiceHooks;
 use crate::service::GroupService;
-use crate::util::{normalize_address, now_ms};
+use crate::util::normalize_address;
+use bp_common::now_ms;
 
 /// Allowed TTL presets for open-invite links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

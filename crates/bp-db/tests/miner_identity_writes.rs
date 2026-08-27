@@ -16,7 +16,7 @@
 //! (`docker start bp-test-pg`), run with `--nocapture`, and read the
 //! passed-count — a skipped test is indistinguishable from a passing one in
 //! `$?`. New migrations are NOT applied to that container automatically:
-//! `0010_add_miner_identity.sql` must be applied or every test here fails on
+//! `0014_add_miner_identity.sql` must be applied or every test here fails on
 //! the missing relation.
 
 use bp_db::{
@@ -142,7 +142,7 @@ async fn a_rotating_identity_round_trips_with_no_address() {
     // The descriptor is 130+ chars and lives in TEXT; only the ledger key is
     // bound by the identity shape. Both widths are read from
     // `bp_common::MAX_ADDRESS_LEN` rather than written as a literal, because the
-    // number moved once already (62 → 90, `0011_widen_identity_columns.sql`) and
+    // number moved once already (62 → 90, `0015_widen_identity_columns.sql`) and
     // a literal here would have gone on claiming the old one.
     assert!(
         DESCRIPTOR.len() > bp_common::MAX_ADDRESS_LEN,
@@ -341,7 +341,7 @@ async fn an_unknown_payout_id_reads_as_none() {
 /// **The rotating bulk read is the only read on the money path, and a static
 /// miner is invisible to it whether or not the backfill covered them.**
 ///
-/// The backfill in `0010_add_miner_identity.sql` copies `pplns_balance` only, so
+/// The backfill in `0014_add_miner_identity.sql` copies `pplns_balance` only, so
 /// a Solo miner with no pending balance and every Group-Solo member (that mode
 /// keeps no ledger) have no row here. The migration's comment states the rule
 /// that makes that safe: this table is read to discover that an identity

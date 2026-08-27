@@ -11,6 +11,7 @@
 //! round-reset-applyConfig callbacks can be inspected without standing
 //! up the full Redis stack.
 
+use bp_common::now_ms;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -960,12 +961,4 @@ async fn max_members_above_the_coinbase_ceiling_is_refused() {
     assert_eq!(row.max_members, Some(52));
 
     cleanup_group(&pool, g.group.id).await;
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

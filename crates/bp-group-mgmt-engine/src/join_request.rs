@@ -24,7 +24,8 @@ use crate::email_hooks::{EmailHooks, JoinDecisionEmailContext, JoinDecisionOutco
 use crate::error::JoinRequestServiceError;
 use crate::hooks::GroupServiceHooks;
 use crate::service::GroupService;
-use crate::util::{normalize_address, now_ms};
+use crate::util::normalize_address;
+use bp_common::now_ms;
 
 /// Multi-layer caps for join requests.
 #[derive(Debug, Clone, Copy)]

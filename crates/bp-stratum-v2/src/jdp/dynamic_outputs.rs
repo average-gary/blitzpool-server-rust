@@ -4,16 +4,17 @@
 //!
 //! The ext 0x0003 payout logic itself lives in
 //! [`crate::jdp::payout_distribution`] (push model: `SetPayoutDistribution`
-//! weights, §4 recompute-and-compare). What remains here are the byte-level
-//! helpers both the base-protocol allocate path and the declare-time
-//! validator need:
+//! weights, ext 0x0003/Payout Computation recompute-and-compare). What remains
+//! here are the byte-level helpers both the base-protocol allocate path and
+//! the declare-time validator need:
 //!
 //! - [`encode_coinbase_outputs`] — `(address, sats)` list → consensus
 //!   `Vec<TxOut>` bytes (`AllocateMiningJobToken.Success.coinbase_tx_outputs`
 //!   on the non-negotiated base path).
 //! - [`designated_payout_script`] / [`pays_designated_output`] — the two
-//!   halves of the §6.4.3 base-protocol convention: which script the pool
-//!   designated, and whether a coinbase honours it.
+//!   halves of the SV2 JDP/AllocateMiningJobToken.Success base-protocol
+//!   convention: which script the pool designated, and whether a coinbase
+//!   honours it.
 //! - [`declared_coinbase_tx`] — the declared prefix/suffix pair → the
 //!   rebuilt transaction, its extranonce slot width and its committed
 //!   scriptSig prefix, fail-closed.
@@ -81,16 +82,16 @@ pub fn encode_coinbase_outputs(
     Ok(buf)
 }
 
-// ── §6.4.3 base-protocol payout output ───────────────────────────────
+// ── SV2 JDP/AllocateMiningJobToken.Success base-protocol payout output ───
 
 /// The script the pool designated as its payout output, read back out of
 /// the blob it sent as `AllocateMiningJobToken.Success.coinbase_tx_outputs`.
 ///
-/// §6.4.3 fixes the convention: "JDS MUST reserve the **first** output with
-/// a locking script where the pool payout will go. While this output is
-/// initially set with a 0 amount of sats, this convention designates this
-/// locking script as the **pool payout output**." The designation is
-/// positional in the ALLOCATE message *only* — see
+/// SV2 JDP/AllocateMiningJobToken.Success fixes the convention: "JDS MUST
+/// reserve the **first** output with a locking script where the pool payout
+/// will go. While this output is initially set with a 0 amount of sats, this
+/// convention designates this locking script as the **pool payout output**."
+/// The designation is positional in the ALLOCATE message *only* — see
 /// [`pays_designated_output`] for why the check side cannot index.
 ///
 /// Reading it back rather than carrying the script alongside keeps one
@@ -102,7 +103,8 @@ pub fn designated_payout_script(coinbase_outputs: &[u8]) -> Option<Vec<u8>> {
     outputs.first().map(|o| o.script_pubkey.as_bytes().to_vec())
 }
 
-/// Does this coinbase honour the pool's designated payout output (§6.4.3)?
+/// Does this coinbase honour the pool's designated payout output
+/// (SV2 JDP/AllocateMiningJobToken.Success)?
 ///
 /// The rule the spec states is narrow, and everything around it is
 /// explicitly free: "JDC MUST allocate sats into the pool payout output in
@@ -115,10 +117,10 @@ pub fn designated_payout_script(coinbase_outputs: &[u8]) -> Option<Vec<u8>> {
 /// pool must send the amount as 0 and the JD-client then rewrites it to the
 /// template's revenue.
 ///
-/// How MUCH is not checked, and that is not a gap this function could
-/// close: §6.4.3 names no threshold and answers a shortfall economically
-/// ("Pool MAY pay proportionally smaller rewards"), so any number here
-/// would be invented and would reject conformant clients.
+/// How MUCH is not checked, and that is not a gap this function could close:
+/// SV2 JDP/AllocateMiningJobToken.Success names no threshold and answers a
+/// shortfall economically ("Pool MAY pay proportionally smaller rewards"), so
+/// any number here would be invented and would reject conformant clients.
 ///
 /// What makes "some sats reached the script" a sufficient test is enforced
 /// elsewhere, and has to be: the ALLOCATE only designates a script when it
@@ -142,13 +144,13 @@ pub fn pays_designated_output(outputs: &[TxOut], designated_script: &[u8]) -> bo
 /// The declared coinbase rebuilt as a whole transaction, plus the width of the
 /// extranonce slot that was zero-filled to get there.
 ///
-/// Every consumer that needs more than the outputs — the §7.1 payout check
-/// reads `tx.output`, the declared-job binding
-/// ([`crate::jdp::custom_job_binding`]) reads the version, scriptSig,
-/// nSequence and locktime as well, and both need the coinbase txid for the
-/// merkle branch — goes through this one reconstruction. The scriptSig it
-/// returns carries the slot as zeroes, so `script_sig[..len - slot]` is the
-/// prefix the JDC actually committed to.
+/// Every consumer that needs more than the outputs — the
+/// ext 0x0003/Output Verification payout check reads `tx.output`, the
+/// declared-job binding ([`crate::jdp::custom_job_binding`]) reads the
+/// version, scriptSig, nSequence and locktime as well, and both need the
+/// coinbase txid for the merkle branch — goes through this one reconstruction.
+/// The scriptSig it returns carries the slot as zeroes, so `script_sig[..len -
+/// slot]` is the prefix the JDC actually committed to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclaredCoinbase {
     pub tx: bitcoin::Transaction,
@@ -276,15 +278,16 @@ fn extranonce_slot_width(coinbase_tx_prefix: &[u8]) -> Option<usize> {
 
 /// The pool-side accounting identity riding on a proven declaration.
 ///
-/// A JDC builds and owns its own coinbase; the pool only publishes a
-/// weight distribution (ext 0x0003 §3.1). A found block may only be
-/// booked once the declared coinbase was validated positionally against
-/// that distribution (§7.1) — this rides along on that proof so the
-/// block-found path can settle exactly the distribution the coinbase
-/// pays (`claim(T_actual) − paid` from the settlement snapshot).
+/// A JDC builds and owns its own coinbase; the pool only publishes a weight
+/// distribution (ext 0x0003/SetPayoutDistribution). A found block may only be
+/// booked once the declared coinbase was validated positionally against that
+/// distribution (ext 0x0003/Output Verification) — this rides along on that
+/// proof so the block-found path can settle exactly the distribution the
+/// coinbase pays (`claim(T_actual) − paid` from the settlement snapshot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PayoutBooking {
-    /// §3.1 `distribution_id` the declaration referenced.
+    /// ext 0x0003/SetPayoutDistribution `distribution_id` the declaration
+    /// referenced.
     pub distribution_id: u64,
     /// Settlement-snapshot identity (weights fingerprint) of that
     /// distribution. Zeroed = the owning mode books without a snapshot.
@@ -301,7 +304,7 @@ pub struct PayoutBooking {
 /// answer two DIFFERENT questions about them and they do not have the same
 /// answer:
 ///
-/// | backing | book it? | §10 settle, and where |
+/// | backing | book it? | ext 0x0003/Implementation Notes settle, and where |
 /// |---|---|---|
 /// | [`Self::BaseProtocol`] | no — nothing published | never — nothing published to invalidate |
 /// | [`Self::UnbookableDistribution`] | no — its snapshot never landed | **at block-found**, see [`Self::settles_here`] |
@@ -319,8 +322,9 @@ pub enum CandidateBacking {
     /// Base-protocol declaration — no distribution was referenced.
     BaseProtocol,
     /// A published distribution was referenced and the declared coinbase was
-    /// proven to pay it (§7.1), but its settlement snapshot never landed, so
-    /// there are no inputs to book against. The coinbase still paid it.
+    /// proven to pay it (ext 0x0003/Output Verification), but its settlement
+    /// snapshot never landed, so there are no inputs to book against. The
+    /// coinbase still paid it.
     UnbookableDistribution { distribution_id: u64 },
     /// Referenced, proven, and its settlement inputs are on file.
     Bookable(PayoutBooking),
@@ -339,8 +343,8 @@ impl CandidateBacking {
         }
     }
 
-    /// Must the §10 settle fire at block-found, or does something later own
-    /// it?
+    /// Must the ext 0x0003/Implementation Notes settle fire at block-found, or
+    /// does something later own it?
     ///
     /// Only [`Self::UnbookableDistribution`], and the asymmetry is not a
     /// preference. Settling invalidates every published distribution AND
@@ -386,7 +390,7 @@ mod tests {
         );
     }
 
-    // ── §6.4.3 designated payout output ────────────────────────────
+    // ── SV2 JDP/AllocateMiningJobToken.Success designated payout output ───
 
     fn txout(sats: u64, script: Vec<u8>) -> TxOut {
         TxOut {
@@ -417,10 +421,10 @@ mod tests {
         );
     }
 
-    /// An ext 0x0003 allocate sends `[0x00]` (§2: outputs MUST be empty),
-    /// and a blob that does not decode is a bug. Both must answer `None`
-    /// so the caller refuses rather than holding a job to a script the
-    /// pool never designated.
+    /// An ext 0x0003 allocate sends `[0x00]` (ext 0x0003/Negotiation: outputs
+    /// MUST be empty), and a blob that does not decode is a bug. Both must
+    /// answer `None` so the caller refuses rather than holding a job to a
+    /// script the pool never designated.
     #[test]
     fn no_designated_script_without_outputs() {
         assert_eq!(designated_payout_script(&[0x00]), None);
@@ -428,10 +432,10 @@ mod tests {
         assert_eq!(designated_payout_script(&[0xFF, 0xFF]), None);
     }
 
-    /// The freedoms §6.4.3 grants the JDC, each one a case a byte-for-byte
-    /// or positional check would have wrongly rejected: it rewrites the
-    /// amount (the pool must send 0), reorders, and appends outputs of its
-    /// own — including valued ones.
+    /// The freedoms SV2 JDP/AllocateMiningJobToken.Success grants the JDC,
+    /// each one a case a byte-for-byte or positional check would have wrongly
+    /// rejected: it rewrites the amount (the pool must send 0), reorders, and
+    /// appends outputs of its own — including valued ones.
     #[test]
     fn a_reordered_coinbase_with_extra_outputs_still_pays_the_designated_output() {
         let pool = vec![0x00, 0x14, 0xAA];
@@ -571,9 +575,10 @@ mod tests {
 
     /// "A coinbase has exactly one input" is decided in exactly one place —
     /// the input-count test inside `extranonce_slot_width` — and every later
-    /// reader depends on it: the §7.1 payout check takes `tx.output` on
-    /// trust, and the declaration binding indexes `input[0]` without a guard
-    /// of its own, because a guard there could not fire.
+    /// reader depends on it: the ext 0x0003/Output Verification payout check
+    /// takes `tx.output` on trust, and the declaration binding indexes
+    /// `input[0]` without a guard of its own, because a guard there could not
+    /// fire.
     ///
     /// So the check gets a test rather than a second copy. Relax it and this
     /// fails, instead of a non-coinbase quietly reaching the payout path.

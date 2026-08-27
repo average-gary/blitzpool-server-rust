@@ -212,6 +212,27 @@ vardiff_silence_easing_enabled = false
 # cert_signed_part = 42
 jdp_enabled = false
 # jdp_port = 3335
+#
+# Hand every declared job to bitcoin-core for a real verdict before
+# accepting it (SV2 JDP/Job Declarator Server). UNSET means declarations
+# are taken on the JD-client's word — the pool then validates nothing.
+# Upstream derives `<dir>/<network>/node.sock` from a data directory, so
+# the path here has to be one that derivation can produce; boot refuses
+# to start on a mismatch rather than validating nothing while the log
+# says otherwise.
+# jdp_validation_socket_path = "/var/lib/bitcoind/node.sock"
+#
+# Resubmit a JDC-found block through `submitblock` as the pool's half of
+# the anti-orphan redundancy. Default `true`. With `false` the JD-client
+# is the sole propagator; the block still travels, the pool just stops
+# contributing the second path.
+# jdp_orphan_submitblock = true
+#
+# Republish cadence in seconds for the ext 0x0003 payout distribution
+# (`SetPayoutDistribution`). Default 60. The publisher also fires
+# immediately on a settlement; this only bounds how stale a published
+# distribution may grow between blocks.
+# jdp_payout_distribution_interval_secs = 60
 
 # ───────────────────────────────────────────────────────────────
 # Protocol-level debug logging — all flags default `false` because

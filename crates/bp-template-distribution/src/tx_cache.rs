@@ -4,7 +4,7 @@
 //!
 //! When a Job-Declaration-Client (JDC) sends a `DeclareMiningJob`, the
 //! pool partitions the JDC's `wtxid_list` against its own template-tx
-//! set (see [`crate::partition_against_template`]) — wtxids the pool
+//! set (see `crate::partition_against_template`) — wtxids the pool
 //! already knows are resolved locally, the missing ones are requested
 //! via `ProvideMissingTransactions`.
 //!

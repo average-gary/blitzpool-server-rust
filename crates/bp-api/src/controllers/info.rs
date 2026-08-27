@@ -13,7 +13,7 @@ use axum::{
 use bp_common::MiningMode;
 use bp_db::{
     find_found_blocks, find_high_scores, find_network_difficulty_tracker,
-    find_pool_mode_hashrate_since, find_user_agents,
+    find_pool_mode_hashrate_since,
 };
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::Serialize;
@@ -756,7 +756,10 @@ where
             "POOL_INFO".to_string(),
             TtlKind::PoolInfo,
             async move {
-                let total_hash_rate = bp_db::sum_active_pool_hashrate(&s.pool).await?;
+                let total_hash_rate = crate::error::or_degraded(
+                    bp_client_live::pool_hashrate(s.redis.as_ref()).await,
+                    || 0.0,
+                )?;
                 let total_miners: i64 =
                     sqlx::query_scalar!(r#"SELECT COUNT("userAgent") FROM client_entity"#,)
                         .fetch_one(&s.pool)
@@ -987,7 +990,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::Chart, async move {
-            let now = crate::time_range::now_ms();
+            let now = bp_common::now_ms();
             let since = now - range.window_ms();
             let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
@@ -1022,7 +1025,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Accepted, async move {
-            let since = crate::time_range::now_ms() - range.window_ms();
+            let since = bp_common::now_ms() - range.window_ms();
             let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
             let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
             let mut buckets: BTreeMap<i64, f64> = boundaries.iter().map(|&b| (b, 0.0)).collect();
@@ -1072,7 +1075,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Workers, async move {
-            let since = crate::time_range::now_ms() - range.window_ms();
+            let since = bp_common::now_ms() - range.window_ms();
             // Skinny projection (slot time + address + worker only) — the
             // distinct counting stays in-process; we just avoid shipping the
             // full 17-column stats row for every session in the window.
@@ -1135,6 +1138,7 @@ pub(crate) const REJECT_REASON_KEYS: &[&str] = &[
     "UnauthorizedWorker",
     "NotSubscribed",
     "Stale",
+    "VersionRollingNotAllowed",
 ];
 
 /// Normalise the reason string stored on `pool_rejected_statistics_entity`
@@ -1148,6 +1152,7 @@ pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
         "JobNotFound" => "JobNotFound",
         "DuplicateShare" => "DuplicateShare",
         "LowDifficultyShare" => "LowDifficultyShare",
+        "VersionRollingNotAllowed" => "VersionRollingNotAllowed",
         "UnauthorizedWorker" => "UnauthorizedWorker",
         "NotSubscribed" => "NotSubscribed",
         "Stale" => "Stale",
@@ -1173,7 +1178,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Rejected, async move {
-            let since = crate::time_range::now_ms() - range.window_ms();
+            let since = bp_common::now_ms() - range.window_ms();
             let rows = bp_db::find_pool_rejected_statistics_since(&s.pool, since).await?;
             let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
             let mut buckets: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
@@ -1246,7 +1251,7 @@ where
             "POOL_SHARE_TOTALS".to_string(),
             TtlKind::Shares,
             async move {
-                let now = crate::time_range::now_ms();
+                let now = bp_common::now_ms();
                 const DAY: i64 = 24 * 60 * 60 * 1000;
                 let day_rows = bp_db::find_pool_share_statistics_since(&s.pool, now - DAY).await?;
                 let fortnight_rows =
@@ -1365,7 +1370,20 @@ where
             TtlKind::SiteInfo,
             async move {
                 let blocks = find_found_blocks(&s.pool).await?;
-                let agents = find_user_agents(&s.pool).await?;
+                let sessions = bp_db::find_active_session_keys(&s.pool).await?;
+                let rows: Vec<bp_client_live::UserAgentSessionRow> = sessions
+                    .into_iter()
+                    .map(|r| bp_client_live::UserAgentSessionRow {
+                        user_agent: r.user_agent,
+                        address: r.address.into_inner(),
+                        worker: r.client_name,
+                        session_id: r.session_id,
+                    })
+                    .collect();
+                let agents = crate::error::or_degraded(
+                    bp_client_live::aggregate_by_user_agent(s.redis.as_ref(), &rows).await,
+                    || bp_client_live::aggregate_offline(&rows),
+                )?;
                 let scores = find_high_scores(&s.pool).await?;
                 Ok(InfoResponse {
                     block_data: blocks
@@ -1382,8 +1400,8 @@ where
                         .map(|a| UserAgentEntry {
                             user_agent: a.user_agent,
                             count: a.count,
-                            best_difficulty: a.best_difficulty,
-                            total_hash_rate: a.total_hash_rate,
+                            best_difficulty: Some(a.best_difficulty as f32),
+                            total_hash_rate: Some(a.total_hash_rate),
                         })
                         .collect(),
                     high_scores: scores
@@ -1436,7 +1454,7 @@ where
         "3d" => (3 * 24 * 60 * 60 * 1000_i64, 600_000_i64),
         _ => (7 * 24 * 60 * 60 * 1000_i64, 600_000_i64),
     };
-    let since = crate::time_range::now_ms() - window_ms;
+    let since = bp_common::now_ms() - window_ms;
     let cutoff_slot = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
     let rows = find_pool_mode_hashrate_since(&state.pool, mode, since).await?;
     Ok(Json(

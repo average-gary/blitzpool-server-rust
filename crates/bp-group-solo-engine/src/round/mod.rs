@@ -71,7 +71,7 @@ pub fn key_best_share(group_id: &str) -> String {
     key(group_id, "best-share")
 }
 /// Dedup zset `share_id → timestamp_ms` for exactly-once `record_share`,
-/// per group. Capped to the newest [`DEDUP_KEEP`] ids by rank.
+/// per group. Capped to the newest `DEDUP_KEEP` ids by rank.
 ///
 /// Scored by the SHARE'S OWN accept time, not by the per-group counter it
 /// used to use. The score's only job is rank ordering for the trim, and a
@@ -138,10 +138,11 @@ const DEDUP_KEEP: i64 = 100_000;
 
 /// Atomic, optionally-idempotent append of one accepted Group-Solo share.
 /// Round state is the per-address aggregate only (no per-share zset — PROP
-/// needs sums, not individual shares). KEYS[1]=total, [2]=by-address,
-/// [3]=last-accepted-share-at, [4]=applied. ARGV[1]=difficulty (string),
-/// [2]=address, [3]=timestamp_ms (string), [4]=share_id (empty ⇒ no dedup),
-/// [5]=keep-count. Same exactly-once contract as the PPLNS window: with a
+/// needs sums, not individual shares). `KEYS[1]`=total, `[2]`=by-address,
+/// `[3]`=last-accepted-share-at, `[4]`=applied. `ARGV[1]`=difficulty (string),
+/// `[2]`=address, `[3]`=timestamp_ms (string),
+/// `[4]`=share_id (empty ⇒ no dedup), `[5]`=keep-count. Same exactly-once
+/// contract as the PPLNS window: with a
 /// `share_id`, a redelivered share is a no-op and the marker is recorded in
 /// the same script, so a consumer crash between apply and ack can't
 /// double-count the round. No trim — Group-Solo is a PROP round.
@@ -166,11 +167,12 @@ return 1
 "#;
 
 /// Atomic, optionally-idempotent append of one accepted share into its TIME
-/// bucket for a `Window`-mode group. KEYS[1]=applied (dedup zset),
-/// [2]=wbuckets (index zset), [3]=window:by-address, [4]=wbucket:{bid},
-/// [5]=last-accepted-share-at. ARGV[1]=difficulty (string), [2]=address,
-/// [3]=share_id (empty ⇒ no dedup), [4]=dedup keep-count, [5]=bucket_id,
-/// [6]=timestamp_ms (also the dedup marker's score — see [`key_applied`]).
+/// bucket for a `Window`-mode group. `KEYS[1]`=applied (dedup zset),
+/// `[2]`=wbuckets (index zset), `[3]`=window:by-address, `[4]`=wbucket:{bid},
+/// `[5]`=last-accepted-share-at. `ARGV[1]`=difficulty (string), `[2]`=address,
+/// `[3]`=share_id (empty ⇒ no dedup), `[4]`=dedup keep-count,
+/// `[5]`=bucket_id,
+/// `[6]`=timestamp_ms (also the dedup marker's score — see [`key_applied`]).
 ///
 /// Aggregates the share into its time bucket + the window aggregate +
 /// registers the bucket in the index zset, all indivisibly so a snapshot taken
@@ -194,8 +196,9 @@ return 1
 "#;
 
 /// Drop the single oldest time bucket when it has aged out of the window.
-/// KEYS[1]=wbuckets (index zset), KEYS[2]=window:by-address. ARGV[1]=cutoff
-/// bucket id (drop buckets with id ≤ cutoff), ARGV[2]=bucket-key prefix.
+/// `KEYS[1]`=wbuckets (index zset), `KEYS[2]`=window:by-address.
+/// `ARGV[1]`=cutoff
+/// bucket id (drop buckets with id ≤ cutoff), `ARGV[2]`=bucket-key prefix.
 ///
 /// Decrements window:by-address by exactly the dropped bucket's per-address
 /// contribution, hDel-ing any address that hits ~0 so the aggregate doesn't
@@ -275,7 +278,7 @@ impl GroupRoundStore {
     ///
     /// Runs the whole append (total/by-address increments + the
     /// `last-accepted-share-at` touch, + the dedup marker) as one
-    /// indivisible Lua script ([`RECORD_SHARE_LUA`]) — same atomicity the old
+    /// indivisible Lua script (`RECORD_SHARE_LUA`) — same atomicity the old
     /// `MULTI/EXEC` gave. With a `Some(share_id)` it also dedups: a
     /// redelivered share whose id is still in the per-group dedup set is a
     /// no-op, and the marker is recorded in the same script. `None` keeps
@@ -313,7 +316,7 @@ impl GroupRoundStore {
 
     /// Append one accepted share into its time bucket for a `Window`-mode
     /// group, optionally exactly-once. The append runs as one indivisible Lua
-    /// script ([`RECORD_SHARE_WINDOWED_LUA`]) with the same dedup contract as
+    /// script (`RECORD_SHARE_WINDOWED_LUA`) with the same dedup contract as
     /// the PROP [`Self::record_share`]. Does NOT trim — the caller trims
     /// separately via [`Self::trim_window`] (on the same `now` as the share's
     /// timestamp). Returns `true` on a real append, `false` on a deduped no-op.

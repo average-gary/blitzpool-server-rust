@@ -13,7 +13,7 @@
 //! [`ApiError`]:
 //! - missing/invalid header → 401 `missing-token`
 //! - service not wired      → 503 `upstream-unavailable`
-//! - service rejects token  → 401/404 per [`GroupServiceError`]
+//! - service rejects token  → 401/404 per `GroupServiceError`
 //!
 //! `POST /api/pplns/groups/:id/...` paths are all protected with a
 //! per-group admin-token guard; this middleware collapses that single

@@ -122,8 +122,9 @@ pub struct SharedAcceptedShare<'a> {
 
     /// Core wall-clock time (epoch milliseconds) at which this share was
     /// accepted, stamped **once** at the protocol-agnostic projection
-    /// boundary (the SV1/SV2 adapters) via [`now_ms`]. Every downstream
-    /// sink MUST window / time-bucket on this value and never re-stamp
+    /// boundary (the SV1/SV2 adapters) via [`bp_common::now_ms`]. Every
+    /// downstream sink MUST window / time-bucket on this value and never
+    /// re-stamp
     /// `now()` at the sink. In a single process the two are microseconds
     /// apart, but once the share path and the accounting sinks can live in
     /// separate processes (Core/Satellite), a sink that re-stamps `now()`
@@ -183,21 +184,6 @@ impl ShareSequencer {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("{}:{}", self.epoch, seq)
     }
-}
-
-/// Stamp the current Core wall-clock time in epoch milliseconds.
-///
-/// Used by the SV1/SV2 adapters to fill [`SharedAcceptedShare::ts_ms`] at
-/// the moment a share enters the protocol-agnostic business layer. Uses
-/// `std::time` so the lean wire-protocol crates don't pull in `chrono`.
-/// A pre-1970 clock (impossible in practice) saturates to `0` rather than
-/// panicking.
-pub fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Hook for accepted shares. Engines implement this once and the

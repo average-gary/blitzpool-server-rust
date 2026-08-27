@@ -368,7 +368,7 @@ impl DistributionBuilder {
 ///
 /// The window IS the shares. Without it there is nothing to distribute,
 /// nothing may be invented, and the caller must serve no job at all
-/// ([`bp_mining_job::ResolvedPayouts::none`]) — so a window error
+/// (`bp_mining_job::ResolvedPayouts::none`) — so a window error
 /// propagates.
 ///
 /// The ledger is a set of PROMISES on top of that split, and a promise

@@ -62,7 +62,7 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::PplnsChart, async move {
-            let now_ms = crate::time_range::now_ms();
+            let now_ms = bp_common::now_ms();
             let since = now_ms - range.window_ms();
             let rows =
                 bp_db::find_pool_mode_hashrate_since(&s.pool, MiningMode::Pplns, since).await?;
@@ -194,27 +194,26 @@ where
     let user_agents = if addresses.is_empty() {
         Vec::new()
     } else {
-        sqlx::query!(
-            r#"SELECT
-                "userAgent" AS user_agent,
-                COUNT("userAgent")::bigint AS "count!",
-                MAX("bestDifficulty") AS best_difficulty,
-                SUM("hashRate") AS total_hash_rate
-               FROM client_entity
-               WHERE address = ANY($1)
-               GROUP BY "userAgent"
-               ORDER BY COUNT("userAgent") DESC"#,
-            &addresses as &[String]
-        )
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?
+        let sessions = bp_db::find_active_sessions_for_addresses(&state.pool, &addresses).await?;
+        let rows: Vec<bp_client_live::UserAgentSessionRow> = sessions
+            .into_iter()
+            .map(|r| bp_client_live::UserAgentSessionRow {
+                user_agent: r.user_agent,
+                address: r.address.into_inner(),
+                worker: r.client_name,
+                session_id: r.session_id,
+            })
+            .collect();
+        crate::error::or_degraded(
+            bp_client_live::aggregate_by_user_agent(state.redis.as_ref(), &rows).await,
+            || bp_client_live::aggregate_offline(&rows),
+        )?
         .into_iter()
-        .map(|r| UserAgentEntry {
-            user_agent: r.user_agent,
-            count: r.count.to_string(),
-            best_difficulty: r.best_difficulty.map(|d| d.floor() as u64),
-            total_hash_rate: r.total_hash_rate,
+        .map(|a| UserAgentEntry {
+            user_agent: a.user_agent,
+            count: a.count.to_string(),
+            best_difficulty: Some(a.best_difficulty.floor() as u64),
+            total_hash_rate: Some(a.total_hash_rate),
         })
         .collect()
     };

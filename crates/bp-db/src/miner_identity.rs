@@ -6,7 +6,7 @@
 //! (pays a fixed address) or `'rotating'` (pays a script derived from a
 //! descriptor at each block's height), and a `CHECK` constraint makes the
 //! half-populated combinations unrepresentable — see
-//! `crates/bp-db/migrations/0010_add_miner_identity.sql`.
+//! `crates/bp-db/migrations/0014_add_miner_identity.sql`.
 //!
 //! **Reads come back as [`MinerIdentityRow`], not as a `PayoutIdentity`.**
 //! Converting here would put a second constructor for the sum type in the data

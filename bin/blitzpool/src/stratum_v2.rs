@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV2 mining-server composition — Phase 7.4c.
+//! SV2 mining-server composition.
 //!
 //! Builds one [`StratumV2MiningServer`] per port (mirrors the SV1
 //! per-port-server topology in [`crate::stratum_v1`]). The shared
@@ -9,16 +9,16 @@
 //! SV2 server clone so `SetCustomMiningJob` routing works across
 //! ports.
 //!
-//! ## Scope of Phase 7.4c → 7.4d
+//! ## What the caller supplies
 //!
 //! - [`PayoutResolver`] is supplied by the caller from
-//!   [`crate::payout_resolver::ProductionPayoutResolver`] (Phase
-//!   7.4d). Pre-7.4d this module shipped a solo-only stub; the
+//!   [`crate::payout_resolver::ProductionPayoutResolver`]. This module
+//!   once shipped a solo-only stub instead; the
 //!   production resolver now consults the mode-gate + PPLNS /
 //!   Group-Solo engine round state to assemble the real per-mode
 //!   coinbase distribution.
 //!
-//! - [`BlockSubmissionSink`] is [`crate::block_sink::TdpBlockSubmissionSink`].
+//! - `BlockSubmissionSink` is [`crate::block_sink::TdpBlockSubmissionSink`].
 //!   The SV2 `ShareAccept` carries the assembled witness coinbase, the
 //!   `template_id`, and the per-job pinned `coinbase_tx_value_remaining`, so
 //!   the block-found path submits the solution via TDP AND writes the per-mode
@@ -73,7 +73,7 @@ use crate::stratum_v1::{
 };
 
 /// Per-port SV2 mining server bundle. One entry per port (mirrors
-/// [`crate::stratum_v1::Sv1PortServer`]). Carries the SV2 [`PortConfig`]
+/// [`crate::stratum_v1::Sv1PortServer`]). Carries the SV2 `PortConfig`
 /// (different shape from SV1's) so the unified accept-loop can hand it
 /// in to `accept_connection`.
 pub(crate) struct Sv2PortServer {
@@ -164,6 +164,7 @@ pub(crate) fn build_per_port_servers(
     noise_config: NoiseConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
+    custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
     // The pool's one rotating-identity intake — the same `Arc` SV1 gets, built
     // in `crate::stratum`. See SV1's `build_per_port_servers`.
     rotating_intake: Arc<dyn bp_common::RotatingIntake>,
@@ -189,7 +190,7 @@ pub(crate) fn build_per_port_servers(
     let sv1_port_configs = stratum_v1::build_port_configs(cfg);
     let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
     let mode_gate = engines.mode_gate.clone();
-    // Phase 7.4d + 7.7: TDP submit + (engine ledger + dispatcher notification)
+    // TDP submit + (engine ledger + dispatcher notification)
     // fan-out. The SV2 ShareAccept now carries the per-job pinned
     // `coinbase_tx_value_remaining`, so the engine ledger-write fires for
     // SV2-found blocks just like SV1; the dispatcher notification fires too.
@@ -219,7 +220,7 @@ pub(crate) fn build_per_port_servers(
     }
     let block_sink: Arc<dyn Sv2BlockSink> = sink.into_sv2_arc();
 
-    // Phase 7.7: device-status sink. Forwards ChannelOpened / ChannelClosed.
+    // Device-status sink. Forwards ChannelOpened / ChannelClosed.
     // With an in-process dispatcher (a front co-located with the `notify` role)
     // it fires directly; without one the front publishes to the `device:status`
     // stream so the Satellite fans it out — never a silent drop. (Stratum only
@@ -247,6 +248,7 @@ pub(crate) fn build_per_port_servers(
             engines.payout_identities.clone(),
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
+            custom_extranonce.clone(),
         );
 
         // Subscribe + snapshot — broadcast catches future updates,
@@ -326,6 +328,7 @@ fn build_port_hooks(
     payout_identities: Arc<PayoutIdentityDirectory>,
     device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
+    custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
 ) -> MiningServerHooks {
     // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
@@ -365,6 +368,7 @@ fn build_port_hooks(
         rejected_sink: rejected,
         session_persistence: session,
         device_status_sink,
+        custom_extranonce,
         rotating_intake: Some(rotating_intake),
     }
 }

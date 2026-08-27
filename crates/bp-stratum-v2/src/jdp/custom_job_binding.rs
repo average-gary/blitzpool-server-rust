@@ -10,27 +10,31 @@
 //! ## What this is NOT about
 //!
 //! Revenue. This module does not look at fees, does not compare the block's
-//! value against anything, and does not reject a JDC for declaring an empty
-//! or low-fee template. **Which transactions a JDC mines is its own call —
-//! that is the entire point of job declaration**, and a small `T` is a
-//! smaller block for everyone in the distribution, not a fault. §4 already
-//! requires the coinbase to pay out exactly the `T` its own template yields,
-//! and `SetCustomMiningJob` is checked against the published distribution
-//! independently ([`crate::jdp::payout_distribution`]), so the split is
-//! guarded regardless of what was declared. Settlement then books from the
-//! block's own coinbase at whatever `T` it actually paid, so a low-revenue
-//! block needs no detection to be booked correctly.
+//! value against anything, and does not reject a JDC for declaring an empty or
+//! low-fee template. **Which transactions a JDC mines is its own call — that
+//! is the entire point of job declaration**, and a small `T` is a smaller
+//! block for everyone in the distribution, not a fault.
+//! ext 0x0003/Payout Computation already requires the coinbase to pay out
+//! exactly the `T` its own template yields, and `SetCustomMiningJob` is
+//! checked against the published distribution independently
+//! ([`crate::jdp::payout_distribution`]), so the split is guarded regardless
+//! of what was declared. Settlement then books from the block's own coinbase
+//! at whatever `T` it actually paid, so a low-revenue block needs no detection
+//! to be booked correctly.
 //!
 //! ## What it IS about
 //!
 //! Making the node validation apply to the job being mined.
 //!
 //! `jdp_server` hands every declaration to bitcoin-core before accepting it
-//! (SV2 §6.1 — `checkBlock` over the job-declaration IPC). That establishes
-//! that the DECLARED transaction set is one a block could be built from.
-//! The mining side never repeats it: `SetCustomMiningJob.merkle_path` goes
-//! into the [`crate::mining::jobs::ExtendedJob`] unexamined, and the §7.1
-//! coinbase check says nothing about the transaction set hanging off it.
+//! (SV2 JDP/Job Declarator Server — `checkBlock` over the job-declaration
+//! IPC). That establishes that the DECLARED transaction set is one a block
+//! could be built from. The mining side never repeats it:
+//! `SetCustomMiningJob.merkle_path` goes into the
+//! [`crate::mining::jobs::ExtendedJob`] unexamined, and the
+//! ext 0x0003/Output Verification coinbase check says nothing about the
+//! transaction set hanging
+//! off it.
 //!
 //! Without this comparison, "the declaration passed the node" and "this job
 //! pays the published distribution" are two true statements about two
@@ -44,10 +48,10 @@
 //! - It is only worth as much as the validator behind it. `job_validator` is
 //!   optional; with none wired, declarations are accepted untested and this
 //!   binds a job to an unverified one.
-//! - Coinbase-only jobs have no declaration to bind, so the same freedom
-//!   over the transaction set exists there. That is base JDP §6.3.1 and is
-//!   accepted, not closed here. This raises a Full-Template declaration back
-//!   to meaning what it says, nothing wider.
+//! - Coinbase-only jobs have no declaration to bind, so the same freedom over
+//!   the transaction set exists there. That is SV2 JDP/Coinbase-only Mode and
+//!   is accepted, not closed here. This raises a Full-Template declaration
+//!   back to meaning what it says, nothing wider.
 //!
 //! This module is pure. It projects a stored [`DeclaredJob`] down to the
 //! fields `SetCustomMiningJob` repeats ([`DeclaredJobBinding`]) and compares
@@ -186,6 +190,42 @@ pub fn check_custom_job(
     binding: &DeclaredJobBinding,
     mined: MinedJobFields<'_>,
 ) -> Result<(), BindingViolation> {
+    // EXACT, BIP-323 general-purpose bits (0x1fffffe0) included. Re-examined
+    // 2026-08-15 against the current spec and left alone, because both field
+    // descriptions name BIP-323 and that reads at first like a licence for
+    // the two to differ:
+    //
+    //   SV2 JDP/DeclareMiningJob.version — "Version header field. To be
+    //   later modified by BIP323-consistent changes."
+    //   SV2 Mining/SetCustomMiningJob.version — "... The general purpose bits
+    //   (as specified in BIP323) can be freely manipulated by the downstream
+    //   node."
+    //
+    // Neither says these two may differ FROM EACH OTHER. Where the spec means
+    // that, it says so without room to read it otherwise, and it says it in
+    // exactly one place: SV2 TDP/SubmitSolution.version — "Bits not defined by
+    // BIP323 as additional nonce MUST be the same as they appear in the
+    // NewTemplate message, other bits may be set to any value." That is the
+    // MINED HEADER against its template, and "to be LATER modified" is the
+    // same rule foreshadowed: later means at hashing time, not at the next
+    // message. SV2 Mining/SetCustomMiningJob.version's sentence is in turn
+    // copied verbatim from SV2 Mining/NewMiningJob.version, where "the
+    // downstream node" is the node that HASHES the job — it describes rolling,
+    // not a second base version.
+    //
+    // The reference agrees on both sides: its JDS compares the two for exact
+    // equality under a comment that lists `version` among the fields which
+    // must match (sv2-apps v0.7.0,
+    // `jd-server/src/lib/job_declarator/job_validation/bitcoin_core_ipc.rs`,
+    // `handle_set_custom_mining_job`), and its JDC builds both fields from
+    // the same `template.version`, so equality holds by construction.
+    //
+    // Rolling is unaffected by any of this. Nothing downstream reads the
+    // DECLARED version: `handle_push_solution` builds the found header from
+    // the SOLUTION's version and share validation from the SUBMISSION's, both
+    // verbatim. Masking here would widen only what a *base* version may be —
+    // and a JDC that needs it would still be refused by the reference JDS,
+    // i.e. everywhere but here.
     if binding.version != mined.version {
         return Err(BindingViolation::Version);
     }
@@ -409,6 +449,47 @@ mod tests {
             check_custom_job(&binding, m),
             Err(BindingViolation::MerklePath)
         );
+    }
+
+    /// The version compare is exact INCLUDING the BIP-323 general-purpose
+    /// bits — a decision, argued at the check itself, not an oversight.
+    ///
+    /// It needs a case of its own because `every_bound_field_is_checked`
+    /// flips bit 0, which lies OUTSIDE the BIP-323 mask: relax the compare to
+    /// `binding.version & !MASK != mined.version & !MASK` and that test still
+    /// passes, so it pins nothing here. This one fails the moment anyone
+    /// masks.
+    #[test]
+    fn a_bip323_only_difference_is_still_a_version_violation() {
+        /// Bits 5–28 inclusive.
+        const BIP323_MASK: u32 = 0x1fff_ffe0;
+
+        let binding = binding_from_declared_job(&declared_job(2)).expect("must project");
+        // Positive control: the declared version passes.
+        assert_eq!(check_custom_job(&binding, mined_from(&binding)), Ok(()));
+
+        // Lowest, a middle one, and the highest bit the mask covers.
+        for bit in [5u32, 12, 28] {
+            let mut m = mined_from(&binding);
+            m.version = binding.version | (1 << bit);
+            // Pins the shape of the tamper, so this cannot pass for a reason
+            // that has nothing to do with BIP-323: the versions DO differ,
+            // and they differ only inside the mask.
+            assert_ne!(
+                m.version, binding.version,
+                "bit {bit} must change the value"
+            );
+            assert_eq!(
+                m.version & !BIP323_MASK,
+                binding.version & !BIP323_MASK,
+                "bit {bit} must lie inside the BIP-323 mask"
+            );
+            assert_eq!(
+                check_custom_job(&binding, m),
+                Err(BindingViolation::Version),
+                "a BIP-323-only difference in bit {bit} must not pass"
+            );
+        }
     }
 
     /// The scriptSig prefix carries the BIP-34 height push, and the pool

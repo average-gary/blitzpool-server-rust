@@ -23,7 +23,7 @@ pub struct DeviceStatusArgs<'a> {
     pub worker_name: Option<&'a str>,
     pub is_online: bool,
     pub is_returning: bool,
-    /// Trailing " – Adresse <fmt>" / " – address <fmt>" suffix used
+    /// Trailing `" – Adresse <fmt>"` / `" – address <fmt>"` suffix used
     /// in multi-address Telegram chats. `None` skips the suffix
     /// (single-address chats / ntfy).
     pub address_suffix: Option<&'a str>,
