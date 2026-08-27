@@ -13,14 +13,13 @@ use sqlx::{postgres::PgPool, FromRow};
 
 use crate::DbError;
 
+/// The birth half of a session. The live half (`hashRate`,
+/// `currentDifficulty`, `channelCount`, per-session `bestDifficulty`,
+/// last-seen) lives in the `client:live:*` Redis hashes — consumers
+/// compose it via `bp_client_live::live_fields_for_sessions`, keyed by
+/// the same `(address, client_name, session_id)` triple.
 #[derive(Clone, Debug, FromRow)]
 pub struct ClientRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
     pub address: AddressId,
     #[sqlx(rename = "clientName")]
     pub client_name: String,
@@ -30,20 +29,18 @@ pub struct ClientRow {
     pub user_agent: Option<String>,
     #[sqlx(rename = "startTime")]
     pub start_time: i64,
-    #[sqlx(rename = "firstSeen")]
-    pub first_seen: Option<i64>,
-    #[sqlx(rename = "bestDifficulty")]
-    pub best_difficulty: f32,
-    #[sqlx(rename = "hashRate")]
-    pub hash_rate: f64,
-    #[sqlx(rename = "currentDifficulty")]
-    pub current_difficulty: Option<f32>,
-    /// Number of mining channels on this session's connection. `1` for a
-    /// direct miner; `> 1` when a rental proxy bundles several same-rig
-    /// devices onto one connection — the UI flags the difficulty as
-    /// aggregated in that case.
-    #[sqlx(rename = "channelCount")]
-    pub channel_count: i32,
+}
+
+impl bp_common::live_client_key::SessionKey for ClientRow {
+    fn address(&self) -> &str {
+        self.address.as_str()
+    }
+    fn worker(&self) -> &str {
+        &self.client_name
+    }
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 pub async fn find_client(
@@ -55,19 +52,11 @@ pub async fn find_client(
     sqlx::query_as!(
         ClientRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
             address AS "address!: AddressId",
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!",
-            "firstSeen" AS "first_seen?",
-            "bestDifficulty" AS "best_difficulty!",
-            "hashRate" AS "hash_rate!",
-            "currentDifficulty" AS "current_difficulty?",
-            "channelCount" AS "channel_count!"
+            "startTime" AS "start_time!"
            FROM client_entity
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3 LIMIT 1"#,
         address.as_str(),
@@ -88,19 +77,11 @@ pub async fn find_clients_by_address(
     sqlx::query_as!(
         ClientRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
             address AS "address!: AddressId",
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!",
-            "firstSeen" AS "first_seen?",
-            "bestDifficulty" AS "best_difficulty!",
-            "hashRate" AS "hash_rate!",
-            "currentDifficulty" AS "current_difficulty?",
-            "channelCount" AS "channel_count!"
+            "startTime" AS "start_time!"
            FROM client_entity
            WHERE address = $1 AND "deletedAt" IS NULL
            ORDER BY "clientName", "sessionId""#,
@@ -111,49 +92,57 @@ pub async fn find_clients_by_address(
     .map_err(DbError::from)
 }
 
-/// Sum of `hashRate` across every non-soft-deleted client row — powers
-/// the `/api/pool` `totalHashRate` field and operator-dashboard
-/// endpoints.
-pub async fn sum_active_pool_hashrate(pool: &PgPool) -> Result<f64, DbError> {
-    let row = sqlx::query!(
-        r#"SELECT COALESCE(SUM("hashRate"), 0.0)::float8 AS "total!"
+/// Every **active** session's `(userAgent, key triple)` — the PG half
+/// of the `/api/info` `userAgents` aggregation; the numbers come from
+/// the `client:live:*` hashes via
+/// `bp_client_live::aggregate_by_user_agent`. The `deletedAt IS NULL`
+/// filter keeps an idle pool from emitting a ghost
+/// `{userAgent: null, count: 0}` entry.
+pub async fn find_active_session_keys(pool: &PgPool) -> Result<Vec<ClientRow>, DbError> {
+    sqlx::query_as!(
+        ClientRow,
+        r#"SELECT
+            address AS "address!: AddressId",
+            "clientName" AS "client_name!",
+            "sessionId" AS "session_id!",
+            "userAgent" AS "user_agent?",
+            "startTime" AS "start_time!"
            FROM client_entity
            WHERE "deletedAt" IS NULL"#,
     )
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
-    .map_err(DbError::from)?;
-    Ok(row.total)
+    .map_err(DbError::from)
 }
 
-/// One row of the user-agent aggregation surfaced by `/api/info` →
-/// `userAgents` (`userAgent`, `count`, `bestDifficulty`, `totalHashRate`).
-#[derive(Clone, Debug, FromRow)]
-pub struct UserAgentAggRow {
-    #[sqlx(rename = "userAgent")]
-    pub user_agent: Option<String>,
-    pub count: i64,
-    #[sqlx(rename = "bestDifficulty")]
-    pub best_difficulty: Option<f32>,
-    #[sqlx(rename = "totalHashRate")]
-    pub total_hash_rate: Option<f64>,
-}
-
-/// GROUP BY `userAgent` over the **active** rows in `client_entity`
-/// — `deletedAt IS NULL` filter so an idle pool with only soft-deleted
-/// sessions doesn't emit a ghost `{userAgent: null, count: 0}` entry.
-/// Ordered by `count DESC`.
-pub async fn find_user_agents(pool: &PgPool) -> Result<Vec<UserAgentAggRow>, DbError> {
-    sqlx::query_as::<_, UserAgentAggRow>(
+/// Active session rows for an address list — the PG half of
+/// `/api/pplns`'s `userAgents` aggregation and of the group roster's
+/// per-member session stats.
+///
+/// The inline SQL this replaced had no `deletedAt` filter, and while it
+/// summed and counted the same rows that was merely generous. It is not
+/// any more: the numbers come from the live hashes, which a retired
+/// session no longer has, so counting its ghost row would report
+/// `count: 31` next to one session's hashrate. Count and sums have to
+/// describe the same population.
+pub async fn find_active_sessions_for_addresses(
+    pool: &PgPool,
+    addresses: &[String],
+) -> Result<Vec<ClientRow>, DbError> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        ClientRow,
         r#"SELECT
-            "userAgent",
-            COUNT("userAgent") AS count,
-            MAX("bestDifficulty") AS "bestDifficulty",
-            SUM("hashRate") AS "totalHashRate"
+            address AS "address!: AddressId",
+            "clientName" AS "client_name!",
+            "sessionId" AS "session_id!",
+            "userAgent" AS "user_agent?",
+            "startTime" AS "start_time!"
            FROM client_entity
-           WHERE "deletedAt" IS NULL
-           GROUP BY "userAgent"
-           ORDER BY COUNT("userAgent") DESC"#,
+           WHERE address = ANY($1) AND "deletedAt" IS NULL"#,
+        addresses,
     )
     .fetch_all(pool)
     .await
@@ -312,31 +301,6 @@ pub async fn find_client_rejected_statistics_since_for_address(
     .fetch_all(pool)
     .await
     .map_err(DbError::from)
-}
-
-/// Sum of `hashRate` across non-soft-deleted clients whose `address`
-/// is in the input list. Used by `/pplns_status` (sum across the
-/// PPLNS distribution) + `/group_status` (sum across group members).
-/// Empty input returns `0.0` without hitting PG.
-pub async fn sum_hashrate_for_addresses(
-    pool: &PgPool,
-    addresses: &[AddressId],
-) -> Result<f64, DbError> {
-    if addresses.is_empty() {
-        return Ok(0.0);
-    }
-    let addr_strs: Vec<&str> = addresses.iter().map(|a| a.as_str()).collect();
-    let row = sqlx::query!(
-        r#"SELECT COALESCE(SUM("hashRate"), 0.0)::float8 AS "total!"
-           FROM client_entity
-           WHERE "deletedAt" IS NULL
-             AND address = ANY($1)"#,
-        &addr_strs as &[&str],
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(row.total)
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -595,11 +559,8 @@ pub async fn find_worker_shares(
 /// row by surviving the debounce window, so a probe that authorizes and
 /// hangs up right away never reaches this type. `firstSeen` is set to
 /// `start_time_ms` (the authorize timestamp) on INSERT and left
-/// unchanged on re-register conflicts. `bestDifficulty` starts at its
-/// column default `0` (`NOT NULL`) until the first touch raises it.
-///
-/// `current_difficulty` is `None` on the production path — vardiff
-/// freshness is owned by the share-touch flush; test seeds may set it.
+/// unchanged on re-register conflicts. The live per-share values live
+/// in the session's `client:live:*` Redis hash, not in this table.
 #[derive(Clone, Debug)]
 pub struct ClientUpsert {
     pub address: String,
@@ -607,16 +568,14 @@ pub struct ClientUpsert {
     pub session_id: String,
     pub user_agent: Option<String>,
     pub start_time_ms: i64,
-    pub current_difficulty: Option<f32>,
 }
 
 /// The one INSERT … ON CONFLICT statement behind [`upsert_client`] and
 /// [`bulk_upsert_clients`] — keyed on the composite PK
 /// `(address, clientName, sessionId)`. The conflict arm covers a
 /// re-register with the same sessionId: refreshes `userAgent`,
-/// `startTime`, `currentDifficulty`, and clears `deletedAt` so a
-/// previously soft-deleted session is reactivated without leaking the
-/// soft-delete flag.
+/// `startTime`, and clears `deletedAt` so a previously soft-deleted
+/// session is reactivated without leaking the soft-delete flag.
 ///
 /// `rows` must be unique per `(address, clientName, sessionId)` —
 /// `ON CONFLICT DO UPDATE` rejects a statement that hits the same row
@@ -631,21 +590,19 @@ where
     let mut session_ids = Vec::with_capacity(rows.len());
     let mut user_agents: Vec<Option<String>> = Vec::with_capacity(rows.len());
     let mut start_times = Vec::with_capacity(rows.len());
-    let mut current_difficulties: Vec<Option<f32>> = Vec::with_capacity(rows.len());
     for row in rows {
         addresses.push(row.address.clone());
         client_names.push(row.client_name.clone());
         session_ids.push(row.session_id.clone());
         user_agents.push(row.user_agent.clone());
         start_times.push(row.start_time_ms);
-        current_difficulties.push(row.current_difficulty);
     }
     let result = sqlx::query!(
         r#"INSERT INTO client_entity
              (address, "clientName", "sessionId", "userAgent", "startTime", "firstSeen",
-              "currentDifficulty", "createdAt", "updatedAt")
+              "createdAt", "updatedAt")
            SELECT u.address, u.client_name, u.session_id, u.user_agent,
-                  u.start_time, u.start_time, u.current_difficulty,
+                  u.start_time, u.start_time,
                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
            FROM (
@@ -654,13 +611,11 @@ where
                    unnest($2::text[])   AS client_name,
                    unnest($3::text[])   AS session_id,
                    unnest($4::text[])   AS user_agent,
-                   unnest($5::bigint[]) AS start_time,
-                   unnest($6::real[])   AS current_difficulty
+                   unnest($5::bigint[]) AS start_time
            ) AS u
            ON CONFLICT (address, "clientName", "sessionId") DO UPDATE
            SET "userAgent"         = EXCLUDED."userAgent",
                "startTime"         = EXCLUDED."startTime",
-               "currentDifficulty" = EXCLUDED."currentDifficulty",
                "updatedAt"         = EXCLUDED."updatedAt",
                "deletedAt"         = NULL"#,
         &addresses,
@@ -668,7 +623,6 @@ where
         &session_ids,
         &user_agents as &[Option<String>],
         &start_times,
-        &current_difficulties as &[Option<f32>],
     )
     .execute(executor)
     .await
@@ -687,11 +641,50 @@ where
     upsert_clients_stmt(executor, std::slice::from_ref(row)).await
 }
 
+/// Advisory-lock key serialising the multi-row writers of
+/// `client_entity`: the row-birth upsert, the dead-session sweep, and
+/// its repair half.
+///
+/// Postgres takes row locks in processing order, and each of these
+/// builds its arrays from an unordered source (a `HashMap` for the
+/// births, a query result for the sweep), so two of them running
+/// concurrently over shared rows can deadlock. That is measured, not
+/// theoretical: 46 deadlocks in ~90 minutes on the prod accounting
+/// process (2026-08-05), back when the touch flush and the hashrate
+/// sampler collided every 60 s.
+///
+/// Sorting the inputs would NOT fix it — the planner may reorder the
+/// join, so input order does not determine lock order. Serialising the
+/// writers does. A process-local mutex would not do either: births run
+/// on the Front, the sweep on the accounting role, i.e. two processes.
+///
+/// ⚠️ Any future multi-row writer of `client_entity` MUST take this
+/// lock too.
+///
+/// The hot writers this lock was born for are gone (the live fields
+/// live in Redis now), so it no longer sits between two 30 s/60 s
+/// statements over the same 700 rows — it now serialises ~9 births per
+/// minute against a once-per-minute sweep that usually touches nothing.
+const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
+
+/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`. The
+/// `_xact_` variant releases on commit OR rollback, so an error path
+/// cannot leak the lock and wedge the other writer.
+async fn take_client_entity_bulk_write_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock($1)",
+        CLIENT_ENTITY_BULK_WRITE_LOCK
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(DbError::from)?;
+    Ok(())
+}
+
 /// Insert / upsert N client rows in one statement — the row-birth flush
-/// of the session-persistence debounce. Runs in its own transaction and
-/// takes `CLIENT_ENTITY_BULK_WRITE_LOCK` first: the INSERT takes
-/// unique-index locks on the same PK space the other bulk writers
-/// UPDATE over, and disjoint columns do not prevent a deadlock.
+/// of the session-persistence debounce.
 pub async fn bulk_upsert_clients(pool: &PgPool, rows: &[ClientUpsert]) -> Result<u64, DbError> {
     let mut tx = pool.begin().await.map_err(DbError::from)?;
     take_client_entity_bulk_write_lock(&mut tx).await?;
@@ -722,30 +715,161 @@ where
     Ok(result.rows_affected())
 }
 
-/// Soft-delete every `client_entity` row whose `updatedAt` is older
-/// than `cutoff_ms` and which isn't already soft-deleted. The periodic
-/// cleanup pass run on a 60s interval that catches sessions whose
-/// disconnect path didn't fire properly (network drop without a clean FIN).
-/// Returns the number of rows soft-deleted.
-///
-/// The 60s cron orchestration that drives this lands in `bin/blitzpool`.
-/// This function is the leaf bp-db primitive — same shape as
-/// `delete_client_for_session`, just keyed on the staleness predicate
-/// rather than a specific session-id.
-pub async fn kill_dead_clients<'e, E>(executor: E, cutoff_ms: i64) -> Result<u64, DbError>
+/// Active sessions whose `updatedAt` is older than `cutoff_ms` — the
+/// CANDIDATES of the dead-session sweep, not its verdict. `updatedAt`
+/// is only stamped at birth, re-register, and soft-delete now, so age
+/// alone no longer means "silent": the cron in `bin/blitzpool` checks
+/// each candidate's `client:live:*` key and soft-deletes (via
+/// [`soft_delete_sessions`]) only those whose live hash is gone. The
+/// age predicate survives purely as the birth grace period — a session
+/// younger than the cutoff may not have flushed its first touch yet.
+pub async fn find_stale_active_sessions<'e, E>(
+    executor: E,
+    cutoff_ms: i64,
+) -> Result<Vec<ClientRow>, DbError>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let result = sqlx::query!(
-        r#"UPDATE client_entity
-           SET "deletedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
-               "updatedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+    sqlx::query_as!(
+        ClientRow,
+        r#"SELECT
+            address AS "address!: AddressId",
+            "clientName" AS "client_name!",
+            "sessionId" AS "session_id!",
+            "userAgent" AS "user_agent?",
+            "startTime" AS "start_time!"
+           FROM client_entity
            WHERE "updatedAt" < $1 AND "deletedAt" IS NULL"#,
         cutoff_ms
     )
-    .execute(executor)
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::from)
+}
+
+/// Soft-delete the given sessions (parallel key arrays), skipping any
+/// that were re-registered or soft-deleted in the meantime. The verdict
+/// half of the dead-session sweep — see [`find_stale_active_sessions`].
+pub async fn soft_delete_sessions(
+    pool: &PgPool,
+    addresses: &[String],
+    client_names: &[String],
+    session_ids: &[String],
+) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
+    let result = sqlx::query!(
+        r#"UPDATE client_entity AS t
+           SET "deletedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
+               "updatedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+           FROM (
+               SELECT
+                   unnest($1::text[]) AS address,
+                   unnest($2::text[]) AS "clientName",
+                   unnest($3::text[]) AS "sessionId"
+           ) AS u
+           WHERE t.address      = u.address
+             AND t."clientName" = u."clientName"
+             AND t."sessionId"  = u."sessionId"
+             AND t."deletedAt" IS NULL"#,
+        addresses,
+        client_names,
+        session_ids,
+    )
+    .execute(&mut *tx)
     .await
     .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
+/// One soft-deleted session, for the sweep's repair half.
+#[derive(Clone, Debug, FromRow)]
+pub struct DeletedSessionRow {
+    pub address: AddressId,
+    #[sqlx(rename = "clientName")]
+    pub client_name: String,
+    #[sqlx(rename = "sessionId")]
+    pub session_id: String,
+    #[sqlx(rename = "deletedAt")]
+    pub deleted_at: i64,
+}
+
+impl bp_common::live_client_key::SessionKey for DeletedSessionRow {
+    fn address(&self) -> &str {
+        self.address.as_str()
+    }
+    fn worker(&self) -> &str {
+        &self.client_name
+    }
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+/// Sessions soft-deleted at or after `since_ms` — the input to the
+/// sweep's REPAIR half ([`revive_sessions`]).
+///
+/// The live fields left Postgres, and with them the touch UPDATE that
+/// used to carry `"deletedAt" = NULL` and undo a wrong sweep on its next
+/// 30 s pass. Nothing else ever cleared the flag, so a session
+/// soft-deleted by mistake — Redis restarted empty, its key was evicted
+/// — stayed invisible for the rest of its TCP connection, i.e. days.
+/// The sweep now reconciles in both directions instead.
+pub async fn find_recently_deleted_sessions(
+    pool: &PgPool,
+    since_ms: i64,
+) -> Result<Vec<DeletedSessionRow>, DbError> {
+    sqlx::query_as!(
+        DeletedSessionRow,
+        r#"SELECT
+            address AS "address!: AddressId",
+            "clientName" AS "client_name!",
+            "sessionId" AS "session_id!",
+            "deletedAt" AS "deleted_at!"
+           FROM client_entity
+           WHERE "deletedAt" IS NOT NULL AND "deletedAt" >= $1"#,
+        since_ms,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)
+}
+
+/// Clear `deletedAt` for the given sessions — the repair half of the
+/// dead-session sweep. The caller decides who qualifies; the rule is
+/// "its live hash has been written SINCE the soft-delete", which only a
+/// session that kept mining can satisfy.
+pub async fn revive_sessions(
+    pool: &PgPool,
+    addresses: &[String],
+    client_names: &[String],
+    session_ids: &[String],
+) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
+    let result = sqlx::query!(
+        r#"UPDATE client_entity AS t
+           SET "deletedAt" = NULL,
+               "updatedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+           FROM (
+               SELECT
+                   unnest($1::text[]) AS address,
+                   unnest($2::text[]) AS "clientName",
+                   unnest($3::text[]) AS "sessionId"
+           ) AS u
+           WHERE t.address      = u.address
+             AND t."clientName" = u."clientName"
+             AND t."sessionId"  = u."sessionId"
+             AND t."deletedAt" IS NOT NULL"#,
+        addresses,
+        client_names,
+        session_ids,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
 
@@ -864,59 +988,6 @@ where
     Ok(r.rows_affected())
 }
 
-/// Per-share touch of a session's `client_entity` row. Called from the
-/// share-accept hook so the row stays alive (kill_dead_clients
-/// otherwise sweeps it after a few minutes of no UPDATE), reflects
-/// the best difficulty the session has ever solved, sets `firstSeen`
-/// on the first share, and keeps `currentDifficulty` in step with the
-/// vardiff target the miner is currently working at.
-///
-/// `hashRate` is **not** written here — that column is owned by the live
-/// hashrate sampler (bp-session-persistence), which writes a self-zeroing
-/// 2-min moving average on its own cadence. A per-share touch of the
-/// column would fight the sampler.
-///
-/// `share_diff` is the share-accepted difficulty (the all-time best
-/// uses GREATEST). `current_diff` is the difficulty currently assigned
-/// to the session (vardiff target) — pass `None` to leave the column
-/// unchanged. `now_ms` is wall-clock epoch-ms.
-#[allow(clippy::too_many_arguments)]
-pub async fn touch_client_for_share<'e, E>(
-    executor: E,
-    address: &str,
-    client_name: &str,
-    session_id: &str,
-    share_diff: f64,
-    current_diff: Option<f64>,
-    channel_count: i32,
-    now_ms: i64,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"UPDATE client_entity
-           SET "bestDifficulty"    = GREATEST("bestDifficulty", $4::real),
-               "currentDifficulty" = COALESCE($6::real, "currentDifficulty"),
-               "firstSeen"         = COALESCE("firstSeen", $5),
-               "channelCount"      = $7,
-               "updatedAt"         = $5,
-               "deletedAt"         = NULL
-           WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
-        address,
-        client_name,
-        session_id,
-        share_diff as f32,
-        now_ms,
-        current_diff.map(|d| d as f32),
-        channel_count,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
 /// When the pool first saw one `(address, clientName)` pair —
 /// see [`device_first_seen`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -941,7 +1012,8 @@ pub struct DeviceFirstSeenRow {
 /// This is the authoritative connectivity answer for the device-status
 /// debounce: `deletedAt` is cleared by [`upsert_client`] on register,
 /// stamped by [`delete_client_for_session`] on disconnect, and swept by
-/// [`kill_dead_clients`] when a session dies without a clean FIN. Asking
+/// the dead-session cron (via [`soft_delete_sessions`]) when a session
+/// dies without a clean FIN. Asking
 /// the table at notification time — rather than counting connect and
 /// disconnect events in memory — is what makes the debounce survive a
 /// process restart and stay correct across several Stratum fronts.
@@ -987,6 +1059,12 @@ pub async fn device_first_seen(
 /// restart. Without it the gate would only ever learn about a device from
 /// a Stratum event, so a miner that died just before the restart — and
 /// will therefore never emit another event — could never be reported.
+///
+/// ⚠️ Since the live fields moved to Redis, `updatedAt` is no longer
+/// touched per share — the `ORDER BY "updatedAt"` inside the aggregate
+/// now picks the user agent of the most recently born or soft-deleted
+/// session rather than the most recently *touched* one. Accepted drift:
+/// this only seasons the seed's user-agent string, never liveness.
 pub async fn device_watch_seed(
     pool: &PgPool,
     addresses: &[String],
@@ -1009,185 +1087,4 @@ pub async fn device_watch_seed(
         .into_iter()
         .map(|r| (r.address, r.client_name, r.user_agent))
         .collect())
-}
-
-/// Advisory-lock key serialising the bulk writers of `client_entity`
-/// (the two bulk UPDATEs below plus [`bulk_upsert_clients`]).
-///
-/// The bulk updates drive `UPDATE … FROM unnest(...)` over the SAME
-/// rows, and each builds its arrays by iterating a `HashMap` — so the
-/// row orders are arbitrary and mutually different. Postgres takes row locks
-/// in processing order, so two of them running concurrently deadlock. That is
-/// measured, not theoretical: 46 times in ~90 minutes on the prod accounting
-/// process (2026-08-05), where the 30 s touch flush and the 60 s hashrate
-/// sampler collide on every sampler tick. `deadlock_timeout` is 1 s, which is
-/// why both statements ALSO trip the 1 s slow-statement warning first — that
-/// warning is a symptom, not a second problem.
-///
-/// Sorting the input arrays would NOT fix it: the planner may reorder the
-/// join, so input order does not guarantee lock order. Serialising the
-/// writers does.
-///
-/// A process-local mutex would not be enough either. `payout` and `stats` are
-/// separate roles and `consumes_streams = (payout || stats) && !front`, so an
-/// operator may split them into two processes — both of which run the stream
-/// consumer, hence both bulk writers. An advisory lock holds across
-/// processes; a mutex would silently stop working the day someone splits the
-/// roles.
-///
-/// ⚠️ Any future bulk writer of `client_entity` MUST take this lock too.
-const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
-
-/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`.
-///
-/// The `_xact_` variant releases on commit OR rollback, so an error path
-/// cannot leak the lock and wedge the other writer — which a session-scoped
-/// `pg_advisory_lock` could. Blocking (not `try_`) is deliberate: skipping
-/// would leave the hashrate sampler's values stale for a whole window, and
-/// the wait is bounded by the other statement, which is milliseconds in
-/// normal operation.
-async fn take_client_entity_bulk_write_lock(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<(), DbError> {
-    sqlx::query!(
-        "SELECT pg_advisory_xact_lock($1)",
-        CLIENT_ENTITY_BULK_WRITE_LOCK
-    )
-    .execute(&mut **tx)
-    .await
-    .map_err(DbError::from)?;
-    Ok(())
-}
-
-/// Bulk variant of [`touch_client_for_share`] — collapses N per-session
-/// updates into a single `UPDATE … FROM unnest(...)`. Same column
-/// semantics as the per-row form: `bestDifficulty` takes `GREATEST`,
-/// `currentDifficulty` `COALESCE`s (NULL preserves existing), `firstSeen`
-/// only fills when NULL, `updatedAt` overwrites, `deletedAt` clears.
-/// `hashRate` is deliberately not touched — it's owned by the live
-/// hashrate sampler ([`bulk_set_client_hashrate`]). Caller is responsible
-/// for collapsing duplicates per `(address, clientName, sessionId)` key
-/// (a buffered flusher keeps only the latest sample per key).
-///
-/// Serialised against the other bulk writer via
-/// `CLIENT_ENTITY_BULK_WRITE_LOCK` — disjoint COLUMNS do not prevent a
-/// deadlock, because row locks are per row.
-#[allow(clippy::too_many_arguments)]
-pub async fn bulk_touch_clients_for_share(
-    pool: &PgPool,
-    addresses: &[String],
-    client_names: &[String],
-    session_ids: &[String],
-    share_diffs: &[f32],
-    current_diffs: &[Option<f32>],
-    channel_counts: &[i32],
-    updated_ats: &[i64],
-) -> Result<u64, DbError> {
-    let mut tx = pool.begin().await.map_err(DbError::from)?;
-    take_client_entity_bulk_write_lock(&mut tx).await?;
-    let result = sqlx::query!(
-        r#"UPDATE client_entity AS t
-           SET "bestDifficulty"    = GREATEST(t."bestDifficulty", u.share_diff),
-               "currentDifficulty" = COALESCE(u.current_diff, t."currentDifficulty"),
-               "firstSeen"         = COALESCE(t."firstSeen", u.updated_at),
-               "channelCount"      = u.channel_count,
-               "updatedAt"         = u.updated_at,
-               "deletedAt"         = NULL
-           FROM (
-               SELECT
-                   unnest($1::text[])     AS address,
-                   unnest($2::text[])     AS "clientName",
-                   unnest($3::text[])     AS "sessionId",
-                   unnest($4::real[])     AS share_diff,
-                   unnest($5::real[])     AS current_diff,
-                   unnest($6::int[])      AS channel_count,
-                   unnest($7::bigint[])   AS updated_at
-           ) AS u
-           WHERE t.address      = u.address
-             AND t."clientName" = u."clientName"
-             AND t."sessionId"  = u."sessionId""#,
-        addresses,
-        client_names,
-        session_ids,
-        share_diffs,
-        current_diffs as &[Option<f32>],
-        channel_counts,
-        updated_ats,
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(DbError::from)?;
-    tx.commit().await.map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// Overwrite `hashRate` for N sessions in one `UPDATE … FROM unnest(...)`.
-/// The live hashrate sampler owns this column: it writes a 2-sample
-/// moving average of each session's per-window share rate every ~60s,
-/// including a `0` once a session goes idle (so the reported hashrate
-/// self-zeroes instead of freezing at the last value). Only `hashRate`
-/// is written — `updatedAt` / `deletedAt` are left alone so session
-/// staleness stays owned by the share-touch path + `kill_dead_clients`.
-/// Already-soft-deleted rows are skipped. Caller collapses duplicates
-/// per `(address, clientName, sessionId)`.
-///
-/// Serialised against [`bulk_touch_clients_for_share`] via
-/// `CLIENT_ENTITY_BULK_WRITE_LOCK`.
-pub async fn bulk_set_client_hashrate(
-    pool: &PgPool,
-    addresses: &[String],
-    client_names: &[String],
-    session_ids: &[String],
-    hash_rates: &[f64],
-) -> Result<u64, DbError> {
-    let mut tx = pool.begin().await.map_err(DbError::from)?;
-    take_client_entity_bulk_write_lock(&mut tx).await?;
-    let result = sqlx::query!(
-        r#"UPDATE client_entity AS t
-           SET "hashRate" = u.hash_rate
-           FROM (
-               SELECT
-                   unnest($1::text[])     AS address,
-                   unnest($2::text[])     AS "clientName",
-                   unnest($3::text[])     AS "sessionId",
-                   unnest($4::float8[])   AS hash_rate
-           ) AS u
-           WHERE t.address      = u.address
-             AND t."clientName" = u."clientName"
-             AND t."sessionId"  = u."sessionId"
-             AND t."deletedAt" IS NULL"#,
-        addresses,
-        client_names,
-        session_ids,
-        hash_rates,
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(DbError::from)?;
-    tx.commit().await.map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// Zero `hashRate` for every active (non-soft-deleted) client row. Run
-/// once at Front startup by the live hashrate sampler, which is the sole
-/// writer of the column: its in-memory window map starts empty after a
-/// restart, so any hashRate left over from the previous process is a ghost
-/// — a session that never reconnects would keep its stale value (and stay
-/// summed into the pool total) until `kill_dead_clients` sweeps the row.
-/// Zeroing on boot removes the ghosts; live sessions repopulate within one
-/// sample window. Only touches rows that are actually non-zero. Returns the
-/// number of rows cleared.
-///
-/// Assumes a single hashRate-writing process (one Front). A future
-/// multi-front deployment would need this scoped per writer.
-pub async fn reset_all_client_hashrate(pool: &PgPool) -> Result<u64, DbError> {
-    let result = sqlx::query!(
-        r#"UPDATE client_entity
-           SET "hashRate" = 0
-           WHERE "deletedAt" IS NULL AND "hashRate" <> 0"#,
-    )
-    .execute(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
 }

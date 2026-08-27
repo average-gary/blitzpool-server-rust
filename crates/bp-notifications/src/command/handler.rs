@@ -76,6 +76,10 @@ struct PendingBestdiffReset {
 
 pub struct CommandHandler {
     pool: PgPool,
+    /// Redis handle for the `client:live:*` hashrate reads
+    /// (`/poolhashrate`, `/pplns_status`, `/group_status`). `None`
+    /// degrades those to their error/0 fallbacks.
+    redis: Option<redis::aio::ConnectionManager>,
     telegram: Option<Arc<TelegramAdapter>>,
     ntfy: Option<Arc<NtfyAdapter>>,
     pplns_engine: Option<Arc<bp_pplns_engine::engine::PplnsEngine>>,
@@ -101,6 +105,7 @@ impl CommandHandler {
     ) -> Self {
         Self {
             pool,
+            redis: None,
             telegram,
             ntfy,
             pplns_engine: None,
@@ -109,6 +114,12 @@ impl CommandHandler {
             pending_bestdiff_resets: Arc::new(Mutex::new(HashMap::new())),
             ntfy_reconnect: None,
         }
+    }
+
+    /// Attach the Redis handle the live-hashrate read commands need.
+    pub fn with_redis(mut self, redis: Option<redis::aio::ConnectionManager>) -> Self {
+        self.redis = redis;
+        self
     }
 
     /// Attach the ntfy listener's reconnect signal so an ntfy
@@ -1007,11 +1018,13 @@ impl CommandHandler {
         name: &'static str,
     ) -> String {
         match name {
-            "/poolhashrate" => super::read::build_pool_hashrate(&self.pool, lang).await,
+            "/poolhashrate" => super::read::build_pool_hashrate(self.redis.as_ref(), lang).await,
             "/difficulty" => super::read::build_current_difficulty(lang).await,
             "/next_difficulty" => super::read::build_next_difficulty(lang).await,
             "/stats" => match self.origin_address(transport).await {
-                Some(addr) => super::read::build_stats(&self.pool, lang, &addr).await,
+                Some(addr) => {
+                    super::read::build_stats(&self.pool, self.redis.as_ref(), lang, &addr).await
+                }
                 None => need_address_text(lang).to_string(),
             },
             "/group_history" => match self.origin_address(transport).await {
@@ -1020,7 +1033,7 @@ impl CommandHandler {
             },
             "/pplns_status" => match (self.origin_address(transport).await, &self.pplns_engine) {
                 (Some(addr), Some(engine)) => {
-                    super::read::build_pplns_status(&self.pool, engine, lang, &addr).await
+                    super::read::build_pplns_status(self.redis.as_ref(), engine, lang, &addr).await
                 }
                 (None, _) => need_address_text(lang).to_string(),
                 (_, None) => engine_unconfigured_text(lang, "PPLNS").to_string(),
@@ -1035,7 +1048,14 @@ impl CommandHandler {
                     &self.group_solo_engine,
                 ) {
                     (Some(addr), Some(engine)) => {
-                        super::read::build_group_status(&self.pool, engine, lang, &addr).await
+                        super::read::build_group_status(
+                            &self.pool,
+                            self.redis.as_ref(),
+                            engine,
+                            lang,
+                            &addr,
+                        )
+                        .await
                     }
                     (None, _) => need_address_text(lang).to_string(),
                     (_, None) => engine_unconfigured_text(lang, "Group-Solo").to_string(),
@@ -1054,7 +1074,10 @@ impl CommandHandler {
                 }
             }
             "/show_workers" => match self.origin_address(transport).await {
-                Some(addr) => super::read::build_show_workers(&self.pool, lang, &addr).await,
+                Some(addr) => {
+                    super::read::build_show_workers(&self.pool, self.redis.as_ref(), lang, &addr)
+                        .await
+                }
                 None => need_address_text(lang).to_string(),
             },
             _ => deferred_text(lang, name),

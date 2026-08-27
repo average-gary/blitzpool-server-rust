@@ -420,6 +420,19 @@ pub mod redis_db {
     pub const RT_SPLIT_E2E: u16 = 12 * RANGE;
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
     pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
+
+    /// `bp-session-persistence`'s `live_store_integration`. ⚠️ This is
+    /// the LAST free 32-slice of the 512-DB test container
+    /// (`15 * 32 + 31 = 511`) — the next binary that needs a base must
+    /// recreate `bp-test-redis` with `--databases` raised past 512.
+    ///
+    /// ⚠️ Index **31** of this range is lent to TWO `bp-api` test
+    /// binaries — `smoke.rs` and `custom_extranonce_guard.rs` — both
+    /// NO-FLUSH and write-free, since their endpoints now need a live
+    /// store to answer at all. Don't claim it for a session-persistence
+    /// test, and don't add a write to either borrower without moving
+    /// them apart first.
+    pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
 }
 
 /// How many logical databases this Redis actually has.
