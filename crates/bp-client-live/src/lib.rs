@@ -61,8 +61,9 @@ pub enum LiveReadError {
     NotConfigured,
     #[error("redis: {0}")]
     Redis(#[from] redis::RedisError),
-    /// One round-trip exceeded [`ROUND_TRIP_TIMEOUT`] — the connection
-    /// is down or mid-reconnect. Same handling as any Redis error.
+    /// One round-trip exceeded the reader's timeout (the `Duration` it
+    /// carries) — the connection is down or mid-reconnect. Same handling
+    /// as any Redis error.
     #[error("redis round-trip exceeded {0:?}")]
     Timeout(Duration),
 }

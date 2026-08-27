@@ -55,10 +55,11 @@ impl SessionPersistenceEngine {
     /// [`Self::spawn`] for the production path; this is for unit tests
     /// that wire the hooks but don't need the flusher.
     ///
-    /// `redis` carries the `client:live:*` live store the share hot
-    /// path writes into (see [`crate::live_store`]). `None` degrades the
-    /// engine to births/soft-deletes/diff-stats only — the live session
-    /// stats are dropped with a warning, never buffered unboundedly.
+    /// `redis` carries the `client:live:*` live store the share hot path
+    /// writes into (see the crate-private `live_store` module). `None`
+    /// degrades the engine to births / soft-deletes / diff-stats only —
+    /// the live session stats are then dropped with a warning, never
+    /// buffered unboundedly.
     pub fn new(
         config: SessionPersistenceConfig,
         pool: PgPool,
