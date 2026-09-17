@@ -34,11 +34,8 @@
 //!   `AnyMessageOwned` ready to wrap in a `MessageFrame` for the
 //!   noise writer.
 //!
-//! ## Scope of this commit
-//!
-//! Covers the **mining-server**'s 9 inbound + 16 outbound variants.
-//! JDP wire-codec is a separate module (`jdp_server_codec.rs`) that
-//! lands with `jdp_server.rs`.
+//! The JDP sub-protocol has its own codec of the same shape,
+//! [`crate::jdp_server_codec`].
 
 use stratum_core::common_messages_sv2::{
     SetupConnection as Sv2SetupConnection, SetupConnectionErrorOwned as Sv2SetupConnError,
@@ -565,7 +562,7 @@ fn seq_from_merkle_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratum_core::binary_sv2::{Seq0255, Seq064K, Str0255, U256};
+    use stratum_core::binary_sv2::Seq064K;
     use stratum_core::common_messages_sv2::Protocol;
 
     // ── decode_setup_connection ────────────────────────────────────
@@ -995,19 +992,5 @@ mod tests {
         );
         let out = decode_mining_inbound(msg).unwrap();
         assert!(out.is_none(), "TDP frames silently ignored on mining port");
-    }
-
-    // ── Unused-import marker for Seq0255 + U256 + Str0255 ──────────
-
-    /// `Seq0255` / `U256` / `Str0255` are part of the internal API
-    /// surface — the encode functions construct them via `.into()` /
-    /// `.try_into()`, but importing the type names directly is the
-    /// stable path for callers who want to peek at the field shapes.
-    #[allow(dead_code)]
-    fn _surface_check(
-        _s: Seq0255<'static, U256<'static>>,
-        _t: U256<'static>,
-        _u: Str0255<'static>,
-    ) {
     }
 }
