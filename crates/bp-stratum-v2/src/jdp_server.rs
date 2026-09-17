@@ -79,7 +79,7 @@ use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::payout_distribution::WeightedOutput;
 use crate::jdp::tx_validation::{merge_provided_with_known, partition_against_template};
 use crate::jdp_server_codec::{
-    decode_jdp_inbound, encode_jdp_outbound, encode_jdp_outbound_ext_0x0003, InboundJdpFrame,
+    decode_jdp_inbound, encode_jdp_outbound, InboundJdpFrame, JdpWireFrame,
 };
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
 
@@ -1931,67 +1931,55 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
 }
 
 /// Serialise + write each [`JdpOutboundFrame`] through the noise
-/// stream. Same pattern as `server::write_outbound_frames`. ext 0x0003
-/// frames (RequestPayoutOutputs Success/Error) take the manual raw-bytes
-/// path below (they're not in `AnyMessage`); all other frames go through
-/// `encode_jdp_outbound`.
+/// stream. Same pattern as `server::write_outbound_frames`, plus the
+/// hand-framed path for ext 0x0003 (`stratum-core` has no type for it).
 async fn write_jdp_outbound_frames(
     writer: &mut NoiseTcpWriteHalf,
     outbound: Vec<JdpOutboundFrame>,
 ) -> Result<(), WriteError> {
     for frame in outbound {
-        // ext 0x0003 (Non-Custodial Pool Payouts) frames take the
-        // raw-bytes path — they're not in `AnyMessage`. Build the SV2
-        // frame manually: 6-byte header (ext_type LE16 + msg_type +
-        // msg_length LE24) + payload.
-        if let Some((msg_type, payload)) = encode_jdp_outbound_ext_0x0003(&frame) {
-            let mut bytes = Vec::with_capacity(6 + payload.len());
-            // ext_type = 0x0003 LE
-            bytes.extend_from_slice(&0x0003u16.to_le_bytes());
-            bytes.push(msg_type);
-            // msg_length = payload.len() as LE U24 (3 bytes)
-            let msg_len = payload.len() as u32;
-            if msg_len > 0x00FF_FFFF {
-                return Err(WriteError::Codec(CodecError::Conversion(format!(
-                    "ext 0x0003 payload too large: {} bytes (max 16M-1)",
-                    payload.len()
-                ))));
+        match encode_jdp_outbound(frame).map_err(WriteError::Codec)? {
+            JdpWireFrame::Message(any_message) => {
+                let sv2_frame: MessageFrame<AnyMessageOwned> = any_message.try_into().map_err(
+                    |e: stratum_core::parsers_sv2::ParserError| {
+                        WriteError::Codec(CodecError::from_conv(e))
+                    },
+                )?;
+                writer
+                    .write_frame(sv2_frame)
+                    .await
+                    .map_err(WriteError::Io)?;
             }
-            bytes.push((msg_len & 0xFF) as u8);
-            bytes.push(((msg_len >> 8) & 0xFF) as u8);
-            bytes.push(((msg_len >> 16) & 0xFF) as u8);
-            bytes.extend_from_slice(&payload);
+            JdpWireFrame::Ext0x0003 { msg_type, payload } => {
+                // 6-byte header (ext_type LE16 + msg_type + msg_length LE24)
+                // + payload.
+                let mut bytes = Vec::with_capacity(6 + payload.len());
+                bytes.extend_from_slice(&0x0003u16.to_le_bytes());
+                bytes.push(msg_type);
+                let msg_len = payload.len() as u32;
+                if msg_len > 0x00FF_FFFF {
+                    return Err(WriteError::Codec(CodecError::Conversion(format!(
+                        "ext 0x0003 payload too large: {} bytes (max 16M-1)",
+                        payload.len()
+                    ))));
+                }
+                bytes.push((msg_len & 0xFF) as u8);
+                bytes.push(((msg_len >> 8) & 0xFF) as u8);
+                bytes.push(((msg_len >> 16) & 0xFF) as u8);
+                bytes.extend_from_slice(&payload);
 
-            // `SerializedFrame::from_bytes` re-reads the header just written
-            // and refuses a frame whose length field and payload disagree.
-            let sv2_frame = SerializedFrame::from_bytes(bytes).map_err(|hint| {
-                WriteError::Codec(CodecError::Conversion(format!("ext 0x0003 frame: {hint}")))
-            })?;
-            writer
-                .write_frame(sv2_frame)
-                .await
-                .map_err(WriteError::Io)?;
-            continue;
-        }
-
-        let any_message = match encode_jdp_outbound(frame) {
-            Ok(m) => m,
-            Err(CodecError::EncodeUnimplemented(what)) => {
-                debug!("jdp write: skipping unimplemented frame ({what})");
-                continue;
-            }
-            Err(e) => return Err(WriteError::Codec(e)),
-        };
-        let sv2_frame: MessageFrame<AnyMessageOwned> =
-            any_message
-                .try_into()
-                .map_err(|e: stratum_core::parsers_sv2::ParserError| {
-                    WriteError::Codec(CodecError::from_conv(e))
+                // `SerializedFrame::from_bytes` re-reads the header just
+                // written and refuses a frame whose length field and payload
+                // disagree.
+                let sv2_frame = SerializedFrame::from_bytes(bytes).map_err(|hint| {
+                    WriteError::Codec(CodecError::Conversion(format!("ext 0x0003 frame: {hint}")))
                 })?;
-        writer
-            .write_frame(sv2_frame)
-            .await
-            .map_err(WriteError::Io)?;
+                writer
+                    .write_frame(sv2_frame)
+                    .await
+                    .map_err(WriteError::Io)?;
+            }
+        }
     }
     Ok(())
 }

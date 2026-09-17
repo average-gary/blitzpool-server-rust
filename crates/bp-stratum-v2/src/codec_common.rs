@@ -48,11 +48,6 @@ pub enum CodecError {
     /// downstream string handling).
     #[error("invalid UTF-8: {0}")]
     InvalidUtf8(String),
-    /// Outbound frame variant doesn't yet have a wire-codec
-    /// implementation. Placeholder during the iterative build-out;
-    /// disappears once every variant is covered.
-    #[error("encode not yet implemented for variant: {0}")]
-    EncodeUnimplemented(&'static str),
 }
 
 impl CodecError {

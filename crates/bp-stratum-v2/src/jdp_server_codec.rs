@@ -17,11 +17,10 @@
 //! - **Outbound** (9 variants): SetupConnection Success/Error,
 //!   RequestExtensions Success/Error, AllocateMiningJobTokenSuccess,
 //!   DeclareMiningJob Success/Error, ProvideMissingTransactions, and
-//!   SetPayoutDistribution (ext 0x0003 via the raw-bytes
-//!   [`encode_jdp_outbound_ext_0x0003`] pre-encoder —
-//!   `stratum-core::AnyMessage` doesn't carry it, so it is written as a
-//!   `SerializedFrame` from the manually-assembled 6-byte header plus
-//!   payload).
+//!   SetPayoutDistribution (ext 0x0003: `stratum-core::AnyMessage`
+//!   doesn't carry it, so [`encode_jdp_outbound`] hands it over as
+//!   [`JdpWireFrame::Ext0x0003`] bytes and the IO layer frames it by hand
+//!   with the 6-byte header).
 //!
 //! ## Notes
 //!
@@ -208,61 +207,66 @@ fn decode_push_solution(m: Sv2PushSolution<'_>) -> Result<PushSolutionInput, Cod
 
 // ── encode_jdp_outbound ─────────────────────────────────────────────
 
-pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessageOwned, CodecError> {
-    match frame {
+/// What the wire gets for one outbound JDP frame.
+#[derive(Debug)]
+pub enum JdpWireFrame {
+    /// A base-protocol message; the IO layer wraps it in a `MessageFrame`.
+    Message(AnyMessageOwned),
+    /// An ext 0x0003 message. `stratum-core` has no type for it, so the
+    /// codec hands over the serialised body and the IO layer frames it by
+    /// hand with `(extension_type = 0x0003, msg_type, len(payload))`.
+    Ext0x0003 { msg_type: u8, payload: Vec<u8> },
+}
+
+pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<JdpWireFrame, CodecError> {
+    let message = match frame {
         JdpOutboundFrame::SetupConnectionSuccess {
             used_version,
             flags,
-        } => Ok(AnyMessageOwned::Common(
-            CommonMessagesOwned::SetupConnectionSuccess(Sv2SetupConnSuccess {
+        } => AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(
+            Sv2SetupConnSuccess {
                 used_version,
                 flags,
-            }),
+            },
         )),
-        JdpOutboundFrame::SetupConnectionError { flags, error_code } => {
-            Ok(AnyMessageOwned::Common(
-                CommonMessagesOwned::SetupConnectionError(Sv2SetupConnError {
-                    flags,
-                    error_code: str0255(error_code)?,
-                }),
-            ))
-        }
+        JdpOutboundFrame::SetupConnectionError { flags, error_code } => AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionError(Sv2SetupConnError {
+                flags,
+                error_code: str0255(error_code)?,
+            }),
+        ),
         JdpOutboundFrame::RequestExtensionsSuccess {
             request_id,
             supported_extensions,
-        } => Ok(AnyMessageOwned::Extensions(
-            ExtensionsOwned::ExtensionsNegotiation(
-                ExtensionsNegotiationOwned::RequestExtensionsSuccess(Sv2ReqExtSuccess {
-                    request_id,
-                    supported_extensions: supported_extensions
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                }),
-            ),
+        } => AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
+            ExtensionsNegotiationOwned::RequestExtensionsSuccess(Sv2ReqExtSuccess {
+                request_id,
+                supported_extensions: supported_extensions
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+            }),
         )),
         JdpOutboundFrame::RequestExtensionsError {
             request_id,
             unsupported_extensions,
             required_extensions,
-        } => Ok(AnyMessageOwned::Extensions(
-            ExtensionsOwned::ExtensionsNegotiation(
-                ExtensionsNegotiationOwned::RequestExtensionsError(Sv2ReqExtError {
-                    request_id,
-                    unsupported_extensions: unsupported_extensions
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                    required_extensions: required_extensions
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                }),
-            ),
+        } => AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
+            ExtensionsNegotiationOwned::RequestExtensionsError(Sv2ReqExtError {
+                request_id,
+                unsupported_extensions: unsupported_extensions
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+                required_extensions: required_extensions
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+            }),
         )),
         JdpOutboundFrame::AllocateMiningJobTokenSuccess {
             request_id,
             mining_job_token,
             coinbase_outputs,
-        } => Ok(AnyMessageOwned::JobDeclaration(
-            JobDeclarationOwned::AllocateMiningJobTokenSuccess(Sv2AllocateMiningJobTokenSuccess {
+        } => AnyMessageOwned::JobDeclaration(JobDeclarationOwned::AllocateMiningJobTokenSuccess(
+            Sv2AllocateMiningJobTokenSuccess {
                 request_id,
                 mining_job_token: mining_job_token
                     .0
@@ -270,37 +274,37 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessageOwned, C
                     .try_into()
                     .map_err(CodecError::from_conv)?,
                 coinbase_outputs: coinbase_outputs.try_into().map_err(CodecError::from_conv)?,
-            }),
+            },
         )),
         JdpOutboundFrame::DeclareMiningJobSuccess {
             request_id,
             new_mining_job_token,
-        } => Ok(AnyMessageOwned::JobDeclaration(
-            JobDeclarationOwned::DeclareMiningJobSuccess(Sv2DeclareMiningJobSuccess {
+        } => AnyMessageOwned::JobDeclaration(JobDeclarationOwned::DeclareMiningJobSuccess(
+            Sv2DeclareMiningJobSuccess {
                 request_id,
                 new_mining_job_token: new_mining_job_token
                     .0
                     .to_vec()
                     .try_into()
                     .map_err(CodecError::from_conv)?,
-            }),
+            },
         )),
         JdpOutboundFrame::DeclareMiningJobError {
             request_id,
             error_code,
             error_details,
-        } => Ok(AnyMessageOwned::JobDeclaration(
-            JobDeclarationOwned::DeclareMiningJobError(Sv2DeclareMiningJobError {
+        } => AnyMessageOwned::JobDeclaration(JobDeclarationOwned::DeclareMiningJobError(
+            Sv2DeclareMiningJobError {
                 request_id,
                 error_code: str0255(error_code)?,
                 error_details: error_details.try_into().map_err(CodecError::from_conv)?,
-            }),
+            },
         )),
         JdpOutboundFrame::ProvideMissingTransactions {
             request_id,
             unknown_tx_position_list,
-        } => Ok(AnyMessageOwned::JobDeclaration(
-            JobDeclarationOwned::ProvideMissingTransactions(Sv2ProvideMissingTransactions {
+        } => AnyMessageOwned::JobDeclaration(JobDeclarationOwned::ProvideMissingTransactions(
+            Sv2ProvideMissingTransactions {
                 request_id,
                 // u32 → u16 cast (SV2 wire field is u16; our local
                 // type uses u32 for ergonomic reasons. Values >65535
@@ -311,33 +315,18 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessageOwned, C
                     .collect::<Vec<u16>>()
                     .try_into()
                     .map_err(CodecError::from_conv)?,
-            }),
+            },
         )),
-        // SetPayoutDistribution is ext 0x0003 — not in `AnyMessage`.
-        // The JDP-server per-connection task takes it through
-        // [`encode_jdp_outbound_ext_0x0003`] (raw-bytes path) BEFORE
-        // falling back to this AnyMessage path.
-        JdpOutboundFrame::SetPayoutDistribution(_) => Err(CodecError::EncodeUnimplemented(
-            "ext 0x0003 must go via encode_jdp_outbound_ext_0x0003",
-        )),
-    }
-}
-
-/// Raw-bytes encoder for ext 0x0003 outbound frames. Returns
-/// `Some((message_type, payload_bytes))` when the frame is an
-/// ext 0x0003 variant the codec can serialise, `None` otherwise
-/// (caller falls through to [`encode_jdp_outbound`]).
-///
-/// The returned `payload_bytes` is just the message body; the IO
-/// layer wraps it in a `SerializedFrame` with the 6-byte header
-/// `(extension_type=0x0003, message_type, msg_length=payload.len())`.
-pub fn encode_jdp_outbound_ext_0x0003(frame: &JdpOutboundFrame) -> Option<(u8, Vec<u8>)> {
-    match frame {
+        // SetPayoutDistribution is ext 0x0003 — not in `AnyMessage`, so it
+        // leaves as serialised bytes for the IO layer to frame.
         JdpOutboundFrame::SetPayoutDistribution(msg) => {
-            Some((EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION, msg.serialize()))
+            return Ok(JdpWireFrame::Ext0x0003 {
+                msg_type: EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION,
+                payload: msg.serialize(),
+            });
         }
-        _ => None,
-    }
+    };
+    Ok(JdpWireFrame::Message(message))
 }
 
 #[cfg(test)]
@@ -468,13 +457,21 @@ mod tests {
         }
     }
 
+    /// The base-protocol message an encoded frame carries; panics on ext 0x0003.
+    fn message_of(frame: JdpOutboundFrame) -> AnyMessageOwned {
+        match encode_jdp_outbound(frame).unwrap() {
+            JdpWireFrame::Message(m) => m,
+            other => panic!("expected a base-protocol message, got {other:?}"),
+        }
+    }
+
     #[test]
     fn encode_setup_connection_success_roundtrips() {
         let frame = JdpOutboundFrame::SetupConnectionSuccess {
             used_version: 2,
             flags: 1,
         };
-        let msg = encode_jdp_outbound(frame).unwrap();
+        let msg = message_of(frame);
         match msg {
             AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(s)) => {
                 assert_eq!(s.used_version, 2);
@@ -491,7 +488,7 @@ mod tests {
             mining_job_token: token(0xAA),
             coinbase_outputs: vec![0x01, 0x02, 0x03],
         };
-        let msg = encode_jdp_outbound(frame).unwrap();
+        let msg = message_of(frame);
         match msg {
             AnyMessageOwned::JobDeclaration(
                 JobDeclarationOwned::AllocateMiningJobTokenSuccess(s),
@@ -510,7 +507,7 @@ mod tests {
             request_id: 5,
             new_mining_job_token: token(0xCC),
         };
-        let msg = encode_jdp_outbound(frame).unwrap();
+        let msg = message_of(frame);
         match msg {
             AnyMessageOwned::JobDeclaration(JobDeclarationOwned::DeclareMiningJobSuccess(s)) => {
                 assert_eq!(s.request_id, 5);
@@ -527,7 +524,7 @@ mod tests {
             error_code: "invalid-mining-job-token".to_string(),
             error_details: b"token expired".to_vec(),
         };
-        let msg = encode_jdp_outbound(frame).unwrap();
+        let msg = message_of(frame);
         match msg {
             AnyMessageOwned::JobDeclaration(JobDeclarationOwned::DeclareMiningJobError(s)) => {
                 assert_eq!(
@@ -546,7 +543,7 @@ mod tests {
             request_id: 7,
             unknown_tx_position_list: vec![0u32, 5u32, 1024u32],
         };
-        let msg = encode_jdp_outbound(frame).unwrap();
+        let msg = message_of(frame);
         match msg {
             AnyMessageOwned::JobDeclaration(JobDeclarationOwned::ProvideMissingTransactions(s)) => {
                 assert_eq!(s.request_id, 7);
@@ -557,23 +554,22 @@ mod tests {
     }
 
     #[test]
-    fn encode_set_payout_distribution_returns_unimplemented_on_anymessage_path() {
-        // ext 0x0003 lands in a separate codec path; the standard
-        // codec rejects with EncodeUnimplemented.
-        let frame =
-            JdpOutboundFrame::SetPayoutDistribution(crate::extensions::SetPayoutDistribution {
-                distribution_id: 1,
-                pool_payout: vec![0xAA; 30],
-                payouts: vec![],
-                dust_limits: vec![],
-                additional_outputs: vec![],
-            });
-        match encode_jdp_outbound(frame) {
-            Err(CodecError::EncodeUnimplemented(s)) => {
-                assert!(s.contains("ext 0x0003"));
-            }
-            _ => panic!("expected EncodeUnimplemented for ext 0x0003"),
-        }
+    fn encode_set_payout_distribution_leaves_as_ext_0x0003_bytes() {
+        let msg = crate::extensions::SetPayoutDistribution {
+            distribution_id: 42,
+            pool_payout: vec![0xAA; 30],
+            payouts: vec![vec![0x01; 31]],
+            dust_limits: vec![546],
+            additional_outputs: vec![],
+        };
+        let JdpWireFrame::Ext0x0003 { msg_type, payload } =
+            encode_jdp_outbound(JdpOutboundFrame::SetPayoutDistribution(msg.clone())).unwrap()
+        else {
+            panic!("ext 0x0003 must not be forced into AnyMessage");
+        };
+        assert_eq!(msg_type, EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION);
+        let parsed = crate::extensions::SetPayoutDistribution::deserialize(&payload).unwrap();
+        assert_eq!(parsed, msg);
     }
 
     #[test]
@@ -590,33 +586,5 @@ mod tests {
             },
         ));
         assert!(decode_jdp_inbound(msg).unwrap().is_none());
-    }
-
-    // ── ext 0x0003 codec (push model) ───────────────────────────────
-
-    #[test]
-    fn ext_0x0003_outbound_encoder_serializes_set_payout_distribution() {
-        let msg = crate::extensions::SetPayoutDistribution {
-            distribution_id: 42,
-            pool_payout: vec![0xAA; 30],
-            payouts: vec![vec![0x01; 31]],
-            dust_limits: vec![546],
-            additional_outputs: vec![],
-        };
-        let (msg_type, payload) =
-            encode_jdp_outbound_ext_0x0003(&JdpOutboundFrame::SetPayoutDistribution(msg.clone()))
-                .expect("ext 0x0003 frame");
-        assert_eq!(msg_type, EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION);
-        let parsed = crate::extensions::SetPayoutDistribution::deserialize(&payload).unwrap();
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
-    fn ext_0x0003_outbound_encoder_returns_none_for_base_frames() {
-        let frame = JdpOutboundFrame::SetupConnectionSuccess {
-            used_version: 2,
-            flags: 0,
-        };
-        assert!(encode_jdp_outbound_ext_0x0003(&frame).is_none());
     }
 }
