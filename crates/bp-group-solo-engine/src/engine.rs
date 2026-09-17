@@ -469,6 +469,27 @@ impl GroupSoloEngine {
         }
     }
 
+    /// After a windowed append at `now_ms`: trim the group's window once per
+    /// hour-bucket (gated by [`Self::advance_trim_watermark`]), for both
+    /// lanes. The window sheds whole buckets at hour boundaries, so a trim
+    /// per append would be a no-op Redis round-trip ~99% of the time. The
+    /// payout read path trims with real wall-clock regardless, so this only
+    /// bounds Redis between reads.
+    async fn trim_window_at_bucket_boundary(
+        &self,
+        group_id: Uuid,
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Result<(), EngineError> {
+        if self.advance_trim_watermark(group_id, now_ms) {
+            self.inner
+                .round
+                .trim_window(&group_id.to_string(), now_ms, window_ms)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Hot path: an accepted Group-Solo share. Caller has resolved
     /// `group_id` (via the mode-gate adapter in `hooks.rs`).
     pub async fn record_share(
@@ -497,15 +518,8 @@ impl GroupSoloEngine {
                     .round
                     .record_share_windowed(share_id, &group_key, address, difficulty, timestamp_ms)
                     .await?;
-                // Trim only when this share opens a new hour-bucket — the window
-                // sheds whole buckets at hour boundaries, so per-share trimming
-                // would be a no-op Redis round-trip ~99% of the time. The payout
-                // read path trims with real wall-clock regardless, so this only
-                // bounds Redis between reads.
-                if applied && self.advance_trim_watermark(group_id, timestamp_ms) {
-                    self.inner
-                        .round
-                        .trim_window(&group_key, timestamp_ms, window_ms)
+                if applied {
+                    self.trim_window_at_bucket_boundary(group_id, timestamp_ms, window_ms)
                         .await?;
                 }
                 applied
@@ -570,14 +584,8 @@ impl GroupSoloEngine {
                     .round
                     .record_reject_windowed(&group_key, address, shares, now_ms)
                     .await?;
-                // Same hour-boundary gate as the accepted path; the trim it
-                // fires sheds both lanes.
-                if self.advance_trim_watermark(group_id, now_ms) {
-                    self.inner
-                        .round
-                        .trim_window(&group_key, now_ms, window_ms)
-                        .await?;
-                }
+                self.trim_window_at_bucket_boundary(group_id, now_ms, window_ms)
+                    .await?;
             }
         }
         Ok(())
