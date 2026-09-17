@@ -22,9 +22,9 @@ use std::path::PathBuf;
 use async_channel::{Receiver as AcReceiver, Sender as AcSender};
 use bitcoin_core_sv2::unix_capnp::v31x::template_distribution_protocol::BitcoinCoreSv2TDP;
 use stratum_core::{
-    parsers_sv2::TemplateDistribution,
+    parsers_sv2::TemplateDistributionOwned,
     template_distribution_sv2::{
-        CoinbaseOutputConstraints, RequestTransactionData, SubmitSolution,
+        CoinbaseOutputConstraints, RequestTransactionData, SubmitSolutionOwned,
     },
 };
 use tokio::sync::{broadcast, mpsc};
@@ -120,9 +120,9 @@ fn run_thread(
             // Channels that talk to BitcoinCoreSv2TDP directly. Re-created
             // per connection — the library takes ownership of one half.
             let (into_tdp_tx, into_tdp_rx) =
-                async_channel::unbounded::<TemplateDistribution<'static>>();
+                async_channel::unbounded::<TemplateDistributionOwned>();
             let (from_tdp_tx, from_tdp_rx) =
-                async_channel::unbounded::<TemplateDistribution<'static>>();
+                async_channel::unbounded::<TemplateDistributionOwned>();
 
             let tdp = match BitcoinCoreSv2TDP::new(
                 &socket_path,
@@ -251,10 +251,10 @@ async fn sleep_or_cancelled(backoff: std::time::Duration, cancel: &CancellationT
 }
 
 async fn send_coinbase_constraints(
-    into_tdp_tx: &AcSender<TemplateDistribution<'static>>,
+    into_tdp_tx: &AcSender<TemplateDistributionOwned>,
     constraints: TdpCoinbaseConstraints,
 ) -> Result<(), String> {
-    let msg = TemplateDistribution::CoinbaseOutputConstraints(CoinbaseOutputConstraints {
+    let msg = TemplateDistributionOwned::CoinbaseOutputConstraints(CoinbaseOutputConstraints {
         coinbase_output_max_additional_size: constraints.max_additional_size,
         coinbase_output_max_additional_sigops: constraints.max_additional_sigops,
     });
@@ -262,7 +262,7 @@ async fn send_coinbase_constraints(
 }
 
 async fn bridge_out(
-    from_tdp_rx: AcReceiver<TemplateDistribution<'static>>,
+    from_tdp_rx: AcReceiver<TemplateDistributionOwned>,
     templates_tx: broadcast::Sender<TemplateUpdate>,
     cancel: CancellationToken,
 ) {
@@ -297,7 +297,7 @@ async fn bridge_out(
 /// stays valid across reconnects.
 async fn bridge_in(
     mut submit_rx: mpsc::Receiver<TdpRequest>,
-    into_tdp_tx: AcSender<TemplateDistribution<'static>>,
+    into_tdp_tx: AcSender<TemplateDistributionOwned>,
     cancel: CancellationToken,
 ) -> mpsc::Receiver<TdpRequest> {
     loop {
@@ -312,14 +312,14 @@ async fn bridge_in(
                         TdpRequest::SetCoinbaseConstraints {
                             max_additional_size,
                             max_additional_sigops,
-                        } => TemplateDistribution::CoinbaseOutputConstraints(
+                        } => TemplateDistributionOwned::CoinbaseOutputConstraints(
                             CoinbaseOutputConstraints {
                                 coinbase_output_max_additional_size: max_additional_size,
                                 coinbase_output_max_additional_sigops: max_additional_sigops,
                             },
                         ),
                         TdpRequest::RequestTransactionData { template_id } => {
-                            TemplateDistribution::RequestTransactionData(
+                            TemplateDistributionOwned::RequestTransactionData(
                                 RequestTransactionData { template_id },
                             )
                         }
@@ -368,19 +368,21 @@ fn make_submit_solution(
     header_timestamp: u32,
     header_nonce: u32,
     coinbase_tx: Vec<u8>,
-) -> Result<TemplateDistribution<'static>, String> {
-    // `B064K::try_from(Vec<u8>)` enforces the upper length bound
+) -> Result<TemplateDistributionOwned, String> {
+    // `B064KOwned::try_from(Vec<u8>)` enforces the upper length bound
     // (u16::MAX bytes — far above any realistic coinbase).
-    let coinbase_tx = stratum_core::binary_sv2::B064K::try_from(coinbase_tx)
+    let coinbase_tx = stratum_core::binary_sv2::B064KOwned::try_from(coinbase_tx)
         .map_err(|e| format!("coinbase_tx too large for B064K: {e:?}"))?;
 
-    Ok(TemplateDistribution::SubmitSolution(SubmitSolution {
-        template_id,
-        version,
-        header_timestamp,
-        header_nonce,
-        coinbase_tx,
-    }))
+    Ok(TemplateDistributionOwned::SubmitSolution(
+        SubmitSolutionOwned {
+            template_id,
+            version,
+            header_timestamp,
+            header_nonce,
+            coinbase_tx,
+        },
+    ))
 }
 
 #[cfg(test)]

@@ -19,9 +19,9 @@
 //!   DeclareMiningJob Success/Error, ProvideMissingTransactions, and
 //!   SetPayoutDistribution (ext 0x0003 via the raw-bytes
 //!   [`encode_jdp_outbound_ext_0x0003`] pre-encoder —
-//!   `stratum-core::AnyMessage` doesn't carry it, so it is written into
-//!   a `Sv2Frame::from_bytes_unchecked` with the manually-assembled
-//!   6-byte header).
+//!   `stratum-core::AnyMessage` doesn't carry it, so it is written as a
+//!   `SerializedFrame` from the manually-assembled 6-byte header plus
+//!   payload).
 //!
 //! ## Notes
 //!
@@ -29,24 +29,27 @@
 //!   for future pool-side metadata.
 
 use stratum_core::common_messages_sv2::{
-    SetupConnection as Sv2SetupConnection, SetupConnectionError as Sv2SetupConnError,
-    SetupConnectionSuccess as Sv2SetupConnSuccess,
+    SetupConnection as Sv2SetupConnection, SetupConnectionErrorOwned as Sv2SetupConnError,
+    SetupConnectionSuccessOwned as Sv2SetupConnSuccess,
 };
 use stratum_core::extensions_sv2::extensions_negotiation::{
-    RequestExtensions as Sv2RequestExtensions, RequestExtensionsError as Sv2ReqExtError,
-    RequestExtensionsSuccess as Sv2ReqExtSuccess,
+    RequestExtensions as Sv2RequestExtensions, RequestExtensionsErrorOwned as Sv2ReqExtError,
+    RequestExtensionsSuccessOwned as Sv2ReqExtSuccess,
 };
 use stratum_core::job_declaration_sv2::{
     AllocateMiningJobToken as Sv2AllocateMiningJobToken,
-    AllocateMiningJobTokenSuccess as Sv2AllocateMiningJobTokenSuccess,
-    DeclareMiningJob as Sv2DeclareMiningJob, DeclareMiningJobError as Sv2DeclareMiningJobError,
-    DeclareMiningJobSuccess as Sv2DeclareMiningJobSuccess,
-    ProvideMissingTransactions as Sv2ProvideMissingTransactions,
+    AllocateMiningJobTokenSuccessOwned as Sv2AllocateMiningJobTokenSuccess,
+    DeclareMiningJob as Sv2DeclareMiningJob,
+    DeclareMiningJobErrorOwned as Sv2DeclareMiningJobError,
+    DeclareMiningJobSuccessOwned as Sv2DeclareMiningJobSuccess,
+    ProvideMissingTransactionsOwned as Sv2ProvideMissingTransactions,
     ProvideMissingTransactionsSuccess as Sv2ProvideMissingTransactionsSuccess,
     PushSolution as Sv2PushSolution,
 };
 use stratum_core::parsers_sv2::{
-    AnyMessage, CommonMessages, Extensions, ExtensionsNegotiation, JobDeclaration,
+    AnyMessage, AnyMessageOwned, CommonMessages, CommonMessagesOwned, Extensions,
+    ExtensionsNegotiation, ExtensionsNegotiationOwned, ExtensionsOwned, JobDeclaration,
+    JobDeclarationOwned,
 };
 
 use crate::codec_common::{bytes_to_32, str0255, token_from_bytes, utf8_from_bytes, CodecError};
@@ -78,7 +81,7 @@ pub enum InboundJdpFrame {
 /// `DeclareMiningJob` / `SetCustomMiningJob` frames.
 pub const EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION: u8 = 0x00;
 
-pub fn decode_jdp_inbound(msg: AnyMessage<'static>) -> Result<Option<InboundJdpFrame>, CodecError> {
+pub fn decode_jdp_inbound(msg: AnyMessage<'_>) -> Result<Option<InboundJdpFrame>, CodecError> {
     match msg {
         AnyMessage::Common(CommonMessages::SetupConnection(m)) => Ok(Some(
             InboundJdpFrame::SetupConnection(decode_setup_connection(m)?),
@@ -93,7 +96,7 @@ pub fn decode_jdp_inbound(msg: AnyMessage<'static>) -> Result<Option<InboundJdpF
     }
 }
 
-fn decode_job_declaration(m: JobDeclaration<'static>) -> Result<InboundJdpFrame, CodecError> {
+fn decode_job_declaration(m: JobDeclaration<'_>) -> Result<InboundJdpFrame, CodecError> {
     match m {
         JobDeclaration::AllocateMiningJobToken(m) => {
             Ok(InboundJdpFrame::AllocateMiningJobToken(decode_allocate(m)?))
@@ -126,9 +129,7 @@ fn jdp_variant_name(m: &JobDeclaration<'_>) -> &'static str {
 
 // ── Per-variant decoders ────────────────────────────────────────────
 
-fn decode_setup_connection(
-    m: Sv2SetupConnection<'static>,
-) -> Result<SetupConnectionInput, CodecError> {
+fn decode_setup_connection(m: Sv2SetupConnection<'_>) -> Result<SetupConnectionInput, CodecError> {
     Ok(SetupConnectionInput {
         protocol: m.protocol as u8,
         min_version: m.min_version,
@@ -142,7 +143,7 @@ fn decode_setup_connection(
 }
 
 fn decode_request_extensions(
-    m: Sv2RequestExtensions<'static>,
+    m: Sv2RequestExtensions<'_>,
 ) -> Result<LocalRequestExtensions, CodecError> {
     Ok(LocalRequestExtensions {
         request_id: m.request_id,
@@ -151,7 +152,7 @@ fn decode_request_extensions(
 }
 
 fn decode_allocate(
-    m: Sv2AllocateMiningJobToken<'static>,
+    m: Sv2AllocateMiningJobToken<'_>,
 ) -> Result<AllocateMiningJobTokenInput, CodecError> {
     Ok(AllocateMiningJobTokenInput {
         request_id: m.request_id,
@@ -159,7 +160,7 @@ fn decode_allocate(
     })
 }
 
-fn decode_declare(m: Sv2DeclareMiningJob<'static>) -> Result<DeclareMiningJobInput, CodecError> {
+fn decode_declare(m: Sv2DeclareMiningJob<'_>) -> Result<DeclareMiningJobInput, CodecError> {
     let mut wtxid_list = Vec::with_capacity(m.wtxid_list.as_slice().len());
     for b in m.wtxid_list.iter_bytes() {
         wtxid_list.push(bytes_to_32(b)?);
@@ -179,7 +180,7 @@ fn decode_declare(m: Sv2DeclareMiningJob<'static>) -> Result<DeclareMiningJobInp
 }
 
 fn decode_provide_success(
-    m: Sv2ProvideMissingTransactionsSuccess<'static>,
+    m: Sv2ProvideMissingTransactionsSuccess<'_>,
 ) -> Result<ProvideMissingTransactionsSuccessInput, CodecError> {
     let transaction_list: Vec<Vec<u8>> = m
         .transaction_list
@@ -192,7 +193,7 @@ fn decode_provide_success(
     })
 }
 
-fn decode_push_solution(m: Sv2PushSolution<'static>) -> Result<PushSolutionInput, CodecError> {
+fn decode_push_solution(m: Sv2PushSolution<'_>) -> Result<PushSolutionInput, CodecError> {
     Ok(PushSolutionInput {
         extranonce: m.extranonce.as_bytes().to_vec(),
         header: SolutionHeader {
@@ -207,47 +208,45 @@ fn decode_push_solution(m: Sv2PushSolution<'static>) -> Result<PushSolutionInput
 
 // ── encode_jdp_outbound ─────────────────────────────────────────────
 
-pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static>, CodecError> {
+pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessageOwned, CodecError> {
     match frame {
         JdpOutboundFrame::SetupConnectionSuccess {
             used_version,
             flags,
-        } => Ok(AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
-            Sv2SetupConnSuccess {
+        } => Ok(AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionSuccess(Sv2SetupConnSuccess {
                 used_version,
                 flags,
-            },
-        ))),
+            }),
+        )),
         JdpOutboundFrame::SetupConnectionError { flags, error_code } => {
-            Ok(AnyMessage::Common(CommonMessages::SetupConnectionError(
-                Sv2SetupConnError {
+            Ok(AnyMessageOwned::Common(
+                CommonMessagesOwned::SetupConnectionError(Sv2SetupConnError {
                     flags,
                     error_code: str0255(error_code)?,
-                }
-                .into_static(),
-            )))
+                }),
+            ))
         }
         JdpOutboundFrame::RequestExtensionsSuccess {
             request_id,
             supported_extensions,
-        } => Ok(AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-            ExtensionsNegotiation::RequestExtensionsSuccess(
-                Sv2ReqExtSuccess {
+        } => Ok(AnyMessageOwned::Extensions(
+            ExtensionsOwned::ExtensionsNegotiation(
+                ExtensionsNegotiationOwned::RequestExtensionsSuccess(Sv2ReqExtSuccess {
                     request_id,
                     supported_extensions: supported_extensions
                         .try_into()
                         .map_err(CodecError::from_conv)?,
-                }
-                .into_static(),
+                }),
             ),
-        ))),
+        )),
         JdpOutboundFrame::RequestExtensionsError {
             request_id,
             unsupported_extensions,
             required_extensions,
-        } => Ok(AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-            ExtensionsNegotiation::RequestExtensionsError(
-                Sv2ReqExtError {
+        } => Ok(AnyMessageOwned::Extensions(
+            ExtensionsOwned::ExtensionsNegotiation(
+                ExtensionsNegotiationOwned::RequestExtensionsError(Sv2ReqExtError {
                     request_id,
                     unsupported_extensions: unsupported_extensions
                         .try_into()
@@ -255,77 +254,64 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                     required_extensions: required_extensions
                         .try_into()
                         .map_err(CodecError::from_conv)?,
-                }
-                .into_static(),
+                }),
             ),
-        ))),
+        )),
         JdpOutboundFrame::AllocateMiningJobTokenSuccess {
             request_id,
             mining_job_token,
             coinbase_outputs,
-        } => Ok(AnyMessage::JobDeclaration(
-            JobDeclaration::AllocateMiningJobTokenSuccess(
-                Sv2AllocateMiningJobTokenSuccess {
-                    request_id,
-                    mining_job_token: mining_job_token
-                        .0
-                        .to_vec()
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                    coinbase_outputs: coinbase_outputs.try_into().map_err(CodecError::from_conv)?,
-                }
-                .into_static(),
-            ),
+        } => Ok(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::AllocateMiningJobTokenSuccess(Sv2AllocateMiningJobTokenSuccess {
+                request_id,
+                mining_job_token: mining_job_token
+                    .0
+                    .to_vec()
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+                coinbase_outputs: coinbase_outputs.try_into().map_err(CodecError::from_conv)?,
+            }),
         )),
         JdpOutboundFrame::DeclareMiningJobSuccess {
             request_id,
             new_mining_job_token,
-        } => Ok(AnyMessage::JobDeclaration(
-            JobDeclaration::DeclareMiningJobSuccess(
-                Sv2DeclareMiningJobSuccess {
-                    request_id,
-                    new_mining_job_token: new_mining_job_token
-                        .0
-                        .to_vec()
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                }
-                .into_static(),
-            ),
+        } => Ok(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::DeclareMiningJobSuccess(Sv2DeclareMiningJobSuccess {
+                request_id,
+                new_mining_job_token: new_mining_job_token
+                    .0
+                    .to_vec()
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+            }),
         )),
         JdpOutboundFrame::DeclareMiningJobError {
             request_id,
             error_code,
             error_details,
-        } => Ok(AnyMessage::JobDeclaration(
-            JobDeclaration::DeclareMiningJobError(
-                Sv2DeclareMiningJobError {
-                    request_id,
-                    error_code: str0255(error_code)?,
-                    error_details: error_details.try_into().map_err(CodecError::from_conv)?,
-                }
-                .into_static(),
-            ),
+        } => Ok(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::DeclareMiningJobError(Sv2DeclareMiningJobError {
+                request_id,
+                error_code: str0255(error_code)?,
+                error_details: error_details.try_into().map_err(CodecError::from_conv)?,
+            }),
         )),
         JdpOutboundFrame::ProvideMissingTransactions {
             request_id,
             unknown_tx_position_list,
-        } => Ok(AnyMessage::JobDeclaration(
-            JobDeclaration::ProvideMissingTransactions(
-                Sv2ProvideMissingTransactions {
-                    request_id,
-                    // u32 → u16 cast (SV2 wire field is u16; our local
-                    // type uses u32 for ergonomic reasons. Values >65535
-                    // would be a wtxid-list of >64K txs — impossible).
-                    unknown_tx_position_list: unknown_tx_position_list
-                        .into_iter()
-                        .map(|x| x as u16)
-                        .collect::<Vec<u16>>()
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                }
-                .into_static(),
-            ),
+        } => Ok(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::ProvideMissingTransactions(Sv2ProvideMissingTransactions {
+                request_id,
+                // u32 → u16 cast (SV2 wire field is u16; our local
+                // type uses u32 for ergonomic reasons. Values >65535
+                // would be a wtxid-list of >64K txs — impossible).
+                unknown_tx_position_list: unknown_tx_position_list
+                    .into_iter()
+                    .map(|x| x as u16)
+                    .collect::<Vec<u16>>()
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+            }),
         )),
         // SetPayoutDistribution is ext 0x0003 — not in `AnyMessage`.
         // The JDP-server per-connection task takes it through
@@ -343,7 +329,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
 /// (caller falls through to [`encode_jdp_outbound`]).
 ///
 /// The returned `payload_bytes` is just the message body; the IO
-/// layer wraps it in a `Sv2Frame` with the 6-byte header
+/// layer wraps it in a `SerializedFrame` with the 6-byte header
 /// `(extension_type=0x0003, message_type, msg_length=payload.len())`.
 pub fn encode_jdp_outbound_ext_0x0003(frame: &JdpOutboundFrame) -> Option<(u8, Vec<u8>)> {
     match frame {
@@ -374,12 +360,12 @@ mod tests {
             min_version: 2,
             max_version: 2,
             flags: 1,
-            endpoint_host: "host".to_string().try_into().unwrap(),
+            endpoint_host: "host".try_into().unwrap(),
             endpoint_port: 4444,
-            vendor: "v".to_string().try_into().unwrap(),
-            hardware_version: "h".to_string().try_into().unwrap(),
-            firmware: "f".to_string().try_into().unwrap(),
-            device_id: "d".to_string().try_into().unwrap(),
+            vendor: "v".try_into().unwrap(),
+            hardware_version: "h".try_into().unwrap(),
+            firmware: "f".try_into().unwrap(),
+            device_id: "d".try_into().unwrap(),
         }));
         let out = decode_jdp_inbound(msg).unwrap().unwrap();
         match out {
@@ -396,7 +382,7 @@ mod tests {
     fn decode_allocate_token_maps_fields() {
         let msg = AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
             Sv2AllocateMiningJobToken {
-                user_identifier: "bcrt1q...".to_string().try_into().unwrap(),
+                user_identifier: "bcrt1q...".try_into().unwrap(),
                 request_id: 7,
             },
         ));
@@ -412,16 +398,16 @@ mod tests {
 
     #[test]
     fn decode_declare_mining_job_maps_fields() {
-        let wtxids: Vec<U256<'static>> = vec![[0x11u8; 32].into(), [0x22u8; 32].into()];
+        let wtxids: Vec<U256<'static>> = vec![(&[0x11u8; 32]).into(), (&[0x22u8; 32]).into()];
         let msg =
             AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJob(Sv2DeclareMiningJob {
                 request_id: 5,
-                mining_job_token: vec![0xAAu8; 16].try_into().unwrap(),
+                mining_job_token: (&[0xAAu8; 16]).try_into().unwrap(),
                 version: 0x2000_0000,
-                coinbase_tx_prefix: vec![0xBB; 8].try_into().unwrap(),
-                coinbase_tx_suffix: vec![0xCC; 8].try_into().unwrap(),
+                coinbase_tx_prefix: (&[0xBB; 8]).try_into().unwrap(),
+                coinbase_tx_suffix: (&[0xCC; 8]).try_into().unwrap(),
                 wtxid_list: Seq064K::new(wtxids).unwrap(),
-                excess_data: vec![].try_into().unwrap(),
+                excess_data: (&[0u8; 0]).try_into().unwrap(),
             }));
         let out = decode_jdp_inbound(msg).unwrap().unwrap();
         match out {
@@ -439,8 +425,8 @@ mod tests {
     #[test]
     fn decode_push_solution_maps_fields() {
         let msg = AnyMessage::JobDeclaration(JobDeclaration::PushSolution(Sv2PushSolution {
-            extranonce: vec![0xEE; 8].try_into().unwrap(),
-            prev_hash: [0xAB; 32].into(),
+            extranonce: (&[0xEE; 8]).try_into().unwrap(),
+            prev_hash: (&[0xAB; 32]).into(),
             ntime: 0x6500_0001,
             nonce: 0xdeadbeef,
             nbits: 0x1d00_ffff,
@@ -462,8 +448,8 @@ mod tests {
     #[test]
     fn decode_provide_missing_success_maps_transactions() {
         let txs: Vec<stratum_core::binary_sv2::B016M<'static>> = vec![
-            vec![0xAA, 0xBB].try_into().unwrap(),
-            vec![0xCC, 0xDD].try_into().unwrap(),
+            (&[0xAAu8, 0xBB]).try_into().unwrap(),
+            (&[0xCCu8, 0xDD]).try_into().unwrap(),
         ];
         let msg = AnyMessage::JobDeclaration(JobDeclaration::ProvideMissingTransactionsSuccess(
             Sv2ProvideMissingTransactionsSuccess {
@@ -490,7 +476,7 @@ mod tests {
         };
         let msg = encode_jdp_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s)) => {
+            AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(s)) => {
                 assert_eq!(s.used_version, 2);
                 assert_eq!(s.flags, 1);
             }
@@ -507,7 +493,9 @@ mod tests {
         };
         let msg = encode_jdp_outbound(frame).unwrap();
         match msg {
-            AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobTokenSuccess(s)) => {
+            AnyMessageOwned::JobDeclaration(
+                JobDeclarationOwned::AllocateMiningJobTokenSuccess(s),
+            ) => {
                 assert_eq!(s.request_id, 7);
                 assert_eq!(s.mining_job_token.as_bytes(), &[0xAAu8; 16]);
                 assert_eq!(s.coinbase_outputs.as_bytes(), &[0x01, 0x02, 0x03]);
@@ -524,7 +512,7 @@ mod tests {
         };
         let msg = encode_jdp_outbound(frame).unwrap();
         match msg {
-            AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJobSuccess(s)) => {
+            AnyMessageOwned::JobDeclaration(JobDeclarationOwned::DeclareMiningJobSuccess(s)) => {
                 assert_eq!(s.request_id, 5);
                 assert_eq!(s.new_mining_job_token.as_bytes(), &[0xCCu8; 16]);
             }
@@ -541,7 +529,7 @@ mod tests {
         };
         let msg = encode_jdp_outbound(frame).unwrap();
         match msg {
-            AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJobError(s)) => {
+            AnyMessageOwned::JobDeclaration(JobDeclarationOwned::DeclareMiningJobError(s)) => {
                 assert_eq!(
                     utf8_from_bytes(s.error_code.as_bytes()).unwrap(),
                     "invalid-mining-job-token"
@@ -560,7 +548,7 @@ mod tests {
         };
         let msg = encode_jdp_outbound(frame).unwrap();
         match msg {
-            AnyMessage::JobDeclaration(JobDeclaration::ProvideMissingTransactions(s)) => {
+            AnyMessageOwned::JobDeclaration(JobDeclarationOwned::ProvideMissingTransactions(s)) => {
                 assert_eq!(s.request_id, 7);
                 assert_eq!(s.unknown_tx_position_list.into_inner(), vec![0u16, 5, 1024]);
             }

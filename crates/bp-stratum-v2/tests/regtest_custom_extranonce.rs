@@ -34,12 +34,11 @@ use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
-use stratum_core::framing_sv2::framing::Frame;
-use stratum_core::mining_sv2::OpenExtendedMiningChannel;
+use stratum_core::codec_sv2::MessageFrame;
+use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
+use stratum_core::mining_sv2::OpenExtendedMiningChannelOwned;
 use stratum_core::parsers_sv2::{
-    parse_message_frame_with_tlvs, AnyMessage, CommonMessages, Mining,
+    parse_message_frame_with_tlvs, AnyMessageOwned, CommonMessagesOwned, MiningOwned,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -52,8 +51,8 @@ const NORMAL_WORKER: &str = "normal";
 const PREFIX_1: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
 const PREFIX_2: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
 
-type Reader = NoiseTcpReadHalf<AnyMessage<'static>>;
-type Writer = NoiseTcpWriteHalf<AnyMessage<'static>>;
+type Reader = NoiseTcpReadHalf;
+type Writer = NoiseTcpWriteHalf;
 
 struct SoloResolver;
 
@@ -288,43 +287,39 @@ async fn connect_and_open(server_addr: std::net::SocketAddr, worker: &str) -> (R
     let socket = TcpStream::connect(server_addr).await.expect("connect");
     socket.set_nodelay(true).ok();
     let pub_key: Secp256k1PublicKey = SRI_TEST_PUB.parse().expect("parse pub key");
-    let noise = connect_with_noise::<AnyMessage<'static>>(socket, Some(pub_key))
+    let noise = connect_with_noise(socket, Some(pub_key))
         .await
         .expect("noise handshake");
     let (mut reader, mut writer) = noise.into_split();
 
     write_any_message(
         &mut writer,
-        AnyMessage::Common(CommonMessages::SetupConnection(
-            SetupConnection {
-                protocol: Protocol::MiningProtocol,
-                min_version: 2,
-                max_version: 2,
-                flags: FLAG_REQUIRES_VERSION_ROLLING,
-                endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
-                endpoint_port: server_addr.port(),
-                vendor: "regtest-miner".to_string().try_into().unwrap(),
-                hardware_version: "v1".to_string().try_into().unwrap(),
-                firmware: "0.1".to_string().try_into().unwrap(),
-                device_id: "test".to_string().try_into().unwrap(),
-            }
-            .into_static(),
-        )),
+        AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
+            protocol: Protocol::MiningProtocol,
+            min_version: 2,
+            max_version: 2,
+            flags: FLAG_REQUIRES_VERSION_ROLLING,
+            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+            endpoint_port: server_addr.port(),
+            vendor: "regtest-miner".to_string().try_into().unwrap(),
+            hardware_version: "v1".to_string().try_into().unwrap(),
+            firmware: "0.1".to_string().try_into().unwrap(),
+            device_id: "test".to_string().try_into().unwrap(),
+        })),
     )
     .await;
     let _ = read_any_message(&mut reader).await; // SetupConnectionSuccess
 
     write_any_message(
         &mut writer,
-        AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
-            OpenExtendedMiningChannel {
+        AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(
+            OpenExtendedMiningChannelOwned {
                 request_id: 1,
                 user_identity: format!("{REGTEST_ADDR}.{worker}").try_into().unwrap(),
                 nominal_hash_rate: 0.0,
                 max_target: [0xFFu8; 32].into(),
                 min_extranonce_size: 8,
-            }
-            .into_static(),
+            },
         )),
     )
     .await;
@@ -339,13 +334,13 @@ async fn drain_until_first_job(reader: &mut Reader) -> OpenObs {
     let _ = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             match read_any_message(reader).await {
-                AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(o)) => {
+                AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannelSuccess(o)) => {
                     open_prefix = Some(o.extranonce_prefix.as_ref().to_vec());
                 }
-                AnyMessage::Mining(Mining::SetExtranoncePrefix(s)) => {
+                AnyMessageOwned::Mining(MiningOwned::SetExtranoncePrefix(s)) => {
                     set_prefix = Some(s.extranonce_prefix.as_ref().to_vec());
                 }
-                AnyMessage::Mining(Mining::NewExtendedMiningJob(_)) => return,
+                AnyMessageOwned::Mining(MiningOwned::NewExtendedMiningJob(_)) => return,
                 _ => {}
             }
         }
@@ -365,10 +360,10 @@ async fn drain_window(reader: &mut Reader, window: Duration) -> WindowObs {
     let _ = tokio::time::timeout(window, async {
         loop {
             match read_any_message(reader).await {
-                AnyMessage::Mining(Mining::SetExtranoncePrefix(s)) => {
+                AnyMessageOwned::Mining(MiningOwned::SetExtranoncePrefix(s)) => {
                     set_prefixes.push(s.extranonce_prefix.as_ref().to_vec());
                 }
-                AnyMessage::Mining(Mining::NewExtendedMiningJob(_)) => {
+                AnyMessageOwned::Mining(MiningOwned::NewExtendedMiningJob(_)) => {
                     got_job = true;
                 }
                 _ => {}
@@ -382,25 +377,18 @@ async fn drain_window(reader: &mut Reader, window: Duration) -> WindowObs {
     }
 }
 
-async fn write_any_message(writer: &mut Writer, msg: AnyMessage<'static>) {
-    let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
-        msg.try_into().expect("AnyMessage → StandardSv2Frame");
-    writer
-        .write_frame(Frame::Sv2(sv2_frame))
-        .await
-        .expect("write_frame");
+async fn write_any_message(writer: &mut Writer, msg: AnyMessageOwned) {
+    let sv2_frame: MessageFrame<AnyMessageOwned> =
+        msg.try_into().expect("AnyMessageOwned → MessageFrame");
+    writer.write_frame(sv2_frame).await.expect("write_frame");
 }
 
-async fn read_any_message(reader: &mut Reader) -> AnyMessage<'static> {
-    let frame = reader.read_frame().await.expect("read_frame");
-    let mut sv2_frame = match frame {
-        Frame::Sv2(f) => f,
-        Frame::HandShake(_) => panic!("unexpected handshake frame post-handshake"),
-    };
-    let header = sv2_frame.get_header().expect("frame header");
+async fn read_any_message(reader: &mut Reader) -> AnyMessageOwned {
+    let mut sv2_frame = reader.read_frame().await.expect("read_frame");
+    let header = sv2_frame.header();
     let (msg, _tlvs) = parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[])
         .expect("parse_message_frame_with_tlvs");
-    msg
+    msg.into_owned()
 }
 
 async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) {

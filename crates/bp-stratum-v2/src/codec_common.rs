@@ -99,6 +99,6 @@ pub(crate) fn token_from_bytes(b: &[u8]) -> Result<Token, CodecError> {
     Ok(Token(arr))
 }
 
-pub(crate) fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255<'static>, CodecError> {
+pub(crate) fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255Owned, CodecError> {
     s.try_into().map_err(CodecError::from_conv)
 }

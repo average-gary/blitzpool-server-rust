@@ -51,10 +51,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bp_common::AddressId;
 use bp_vardiff::{Clock, SystemClock};
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::framing_sv2::framing::Frame;
+use stratum_core::codec_sv2::MessageFrame;
+use stratum_core::framing_sv2::framing::SerializedFrame;
 use stratum_core::job_declaration_sv2::MESSAGE_TYPE_DECLARE_MINING_JOB;
-use stratum_core::parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage};
+use stratum_core::parsers_sv2::{parse_message_frame_with_tlvs, AnyMessageOwned};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -907,7 +907,7 @@ impl SessionPlan {
 async fn republish_tailored(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
-    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    writer: &mut NoiseTcpWriteHalf,
     session_id: u32,
     session_id_hex: &str,
     miner: &AddressId,
@@ -945,7 +945,7 @@ async fn republish_tailored(
 async fn rebuild_tailored_plan(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
-    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    writer: &mut NoiseTcpWriteHalf,
     session_id: u32,
     session_id_hex: &str,
     miner: &AddressId,
@@ -1142,7 +1142,7 @@ async fn run_jdp_connection(
 ) -> std::io::Result<()> {
     let session_id_hex = format!("jdp-{session_id:08x}");
 
-    let noise = match accept_pool_noise::<AnyMessage<'static>>(socket, &noise_config).await {
+    let noise = match accept_pool_noise(socket, &noise_config).await {
         Ok(n) => n,
         Err(err) => {
             debug!("jdp {session_id_hex} noise handshake failed: {err:?}");
@@ -1254,20 +1254,8 @@ async fn run_jdp_connection(
                         break;
                     }
                 };
-                let mut sv2_frame = match frame {
-                    Frame::Sv2(f) => f,
-                    Frame::HandShake(_) => {
-                        warn!("jdp {session_id_hex} unexpected HandShakeFrame post-setup");
-                        continue;
-                    }
-                };
-                let header = match sv2_frame.get_header() {
-                    Some(h) => h,
-                    None => {
-                        warn!("jdp {session_id_hex} frame missing header");
-                        continue;
-                    }
-                };
+                let mut sv2_frame = frame;
+                let header = sv2_frame.header();
                 // The push model defines no inbound ext-0x0003 frames
                 // (`SetPayoutDistribution` is JDS→JDC only;
                 // ext 0x0003/distribution_id TLV Field references arrive as
@@ -1948,7 +1936,7 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
 /// path below (they're not in `AnyMessage`); all other frames go through
 /// `encode_jdp_outbound`.
 async fn write_jdp_outbound_frames(
-    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    writer: &mut NoiseTcpWriteHalf,
     outbound: Vec<JdpOutboundFrame>,
 ) -> Result<(), WriteError> {
     for frame in outbound {
@@ -1974,14 +1962,13 @@ async fn write_jdp_outbound_frames(
             bytes.push(((msg_len >> 16) & 0xFF) as u8);
             bytes.extend_from_slice(&payload);
 
-            // Sv2Frame::from_bytes_unchecked wraps pre-serialised
-            // bytes; the phantom `AnyMessage` type isn't actually
-            // touched because `serialized = Some(...)` short-circuits
-            // the encoder.
-            let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
-                StandardSv2Frame::from_bytes_unchecked(bytes.into());
+            // `SerializedFrame::from_bytes` re-reads the header just written
+            // and refuses a frame whose length field and payload disagree.
+            let sv2_frame = SerializedFrame::from_bytes(bytes).map_err(|hint| {
+                WriteError::Codec(CodecError::Conversion(format!("ext 0x0003 frame: {hint}")))
+            })?;
             writer
-                .write_frame(Frame::Sv2(sv2_frame))
+                .write_frame(sv2_frame)
                 .await
                 .map_err(WriteError::Io)?;
             continue;
@@ -1995,14 +1982,14 @@ async fn write_jdp_outbound_frames(
             }
             Err(e) => return Err(WriteError::Codec(e)),
         };
-        let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
+        let sv2_frame: MessageFrame<AnyMessageOwned> =
             any_message
                 .try_into()
                 .map_err(|e: stratum_core::parsers_sv2::ParserError| {
                     WriteError::Codec(CodecError::from_conv(e))
                 })?;
         writer
-            .write_frame(Frame::Sv2(sv2_frame))
+            .write_frame(sv2_frame)
             .await
             .map_err(WriteError::Io)?;
     }

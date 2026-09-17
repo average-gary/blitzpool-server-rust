@@ -37,12 +37,11 @@ use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
-use stratum_core::framing_sv2::framing::Frame;
-use stratum_core::mining_sv2::OpenExtendedMiningChannel;
+use stratum_core::codec_sv2::MessageFrame;
+use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
+use stratum_core::mining_sv2::OpenExtendedMiningChannelOwned;
 use stratum_core::parsers_sv2::{
-    parse_message_frame_with_tlvs, AnyMessage, CommonMessages, Mining,
+    parse_message_frame_with_tlvs, AnyMessageOwned, CommonMessagesOwned, MiningOwned,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -132,14 +131,14 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     let miner_socket = TcpStream::connect(addr).await.expect("connect to server");
     miner_socket.set_nodelay(true).ok();
     let pub_key: Secp256k1PublicKey = SRI_TEST_PUB.parse().expect("parse pub key");
-    let noise = connect_with_noise::<AnyMessage<'static>>(miner_socket, Some(pub_key))
+    let noise = connect_with_noise(miner_socket, Some(pub_key))
         .await
         .expect("noise handshake (initiator)");
     let (mut reader, mut writer) = noise.into_split();
 
     // SetupConnection (mining-protocol, version-rolling flag).
-    let setup = AnyMessage::Common(CommonMessages::SetupConnection(
-        SetupConnection {
+    let setup =
+        AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
@@ -156,14 +155,12 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
             hardware_version: "v1".to_string().try_into().unwrap(),
             firmware: "0.1".to_string().try_into().unwrap(),
             device_id: "test-ext".to_string().try_into().unwrap(),
-        }
-        .into_static(),
-    ));
+        }));
     write_any_message(&mut writer, setup).await;
 
     let resp = read_any_message(&mut reader).await;
     match resp {
-        AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s)) => {
+        AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(s)) => {
             assert_eq!(s.used_version, 2);
             // Server capability bits
             // (SV2 Mining/SetupConnection Flags for Mining Protocol) are built
@@ -183,15 +180,14 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     // OpenExtendedMiningChannel: request 10 rollable bytes — ABOVE the old
     // 8-byte cap. This exercises that the pool now HONORS a >8 request exactly
     // (an aggregating proxy needs this) instead of silently under-granting.
-    let open = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
-        OpenExtendedMiningChannel {
+    let open = AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(
+        OpenExtendedMiningChannelOwned {
             request_id: 7,
             user_identity: format!("{REGTEST_ADDR}.worker-ext").try_into().unwrap(),
             nominal_hash_rate: 5.0e12,
             max_target: [0xFFu8; 32].into(),
             min_extranonce_size: 10,
-        }
-        .into_static(),
+        },
     ));
     write_any_message(&mut writer, open).await;
 
@@ -210,22 +206,22 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         while !got_open_success || !got_new_ext_job {
             let m = read_any_message(&mut reader).await;
             match m {
-                AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) => {
+                AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannelSuccess(s)) => {
                     assert_eq!(s.request_id, 7);
                     seen_extranonce_size = Some(s.extranonce_size);
                     seen_extranonce_prefix_len = Some(s.extranonce_prefix.as_bytes().len());
                     got_open_success = true;
                 }
-                AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) => {
+                AnyMessageOwned::Mining(MiningOwned::NewExtendedMiningJob(j)) => {
                     seen_version_rolling_allowed = Some(j.version_rolling_allowed);
                     seen_merkle_path_len = Some(j.merkle_path.as_slice().len());
                     seen_coinbase_prefix_len = Some(j.coinbase_tx_prefix.as_bytes().len());
                     seen_coinbase_suffix_len = Some(j.coinbase_tx_suffix.as_bytes().len());
                     got_new_ext_job = true;
                 }
-                AnyMessage::Mining(Mining::SetNewPrevHash(_)) => {}
-                AnyMessage::Mining(Mining::SetTarget(_)) => {}
-                AnyMessage::Mining(Mining::NewMiningJob(_)) => {
+                AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(_)) => {}
+                AnyMessageOwned::Mining(MiningOwned::SetTarget(_)) => {}
+                AnyMessageOwned::Mining(MiningOwned::NewMiningJob(_)) => {
                     panic!("Extended channel must not receive NewMiningJob (Standard-only frame)");
                 }
                 other => panic!(
@@ -253,7 +249,7 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
             while !got_new_ext_job {
                 let m = read_any_message(&mut reader).await;
-                if let AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) = m {
+                if let AnyMessageOwned::Mining(MiningOwned::NewExtendedMiningJob(j)) = m {
                     seen_version_rolling_allowed = Some(j.version_rolling_allowed);
                     seen_merkle_path_len = Some(j.merkle_path.as_slice().len());
                     seen_coinbase_prefix_len = Some(j.coinbase_tx_prefix.as_bytes().len());
@@ -321,22 +317,21 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     //    SV2 Mining/OpenExtendedMiningChannel binds the granted size to the
     //    requested minimum nowhere.
     //    17 > the pool's 16-byte rollable cap.
-    let oversize = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
-        OpenExtendedMiningChannel {
+    let oversize = AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(
+        OpenExtendedMiningChannelOwned {
             request_id: 8,
             user_identity: format!("{REGTEST_ADDR}.worker-ext").try_into().unwrap(),
             nominal_hash_rate: 5.0e12,
             max_target: [0xFFu8; 32].into(),
             min_extranonce_size: 17,
-        }
-        .into_static(),
+        },
     ));
     write_any_message(&mut writer, oversize).await;
     let mut got_reject = false;
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         while !got_reject {
             match read_any_message(&mut reader).await {
-                AnyMessage::Mining(Mining::OpenMiningChannelError(e)) => {
+                AnyMessageOwned::Mining(MiningOwned::OpenMiningChannelError(e)) => {
                     assert_eq!(e.request_id, 8);
                     assert_eq!(
                         std::str::from_utf8(e.error_code.as_ref()).unwrap(),
@@ -346,7 +341,7 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
                 }
                 // Broadcast job / prev-hash / target frames for the already-open
                 // channel may interleave — ignore them while awaiting the reject.
-                AnyMessage::Mining(_) => {}
+                AnyMessageOwned::Mining(_) => {}
                 other => panic!(
                     "unexpected frame while awaiting oversize reject: {:?}",
                     decode_label(&other)
@@ -373,40 +368,31 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
 // ── Helpers (identical to regtest_standard.rs) ──────────────────────
 
 async fn write_any_message(
-    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf<
-        AnyMessage<'static>,
-    >,
-    msg: AnyMessage<'static>,
+    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf,
+    msg: AnyMessageOwned,
 ) {
-    let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
-        msg.try_into().expect("AnyMessage → StandardSv2Frame");
-    writer
-        .write_frame(Frame::Sv2(sv2_frame))
-        .await
-        .expect("write_frame");
+    let sv2_frame: MessageFrame<AnyMessageOwned> =
+        msg.try_into().expect("AnyMessageOwned → MessageFrame");
+    writer.write_frame(sv2_frame).await.expect("write_frame");
 }
 
 async fn read_any_message(
-    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf<AnyMessage<'static>>,
-) -> AnyMessage<'static> {
-    let frame = reader.read_frame().await.expect("read_frame");
-    let mut sv2_frame = match frame {
-        Frame::Sv2(f) => f,
-        Frame::HandShake(_) => panic!("unexpected handshake frame post-handshake"),
-    };
-    let header = sv2_frame.get_header().expect("frame must have header");
+    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf,
+) -> AnyMessageOwned {
+    let mut sv2_frame = reader.read_frame().await.expect("read_frame");
+    let header = sv2_frame.header();
     let (msg, _tlvs) = parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[])
         .expect("parse_message_frame_with_tlvs");
-    msg
+    msg.into_owned()
 }
 
-fn decode_label(m: &AnyMessage<'_>) -> &'static str {
+fn decode_label(m: &AnyMessageOwned) -> &'static str {
     match m {
-        AnyMessage::Common(_) => "Common",
-        AnyMessage::Mining(_) => "Mining",
-        AnyMessage::JobDeclaration(_) => "JobDeclaration",
-        AnyMessage::TemplateDistribution(_) => "TemplateDistribution",
-        AnyMessage::Extensions(_) => "Extensions",
+        AnyMessageOwned::Common(_) => "Common",
+        AnyMessageOwned::Mining(_) => "Mining",
+        AnyMessageOwned::JobDeclaration(_) => "JobDeclaration",
+        AnyMessageOwned::TemplateDistribution(_) => "TemplateDistribution",
+        AnyMessageOwned::Extensions(_) => "Extensions",
     }
 }
 

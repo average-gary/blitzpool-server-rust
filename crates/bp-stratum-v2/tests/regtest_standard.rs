@@ -44,12 +44,11 @@ use bp_stratum_v2::server_codec::{decode_mining_inbound, encode_mining_outbound}
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
-use stratum_core::framing_sv2::framing::Frame;
-use stratum_core::mining_sv2::OpenStandardMiningChannel;
+use stratum_core::codec_sv2::MessageFrame;
+use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
+use stratum_core::mining_sv2::OpenStandardMiningChannelOwned;
 use stratum_core::parsers_sv2::{
-    parse_message_frame_with_tlvs, AnyMessage, CommonMessages, Mining,
+    parse_message_frame_with_tlvs, AnyMessageOwned, CommonMessagesOwned, MiningOwned,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -146,14 +145,14 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
     let miner_socket = TcpStream::connect(addr).await.expect("connect to server");
     miner_socket.set_nodelay(true).ok();
     let pub_key: Secp256k1PublicKey = SRI_TEST_PUB.parse().expect("parse pub key");
-    let noise = connect_with_noise::<AnyMessage<'static>>(miner_socket, Some(pub_key))
+    let noise = connect_with_noise(miner_socket, Some(pub_key))
         .await
         .expect("noise handshake (initiator)");
     let (mut reader, mut writer) = noise.into_split();
 
     // Send SetupConnection (mining protocol).
-    let setup = AnyMessage::Common(CommonMessages::SetupConnection(
-        SetupConnection {
+    let setup =
+        AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
@@ -164,15 +163,13 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
             hardware_version: "v1".to_string().try_into().unwrap(),
             firmware: "0.1".to_string().try_into().unwrap(),
             device_id: "test".to_string().try_into().unwrap(),
-        }
-        .into_static(),
-    ));
+        }));
     write_any_message(&mut writer, setup).await;
 
     // Read SetupConnectionSuccess.
     let resp = read_any_message(&mut reader).await;
     match resp {
-        AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s)) => {
+        AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(s)) => {
             assert_eq!(s.used_version, 2, "must use SV2 version 2");
             // Server capability bits
             // (SV2 Mining/SetupConnection Flags for Mining Protocol) built
@@ -190,14 +187,13 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
     }
 
     // Send OpenStandardMiningChannel.
-    let open = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
-        OpenStandardMiningChannel {
+    let open = AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannel(
+        OpenStandardMiningChannelOwned {
             request_id: 1u32,
             user_identity: format!("{REGTEST_ADDR}.worker1").try_into().unwrap(),
             nominal_hash_rate: 1_000_000.0,
             max_target: [0xFFu8; 32].into(),
-        }
-        .into_static(),
+        },
     ));
     write_any_message(&mut writer, open).await;
 
@@ -211,19 +207,19 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
         while !got_open_success || !got_new_mining_job {
             let m = read_any_message(&mut reader).await;
             match m {
-                AnyMessage::Mining(Mining::OpenStandardMiningChannelSuccess(s)) => {
+                AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannelSuccess(s)) => {
                     assert_eq!(s.request_id, 1);
                     assert_eq!(s.extranonce_prefix.as_bytes().len(), 4);
                     got_open_success = true;
                 }
-                AnyMessage::Mining(Mining::NewMiningJob(_)) => {
+                AnyMessageOwned::Mining(MiningOwned::NewMiningJob(_)) => {
                     got_new_mining_job = true;
                 }
-                AnyMessage::Mining(Mining::SetNewPrevHash(_)) => {
+                AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(_)) => {
                     // Allowed — appears before NewMiningJob on block
                     // change. Keep draining.
                 }
-                AnyMessage::Mining(Mining::SetTarget(_)) => {
+                AnyMessageOwned::Mining(MiningOwned::SetTarget(_)) => {
                     // Allowed — vardiff initial-set. Keep draining.
                 }
                 other => panic!(
@@ -251,7 +247,7 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
             while !got_new_mining_job {
                 let m = read_any_message(&mut reader).await;
-                if matches!(m, AnyMessage::Mining(Mining::NewMiningJob(_))) {
+                if matches!(m, AnyMessageOwned::Mining(MiningOwned::NewMiningJob(_))) {
                     got_new_mining_job = true;
                     break;
                 }
@@ -277,28 +273,19 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 async fn write_any_message(
-    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf<
-        AnyMessage<'static>,
-    >,
-    msg: AnyMessage<'static>,
+    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf,
+    msg: AnyMessageOwned,
 ) {
-    let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
-        msg.try_into().expect("AnyMessage → StandardSv2Frame");
-    writer
-        .write_frame(Frame::Sv2(sv2_frame))
-        .await
-        .expect("write_frame");
+    let sv2_frame: MessageFrame<AnyMessageOwned> =
+        msg.try_into().expect("AnyMessageOwned → MessageFrame");
+    writer.write_frame(sv2_frame).await.expect("write_frame");
 }
 
 async fn read_any_message(
-    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf<AnyMessage<'static>>,
-) -> AnyMessage<'static> {
-    let frame = reader.read_frame().await.expect("read_frame");
-    let mut sv2_frame = match frame {
-        Frame::Sv2(f) => f,
-        Frame::HandShake(_) => panic!("unexpected handshake frame post-handshake"),
-    };
-    let header = sv2_frame.get_header().expect("frame must have header");
+    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf,
+) -> AnyMessageOwned {
+    let mut sv2_frame = reader.read_frame().await.expect("read_frame");
+    let header = sv2_frame.header();
     let (msg, _tlvs) = parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[])
         .expect("parse_message_frame_with_tlvs");
     // Confirm the decoder can map it (or returns None for non-mining
@@ -307,16 +294,16 @@ async fn read_any_message(
     // wire.
     let _ = decode_mining_inbound(msg.clone());
     let _ = encode_mining_outbound; // silence unused-import warning
-    msg
+    msg.into_owned()
 }
 
-fn decode_label(m: &AnyMessage<'_>) -> &'static str {
+fn decode_label(m: &AnyMessageOwned) -> &'static str {
     match m {
-        AnyMessage::Common(_) => "Common",
-        AnyMessage::Mining(_) => "Mining",
-        AnyMessage::JobDeclaration(_) => "JobDeclaration",
-        AnyMessage::TemplateDistribution(_) => "TemplateDistribution",
-        AnyMessage::Extensions(_) => "Extensions",
+        AnyMessageOwned::Common(_) => "Common",
+        AnyMessageOwned::Mining(_) => "Mining",
+        AnyMessageOwned::JobDeclaration(_) => "JobDeclaration",
+        AnyMessageOwned::TemplateDistribution(_) => "TemplateDistribution",
+        AnyMessageOwned::Extensions(_) => "Extensions",
     }
 }
 

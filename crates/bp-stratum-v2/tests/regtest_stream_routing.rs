@@ -56,12 +56,11 @@ use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use bp_test_support::poll_for_height;
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
-use stratum_core::framing_sv2::framing::Frame;
-use stratum_core::mining_sv2::{OpenStandardMiningChannel, SubmitSharesStandard};
+use stratum_core::codec_sv2::MessageFrame;
+use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
+use stratum_core::mining_sv2::{OpenStandardMiningChannelOwned, SubmitSharesStandardOwned};
 use stratum_core::parsers_sv2::{
-    parse_message_frame_with_tlvs, AnyMessage, CommonMessages, Mining,
+    parse_message_frame_with_tlvs, AnyMessageOwned, CommonMessagesOwned, MiningOwned,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -404,28 +403,25 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
     let miner_socket = TcpStream::connect(addr).await.expect("connect");
     miner_socket.set_nodelay(true).ok();
     let pub_key: Secp256k1PublicKey = SRI_TEST_PUB.parse().expect("parse pub key");
-    let noise = connect_with_noise::<AnyMessage<'static>>(miner_socket, Some(pub_key))
+    let noise = connect_with_noise(miner_socket, Some(pub_key))
         .await
         .expect("noise handshake");
     let (mut reader, mut writer) = noise.into_split();
 
     write_any_message(
         &mut writer,
-        AnyMessage::Common(CommonMessages::SetupConnection(
-            SetupConnection {
-                protocol: Protocol::MiningProtocol,
-                min_version: 2,
-                max_version: 2,
-                flags: FLAG_REQUIRES_VERSION_ROLLING,
-                endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
-                endpoint_port: addr.port(),
-                vendor: "regtest-miner".to_string().try_into().unwrap(),
-                hardware_version: "v1".to_string().try_into().unwrap(),
-                firmware: "0.1".to_string().try_into().unwrap(),
-                device_id: "test".to_string().try_into().unwrap(),
-            }
-            .into_static(),
-        )),
+        AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
+            protocol: Protocol::MiningProtocol,
+            min_version: 2,
+            max_version: 2,
+            flags: FLAG_REQUIRES_VERSION_ROLLING,
+            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+            endpoint_port: addr.port(),
+            vendor: "regtest-miner".to_string().try_into().unwrap(),
+            hardware_version: "v1".to_string().try_into().unwrap(),
+            firmware: "0.1".to_string().try_into().unwrap(),
+            device_id: "test".to_string().try_into().unwrap(),
+        })),
     )
     .await;
     let _ = read_any_message(&mut reader).await; // SetupConnectionSuccess
@@ -433,16 +429,15 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
     // OpenStandardMiningChannel with the mode's address → triggers the swap.
     write_any_message(
         &mut writer,
-        AnyMessage::Mining(Mining::OpenStandardMiningChannel(
-            OpenStandardMiningChannel {
+        AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannel(
+            OpenStandardMiningChannelOwned {
                 request_id: 1u32,
                 user_identity: format!("{REGTEST_ADDR}.w1").try_into().unwrap(),
                 // 0 H/s → assigned `min_difficulty` (1e-18) → trivial target →
                 // every submit accepted, ~every accepted share a block candidate.
                 nominal_hash_rate: 0.0,
                 max_target: [0xFFu8; 32].into(),
-            }
-            .into_static(),
+            },
         )),
     )
     .await;
@@ -454,7 +449,7 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
     let _ = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             match read_any_message(&mut reader).await {
-                AnyMessage::Mining(Mining::NewMiningJob(j)) => {
+                AnyMessageOwned::Mining(MiningOwned::NewMiningJob(j)) => {
                     if let Some(t) = j.min_ntime.clone().into_inner() {
                         ntime = Some(t);
                     }
@@ -462,7 +457,7 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
                 }
                 // A future job carries an empty min_ntime; the activating
                 // SetNewPrevHash supplies it.
-                AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
+                AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(p)) => {
                     ntime = Some(p.min_ntime);
                 }
                 _ => {}
@@ -492,34 +487,36 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
         let (cid, jid, ver, nt) = latest_job;
         write_any_message(
             &mut writer,
-            AnyMessage::Mining(Mining::SubmitSharesStandard(SubmitSharesStandard {
-                channel_id: cid,
-                sequence_number: nonce,
-                job_id: jid,
-                nonce,
-                ntime: nt,
-                version: ver,
-            })),
+            AnyMessageOwned::Mining(MiningOwned::SubmitSharesStandard(
+                SubmitSharesStandardOwned {
+                    channel_id: cid,
+                    sequence_number: nonce,
+                    job_id: jid,
+                    nonce,
+                    ntime: nt,
+                    version: ver,
+                },
+            )),
         )
         .await;
         // Drain the server's responses for a short window, classifying each.
         let _ = tokio::time::timeout(Duration::from_millis(500), async {
             loop {
                 match read_any_message(&mut reader).await {
-                    AnyMessage::Mining(Mining::SubmitSharesError(e)) => {
+                    AnyMessageOwned::Mining(MiningOwned::SubmitSharesError(e)) => {
                         errors.push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
                     }
-                    AnyMessage::Mining(Mining::SubmitSharesSuccess(_)) => successes += 1,
+                    AnyMessageOwned::Mining(MiningOwned::SubmitSharesSuccess(_)) => successes += 1,
                     // Track job refresh so we don't submit against a stale id.
                     // A future job keeps the previous ntime until its
                     // SetNewPrevHash arrives (handled below).
-                    AnyMessage::Mining(Mining::NewMiningJob(j)) => {
+                    AnyMessageOwned::Mining(MiningOwned::NewMiningJob(j)) => {
                         let nt = j.min_ntime.clone().into_inner().unwrap_or(nt);
                         latest_job = (j.channel_id, j.job_id, j.version, nt);
                     }
                     // Future-job activation supplies the ntime for the
                     // just-received job.
-                    AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
+                    AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(p)) => {
                         let (cid, jid, ver, _) = latest_job;
                         latest_job = (cid, jid, ver, p.min_ntime);
                     }
@@ -554,33 +551,24 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
 // ── helpers (mirror regtest_standard.rs) ────────────────────────────────
 
 async fn write_any_message(
-    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf<
-        AnyMessage<'static>,
-    >,
-    msg: AnyMessage<'static>,
+    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf,
+    msg: AnyMessageOwned,
 ) {
-    let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
-        msg.try_into().expect("AnyMessage → StandardSv2Frame");
-    writer
-        .write_frame(Frame::Sv2(sv2_frame))
-        .await
-        .expect("write_frame");
+    let sv2_frame: MessageFrame<AnyMessageOwned> =
+        msg.try_into().expect("AnyMessageOwned → MessageFrame");
+    writer.write_frame(sv2_frame).await.expect("write_frame");
 }
 
 async fn read_any_message(
-    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf<AnyMessage<'static>>,
-) -> AnyMessage<'static> {
-    let frame = reader.read_frame().await.expect("read_frame");
-    let mut sv2_frame = match frame {
-        Frame::Sv2(f) => f,
-        Frame::HandShake(_) => panic!("unexpected handshake frame post-handshake"),
-    };
-    let header = sv2_frame.get_header().expect("frame header");
+    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf,
+) -> AnyMessageOwned {
+    let mut sv2_frame = reader.read_frame().await.expect("read_frame");
+    let header = sv2_frame.header();
     let (msg, _tlvs) = parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[])
         .expect("parse_message_frame_with_tlvs");
     let _ = decode_mining_inbound(msg.clone());
     let _ = encode_mining_outbound;
-    msg
+    msg.into_owned()
 }
 
 async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) {

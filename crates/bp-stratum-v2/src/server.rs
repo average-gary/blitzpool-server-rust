@@ -87,11 +87,10 @@ use bp_mining_job::{MiningJobCache, MiningJobError};
 use bp_template_distribution::TemplateUpdate;
 use bp_vardiff::{Clock, SystemClock};
 use stratum_core::binary_sv2::GetSize;
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::framing_sv2::framing::Frame;
+use stratum_core::codec_sv2::MessageFrame;
 use stratum_core::mining_sv2::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB;
 use stratum_core::parsers_sv2::{
-    message_type_to_name, parse_message_frame_with_tlvs, AnyMessage, IsSv2Message,
+    message_type_to_name, parse_message_frame_with_tlvs, AnyMessageOwned, IsSv2Message,
 };
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
@@ -577,7 +576,7 @@ async fn run_mining_connection(
     // Noise-XK handshake. On failure log + return; the IO-layer
     // accept loop already increments its per-IP failure counter
     // (fail-ban lives there).
-    let noise = match accept_pool_noise::<AnyMessage<'static>>(socket, &noise_config).await {
+    let noise = match accept_pool_noise(socket, &noise_config).await {
         Ok(n) => n,
         Err(err) => {
             debug!("sv2 connection {session_id_hex} noise handshake failed: {err:?}");
@@ -628,22 +627,8 @@ async fn run_mining_connection(
                         break;
                     }
                 };
-                let mut sv2_frame = match frame {
-                    Frame::Sv2(f) => f,
-                    Frame::HandShake(_) => {
-                        // Should never see a HandShake frame after the
-                        // initial handshake completed. Defensive log.
-                        warn!("sv2 connection {session_id_hex} unexpected HandShakeFrame post-setup");
-                        continue;
-                    }
-                };
-                let header = match sv2_frame.get_header() {
-                    Some(h) => h,
-                    None => {
-                        warn!("sv2 connection {session_id_hex} frame missing header");
-                        continue;
-                    }
-                };
+                let mut sv2_frame = frame;
+                let header = sv2_frame.header();
                 let payload_len = sv2_frame.payload().len();
                 let header_msg_type = header.msg_type();
                 // ext 0x0003/Negotiation: a 0x0003 reference from a session
@@ -1507,12 +1492,12 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
 }
 
 /// Serialise every [`OutboundFrame`] in `outbound` via
-/// [`encode_mining_outbound`] + `Sv2Frame::try_from(any_message)`
+/// [`encode_mining_outbound`] + `MessageFrame::try_from(any_message)`
 /// and write it through the Noise stream. When `debug_messages` is
 /// `true`, each frame produces a `📤 TX:` DEBUG log line carrying the
 /// SV2 message name, msg_type byte, and payload length.
 async fn write_outbound_frames(
-    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    writer: &mut NoiseTcpWriteHalf,
     outbound: Vec<OutboundFrame>,
     debug_messages: bool,
     session_id_hex: &str,
@@ -1529,14 +1514,14 @@ async fn write_outbound_frames(
             );
         }
         {
-            let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
+            let sv2_frame: MessageFrame<AnyMessageOwned> =
                 any_message
                     .try_into()
                     .map_err(|e: stratum_core::parsers_sv2::ParserError| {
                         WriteError::Codec(crate::codec_common::CodecError::from_conv(e))
                     })?;
             writer
-                .write_frame(Frame::Sv2(sv2_frame))
+                .write_frame(sv2_frame)
                 .await
                 .map_err(WriteError::Io)?;
         }
@@ -1565,7 +1550,7 @@ async fn write_outbound_frames(
 /// connection (mirrors the `break`-on-write-error in the other loop arms).
 async fn run_vardiff_check(
     state: &mut MiningSessionState<SystemClock>,
-    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    writer: &mut NoiseTcpWriteHalf,
     debug_messages: bool,
     session_id_hex: &str,
     hooks: &MiningServerHooks,
@@ -3467,8 +3452,8 @@ mod tests {
     /// can short-circuit. Pin via building the call but with a
     /// dummy writer? Not testable without a real noise stream — but
     /// we can at least assert that encode_mining_outbound for an
-    /// arbitrary OutboundFrame produces an AnyMessage that try_into
-    /// converts cleanly to a StandardSv2Frame. That's the second
+    /// arbitrary OutboundFrame produces an AnyMessageOwned that try_into
+    /// converts cleanly to a MessageFrame. That's the second
     /// half of write_outbound_frames; the first half (write_frame
     /// over noise) needs a regtest.
     #[test]
@@ -3480,7 +3465,10 @@ mod tests {
             new_shares_sum: 1024,
         };
         let any_msg = crate::server_codec::encode_mining_outbound(outbound).unwrap();
-        let result: Result<StandardSv2Frame<AnyMessage<'static>>, _> = any_msg.try_into();
-        assert!(result.is_ok(), "AnyMessage must wrap into StandardSv2Frame");
+        let result: Result<MessageFrame<AnyMessageOwned>, _> = any_msg.try_into();
+        assert!(
+            result.is_ok(),
+            "AnyMessageOwned must wrap into MessageFrame"
+        );
     }
 }

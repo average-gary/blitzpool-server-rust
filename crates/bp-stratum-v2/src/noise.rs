@@ -58,7 +58,6 @@ use std::time::Duration;
 
 use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use stratum_apps::network_helpers::{accept_noise_connection, Error as NoiseHelpersError};
-use stratum_core::binary_sv2::{Deserialize, GetSize, Serialize};
 use tokio::net::TcpStream;
 
 // ── Re-exports — let consumers import via `crate::noise::*` ─────────
@@ -210,26 +209,19 @@ impl NoiseConfig {
 /// [`stratum_apps::network_helpers::accept_noise_connection`] that
 /// passes the pool's authority key-pair + cert validity from
 /// [`NoiseConfig`]. The handshake timeout is `stratum_apps`-internal
-/// (10 s default at the time of pinning); see
-/// [`stratum_apps::network_helpers::noise_stream::NoiseTcpStream::new`]
+/// (10 s, fixed at the time of pinning); see
+/// [`stratum_apps::network_helpers::noise_stream::NoiseTcpStream::accept`]
 /// for the override path.
 ///
-/// On success returns a [`NoiseTcpStream<Message>`] split-ready for
+/// On success returns a [`NoiseTcpStream`] split-ready for
 /// the per-connection task; on failure the IO layer closes the TCP
 /// stream and increments a handshake-failure counter (per-IP fail-ban
 /// is the listener-loop's concern, deferred to `server.rs`).
-///
-/// `Message` is the SV2 protocol-message-union type the caller
-/// chooses (mining-side or JDP-side). The generic stays decoupled
-/// from this layer.
-pub async fn accept_pool_noise<Message>(
+pub async fn accept_pool_noise(
     stream: TcpStream,
     config: &NoiseConfig,
-) -> Result<NoiseTcpStream<Message>, NoiseError>
-where
-    Message: Serialize + Deserialize<'static> + GetSize + Send + 'static,
-{
-    accept_noise_connection::<Message>(
+) -> Result<NoiseTcpStream, NoiseError> {
+    accept_noise_connection(
         stream,
         config.authority_pub,
         config.authority_prv,
@@ -338,17 +330,10 @@ mod tests {
     fn accept_pool_noise_surface_type_compiles() {
         fn _assert_signature() {
             // Compile-time only — confirms accept_pool_noise's
-            // generic signature is callable with a concrete
-            // Message type. Doesn't run.
+            // signature still matches the upstream helper. Doesn't run.
             #[allow(dead_code)]
             async fn _example(stream: TcpStream, cfg: &NoiseConfig) {
-                // Pick any Message type that satisfies the trait
-                // bounds — `stratum_core::mining_sv2::CloseChannel`
-                // is small + ubiquitous.
-                let _: Result<
-                    NoiseTcpStream<stratum_core::mining_sv2::CloseChannel<'static>>,
-                    NoiseError,
-                > = accept_pool_noise(stream, cfg).await;
+                let _: Result<NoiseTcpStream, NoiseError> = accept_pool_noise(stream, cfg).await;
             }
         }
     }
