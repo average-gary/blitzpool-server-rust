@@ -51,10 +51,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bp_common::AddressId;
 use bp_vardiff::{Clock, SystemClock};
-use stratum_core::codec_sv2::MessageFrame;
-use stratum_core::framing_sv2::framing::SerializedFrame;
 use stratum_core::job_declaration_sv2::MESSAGE_TYPE_DECLARE_MINING_JOB;
-use stratum_core::parsers_sv2::{parse_message_frame_with_tlvs, AnyMessageOwned};
+use stratum_core::parsers_sv2::parse_message_frame_with_tlvs;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -64,7 +62,7 @@ use crate::bridge::{
     AllocatedTokenRef, AllocationKind, DistributionAcceptance, DistributionAccounting,
     DistributionScope, JdpDeclaredJobRegistry, PayoutDistributionEntry, RegisteredDeclaredJob,
 };
-use crate::codec_common::CodecError;
+use crate::codec_common::{write_message, write_raw_frame, WriteError};
 use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
@@ -1938,58 +1936,20 @@ async fn write_jdp_outbound_frames(
     outbound: Vec<JdpOutboundFrame>,
 ) -> Result<(), WriteError> {
     for frame in outbound {
-        match encode_jdp_outbound(frame).map_err(WriteError::Codec)? {
-            JdpWireFrame::Message(any_message) => {
-                let sv2_frame: MessageFrame<AnyMessageOwned> = any_message.try_into().map_err(
-                    |e: stratum_core::parsers_sv2::ParserError| {
-                        WriteError::Codec(CodecError::from_conv(e))
-                    },
-                )?;
-                writer
-                    .write_frame(sv2_frame)
-                    .await
-                    .map_err(WriteError::Io)?;
-            }
+        match encode_jdp_outbound(frame)? {
+            JdpWireFrame::Message(message) => write_message(writer, message).await?,
             JdpWireFrame::Ext0x0003 { msg_type, payload } => {
-                // 6-byte header (ext_type LE16 + msg_type + msg_length LE24)
-                // + payload.
-                let mut bytes = Vec::with_capacity(6 + payload.len());
-                bytes.extend_from_slice(&0x0003u16.to_le_bytes());
-                bytes.push(msg_type);
-                let msg_len = payload.len() as u32;
-                if msg_len > 0x00FF_FFFF {
-                    return Err(WriteError::Codec(CodecError::Conversion(format!(
-                        "ext 0x0003 payload too large: {} bytes (max 16M-1)",
-                        payload.len()
-                    ))));
-                }
-                bytes.push((msg_len & 0xFF) as u8);
-                bytes.push(((msg_len >> 8) & 0xFF) as u8);
-                bytes.push(((msg_len >> 16) & 0xFF) as u8);
-                bytes.extend_from_slice(&payload);
-
-                // `SerializedFrame::from_bytes` re-reads the header just
-                // written and refuses a frame whose length field and payload
-                // disagree.
-                let sv2_frame = SerializedFrame::from_bytes(bytes).map_err(|hint| {
-                    WriteError::Codec(CodecError::Conversion(format!("ext 0x0003 frame: {hint}")))
-                })?;
-                writer
-                    .write_frame(sv2_frame)
-                    .await
-                    .map_err(WriteError::Io)?;
+                write_raw_frame(
+                    writer,
+                    SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
+                    msg_type,
+                    payload,
+                )
+                .await?
             }
         }
     }
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum WriteError {
-    #[error("codec: {0}")]
-    Codec(#[from] CodecError),
-    #[error("noise io: {0:?}")]
-    Io(crate::noise::NoiseError),
 }
 
 /// What the bridge does with an allocate token.

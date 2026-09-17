@@ -16,10 +16,17 @@
 //! the JDP codec could not see it. Counting the write paths, that one function
 //! existed in four spellings.
 //!
-//! [`CodecError`] lives here for the same reason: both codecs return it, and
-//! both server tasks wrap it in their own `WriteError`. It is not the mining
-//! codec's type — it only used to be declared there.
+//! [`CodecError`] lives here for the same reason: both codecs return it. It is
+//! not the mining codec's type — it only used to be declared there. The same
+//! goes for the write side: both server tasks put a message into its frame
+//! and hand it to the Noise writer, and [`WriteError`] is what that fails
+//! with, so `write_message` and `write_raw_frame` live here too.
 
+use stratum_core::codec_sv2::MessageFrame;
+use stratum_core::framing_sv2::framing::SerializedFrame;
+use stratum_core::parsers_sv2::{AnyMessageOwned, ParserError};
+
+use crate::noise::{NoiseError, NoiseTcpWriteHalf};
 use crate::tokens::Token;
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -59,6 +66,61 @@ impl CodecError {
     pub(crate) fn from_conv<E: core::fmt::Debug>(e: E) -> Self {
         CodecError::Conversion(format!("{e:?}"))
     }
+}
+
+/// Outbound-write failure modes, shared by both server tasks.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    #[error("codec: {0}")]
+    Codec(#[from] CodecError),
+    #[error("noise io: {0:?}")]
+    Io(NoiseError),
+}
+
+// ── Frame writers ───────────────────────────────────────────────────
+
+/// Put a base-protocol message into its SV2 frame and write it.
+pub(crate) async fn write_message(
+    writer: &mut NoiseTcpWriteHalf,
+    message: AnyMessageOwned,
+) -> Result<(), WriteError> {
+    let frame: MessageFrame<AnyMessageOwned> = message
+        .try_into()
+        .map_err(|e: ParserError| WriteError::Codec(CodecError::from_conv(e)))?;
+    writer.write_frame(frame).await.map_err(WriteError::Io)
+}
+
+/// Frame `payload` by hand under `(ext_type, msg_type)` and write it. For
+/// messages `stratum-core` has no type for (ext 0x0003): 6-byte header
+/// (ext_type LE16 + msg_type + msg_length LE24) + payload.
+pub(crate) async fn write_raw_frame(
+    writer: &mut NoiseTcpWriteHalf,
+    ext_type: u16,
+    msg_type: u8,
+    payload: Vec<u8>,
+) -> Result<(), WriteError> {
+    let msg_len = payload.len() as u32;
+    if msg_len > 0x00FF_FFFF {
+        return Err(WriteError::Codec(CodecError::Conversion(format!(
+            "ext 0x{ext_type:04x} payload too large: {} bytes (max 16M-1)",
+            payload.len()
+        ))));
+    }
+    let mut bytes = Vec::with_capacity(6 + payload.len());
+    bytes.extend_from_slice(&ext_type.to_le_bytes());
+    bytes.push(msg_type);
+    bytes.push((msg_len & 0xFF) as u8);
+    bytes.push(((msg_len >> 8) & 0xFF) as u8);
+    bytes.push(((msg_len >> 16) & 0xFF) as u8);
+    bytes.extend_from_slice(&payload);
+    // `SerializedFrame::from_bytes` re-reads the header just written and
+    // refuses a frame whose length field and payload disagree.
+    let frame = SerializedFrame::from_bytes(bytes).map_err(|hint| {
+        WriteError::Codec(CodecError::Conversion(format!(
+            "ext 0x{ext_type:04x} frame: {hint}"
+        )))
+    })?;
+    writer.write_frame(frame).await.map_err(WriteError::Io)
 }
 
 // ── Wire primitives ─────────────────────────────────────────────────

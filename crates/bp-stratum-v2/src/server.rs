@@ -87,10 +87,9 @@ use bp_mining_job::{MiningJobCache, MiningJobError};
 use bp_template_distribution::TemplateUpdate;
 use bp_vardiff::{Clock, SystemClock};
 use stratum_core::binary_sv2::GetSize;
-use stratum_core::codec_sv2::MessageFrame;
 use stratum_core::mining_sv2::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB;
 use stratum_core::parsers_sv2::{
-    message_type_to_name, parse_message_frame_with_tlvs, AnyMessageOwned, IsSv2Message,
+    message_type_to_name, parse_message_frame_with_tlvs, IsSv2Message,
 };
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
@@ -99,6 +98,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::bridge::JdpDeclaredJobRegistry;
+use crate::codec_common::{write_message, WriteError};
 use crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS;
 use crate::extranonce::ExtranonceAllocator;
 use crate::hooks::MiningServerHooks;
@@ -1513,18 +1513,7 @@ async fn write_outbound_frames(
                 "📤 TX: {msg_name} (0x{msg_type:02x}) - {payload_len} bytes"
             );
         }
-        {
-            let sv2_frame: MessageFrame<AnyMessageOwned> =
-                any_message
-                    .try_into()
-                    .map_err(|e: stratum_core::parsers_sv2::ParserError| {
-                        WriteError::Codec(crate::codec_common::CodecError::from_conv(e))
-                    })?;
-            writer
-                .write_frame(sv2_frame)
-                .await
-                .map_err(WriteError::Io)?;
-        }
+        write_message(writer, any_message).await?;
     }
     Ok(())
 }
@@ -1565,15 +1554,6 @@ async fn run_vardiff_check(
     }
     apply_session_events(outcome.events, session_id_hex, state, hooks).await;
     Ok(())
-}
-
-/// Outbound-write failure modes.
-#[derive(Debug, thiserror::Error)]
-pub enum WriteError {
-    #[error("codec: {0}")]
-    Codec(#[from] crate::codec_common::CodecError),
-    #[error("noise io: {0:?}")]
-    Io(crate::noise::NoiseError),
 }
 
 /// Resolve payouts + pack the per-template coinbase fields into a
@@ -3465,7 +3445,10 @@ mod tests {
             new_shares_sum: 1024,
         };
         let any_msg = crate::server_codec::encode_mining_outbound(outbound).unwrap();
-        let result: Result<MessageFrame<AnyMessageOwned>, _> = any_msg.try_into();
+        let result: Result<
+            stratum_core::codec_sv2::MessageFrame<stratum_core::parsers_sv2::AnyMessageOwned>,
+            _,
+        > = any_msg.try_into();
         assert!(
             result.is_ok(),
             "AnyMessageOwned must wrap into MessageFrame"
