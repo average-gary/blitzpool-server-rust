@@ -539,7 +539,16 @@ impl GroupSoloEngine {
         Ok(())
     }
 
-    /// Per-rejected-share counter.
+    /// Per-rejected-share counter. PROP adds to the round's running tally
+    /// (wiped with the round); Window appends into the reject lane of the
+    /// sliding window and self-trims like [`Self::record_share`], so the
+    /// round-stats rate divides rejects by accepted work of the same period.
+    ///
+    /// Bucketed on wall-clock, not on a share timestamp: a rejected share
+    /// carries none (`SharedRejectedShare` has no accept time to report), and
+    /// the lane feeds only the stats view, so stream lag of a few seconds
+    /// moving a reject into the neighbouring hour-bucket changes nothing a
+    /// payout depends on.
     pub async fn record_reject(
         &self,
         group_id: Uuid,
@@ -547,10 +556,30 @@ impl GroupSoloEngine {
         shares: f64,
     ) -> Result<(), EngineError> {
         let group_key = group_id.to_string();
-        self.inner
-            .round
-            .record_reject(&group_key, address, shares)
-            .await?;
+        let (mode, window_ms) = self.resolve_group_mode(group_id).await;
+        match mode {
+            PayoutMode::Prop => {
+                self.inner
+                    .round
+                    .record_reject(&group_key, address, shares)
+                    .await?;
+            }
+            PayoutMode::Window => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                self.inner
+                    .round
+                    .record_reject_windowed(&group_key, address, shares, now_ms)
+                    .await?;
+                // Same hour-boundary gate as the accepted path; the trim it
+                // fires sheds both lanes.
+                if self.advance_trim_watermark(group_id, now_ms) {
+                    self.inner
+                        .round
+                        .trim_window(&group_key, now_ms, window_ms)
+                        .await?;
+                }
+            }
+        }
         Ok(())
     }
 

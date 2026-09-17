@@ -13,7 +13,7 @@
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
     key_applied, key_best_share, key_by_address, key_counter, key_last_accepted_share_at,
-    key_rejected_shares, key_total, key_window_buckets, snapshot, GroupRoundStore,
+    key_rejected_shares, key_total, key_window_buckets, snapshot, GroupRoundStore, WindowLane,
     WINDOW_BUCKET_MS,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
@@ -865,4 +865,179 @@ async fn windowed_record_is_idempotent_per_share_id() {
     let mut conn = conn;
     let buckets: Vec<i64> = conn.zrange(key_window_buckets(group), 0, -1).await.unwrap();
     assert!(buckets.is_empty(), "reset_full drops the window index zset");
+}
+
+// ── Test 18 — a windowed reject lands in its bucket, not in the tally ─
+//
+// The reject lane has the same bucket / index / aggregate shape as the
+// accepted lane. The PROP running tally (`rejected-shares`) must stay
+// untouched: that tally never shrinks, and reading it against a windowed
+// denominator is exactly the 75 % "reject rate" this lane replaces.
+#[tokio::test]
+async fn windowed_reject_lands_in_its_bucket_and_window_aggregate() {
+    let conn = match connect_or_skip(17).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_wrej_record";
+    let bkt = WINDOW_BUCKET_MS;
+    store
+        .record_reject_windowed(group, "bc1qfoo", 3.0, 100 * bkt)
+        .await
+        .expect("ok");
+    store
+        .record_reject_windowed(group, "bc1qfoo", 2.0, 100 * bkt + 5)
+        .await
+        .expect("ok");
+    store
+        .record_reject_windowed(group, "bc1qbar", 7.0, 102 * bkt)
+        .await
+        .expect("ok");
+
+    let agg = store.read_window_rejected(group).await.unwrap();
+    assert!((agg["bc1qfoo"] - 5.0).abs() < 1e-9, "foo summed in-bucket");
+    assert!((agg["bc1qbar"] - 7.0).abs() < 1e-9);
+
+    let mut conn = conn;
+    let buckets: Vec<i64> = conn
+        .zrange(WindowLane::Rejected.index_key(group), 0, -1)
+        .await
+        .unwrap();
+    assert_eq!(buckets, vec![100, 102], "FIFO-ordered reject bucket ids");
+    let in_bucket: Option<String> = conn
+        .hget(WindowLane::Rejected.bucket_key(group, 100), "bc1qfoo")
+        .await
+        .unwrap();
+    assert_eq!(
+        in_bucket.as_deref().and_then(|v| v.parse::<f64>().ok()),
+        Some(5.0)
+    );
+
+    // Negative control: neither the PROP tally nor the accepted lane saw it.
+    assert!(store.read_rejected(group).await.unwrap().is_empty());
+    assert!(store
+        .read_window_by_address(group)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+// ── Test 19 — one trim sheds both lanes; reset drops both lanes ────
+#[tokio::test]
+async fn windowed_trim_and_reset_cover_the_reject_lane() {
+    let conn = match connect_or_skip(18).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_wrej_trim";
+    let bkt = WINDOW_BUCKET_MS;
+    // Both lanes: an old bucket 0 and a fresh bucket 5.
+    store
+        .record_share_windowed(None, group, "bc1qold", 40.0, 0)
+        .await
+        .unwrap();
+    store
+        .record_share_windowed(None, group, "bc1qfresh", 60.0, 5 * bkt)
+        .await
+        .unwrap();
+    store
+        .record_reject_windowed(group, "bc1qold", 4.0, 0)
+        .await
+        .unwrap();
+    store
+        .record_reject_windowed(group, "bc1qfresh", 6.0, 5 * bkt)
+        .await
+        .unwrap();
+    assert_eq!(store.read_window_rejected(group).await.unwrap().len(), 2);
+
+    // now = bucket 5, window = 2 buckets → drop bucket 0 in BOTH lanes.
+    store.trim_window(group, 5 * bkt, 2 * bkt).await.unwrap();
+
+    let rejected = store.read_window_rejected(group).await.unwrap();
+    assert!(!rejected.contains_key("bc1qold"), "aged-out reject dropped");
+    assert!(
+        (rejected["bc1qfresh"] - 6.0).abs() < 1e-9,
+        "fresh reject kept"
+    );
+    let accepted = store.read_window_by_address(group).await.unwrap();
+    assert!(!accepted.contains_key("bc1qold"));
+    assert!((accepted["bc1qfresh"] - 60.0).abs() < 1e-9);
+
+    let mut conn = conn;
+    let buckets: Vec<i64> = conn
+        .zrange(WindowLane::Rejected.index_key(group), 0, -1)
+        .await
+        .unwrap();
+    assert_eq!(buckets, vec![5]);
+    let old_exists: bool = conn
+        .exists(WindowLane::Rejected.bucket_key(group, 0))
+        .await
+        .unwrap();
+    assert!(!old_exists, "dropped reject bucket hash deleted");
+
+    // A full reset leaves no reject-lane key behind either.
+    store.reset_full(group).await.unwrap();
+    for key in [
+        WindowLane::Rejected.index_key(group),
+        WindowLane::Rejected.aggregate_key(group),
+        WindowLane::Rejected.bucket_key(group, 5),
+        WindowLane::Accepted.aggregate_key(group),
+    ] {
+        let exists: bool = conn.exists(&key).await.unwrap();
+        assert!(!exists, "{key} survived reset_full");
+    }
+}
+
+// ── Test 20 — round stats: Window reads the windowed rejects, PROP the tally ─
+//
+// Both directions in one test, so it cannot pass on a precondition that
+// silently did not hold: the PROP tally carries 999, the reject lane carries
+// 5 fresh + 4 aged-out. A Window read must answer 5 (trimmed on read, tally
+// ignored); a PROP read of the same group must answer 999 (lane ignored).
+#[tokio::test]
+async fn round_stats_window_reads_the_reject_lane_not_the_running_tally() {
+    let conn = match connect_or_skip(19).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_wrej_stats";
+    let bkt = WINDOW_BUCKET_MS;
+    store
+        .record_share_windowed(None, group, "bc1qa", 20.0, 10 * bkt)
+        .await
+        .unwrap();
+    store.record_reject(group, "bc1qa", 999.0).await.unwrap();
+    store
+        .record_reject_windowed(group, "bc1qa", 4.0, 0)
+        .await
+        .unwrap();
+    store
+        .record_reject_windowed(group, "bc1qa", 5.0, 10 * bkt)
+        .await
+        .unwrap();
+
+    let win = store
+        .read_round_stats_for(group, PayoutMode::Window, 10 * bkt, 2 * bkt)
+        .await
+        .unwrap();
+    assert!((win.total_shares - 20.0).abs() < 1e-9);
+    assert!(
+        (win.total_rejected - 5.0).abs() < 1e-9,
+        "window: fresh reject only, tally and aged bucket ignored (got {})",
+        win.total_rejected
+    );
+    assert!((win.rejected_per_address["bc1qa"] - 5.0).abs() < 1e-9);
+
+    let prop = store
+        .read_round_stats_for(group, PayoutMode::Prop, 10 * bkt, 2 * bkt)
+        .await
+        .unwrap();
+    assert!(
+        (prop.total_rejected - 999.0).abs() < 1e-9,
+        "prop: the running tally, lane ignored (got {})",
+        prop.total_rejected
+    );
 }

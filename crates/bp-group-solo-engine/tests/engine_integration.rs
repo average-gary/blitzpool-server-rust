@@ -1438,6 +1438,64 @@ async fn window_mode_record_path_trims_aged_buckets() {
     drop_harness(h).await;
 }
 
+// ── Window mode — a reject is windowed like the share it stands next to ─
+//
+// Drives the real `GroupSoloEngine::record_reject` entry point for a
+// window-mode group. The reject must reach round-stats through the trimmed
+// reject lane, and the PROP running tally (`rejected-shares`) must stay
+// empty: that tally never shrinks, so reading it against a windowed share
+// total is what produced a 75 % "reject rate" for a miner rejecting 0.4 %.
+#[tokio::test]
+async fn window_mode_reject_is_windowed_not_tallied() {
+    let h = match spawn_or_skip(20, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    sqlx::query(r#"UPDATE pplns_group SET "payoutMode" = 'window' WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("set window mode");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    h.engine
+        .record_share(None, h.group_id, "bc1qwin", 60.0, now)
+        .await
+        .expect("record share");
+    h.engine
+        .record_reject(h.group_id, "bc1qwin", 3.0)
+        .await
+        .expect("record reject");
+    h.engine
+        .record_reject(h.group_id, "bc1qwin", 2.0)
+        .await
+        .expect("record reject");
+
+    let stats = h.engine.reader().round_stats(h.group_id).await.expect("ok");
+    assert!((stats.total_shares - 60.0).abs() < 1e-9);
+    assert!(
+        (stats.total_rejected - 5.0).abs() < 1e-9,
+        "window-mode rejects reach round-stats via the reject lane (got {})",
+        stats.total_rejected
+    );
+    // Negative control: the PROP tally was never written for this group.
+    let tally = h
+        .engine
+        .round()
+        .read_rejected(&h.group_id.to_string())
+        .await
+        .expect("read tally");
+    assert!(
+        tally.is_empty(),
+        "window mode must not touch the PROP tally"
+    );
+
+    drop_harness(h).await;
+}
+
 // ── Window mode — growing the window invalidates the stale mode cache ──
 //
 // Regression for the record-path trim using a STALE cached window length after
