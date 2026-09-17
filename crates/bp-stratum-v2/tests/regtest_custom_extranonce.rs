@@ -34,15 +34,14 @@ use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
-use stratum_core::codec_sv2::MessageFrame;
 use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
 use stratum_core::mining_sv2::OpenExtendedMiningChannelOwned;
-use stratum_core::parsers_sv2::{
-    parse_message_frame_with_tlvs, AnyMessageOwned, CommonMessagesOwned, MiningOwned,
-};
+use stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwned, MiningOwned};
 use tokio::net::{TcpListener, TcpStream};
 
-const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+mod common;
+use common::{read_any_message, wait_until, write_any_message, REGTEST_ADDR};
+
 const SRI_TEST_PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 
@@ -374,29 +373,5 @@ async fn drain_window(reader: &mut Reader, window: Duration) -> WindowObs {
     WindowObs {
         set_prefixes,
         got_job,
-    }
-}
-
-async fn write_any_message(writer: &mut Writer, msg: AnyMessageOwned) {
-    let sv2_frame: MessageFrame<AnyMessageOwned> =
-        msg.try_into().expect("AnyMessageOwned → MessageFrame");
-    writer.write_frame(sv2_frame).await.expect("write_frame");
-}
-
-async fn read_any_message(reader: &mut Reader) -> AnyMessageOwned {
-    let mut sv2_frame = reader.read_frame().await.expect("read_frame");
-    let header = sv2_frame.header();
-    let (msg, _tlvs) = parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[])
-        .expect("parse_message_frame_with_tlvs");
-    msg.into_owned()
-}
-
-async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

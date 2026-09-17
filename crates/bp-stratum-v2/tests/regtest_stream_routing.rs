@@ -51,20 +51,18 @@ use bp_stratum_v2::mining::client::{PortConfig, FLAG_REQUIRES_VERSION_ROLLING};
 use bp_stratum_v2::mining::submit::ShareAccept;
 use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
 use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
-use bp_stratum_v2::server_codec::{decode_mining_inbound, encode_mining_outbound};
 use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use bp_test_support::poll_for_height;
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
-use stratum_core::codec_sv2::MessageFrame;
 use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
 use stratum_core::mining_sv2::{OpenStandardMiningChannelOwned, SubmitSharesStandardOwned};
-use stratum_core::parsers_sv2::{
-    parse_message_frame_with_tlvs, AnyMessageOwned, CommonMessagesOwned, MiningOwned,
-};
+use stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwned, MiningOwned};
 use tokio::net::{TcpListener, TcpStream};
 
-const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+mod common;
+use common::{read_any_message, wait_until, write_any_message, REGTEST_ADDR};
+
 const SRI_TEST_PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 
@@ -549,34 +547,3 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
 }
 
 // ── helpers (mirror regtest_standard.rs) ────────────────────────────────
-
-async fn write_any_message(
-    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf,
-    msg: AnyMessageOwned,
-) {
-    let sv2_frame: MessageFrame<AnyMessageOwned> =
-        msg.try_into().expect("AnyMessageOwned → MessageFrame");
-    writer.write_frame(sv2_frame).await.expect("write_frame");
-}
-
-async fn read_any_message(
-    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf,
-) -> AnyMessageOwned {
-    let mut sv2_frame = reader.read_frame().await.expect("read_frame");
-    let header = sv2_frame.header();
-    let (msg, _tlvs) = parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[])
-        .expect("parse_message_frame_with_tlvs");
-    let _ = decode_mining_inbound(msg.clone());
-    let _ = encode_mining_outbound;
-    msg.into_owned()
-}
-
-async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
