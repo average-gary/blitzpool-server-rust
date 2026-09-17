@@ -316,7 +316,10 @@ async fn forget_member_subtracts_contribution() {
         .await
         .unwrap();
 
-    let removed = store.forget_member(group, "bc1qa").await.unwrap();
+    let removed = store
+        .forget_member(group, "bc1qa", PayoutMode::Prop)
+        .await
+        .unwrap();
     assert!((removed - 50.0).abs() < 1e-9);
 
     let by_addr = store.read_by_address(group).await.unwrap();
@@ -1040,4 +1043,112 @@ async fn round_stats_window_reads_the_reject_lane_not_the_running_tally() {
         "prop: the running tally, lane ignored (got {})",
         prop.total_rejected
     );
+}
+
+// ── Test 21 — forget_member is mode-aware: a kick leaves the window too ─
+//
+// Both directions: a PROP forget touches only the round keys (the window
+// lanes keep the address), a Window forget removes the address from every
+// live bucket of both lanes plus the aggregates and returns the window
+// contribution. Before this, a kicked Window member stayed in
+// `window:by-address`, which is the coinbase source, until their buckets
+// aged out.
+#[tokio::test]
+async fn forget_member_window_removes_the_address_from_both_lanes() {
+    let conn = match connect_or_skip(20).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_forget_win";
+    let bkt = WINDOW_BUCKET_MS;
+    // Window: bc1qa in buckets 3 and 5, bc1qb in bucket 5; rejects for bc1qa.
+    store
+        .record_share_windowed(None, group, "bc1qa", 30.0, 3 * bkt)
+        .await
+        .unwrap();
+    store
+        .record_share_windowed(None, group, "bc1qa", 20.0, 5 * bkt)
+        .await
+        .unwrap();
+    store
+        .record_share_windowed(None, group, "bc1qb", 40.0, 5 * bkt)
+        .await
+        .unwrap();
+    store
+        .record_reject_windowed(group, "bc1qa", 7.0, 5 * bkt)
+        .await
+        .unwrap();
+    // And a PROP-keyspace share for bc1qa in the same group.
+    store
+        .record_share(None, group, "bc1qa", 99.0, 1)
+        .await
+        .unwrap();
+
+    // Direction 1: a PROP forget leaves the window lanes alone.
+    let removed_prop = store
+        .forget_member(group, "bc1qa", PayoutMode::Prop)
+        .await
+        .unwrap();
+    assert!((removed_prop - 99.0).abs() < 1e-9);
+    assert!(store.read_by_address(group).await.unwrap().is_empty());
+    let win = store.read_window_by_address(group).await.unwrap();
+    assert!(
+        (win["bc1qa"] - 50.0).abs() < 1e-9,
+        "PROP forget must not touch the window lane"
+    );
+
+    // Direction 2: a Window forget removes bc1qa from buckets + aggregates.
+    let removed_win = store
+        .forget_member(group, "bc1qa", PayoutMode::Window)
+        .await
+        .unwrap();
+    assert!(
+        (removed_win - 50.0).abs() < 1e-9,
+        "window contribution returned"
+    );
+
+    let payout = store
+        .read_payout_shares(group, PayoutMode::Window, 5 * bkt, 24 * bkt)
+        .await
+        .unwrap();
+    assert!(
+        !payout.contains_key("bc1qa"),
+        "kicked member left the payout source"
+    );
+    assert!(
+        (payout["bc1qb"] - 40.0).abs() < 1e-9,
+        "the rest is unchanged"
+    );
+    assert!(
+        !store
+            .read_window_rejected(group)
+            .await
+            .unwrap()
+            .contains_key("bc1qa"),
+        "reject lane forgets the member too"
+    );
+
+    let mut conn = conn;
+    for lane in [WindowLane::Accepted, WindowLane::Rejected] {
+        for bid in [3, 5] {
+            let present: bool = conn
+                .hexists(lane.bucket_key(group, bid), "bc1qa")
+                .await
+                .unwrap();
+            assert!(!present, "{lane:?} bucket {bid} still holds bc1qa");
+        }
+    }
+    let last_at_has_a: bool = conn
+        .hexists(key_last_accepted_share_at(group), "bc1qa")
+        .await
+        .unwrap();
+    assert!(!last_at_has_a, "inactivity clock slot deleted");
+    // The other member's bucket entries survive; a later trim of bucket 5
+    // still finds bc1qb there and nothing for bc1qa.
+    let b_in_5: bool = conn
+        .hexists(WindowLane::Accepted.bucket_key(group, 5), "bc1qb")
+        .await
+        .unwrap();
+    assert!(b_in_5);
 }

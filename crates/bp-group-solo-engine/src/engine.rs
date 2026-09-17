@@ -583,6 +583,20 @@ impl GroupSoloEngine {
         Ok(())
     }
 
+    /// Kick flow: drop the address from the group's payout source
+    /// (mode-aware, see [`GroupRoundStore::forget_member`]) and forget any
+    /// distribution built on it. Returns the diff-1-weighted amount removed.
+    pub async fn forget_member(&self, group_id: Uuid, address: &str) -> Result<f64, EngineError> {
+        let (mode, _window_ms) = self.resolve_group_mode(group_id).await;
+        let removed = self
+            .inner
+            .round
+            .forget_member(&group_id.to_string(), address, mode)
+            .await?;
+        self.inner.distribution_builder.invalidate_all();
+        Ok(removed)
+    }
+
     /// Build the current distribution for `(group_id, reward, finder)`.
     pub async fn build_distribution(
         &self,

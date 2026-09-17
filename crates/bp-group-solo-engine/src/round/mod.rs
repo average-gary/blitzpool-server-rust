@@ -833,41 +833,78 @@ impl GroupRoundStore {
         self.conn.clone()
     }
 
-    pub async fn forget_member(&self, group_id: &str, address: &str) -> Result<f64, RoundError> {
+    /// Subtract the address's contribution from the group (kick flow),
+    /// mode-aware like [`Self::read_payout_shares`]: a PROP member leaves
+    /// the round aggregate, a Window member leaves every live bucket of both
+    /// lanes plus the two aggregates. Returns the diff-1-weighted amount
+    /// removed from the payout source so the caller can log it; the rest of
+    /// the group then splits proportionally between whoever is left.
+    ///
+    /// The mode has to come from the caller: this store has no group row,
+    /// and a kick that only cleans the PROP keys leaves a Window member in
+    /// the coinbase until their buckets age out — that is what this replaced.
+    pub async fn forget_member(
+        &self,
+        group_id: &str,
+        address: &str,
+        mode: PayoutMode,
+    ) -> Result<f64, RoundError> {
         let mut conn = self.conn.clone();
 
-        // 1. The member's round contribution IS their by-address aggregate —
-        //    no per-share scan needed.
-        let removed_diff: f64 = conn
-            .hget::<_, _, Option<String>>(key_by_address(group_id), address)
-            .await?
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|d| d.is_finite() && *d > 0.0)
-            .unwrap_or(0.0);
+        let removed_diff = match mode {
+            PayoutMode::Prop => {
+                // The member's round contribution IS their by-address
+                // aggregate — no per-share scan needed.
+                let removed_diff =
+                    read_hash_f64(&mut conn, key_by_address(group_id), address).await?;
+                // Decrement total + drop the address's slots. Single pipeline
+                // for cross-key coherence (MULTI/EXEC not necessary because no
+                // concurrent caller mutates these for the same address during
+                // a kick — admin flow is serialized at the engine level).
+                let mut pipe = redis::pipe();
+                if removed_diff > 0.0 {
+                    pipe.cmd("INCRBYFLOAT")
+                        .arg(key_total(group_id))
+                        .arg(-removed_diff)
+                        .ignore();
+                }
+                pipe.hdel(key_by_address(group_id), address)
+                    .ignore()
+                    .hdel(key_rejected_shares(group_id), address)
+                    .ignore();
+                pipe.query_async::<()>(&mut conn).await?;
+                removed_diff
+            }
+            PayoutMode::Window => {
+                let removed_diff = read_hash_f64(
+                    &mut conn,
+                    WindowLane::Accepted.aggregate_key(group_id),
+                    address,
+                )
+                .await?;
+                // Every live bucket of both lanes, then the aggregates. The
+                // aggregate stays lock-step with its buckets: a later trim of
+                // a bucket that no longer holds the address decrements
+                // nothing for it.
+                let mut pipe = redis::pipe();
+                for lane in WindowLane::ALL {
+                    let bucket_ids: Vec<i64> = conn.zrange(lane.index_key(group_id), 0, -1).await?;
+                    for bid in bucket_ids {
+                        pipe.hdel(lane.bucket_key(group_id, bid), address).ignore();
+                    }
+                    pipe.hdel(lane.aggregate_key(group_id), address).ignore();
+                }
+                pipe.query_async::<()>(&mut conn).await?;
+                removed_diff
+            }
+        };
 
-        if removed_diff == 0.0 {
-            return Ok(0.0);
-        }
-
-        // 2. Decrement total + drop the address's by-address / last-accepted
-        //    slots + best-share if it referenced this address. Single pipeline
-        //    for cross-key coherence (MULTI/EXEC not necessary because no
-        //    concurrent caller mutates these for the same address during a
-        //    kick — admin flow is serialized at the engine level).
-        let mut pipe = redis::pipe();
-        pipe.cmd("INCRBYFLOAT")
-            .arg(key_total(group_id))
-            .arg(-removed_diff)
-            .ignore()
-            .hdel(key_by_address(group_id), address)
-            .ignore()
+        // Shared tail: the inactivity clock and, if it pointed at this
+        // address, the best share (next share sets a fresh one; losing a
+        // best-share record is cosmetic, so read-then-DEL is enough).
+        let _: i64 = conn
             .hdel(key_last_accepted_share_at(group_id), address)
-            .ignore();
-        pipe.query_async::<()>(&mut conn).await?;
-
-        // Best-share: if it was for this address, delete (next share
-        // sets a fresh one). Read-then-DEL is the simpler shape than
-        // WATCH/CAS — losing a best-share record is cosmetic.
+            .await?;
         if let Some(best) = self.read_best_share(group_id).await? {
             if best.address == address {
                 let _: i64 = conn.del(key_best_share(group_id)).await?;
@@ -876,6 +913,20 @@ impl GroupRoundStore {
 
         Ok(removed_diff)
     }
+}
+
+/// One `addr → diff` field of a hash as a finite, positive number, else 0.
+async fn read_hash_f64(
+    conn: &mut ConnectionManager,
+    key: String,
+    field: &str,
+) -> Result<f64, RoundError> {
+    Ok(conn
+        .hget::<_, _, Option<String>>(key, field)
+        .await?
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(0.0))
 }
 
 #[cfg(test)]

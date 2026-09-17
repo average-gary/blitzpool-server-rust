@@ -420,11 +420,12 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
     ) {
         let group_id_str = group_id.to_string();
 
-        // Redis: zRem + decrement total + hdel by-address/rejected/last-share + del best-share.
+        // Redis: drop the address from the payout source of the group's
+        // mode (PROP round or both window lanes), its reject counter, the
+        // inactivity clock and, if it was theirs, the best share.
         match self
             .group_solo
-            .round()
-            .forget_member(&group_id_str, kicked_address.as_str())
+            .forget_member(group_id, kicked_address.as_str())
             .await
         {
             Ok(removed_diff) => {

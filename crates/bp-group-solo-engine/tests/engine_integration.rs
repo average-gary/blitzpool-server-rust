@@ -1496,6 +1496,58 @@ async fn window_mode_reject_is_windowed_not_tallied() {
     drop_harness(h).await;
 }
 
+// ── Window mode — a kick drops the member from the payout source ─────
+//
+// Drives the engine entry point the kick hook uses. The distribution reads
+// `read_payout_shares`, and so does `round_stats`, so the member vanishing
+// from round-stats is the member vanishing from the next coinbase.
+#[tokio::test]
+async fn window_mode_kick_drops_the_member_from_the_payout_source() {
+    let h = match spawn_or_skip(21, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    sqlx::query(r#"UPDATE pplns_group SET "payoutMode" = 'window' WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("set window mode");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    h.engine
+        .record_share(None, h.group_id, "bc1qkicked", 30.0, now)
+        .await
+        .expect("record share");
+    h.engine
+        .record_share(None, h.group_id, "bc1qstays", 70.0, now)
+        .await
+        .expect("record share");
+    let before = h.engine.reader().round_stats(h.group_id).await.expect("ok");
+    assert!(
+        before.per_address.contains_key("bc1qkicked"),
+        "precondition: the member is in the window before the kick"
+    );
+
+    let removed = h
+        .engine
+        .forget_member(h.group_id, "bc1qkicked")
+        .await
+        .expect("forget");
+    assert!((removed - 30.0).abs() < 1e-9);
+
+    let after = h.engine.reader().round_stats(h.group_id).await.expect("ok");
+    assert!(
+        !after.per_address.contains_key("bc1qkicked"),
+        "kicked member left the window payout source"
+    );
+    assert!((after.per_address["bc1qstays"] - 70.0).abs() < 1e-9);
+
+    drop_harness(h).await;
+}
+
 // ── Window mode — growing the window invalidates the stale mode cache ──
 //
 // Regression for the record-path trim using a STALE cached window length after
