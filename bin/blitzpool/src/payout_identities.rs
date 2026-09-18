@@ -73,7 +73,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bitcoin::Network;
@@ -90,6 +93,18 @@ use tracing::{debug, error, info, warn};
 /// costs a store read at settlement, or one dropped row on one template, which is
 /// the behaviour the pool had before the tier existed.
 const VOUCHED_CAPACITY: usize = 4096;
+
+/// How many identities [`PoolRotatingIntake`] keeps answerable by `payout_id`.
+///
+/// Evicting one costs a single `miner_identity` read the next time a miner
+/// names it by id, nothing else. The bound is what keeps a stream of throwaway
+/// xpubs from growing the map without limit.
+const KNOWN_BY_ID_CAPACITY: usize = 4096;
+
+/// How long [`PoolRotatingIntake::warm`] may wait for its one row. It runs on
+/// the authorize / channel-open path of a single session, before that miner
+/// gets any job, and a stall must not hold it longer than this.
+const WARM_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// In-memory `payout_id → rotating identity`, in two tiers.
 ///
@@ -116,7 +131,7 @@ const VOUCHED_CAPACITY: usize = 4096;
 /// hashes to it. A stale entry is a correct entry.
 pub(crate) struct PayoutIdentityDirectory {
     connected: Mutex<HashMap<String, RefcountedIdentity>>,
-    vouched: Mutex<VouchedTier>,
+    vouched: Mutex<BoundedIdentities>,
 }
 
 #[derive(Debug)]
@@ -125,21 +140,42 @@ struct RefcountedIdentity {
     count: usize,
 }
 
-/// FIFO-bounded identities kept past their connection. `order` is insertion
+/// FIFO-bounded `payout_id → identity`, used for the directory's vouched tier
+/// and for [`PoolRotatingIntake`]'s by-id lookup. `order` is insertion
 /// order, not use order: an LRU would need a write on every read of a map that is
 /// read once per template per connection, and the eviction penalty here is a store
 /// read rather than a wrong payment.
 #[derive(Debug, Default)]
-struct VouchedTier {
+struct BoundedIdentities {
     by_key: HashMap<String, PayoutIdentity>,
     order: VecDeque<String>,
+}
+
+impl BoundedIdentities {
+    /// Insert under `key`, evicting the oldest past `capacity`.
+    ///
+    /// An existing entry is left as it is: the maps are content-addressed, so
+    /// an entry under this key IS this identity, and re-inserting would only
+    /// churn the eviction order.
+    fn insert(&mut self, key: String, identity: PayoutIdentity, capacity: usize) {
+        if self.by_key.contains_key(&key) {
+            return;
+        }
+        self.order.push_back(key.clone());
+        self.by_key.insert(key, identity);
+        while self.order.len() > capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.by_key.remove(&evicted);
+            }
+        }
+    }
 }
 
 impl PayoutIdentityDirectory {
     pub(crate) fn new() -> Self {
         Self {
             connected: Mutex::new(HashMap::new()),
-            vouched: Mutex::new(VouchedTier::default()),
+            vouched: Mutex::new(BoundedIdentities::default()),
         }
     }
 
@@ -179,19 +215,10 @@ impl PayoutIdentityDirectory {
             PayoutIdentity::Static { .. } => return,
             PayoutIdentity::Rotating { payout_id, .. } => payout_id.as_str().to_string(),
         };
-        let mut guard = self.vouched.lock().expect("payout-identity mutex poisoned");
-        if guard.by_key.contains_key(&key) {
-            // Content-addressed: an existing entry under this key IS this
-            // identity, so re-inserting would only churn the eviction order.
-            return;
-        }
-        guard.order.push_back(key.clone());
-        guard.by_key.insert(key, identity);
-        while guard.order.len() > VOUCHED_CAPACITY {
-            if let Some(evicted) = guard.order.pop_front() {
-                guard.by_key.remove(&evicted);
-            }
-        }
+        self.vouched
+            .lock()
+            .expect("payout-identity mutex poisoned")
+            .insert(key, identity, VOUCHED_CAPACITY);
     }
 
     /// Drop one reference; remove the entry at zero.
@@ -304,6 +331,11 @@ pub(crate) struct PoolRotatingIntake {
     /// Where an admitted descriptor is written so **settlement** can still find
     /// it. See [`Self::persist`].
     pool: PgPool,
+    /// Rotating identities this intake can admit **by `payout_id`**, without
+    /// the xpub. Filled by every xpub it admits and by [`RotatingIntake::warm`]
+    /// from `miner_identity`. Content-addressed like the directory, so a stale
+    /// entry is still a correct one.
+    known_by_id: Mutex<BoundedIdentities>,
 }
 
 impl PoolRotatingIntake {
@@ -323,6 +355,108 @@ impl PoolRotatingIntake {
             directory,
             allow_rotating,
             pool,
+            known_by_id: Mutex::new(BoundedIdentities::default()),
+        }
+    }
+
+    fn remember_by_id(&self, identity: &PayoutIdentity) {
+        let key = match identity {
+            // Nothing to remember: a static identity IS its address.
+            PayoutIdentity::Static { .. } => return,
+            PayoutIdentity::Rotating { payout_id, .. } => payout_id.as_str().to_string(),
+        };
+        self.known_by_id
+            .lock()
+            .expect("payout-identity mutex poisoned")
+            .insert(key, identity.clone(), KNOWN_BY_ID_CAPACITY);
+    }
+
+    /// Admit a rotating identity the miner named by its `payout_id`.
+    ///
+    /// Rented hashrate arrives this way: MRR, Braiins and the marketplace are
+    /// configured from the dashboard key, which for an xpub miner is the id,
+    /// and the xpub never has to leave the pool. Refused when the flag is off,
+    /// like an xpub is, and when the id is not known here: [`RotatingIntake::warm`]
+    /// runs first and loads it from `miner_identity` if the pool has ever
+    /// admitted that xpub or resolved it for a login.
+    fn intake_by_payout_id(
+        &self,
+        payout_id: &str,
+    ) -> Result<Option<PayoutIdentity>, IdentityRefused> {
+        if !self.allow_rotating {
+            warn!(
+                payout_id,
+                "payout-identity: a miner presented a payout id but [payout_identity] \
+                 allow_rotating is false; refusing the connection"
+            );
+            return Err(IdentityRefused);
+        }
+        let Some(identity) = self
+            .known_by_id
+            .lock()
+            .expect("payout-identity mutex poisoned")
+            .by_key
+            .get(payout_id)
+            .cloned()
+        else {
+            warn!(
+                payout_id,
+                "payout-identity: a miner presented a payout id this pool holds no \
+                 descriptor for; refusing the connection"
+            );
+            return Err(IdentityRefused);
+        };
+        // The same publication an admitted xpub gets. No `persist`: the row is
+        // where this identity came from, or intake wrote it when it admitted
+        // the xpub.
+        self.directory.publish(identity.clone());
+        debug!(
+            payout_id,
+            "payout-identity: rotating identity admitted by payout id"
+        );
+        Ok(Some(identity))
+    }
+
+    /// The one row [`RotatingIntake::warm`] needs, rehydrated and checked.
+    async fn load_by_id(&self, payout_id: &str) {
+        let row = match tokio::time::timeout(
+            WARM_READ_TIMEOUT,
+            bp_db::find_miner_identity(&self.pool, payout_id),
+        )
+        .await
+        {
+            Ok(Ok(Some(row))) => row,
+            // Unknown id: intake refuses it next, with its own line.
+            Ok(Ok(None)) => return,
+            Ok(Err(err)) => {
+                warn!(%err, payout_id, "payout-identity: miner_identity read failed while warming");
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    payout_id,
+                    "payout-identity: miner_identity read timed out while warming"
+                );
+                return;
+            }
+        };
+        // `kind`, not `descriptor.is_some()`, for the reason the settlement read
+        // gives: the presence of a per-kind field is not the kind.
+        if row.kind != bp_db::KIND_ROTATING {
+            return;
+        }
+        let Some(descriptor) = row.descriptor.as_deref() else {
+            return;
+        };
+        match bp_payout_descriptor::rehydrate_stored_identity(payout_id, descriptor) {
+            Ok(payout) => self.remember_by_id(&payout.into_payout_identity()),
+            // `IntakeError` is `Copy` with a fixed `Display`: no descriptor text.
+            Err(refusal) => error!(
+                payout_id,
+                %refusal,
+                "payout-identity: the stored identity for a payout id was refused; not \
+                 admitting it by id"
+            ),
         }
     }
 
@@ -381,6 +515,10 @@ impl PoolRotatingIntake {
 
 impl RotatingIntake for PoolRotatingIntake {
     fn intake(&self, payout_part: &str) -> Result<Option<PayoutIdentity>, IdentityRefused> {
+        let trimmed = payout_part.trim();
+        if bp_payout_descriptor::is_payout_id(trimmed) {
+            return self.intake_by_payout_id(trimmed);
+        }
         let rotating = match intake_wire_identity(payout_part, self.allow_rotating) {
             Ok(None) => return Ok(None),
             Ok(Some(r)) => r,
@@ -415,11 +553,35 @@ impl RotatingIntake for PoolRotatingIntake {
         // Both halves, together: the directory serves the coinbase while this
         // connection lives, the row serves settlement after it is gone.
         self.persist(&identity);
+        // And a later connection may name it by id (rented hashrate does).
+        self.remember_by_id(&identity);
         debug!(
             payout_id = identity.payout_id(),
             "payout-identity: rotating identity admitted"
         );
         Ok(Some(identity))
+    }
+
+    fn warm<'a>(&'a self, payout_part: &'a str) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let payout_id = payout_part.trim();
+            // Only a payout id needs anything: an xpub carries its own
+            // descriptor, an address needs none. With the flag off intake
+            // refuses the id anyway, so there is nothing worth a read.
+            if !self.allow_rotating || !bp_payout_descriptor::is_payout_id(payout_id) {
+                return;
+            }
+            if self
+                .known_by_id
+                .lock()
+                .expect("payout-identity mutex poisoned")
+                .by_key
+                .contains_key(payout_id)
+            {
+                return;
+            }
+            self.load_by_id(payout_id).await;
+        })
     }
 }
 
@@ -799,6 +961,128 @@ mod tests {
             .acquire_timeout(Duration::from_millis(500))
             .connect_lazy("postgres://bp-test:bp-test@127.0.0.1:1/bp_never")
             .expect("a lazy pool does not connect, so it cannot fail to")
+    }
+
+    // ── Admission by payout id (rented hashrate names a miner this way) ──
+
+    /// An id is admitted once this intake has admitted its xpub, and only the
+    /// identity that hashes to it comes back. Control on the same intake: an
+    /// id it never saw is refused and publishes nothing.
+    #[tokio::test]
+    async fn a_payout_id_is_admitted_once_its_xpub_was() {
+        let (dir, intake) = directory_and_intake(true);
+        let by_xpub = intake
+            .intake(XPUB_A)
+            .expect("the flag is on")
+            .expect("an xpub is an intake attempt");
+        let id = by_xpub.payout_id().to_string();
+        dir.release(&id);
+        assert_eq!(dir.len(), 0, "precondition: the xpub's connection is gone");
+
+        let by_id = intake
+            .intake(&id)
+            .expect("a known id is admitted")
+            .expect("an id is an intake attempt");
+        assert_eq!(
+            by_id, by_xpub,
+            "the id admits exactly the identity it hashes to"
+        );
+        assert_eq!(dir.len(), 1, "and publishes it like an xpub admission does");
+
+        let unknown = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB_B)
+            .expect("a BIP-32 vector is a valid xpub")
+            .payout_id()
+            .as_str()
+            .to_string();
+        assert_eq!(intake.intake(&unknown), Err(IdentityRefused));
+        assert_eq!(dir.len(), 1, "a refused id publishes nothing");
+    }
+
+    /// `warm` loads a stored identity so a fresh intake admits it by id, the
+    /// way a pure renter's first rented connection arrives after the resolve
+    /// endpoint wrote the row. Both directions on one row: refused before the
+    /// warm, admitted after. A row whose descriptor does not hash to its key
+    /// stays refused, warm or not.
+    #[tokio::test]
+    async fn warming_admits_a_stored_identity_by_payout_id() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let stored = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB_B)
+            .expect("a BIP-32 vector is a valid xpub");
+        let id = stored.payout_id().as_str().to_string();
+        assert!(
+            bp_payout_descriptor::is_payout_id(MISMATCHED_ID),
+            "precondition: the mismatched key must be shaped like an id, or warm \
+             skips it for that reason instead"
+        );
+        for key in [id.as_str(), MISMATCHED_ID] {
+            sqlx::query(r#"DELETE FROM miner_identity WHERE "payoutId" = $1"#)
+                .bind(key)
+                .execute(&pool)
+                .await
+                .expect("clear any earlier run's row");
+        }
+        bp_db::upsert_rotating_identity(&pool, &id, stored.canonical_descriptor(), 1)
+            .await
+            .expect("seed the row");
+        bp_db::upsert_rotating_identity(&pool, MISMATCHED_ID, stored.canonical_descriptor(), 1)
+            .await
+            .expect("seed the mismatched row");
+
+        let dir = Arc::new(PayoutIdentityDirectory::new());
+        let intake = PoolRotatingIntake::new(dir.clone(), true, pool.clone());
+        assert_eq!(
+            intake.intake(&id),
+            Err(IdentityRefused),
+            "not before the warm"
+        );
+
+        intake.warm(&id).await;
+        let admitted = intake
+            .intake(&id)
+            .expect("a warmed id is admitted")
+            .expect("an id is an intake attempt");
+        assert_eq!(admitted.payout_id(), id);
+        assert_eq!(
+            admitted
+                .script_at(HEIGHT)
+                .expect("rotating")
+                .expect("derivable"),
+            stored.script_at(HEIGHT).expect("derivable").to_bytes(),
+            "the admitted identity pays what the stored descriptor derives"
+        );
+
+        intake.warm(MISMATCHED_ID).await;
+        assert_eq!(
+            intake.intake(MISMATCHED_ID),
+            Err(IdentityRefused),
+            "a row that does not re-hash to its key is never admitted"
+        );
+
+        for key in [id.as_str(), MISMATCHED_ID] {
+            let _ = sqlx::query(r#"DELETE FROM miner_identity WHERE "payoutId" = $1"#)
+                .bind(key)
+                .execute(&pool)
+                .await;
+        }
+    }
+
+    /// A store that cannot be reached costs the connection, not the session
+    /// task: `warm` returns inside its time limit and intake refuses.
+    #[tokio::test]
+    async fn warming_against_an_unreachable_store_returns_and_refuses() {
+        let (dir, intake) = directory_and_intake(true);
+        let id = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB_B)
+            .expect("a BIP-32 vector is a valid xpub")
+            .payout_id()
+            .as_str()
+            .to_string();
+        tokio::time::timeout(WARM_READ_TIMEOUT + Duration::from_secs(1), intake.warm(&id))
+            .await
+            .expect("warm must give up within its time limit");
+        assert_eq!(intake.intake(&id), Err(IdentityRefused));
+        assert_eq!(dir.len(), 0);
     }
 
     /// A static address is not this module's business, and the directory must

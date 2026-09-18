@@ -15,8 +15,14 @@
 //! in access logs, and an xpub is the watch-only capability for the whole
 //! payout branch.
 //!
-//! No database, no session: the mapping is a pure function of the key and the
-//! operator's flag. Rate-limited because it parses attacker-chosen input.
+//! The mapping is a pure function of the key and the operator's flag. The one
+//! write: a resolved identity is recorded in `miner_identity`, the same row
+//! stratum intake writes when a miner connects with the xpub. That is what lets
+//! a miner connect with the **id** instead, which rented hashrate does: MRR,
+//! Braiins and the marketplace are configured from the dashboard key, and the
+//! pool admits a known id by rehydrating this row. A pure renter who never
+//! mined with the xpub would otherwise have no row. Rate-limited because it
+//! parses attacker-chosen input and writes.
 
 use axum::{extract::State, response::Json, routing::post, Router};
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
@@ -62,7 +68,20 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    resolve_identity(&req.xpub, state.allow_rotating_identities).map(Json)
+    let resolved = resolve_identity(&req.xpub, state.allow_rotating_identities)?;
+    // Idempotent, content-addressed: the key is the hash of the descriptor, so
+    // this can only ever write the row intake would write for the same xpub.
+    // A failed write fails the call. Answering without it would send a miner
+    // into rentals that the pool then refuses to credit.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    bp_db::upsert_rotating_identity(
+        &state.pool,
+        &resolved.payout_id,
+        &resolved.descriptor,
+        now_ms,
+    )
+    .await?;
+    Ok(Json(resolved))
 }
 
 /// The whole endpoint, minus axum. Goes through the SAME intake function

@@ -26,7 +26,9 @@
 //! — which is the same shape the coinbase seam already produces.
 
 use std::fmt;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::{normalize_btc_address, AddressId, InvalidAddressError};
@@ -446,13 +448,32 @@ pub trait RotatingIntake: Send + Sync {
     ///
     /// - `Ok(None)` — not an extended-key attempt. The caller's existing static
     ///   address path handles it, byte for byte as before.
-    /// - `Ok(Some(_))` — a validated rotating identity.
+    /// - `Ok(Some(_))` — a validated rotating identity: an xpub admitted now,
+    ///   or a `payout_id` this pool already holds the descriptor for (see
+    ///   [`Self::warm`]).
     /// - `Err(_)` — it *was* an extended-key attempt and this pool refuses it:
     ///   an invalid key, a descriptor that cannot rotate, or the operator flag
     ///   being off. Deliberately not `Ok(None)`: falling through to the address
     ///   path would refuse the same connection with a length-related message and
     ///   leave the miner debugging the wrong thing.
     fn intake(&self, payout_part: &str) -> Result<Option<PayoutIdentity>, IdentityRefused>;
+
+    /// Let [`Self::intake`] answer for `payout_part` without waiting on I/O.
+    ///
+    /// A miner may name a rotating identity by its `payout_id` instead of its
+    /// xpub. Hashrate rented from MRR, Braiins or the marketplace arrives that
+    /// way: those are configured from the dashboard key, which for an xpub miner
+    /// is the id, and the xpub itself never leaves the pool. `intake` cannot
+    /// derive anything from a hash, so it needs the stored descriptor, and it is
+    /// synchronous on purpose. The protocol servers await this in their async
+    /// session loop right before the pure authorize / channel-open handler.
+    ///
+    /// Nothing to prepare by default, which is right for every implementation
+    /// that does not resolve ids.
+    fn warm<'a>(&'a self, payout_part: &'a str) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        let _ = payout_part;
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// The pool refused this payout identity. **Carries no detail, deliberately.**

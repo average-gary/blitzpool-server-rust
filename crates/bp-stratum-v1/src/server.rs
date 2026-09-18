@@ -682,6 +682,19 @@ async fn run_connection(
                                 "📨 RX: {line}"
                             );
                         }
+                        // A payout id as the mining username needs its stored
+                        // descriptor loaded before the pure authorize handler
+                        // runs; see `RotatingIntake::warm`. The substring test
+                        // keeps the share-submit hot path free of a second parse.
+                        if line.contains("\"mining.authorize\"") {
+                            if let Some(intake) = state.rotating_intake.clone() {
+                                if let Ok(crate::frame::SV1Request::Authorize(req)) =
+                                    crate::frame::parse_request(&line)
+                                {
+                                    intake.warm(&req.address).await;
+                                }
+                            }
+                        }
                         let now = SystemClock.now_ms();
                         let outcome = dispatch(
                             &mut state,

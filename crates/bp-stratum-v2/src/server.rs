@@ -742,6 +742,25 @@ async fn run_mining_connection(
                         );
                     }
                 }
+                // A payout id as the channel's user identity needs its stored
+                // descriptor loaded before the pure open handler runs; see
+                // `RotatingIntake::warm`. Only a channel open carries one.
+                if let Some(intake) = state.rotating_intake.clone() {
+                    let user_identity = match &inbound {
+                        InboundMiningFrame::OpenStandardMiningChannel(input, _) => {
+                            Some(input.user_identity.as_str())
+                        }
+                        InboundMiningFrame::OpenExtendedMiningChannel(input, _) => {
+                            Some(input.user_identity.as_str())
+                        }
+                        _ => None,
+                    };
+                    if let Some(user_identity) = user_identity {
+                        let (payout_part, _worker) =
+                            bp_common::split_identity_and_worker(user_identity);
+                        intake.warm(payout_part).await;
+                    }
+                }
                 let is_submit =
                     matches!(inbound, InboundMiningFrame::SubmitSharesExtended(_));
                 // The pool-wide extranonce allocator is locked INSIDE the
