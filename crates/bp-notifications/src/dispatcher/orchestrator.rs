@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use bp_common::AddressId;
+use bp_common::{short_address, AddressId};
 use bp_db::{
     delete_push_subscription_by_endpoint, find_ntfy_subscription_by_address,
     find_push_subscriptions_by_address, find_telegram_subscriptions_by_address,
@@ -495,7 +495,7 @@ async fn send_telegram_best_diff(
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
             let include_address = chat_count > 1;
-            let fmt_addr = format_address_short(address.as_str());
+            let fmt_addr = short_address(address.as_str());
             let text = match (lang, include_address) {
                 (Language::De, true) => format!(
                     "\u{1f3c6} Neue beste Difficulty für Adresse {fmt_addr}!\nWert: {formatted}"
@@ -527,7 +527,7 @@ async fn send_telegram_device_status(
     subs: Vec<TelegramSubscriptionRow>,
     tz: chrono_tz::Tz,
 ) {
-    let fmt_addr = format_address_short(event.address.as_str());
+    let fmt_addr = short_address(event.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
         let adapter = Arc::clone(&adapter);
         let pool = pool.clone();
@@ -581,7 +581,7 @@ async fn send_telegram_device_partial(
     subs: Vec<TelegramSubscriptionRow>,
     tz: chrono_tz::Tz,
 ) {
-    let fmt_addr = format_address_short(partial.address.as_str());
+    let fmt_addr = short_address(partial.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
         let adapter = Arc::clone(&adapter);
         let pool = pool.clone();
@@ -690,7 +690,7 @@ async fn send_telegram_device_aggregate(
     subs: Vec<TelegramSubscriptionRow>,
     tz: chrono_tz::Tz,
 ) {
-    let fmt_addr = format_address_short(agg.address.as_str());
+    let fmt_addr = short_address(agg.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
         let adapter = Arc::clone(&adapter);
         let pool = pool.clone();
@@ -1072,24 +1072,6 @@ async fn count_chat_subscriptions(pool: &PgPool, chat_id: i64) -> usize {
     }
 }
 
-fn format_address_short(address: &str) -> String {
-    // First 4 chars + "..." + last 5 chars. For addresses ≤ 9 chars
-    // return the full string.
-    if address.len() <= 9 {
-        return address.to_string();
-    }
-    let head: String = address.chars().take(4).collect();
-    let tail: String = address
-        .chars()
-        .rev()
-        .take(5)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}...{tail}")
-}
-
 fn extract_difficulty_tag(message: &str) -> String {
     // The BlockSubmitted hook formats its result message as `valid (158T)`
     // etc. Pull the bracketed token out for the data.difficulty field.
@@ -1136,20 +1118,6 @@ fn log_adapter_send(kind: &'static str, result: Result<(), AdapterError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn short_address_keeps_prefix_dots_suffix() {
-        assert_eq!(
-            format_address_short("bc1q1234567890abcdefxyz"),
-            "bc1q...efxyz".to_string()
-        );
-    }
-
-    #[test]
-    fn short_address_passthrough_for_tiny_input() {
-        assert_eq!(format_address_short("abc"), "abc");
-        assert_eq!(format_address_short("123456789"), "123456789");
-    }
 
     #[test]
     fn extract_difficulty_picks_bracketed_token() {

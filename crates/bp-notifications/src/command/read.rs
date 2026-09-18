@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_client_live::{hashrate_for_addresses, pool_hashrate};
-use bp_common::AddressId;
+use bp_common::{short_address, AddressId};
 use bp_db::{
     find_address_settings, find_clients_by_address, find_group, find_group_member_by_address,
     find_pplns_group_members_for_group, find_recent_group_block_history, PplnsGroupBlockHistoryRow,
@@ -222,11 +222,11 @@ pub(crate) async fn build_stats(
         return match lang {
             Language::De => format!(
                 "Keine aktiven Worker für {addr} gefunden.",
-                addr = format_address_short(address.as_str())
+                addr = short_address(address.as_str())
             ),
             Language::En => format!(
                 "No active workers found for {addr}.",
-                addr = format_address_short(address.as_str())
+                addr = short_address(address.as_str())
             ),
         };
     }
@@ -322,12 +322,12 @@ pub(super) async fn build_group_history(
         return match lang {
             Language::De => format!(
                 "Keine Auszahlungen für {addr} in \"{name}\".",
-                addr = format_address_short(address.as_str()),
+                addr = short_address(address.as_str()),
                 name = group.name,
             ),
             Language::En => format!(
                 "No payouts for {addr} in \"{name}\".",
-                addr = format_address_short(address.as_str()),
+                addr = short_address(address.as_str()),
                 name = group.name,
             ),
         };
@@ -350,36 +350,20 @@ pub(super) async fn build_group_history(
     match lang {
         Language::De => format!(
             "Letzte Auszahlungen für {addr} in \"{name}\":\n{body}",
-            addr = format_address_short(address.as_str()),
+            addr = short_address(address.as_str()),
             name = group.name,
             body = lines.join("\n"),
         ),
         Language::En => format!(
             "Recent payouts for {addr} in \"{name}\":\n{body}",
-            addr = format_address_short(address.as_str()),
+            addr = short_address(address.as_str()),
             name = group.name,
             body = lines.join("\n"),
         ),
     }
 }
 
-// ── Local helpers ────────────────────────────────────────────────────
-
-pub(super) fn format_address_short(address: &str) -> String {
-    if address.len() <= 9 {
-        return address.to_string();
-    }
-    let head: String = address.chars().take(4).collect();
-    let tail: String = address
-        .chars()
-        .rev()
-        .take(5)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}...{tail}")
-}
+// ── Local helpers ─────────────────────────────────────────────────────────────────────
 
 fn format_sats(sats: i64) -> String {
     // en-US thousand separators ("12,345").
@@ -410,7 +394,7 @@ fn db_error_text(lang: Language) -> String {
 }
 
 fn not_in_group_text(lang: Language, address: &str) -> String {
-    let short = format_address_short(address);
+    let short = short_address(address);
     match lang {
         Language::De => format!("{short} ist in keiner Gruppe."),
         Language::En => format!("{short} is not in any group."),
@@ -494,7 +478,7 @@ pub(super) async fn build_pplns_status(
             })
     };
 
-    let trimmed = format_address_short(address.as_str());
+    let trimmed = short_address(address.as_str());
     let (percent, my_shares, balance, total_paid) = match status {
         Some(s) => (
             s.current_window_percent,
@@ -585,7 +569,7 @@ pub(super) async fn build_pplns_top(pplns: &Arc<PplnsEngine>, lang: Language) ->
         lines.push(format!(
             "{idx:>2}. {addr}   {pct:.2}%",
             idx = idx + 1,
-            addr = format_address_short(&entry.address),
+            addr = short_address(&entry.address),
             pct = entry.percent,
         ));
     }
@@ -682,7 +666,7 @@ pub(super) async fn build_group_status(
         Some(b) if b.difficulty > 0.0 => format!(
             "{} ({})",
             format_number_suffix(b.difficulty),
-            format_address_short(&b.address)
+            short_address(&b.address)
         ),
         _ => "—".to_string(),
     };
@@ -794,7 +778,7 @@ pub(super) async fn build_group_members(
             Some(p) => format!("{p:.2}%"),
             None => "—".to_string(),
         };
-        let trimmed = format_address_short(m.address.as_str());
+        let trimmed = short_address(m.address.as_str());
         let me = m.address == address.clone();
         lines_de.push(format!(
             "{trimmed}   {pct_str}{marker}",
@@ -839,11 +823,11 @@ pub(crate) async fn build_show_workers(
         return match lang {
             Language::De => format!(
                 "Keine aktiven Worker für {addr} gefunden.",
-                addr = format_address_short(address.as_str())
+                addr = short_address(address.as_str())
             ),
             Language::En => format!(
                 "No active workers found for {addr}.",
-                addr = format_address_short(address.as_str())
+                addr = short_address(address.as_str())
             ),
         };
     }
@@ -983,14 +967,6 @@ mod tests {
         assert!(out.contains("Progress: 12.00%"));
         assert!(out.contains("\u{1f4c9} -2.00%"));
         assert!(out.contains("Expected change"));
-    }
-
-    #[test]
-    fn format_address_short_keeps_first_4_last_5() {
-        assert_eq!(
-            format_address_short("bc1q1234567890abcdefxyz"),
-            "bc1q...efxyz"
-        );
     }
 
     #[test]

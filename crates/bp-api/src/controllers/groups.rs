@@ -1059,7 +1059,7 @@ where
                             group_id: h.group_id,
                             block_height: h.block_height,
                             created_at: crate::time_range::format_slot_label(h.created_at),
-                            address_label: mask_address_tail(h.address.as_str(), 5),
+                            address_label: bp_common::short_address(h.address.as_str()),
                             paid_sats: h.paid_sats.to_i64(),
                             percent: h.percent as f64,
                             shares_in_round: h.shares_in_round,
@@ -1099,20 +1099,6 @@ fn member_id(group_id: Uuid, address: &str) -> String {
     hex::encode(&h.finalize()[..8]) // 64-bit → collision-free within a group
 }
 
-/// Masked address for display: first 4 + "..." + last `tail` chars, mirroring
-/// the UI's `formatBtcAddress` (tail = 5). Returns the input unchanged when
-/// it's too short to shorten.
-fn mask_address_tail(address: &str, tail: usize) -> String {
-    let a = address.trim();
-    let n = a.chars().count();
-    if n <= 4 + tail {
-        return a.to_string();
-    }
-    let first: String = a.chars().take(4).collect();
-    let last: String = a.chars().skip(n - tail).collect();
-    format!("{first}...{last}")
-}
-
 /// Masked labels for a group's members, guaranteed unique within the group.
 /// Base = last-5 (like the UI); if two members would collapse to the same
 /// label, both are widened to last-9, which makes an intra-group visual
@@ -1121,13 +1107,13 @@ fn mask_address_tail(address: &str, tail: usize) -> String {
 fn build_member_labels(addresses: &[String]) -> HashMap<String, String> {
     let mut base_counts: HashMap<String, usize> = HashMap::new();
     for a in addresses {
-        *base_counts.entry(mask_address_tail(a, 5)).or_insert(0) += 1;
+        *base_counts.entry(bp_common::short_address(a)).or_insert(0) += 1;
     }
     let mut out = HashMap::with_capacity(addresses.len());
     for a in addresses {
-        let base = mask_address_tail(a, 5);
+        let base = bp_common::short_address(a);
         let label = if base_counts.get(&base).copied().unwrap_or(0) > 1 {
-            mask_address_tail(a, 9)
+            bp_common::short_address_with_tail(a, 9)
         } else {
             base
         };
@@ -1330,7 +1316,7 @@ where
                     address_label: labels
                         .get(addr_str)
                         .cloned()
-                        .unwrap_or_else(|| mask_address_tail(addr_str, 5)),
+                        .unwrap_or_else(|| bp_common::short_address(addr_str)),
                     address: is_admin.then(|| addr_str.to_string()),
                     is_self: viewer.as_deref() == Some(addr_str),
                     role: m.role,
@@ -1451,7 +1437,7 @@ where
                         address_label: labels
                             .get(a.as_str())
                             .cloned()
-                            .unwrap_or_else(|| mask_address_tail(a.as_str(), 5)),
+                            .unwrap_or_else(|| bp_common::short_address(a.as_str())),
                     })
                     .collect(),
             })
@@ -1559,7 +1545,7 @@ fn distribution_entries(
                 address_label: labels
                     .get(&address)
                     .cloned()
-                    .unwrap_or_else(|| mask_address_tail(&address, 5)),
+                    .unwrap_or_else(|| bp_common::short_address(&address)),
                 total_shares: shares,
                 percent,
                 total_rejected: rejected_per_address.get(&address).copied().unwrap_or(0.0),
@@ -1660,7 +1646,7 @@ fn build_window_timeline_response(
             address_label: labels
                 .get(a)
                 .cloned()
-                .unwrap_or_else(|| mask_address_tail(a, 5)),
+                .unwrap_or_else(|| bp_common::short_address(a)),
         })
         .collect();
 
@@ -1743,7 +1729,7 @@ where
                 };
                 Ok(BestDifficultyResponse {
                     best_difficulty: best.difficulty.floor() as u64,
-                    address_label: Some(mask_address_tail(&best.address, 5)),
+                    address_label: Some(bp_common::short_address(&best.address)),
                     time: Some(crate::time_range::format_slot_label(best.timestamp_ms)),
                 })
             },
@@ -1801,7 +1787,7 @@ where
                     group_id: h.group_id,
                     block_height: h.block_height,
                     created_at: crate::time_range::format_slot_label(h.created_at),
-                    address_label: mask_address_tail(h.address.as_str(), 5),
+                    address_label: bp_common::short_address(h.address.as_str()),
                     paid_sats: h.paid_sats.to_i64(),
                     percent: h.percent as f64,
                     shares_in_round: h.shares_in_round,
@@ -2492,17 +2478,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_address_tail_shows_first4_and_last_n() {
-        let a = "bc1qxyzabcdefghijklmnop9k2p4";
-        assert_eq!(mask_address_tail(a, 5), "bc1q...9k2p4");
-        assert_eq!(mask_address_tail(a, 9), "bc1q...mnop9k2p4");
-        // Too short to shorten → returned verbatim.
-        assert_eq!(mask_address_tail("bc1qab", 5), "bc1qab");
-        // Never contains the full middle of the address.
-        assert!(!mask_address_tail(a, 5).contains("xyzabc"));
-    }
-
-    #[test]
     fn member_id_is_stable_group_scoped_and_opaque() {
         let g1 = Uuid::from_u128(1);
         let g2 = Uuid::from_u128(2);
@@ -2549,12 +2524,12 @@ mod tests {
         let a = "bc1qAAAAAAAAA12345".to_string();
         let b = "bc1qBBBBBBBBB12345".to_string();
         let labels = build_member_labels(&[a.clone(), b.clone()]);
-        assert_eq!(mask_address_tail(&a, 5), mask_address_tail(&b, 5)); // base collides
+        assert_eq!(bp_common::short_address(&a), bp_common::short_address(&b)); // base collides
         assert_ne!(labels[&a], labels[&b], "colliding labels must be widened");
         // A non-colliding address keeps the short last-5 label.
         let c = "bc1qCCCCCCCCCC99999".to_string();
         let labels2 = build_member_labels(&[a, c.clone()]);
-        assert_eq!(labels2[&c], mask_address_tail(&c, 5));
+        assert_eq!(labels2[&c], bp_common::short_address(&c));
     }
 
     #[test]

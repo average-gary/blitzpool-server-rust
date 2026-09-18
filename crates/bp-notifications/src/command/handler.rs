@@ -39,11 +39,11 @@ use super::parser::{
     parse_address_callback, parse_bestdiff_callback, parse_hourly_callback, AddressCallback,
     Command, FlagToggle, HourlyTarget, LanguageSwitch,
 };
-use super::read::format_address_short;
 use crate::adapter::{
     AdapterError, AdapterResult, InlineButton, InlineKeyboard, NtfyAdapter, TelegramAdapter,
 };
 use crate::format::Language;
+use bp_common::short_address;
 
 /// Shared, process-lifetime map of Telegram `chat_id` → chosen
 /// [`Language`]. Owned by [`CommandHandler`] and handed to the
@@ -284,7 +284,7 @@ impl CommandHandler {
                 let star = if s.is_default { "⭐ " } else { "" };
                 vec![
                     InlineButton::new(
-                        format!("{star}{}", format_address_short(s.address.as_str())),
+                        format!("{star}{}", short_address(s.address.as_str())),
                         format!("addr:set:{}", s.id),
                     ),
                     InlineButton::new("🗑", format!("addr:rm:{}", s.id)),
@@ -405,7 +405,7 @@ impl CommandHandler {
                 .await;
             return;
         };
-        let trimmed = format_address_short(target.address.as_str());
+        let trimmed = short_address(target.address.as_str());
         match cb {
             AddressCallback::SetDefault(_) => {
                 if target.is_default {
@@ -635,7 +635,7 @@ impl CommandHandler {
             },
         };
         let de = matches!(lang, Language::De);
-        let trimmed = format_address_short(address.as_str());
+        let trimmed = short_address(address.as_str());
         let text = if de {
             format!("Best Difficulty für {trimmed} wirklich zurücksetzen?")
         } else {
@@ -691,7 +691,7 @@ impl CommandHandler {
                 return;
             }
         };
-        let trimmed = format_address_short(pending.address.as_str());
+        let trimmed = short_address(pending.address.as_str());
 
         if !confirm {
             let _ = adapter
