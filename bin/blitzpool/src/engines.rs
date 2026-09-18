@@ -138,6 +138,50 @@ pub(crate) enum EngineError {
     InvalidAddress(String, bp_common::InvalidAddressError),
     #[error("core epoch fetch (INCR core:epoch) failed: {0}")]
     CoreEpoch(#[from] redis::RedisError),
+    #[error("reading the pplns payout keys to preload rotating identities failed: {0}")]
+    PplnsPayoutKeys(#[from] bp_pplns_engine::distribution::DistributionError),
+    #[error("reading the group-solo payout keys to preload rotating identities failed: {0}")]
+    GroupSoloPayoutKeys(#[from] bp_group_solo_engine::distribution::DistributionError),
+    #[error(
+        "preloading rotating payout identities failed: {0}; not starting with miners the \
+         first distribution builds would drop"
+    )]
+    IdentityPreload(#[from] crate::payout_identities::StoreUnreadable),
+}
+
+/// Load every rotating identity in play into memory before the first
+/// distribution build, while the database is known to be there. See
+/// [`crate::payout_identities::PoolPaidAddresses::preload`] for what it
+/// prevents. The keys come from the same reads the builds make, so the preload
+/// covers exactly the miners a build will ask about.
+async fn preload_payout_identities(
+    paid_addresses: &crate::payout_identities::PoolPaidAddresses,
+    pplns: Option<&PplnsEngine>,
+    group_solo: &GroupSoloEngine,
+) -> Result<(), EngineError> {
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(engine) = pplns {
+        keys.extend(
+            engine
+                .payout_keys_in_play()
+                .await?
+                .into_iter()
+                .map(|key| key.as_str().to_string()),
+        );
+    }
+    keys.extend(
+        group_solo
+            .payout_keys_in_play()
+            .await?
+            .into_iter()
+            .map(|key| key.as_str().to_string()),
+    );
+    let rotating = paid_addresses.preload(&keys).await?;
+    info!(
+        keys = keys.len(),
+        rotating, "payout-identity: rotating identities in play loaded before the first build"
+    );
+    Ok(())
 }
 
 /// Fetch this Core process's share-id epoch: `INCR core:epoch`. Unique per
@@ -225,12 +269,13 @@ pub(crate) async fn spawn(
     // read-only engine never reaches settlement, so the install is inert there,
     // whereas gating it would make "can this process attribute a payout" a
     // second, role-shaped answer to the question above.
+    let paid_addresses = Arc::new(crate::payout_identities::PoolPaidAddresses::new(
+        payout_identities.clone(),
+        handles.db.pool().clone(),
+        crate::network::config_network_to_bitcoin(cfg.network),
+    ));
     let identity_resolver: Arc<dyn bp_coinbase_snapshot::PayoutIdentityResolver> =
-        Arc::new(crate::payout_identities::PoolPaidAddresses::new(
-            payout_identities.clone(),
-            handles.db.pool().clone(),
-            crate::network::config_network_to_bitcoin(cfg.network),
-        ));
+        paid_addresses.clone();
     if let Some(engine) = pplns.as_ref() {
         // False only if something installed one first, which nothing does — the
         // engines are constructed above and handed out below.
@@ -240,6 +285,13 @@ pub(crate) async fn spawn(
     }
     if !group_solo.install_payout_identity_resolver(identity_resolver) {
         warn!("group-solo: a paid-address resolver was already installed; keeping the first");
+    }
+
+    // Front only: its builds are the ones that put miners into a coinbase, and
+    // they run from its own directory. Before Stratum starts, so before the
+    // first build.
+    if cfg.has_role(Role::Front) {
+        preload_payout_identities(&paid_addresses, pplns.as_ref(), &group_solo).await?;
     }
 
     info!(

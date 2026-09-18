@@ -128,6 +128,13 @@ const UNKNOWN_ID_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// early costs a read, never an admission.
 const UNKNOWN_ID_CAPACITY: usize = 4096;
 
+/// The first wait before [`PoolRotatingIntake::persist`] writes a failed row
+/// again. Doubles per attempt up to [`PERSIST_RETRY_MAX`].
+const PERSIST_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// The longest wait between two attempts to write one identity's row.
+const PERSIST_RETRY_MAX: Duration = Duration::from_secs(30);
+
 /// In-memory `payout_id → rotating identity`, in two tiers.
 ///
 /// | Tier | Lifetime | Who fills it |
@@ -389,6 +396,12 @@ pub(crate) struct PoolRotatingIntake {
     unknown_id_retry_after: Duration,
     /// The [`WARM_CONCURRENT_READS`] slots every warm read takes one of.
     warm_reads: Semaphore,
+    /// Payout ids with a [`Self::persist`] write in flight or waiting to be
+    /// retried. A second admission of the same identity meanwhile starts no
+    /// second writer: the row it would write is the same row.
+    persisting: Arc<Mutex<HashSet<String>>>,
+    /// [`PERSIST_RETRY_AFTER`]; a field so tests can shorten it.
+    persist_retry_after: Duration,
 }
 
 impl PoolRotatingIntake {
@@ -412,6 +425,8 @@ impl PoolRotatingIntake {
             unknown_ids: Mutex::new(BoundedMap::default()),
             unknown_id_retry_after: UNKNOWN_ID_RETRY_AFTER,
             warm_reads: Semaphore::new(WARM_CONCURRENT_READS),
+            persisting: Arc::new(Mutex::new(HashSet::new())),
+            persist_retry_after: PERSIST_RETRY_AFTER,
         }
     }
 
@@ -559,12 +574,17 @@ impl PoolRotatingIntake {
     /// the process may have restarted. `miner_identity` is the one place the
     /// descriptor survives that, and [`PoolPaidAddresses`] reads it there.
     ///
-    /// Fire-and-forget because [`RotatingIntake::intake`] is synchronous: it runs
-    /// on the authorize / channel-open path, which must not wait on Postgres to
-    /// answer a miner. A lost write is not silent — the upsert is idempotent so
-    /// every reconnect retries it, and a settlement that finds no row refuses the
-    /// block by name (`PaidAtHeightError::Unresolvable`, non-terminal) rather than
-    /// booking a rotating miner's claim twice.
+    /// In the background because [`RotatingIntake::intake`] is synchronous: it
+    /// runs on the authorize / channel-open path, which must not wait on Postgres
+    /// to answer a miner. A failed write is retried until it lands, with a
+    /// growing wait, for as long as the process runs. Waiting for the miner's
+    /// next connection is not enough: a miner that stops mining while the
+    /// database is away never makes one, and after the next restart the job
+    /// path has nowhere to find the identity it still has shares for. The
+    /// upsert is idempotent, so a retry and a later admission cannot disagree.
+    /// A settlement that still finds no row refuses the block by name
+    /// (`PaidAtHeightError::Unresolvable`, non-terminal) rather than booking a
+    /// rotating miner's claim twice.
     fn persist(&self, identity: &PayoutIdentity) {
         // Exhaustive on purpose. A third identity kind has to decide here whether
         // it leaves anything behind for settlement, rather than falling into a
@@ -581,25 +601,62 @@ impl PoolRotatingIntake {
                 descriptor.canonical_descriptor().to_string(),
             ),
         };
+        if !self
+            .persisting
+            .lock()
+            .expect("payout-identity mutex poisoned")
+            .insert(payout_id.clone())
+        {
+            return;
+        }
         let pool = self.pool.clone();
+        let persisting = self.persisting.clone();
+        let mut wait = self.persist_retry_after;
         tokio::spawn(async move {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            // The line carries the DbError and the `payout_id` (a published hash)
-            // — never `descriptor`, which is in scope here and is a
+            let mut attempt: u32 = 1;
+            // The lines carry the DbError and the `payout_id` (a published hash)
+            // and never `descriptor`, which is in scope here and is a
             // wallet-watching capability over every address the pool will pay
             // this miner.
-            match bp_db::upsert_rotating_identity(&pool, &payout_id, &descriptor, now_ms).await {
-                Ok(()) => debug!(
-                    payout_id,
-                    "payout-identity: descriptor persisted for settlement"
-                ),
-                Err(err) => warn!(
-                    %err,
-                    payout_id,
-                    "payout-identity: persisting the descriptor failed; settlement cannot \
-                     rehydrate this miner until a reconnect re-writes the row"
-                ),
+            loop {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                match bp_db::upsert_rotating_identity(&pool, &payout_id, &descriptor, now_ms).await
+                {
+                    Ok(()) if attempt == 1 => {
+                        debug!(
+                            payout_id,
+                            "payout-identity: descriptor persisted for settlement"
+                        );
+                        break;
+                    }
+                    Ok(()) => {
+                        info!(
+                            payout_id,
+                            attempt, "payout-identity: descriptor persisted after retrying"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        if attempt == 1 {
+                            warn!(
+                                %err,
+                                payout_id,
+                                "payout-identity: persisting the descriptor failed; retrying \
+                                 until the database takes it"
+                            );
+                        } else {
+                            debug!(%err, payout_id, attempt, "payout-identity: persist retry failed");
+                        }
+                        tokio::time::sleep(wait).await;
+                        wait = (wait * 2).min(PERSIST_RETRY_MAX);
+                        attempt = attempt.saturating_add(1);
+                    }
+                }
             }
+            persisting
+                .lock()
+                .expect("payout-identity mutex poisoned")
+                .remove(&payout_id);
         });
     }
 }
@@ -679,6 +736,16 @@ impl RotatingIntake for PoolRotatingIntake {
     }
 }
 
+/// The `miner_identity` read [`PoolPaidAddresses`] needed failed, leaving
+/// `unresolved` keys without an identity. The read's own error is logged where
+/// it happened; the rows it failed to read hold descriptors, so it travels no
+/// further.
+#[derive(Debug, thiserror::Error)]
+#[error("miner_identity could not be read; {unresolved} rotating keys unresolved")]
+pub(crate) struct StoreUnreadable {
+    pub(crate) unresolved: usize,
+}
+
 /// **The pool's [`PayoutIdentityResolver`]: which address a ledger key was paid
 /// under, at one block's height.**
 ///
@@ -738,6 +805,91 @@ impl PoolPaidAddresses {
             pool,
             network,
         }
+    }
+
+    /// **Boot-time preload:** vouch for every rotating identity among
+    /// `ledger_keys` before the first distribution build, while the database
+    /// is known to be there. The process does not start without it.
+    ///
+    /// The directory is empty after a restart, so the first builds would read
+    /// every miner in play from `miner_identity`, and a store that failed right
+    /// then would drop them all from the coinbase. After this they are in
+    /// memory, and a later outage costs none of them their row. Unlike the job
+    /// path this fails when the store cannot be read, so boot stops instead of
+    /// starting with miners the first builds would drop. A key the store holds
+    /// no usable row for is not a failure: it is logged the way a build logs
+    /// it, and no retry at boot would change it.
+    ///
+    /// Returns how many rotating identities it vouched for.
+    pub(crate) async fn preload(&self, ledger_keys: &[String]) -> Result<usize, StoreUnreadable> {
+        let mut derived = HashSet::with_capacity(ledger_keys.len());
+        self.vouch_for(ledger_keys, &mut derived).await?;
+        Ok(derived.len())
+    }
+
+    /// Vouch for every key among `ledger_keys` that is a rotating identity the
+    /// directory or the store can answer for, and add it to `derived`. The one
+    /// implementation behind both the job path and [`Self::preload`].
+    ///
+    /// Every key it answers `yes` for is also
+    /// [vouched](PayoutIdentityDirectory::vouch) into the directory; see
+    /// [`PayoutIdentityResolver::derived_payout_keys`] on this type for why that
+    /// is load-bearing. `Err` only when the store read itself failed; the keys
+    /// the directory answered are in `derived` either way.
+    async fn vouch_for(
+        &self,
+        ledger_keys: &[String],
+        derived: &mut HashSet<String>,
+    ) -> Result<(), StoreUnreadable> {
+        let mut needing_the_store: Vec<&String> = Vec::new();
+
+        for key in ledger_keys {
+            let identity = self.directory.identity_for(key);
+            // `match`, not `identity.rotates()`: the Static arm has a real
+            // decision in it (literal address vs the directory's miss branch), and
+            // a boolean would hide that this is where the second one is routed.
+            match identity {
+                PayoutIdentity::Rotating { .. } => {
+                    // The directory is keyed by `payout_id`, so a hit means the
+                    // identity's own id IS `key` — insert what the caller holds.
+                    self.directory.vouch(identity);
+                    derived.insert(key.clone());
+                }
+                PayoutIdentity::Static { ref address } => {
+                    if !bp_pplns::is_valid_payout_address(address) {
+                        // The miss branch, handing back a `payout_id` dressed as an
+                        // address. Postgres decides, not this.
+                        needing_the_store.push(key);
+                    }
+                    // A literal address needs no entry here: the consumer's
+                    // predicate is `is_valid_payout_address(key) || derived
+                    // .contains(key)` and the first half already accepts it.
+                }
+            }
+        }
+
+        if needing_the_store.is_empty() {
+            return Ok(());
+        }
+        let outcomes = self
+            .rehydrate_from_the_store(&needing_the_store)
+            .await
+            .map_err(|_| StoreUnreadable {
+                unresolved: needing_the_store.len(),
+            })?;
+        for (key, outcome) in outcomes {
+            match outcome {
+                StoredOutcome::Resolved(identity) => {
+                    self.directory.vouch(identity);
+                    derived.insert(key);
+                }
+                // Both already logged per key by `rehydrate_from_the_store`, and
+                // both mean the same thing here: not payable this build. The
+                // distinction is settlement's, not this path's.
+                StoredOutcome::Absent | StoredOutcome::Rejected => {}
+            }
+        }
+        Ok(())
     }
 
     /// Rebuild the identities for keys the directory did not hold, from
@@ -927,64 +1079,19 @@ impl PayoutIdentityResolver for PoolPaidAddresses {
     /// is the opposite of what settlement does with the same key.
     async fn derived_payout_keys(&self, ledger_keys: &[String]) -> HashSet<String> {
         let mut derived = HashSet::with_capacity(ledger_keys.len());
-        let mut needing_the_store: Vec<&String> = Vec::new();
-
-        for key in ledger_keys {
-            let identity = self.directory.identity_for(key);
-            // `match`, not `identity.rotates()`: the Static arm has a real
-            // decision in it (literal address vs the directory's miss branch), and
-            // a boolean would hide that this is where the second one is routed.
-            match identity {
-                PayoutIdentity::Rotating { .. } => {
-                    // The directory is keyed by `payout_id`, so a hit means the
-                    // identity's own id IS `key` — insert what the caller holds.
-                    self.directory.vouch(identity);
-                    derived.insert(key.clone());
-                }
-                PayoutIdentity::Static { ref address } => {
-                    if !bp_pplns::is_valid_payout_address(address) {
-                        // The miss branch, handing back a `payout_id` dressed as an
-                        // address. Postgres decides, not this.
-                        needing_the_store.push(key);
-                    }
-                    // A literal address needs no entry here: the consumer's
-                    // predicate is `is_valid_payout_address(key) || derived
-                    // .contains(key)` and the first half already accepts it.
-                }
-            }
-        }
-
-        if needing_the_store.is_empty() {
-            return derived;
-        }
-        let outcomes = match self.rehydrate_from_the_store(&needing_the_store).await {
-            Ok(outcomes) => outcomes,
-            Err(err) => {
-                // The store is unreachable. Every one of these rows is dropped
-                // from this build — which costs those miners one template, and is
-                // the same degradation `load_inputs` accepts for an unreadable
-                // ledger. Failing instead would serve no job to anybody.
-                error!(
-                    %err,
-                    unresolved = needing_the_store.len(),
-                    "payout-identity: miner_identity could not be read on the job path; these \
-                     rotating miners are dropped from this distribution build and rejoin when \
-                     it is rebuilt"
-                );
-                return derived;
-            }
-        };
-        for (key, outcome) in outcomes {
-            match outcome {
-                StoredOutcome::Resolved(identity) => {
-                    self.directory.vouch(identity);
-                    derived.insert(key);
-                }
-                // Both already logged per key by `rehydrate_from_the_store`, and
-                // both mean the same thing here: not payable this build. The
-                // distinction is settlement's, not this path's.
-                StoredOutcome::Absent | StoredOutcome::Rejected => {}
-            }
+        if let Err(StoreUnreadable { unresolved }) = self.vouch_for(ledger_keys, &mut derived).await
+        {
+            // Every one of these rows is dropped from this build, which costs
+            // those miners one template, and is the same degradation
+            // `load_inputs` accepts for an unreadable ledger. Failing instead
+            // would serve no job to anybody. The boot-time preload is what keeps
+            // this from reaching miners already in play.
+            error!(
+                unresolved,
+                "payout-identity: miner_identity could not be read on the job path; these \
+                 rotating miners are dropped from this distribution build and rejoin when \
+                 it is rebuilt"
+            );
         }
         derived
     }
@@ -1270,6 +1377,143 @@ mod tests {
         assert!(
             matches!(intake.intake(&id), Ok(Some(_))),
             "after the window the row is read and admitted"
+        );
+
+        clear_identity_row(&pool, &id).await;
+    }
+
+    /// A row write that fails is retried until the database takes it, not left
+    /// for the miner's next connection. The store is unreachable when the xpub
+    /// is admitted and appears afterwards, with no second admission: the row
+    /// must still arrive. Without the retry it never does, because a miner who
+    /// stops mining never connects again.
+    #[tokio::test]
+    async fn a_failed_identity_write_is_retried_until_the_database_takes_it() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let url = std::env::var("BP_PG_URL")
+            .unwrap_or_else(|_| bp_test_support::PG_DEFAULT_URL.to_string());
+        let real: sqlx::postgres::PgConnectOptions =
+            url.parse().expect("the test database URL parses");
+        let upstream = format!("{}:{}", real.get_host(), real.get_port());
+
+        // A port nothing listens on yet. A proxy to the real database opens on
+        // it only after the first write has failed.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|probe| probe.local_addr())
+            .expect("a free local port")
+            .port();
+        let late_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy_with(real.clone().host("127.0.0.1").port(port));
+
+        let xpub = own_xpub(0xA3);
+        let stored = bp_payout_descriptor::RotatingPayout::from_xpub_str(&xpub)
+            .expect("a derived master xpub is a valid xpub");
+        let id = stored.payout_id().as_str().to_string();
+        clear_identity_row(&pool, &id).await;
+
+        let mut intake =
+            PoolRotatingIntake::new(Arc::new(PayoutIdentityDirectory::new()), true, late_pool);
+        intake.persist_retry_after = Duration::from_millis(100);
+        intake
+            .intake(&xpub)
+            .expect("the flag is on")
+            .expect("an xpub is an intake attempt");
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            bp_db::find_miner_identity(&pool, &id)
+                .await
+                .expect("read")
+                .is_none(),
+            "precondition: the first write must have failed, or this proves \
+             nothing about the retry"
+        );
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("open the port the pool writes to");
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let row = loop {
+            if let Some(row) = bp_db::find_miner_identity(&pool, &id).await.expect("read") {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "the retried write never arrived");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(
+            row.descriptor.as_deref(),
+            Some(stored.canonical_descriptor()),
+            "the row the retry wrote is the identity that was admitted"
+        );
+
+        clear_identity_row(&pool, &id).await;
+    }
+
+    /// The boot-time preload puts a stored rotating identity into memory, so a
+    /// build after it needs no database for that miner: the same directory
+    /// behind a resolver whose store is unreachable still pays it. A key the
+    /// store has no row for does not stop the boot. An unreadable store does,
+    /// but only when some key needs it.
+    #[tokio::test]
+    async fn preloading_holds_stored_identities_and_fails_only_on_an_unreadable_store() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let stored = bp_payout_descriptor::RotatingPayout::from_xpub_str(&own_xpub(0xA4))
+            .expect("a derived master xpub is a valid xpub");
+        let id = stored.payout_id().as_str().to_string();
+        clear_identity_row(&pool, &id).await;
+        bp_db::upsert_rotating_identity(&pool, &id, stored.canonical_descriptor(), 1)
+            .await
+            .expect("seed the row");
+
+        let dir = Arc::new(PayoutIdentityDirectory::new());
+        let online = PoolPaidAddresses::new(dir.clone(), pool.clone(), Network::Regtest);
+        let keys = [id.clone(), STATIC_ADDR.to_string(), ABSENT_ID.to_string()];
+        assert_eq!(
+            online.preload(&keys).await.expect("the store answers"),
+            1,
+            "the one stored rotating identity; a missing row is not a boot failure"
+        );
+
+        let offline = PoolPaidAddresses::new(dir.clone(), unreachable_pool(), Network::Regtest);
+        assert!(
+            offline
+                .derived_payout_keys(std::slice::from_ref(&id))
+                .await
+                .contains(&id),
+            "after the preload a build pays this miner without the database"
+        );
+
+        let cold = PoolPaidAddresses::new(
+            Arc::new(PayoutIdentityDirectory::new()),
+            unreachable_pool(),
+            Network::Regtest,
+        );
+        assert!(
+            cold.preload(std::slice::from_ref(&id)).await.is_err(),
+            "an unreadable store stops the boot instead of starting with the miner dropped"
+        );
+        assert_eq!(
+            cold.preload(&[STATIC_ADDR.to_string()])
+                .await
+                .expect("an address needs no store"),
+            0
         );
 
         clear_identity_row(&pool, &id).await;

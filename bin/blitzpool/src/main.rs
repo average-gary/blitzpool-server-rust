@@ -1554,6 +1554,18 @@ fn print_engine_error_help(err: &EngineError) {
                  check the `[redis]` URL and that the server is up."
             );
         }
+        EngineError::PplnsPayoutKeys(_)
+        | EngineError::GroupSoloPayoutKeys(_)
+        | EngineError::IdentityPreload(_) => {
+            eprintln!(
+                "hint: the front loads every rotating payout identity in play \
+                 before its first distribution build, and needs Redis (the \
+                 window and rounds) and Postgres (balances, groups, \
+                 miner_identity) for it. Starting without them would drop \
+                 those miners from the coinbase, so it stops instead. Check \
+                 both are reachable and restart."
+            );
+        }
     }
 }
 

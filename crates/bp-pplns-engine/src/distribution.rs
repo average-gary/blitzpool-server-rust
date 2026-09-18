@@ -35,7 +35,7 @@ use bp_coinbase_snapshot::{
     build_and_snapshot, resolve_derived_keys, BuildRequest, InstalledResolver,
 };
 use bp_common::{AddressId, Sats};
-use bp_db::{find_pplns_balances_with_open_balance, PplnsBalanceRow};
+use bp_db::{find_pplns_balances_with_open_balance, DbError, PplnsBalanceRow};
 use bp_pplns::{WeightBuildError, WeightDistribution};
 use sqlx::PgPool;
 use thiserror::Error;
@@ -360,6 +360,61 @@ impl DistributionBuilder {
 
 // ── Internals ────────────────────────────────────────────────────────
 
+/// The two places every PPLNS build takes its ledger keys from: the window
+/// (Redis) and the open-balance ledger (Postgres), sanitized to `AddressId`s.
+///
+/// Read here for a build ([`load_inputs`]) and for the boot-time identity
+/// preload ([`payout_keys_in_play`]) alike, so the preload cannot come to ask
+/// about a different set of keys than a build does. A window error is `Err`;
+/// the ledger result is handed back as it is, because the two callers treat a
+/// failed ledger read differently.
+async fn read_key_sources(
+    pool: &PgPool,
+    window: &WindowStore,
+) -> Result<
+    (
+        HashMap<AddressId, f64>,
+        Result<HashMap<AddressId, Sats>, DbError>,
+    ),
+    DistributionError,
+> {
+    // Window aggregate from Redis (HashMap<String, f64>).
+    let window_raw = window.read_window_by_address().await?;
+
+    // Open-balance ledger rows from PG.
+    let ledger = find_pplns_balances_with_open_balance(pool)
+        .await
+        .map(|rows| open_balance_rows_to_balance_map(&rows));
+
+    // Window addresses are raw strings. Ones that fail `AddressId` validation
+    // are skipped with a warn (an upstream bug could have pushed an invalid
+    // address into Redis; better to skip its share than fail the
+    // distribution). Dropping addresses that parse but are not usable payout
+    // scripts happens in the shared build.
+    let address_shares = share_map_from_redis_hash(
+        &window_raw,
+        "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
+    );
+    Ok((address_shares, ledger))
+}
+
+/// Every ledger key the next build will ask the identity resolver about: the
+/// window's and the open balances'. For the boot-time preload of rotating
+/// identities, which reads the ledger **hard**, unlike a build: a preload that
+/// skipped the balances would leave exactly the keys it exists for unloaded.
+pub async fn payout_keys_in_play(
+    pool: &PgPool,
+    window: &WindowStore,
+) -> Result<Vec<AddressId>, DistributionError> {
+    let (address_shares, ledger) = read_key_sources(pool, window).await?;
+    let balances = ledger.map_err(|err| DistributionError::Inputs(err.to_string()))?;
+    let keys: HashSet<AddressId> = address_shares
+        .into_keys()
+        .chain(balances.into_keys())
+        .collect();
+    Ok(keys.into_iter().collect())
+}
+
 /// Steps 1-3: the reward-independent half of a build — read the window
 /// and the ledger, sanitize both. Shared by every concurrent build via
 /// [`DistributionBuilder::inputs_cache`].
@@ -392,12 +447,10 @@ async fn load_inputs(
     window: &WindowStore,
     identities: &InstalledResolver,
 ) -> Result<DistributionInputs, DistributionError> {
-    // 1. Read window aggregate from Redis (HashMap<String, f64>). Hard.
-    let window_raw = window.read_window_by_address().await?;
-
-    // 2. Read open-balance ledger rows from PG. Soft — see the docs above.
-    let balances = match find_pplns_balances_with_open_balance(pool).await {
-        Ok(rows) => open_balance_rows_to_balance_map(&rows),
+    // 1-3. The window (hard) and the ledger (soft, see the docs above).
+    let (address_shares, ledger) = read_key_sources(pool, window).await?;
+    let balances = match ledger {
+        Ok(balances) => balances,
         Err(err) => {
             error!(
                 %err,
@@ -408,17 +461,6 @@ async fn load_inputs(
             HashMap::new()
         }
     };
-
-    // 3. Convert to bp_pplns inputs. Window addresses are raw strings —
-    //    ones that fail `AddressId` validation are skipped with a warn
-    //    (an upstream bug could have pushed an invalid address into
-    //    Redis; better to skip its share than fail the distribution).
-    //    Dropping addresses that parse but are not usable payout scripts
-    //    happens in the shared build.
-    let address_shares = share_map_from_redis_hash(
-        &window_raw,
-        "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
-    );
 
     // 4. Ask who is behind the keys that are not addresses. Both maps, because
     //    the window and the ledger are filtered by the same predicate and a

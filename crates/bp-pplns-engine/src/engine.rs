@@ -461,6 +461,16 @@ impl PplnsEngine {
         self.inner.identity_resolver.install(resolver)
     }
 
+    /// Every ledger key the next distribution build will ask the identity
+    /// resolver about, read the way a build reads them but with the ledger
+    /// required. For the boot-time preload of rotating identities; see
+    /// [`crate::distribution::payout_keys_in_play`].
+    pub async fn payout_keys_in_play(
+        &self,
+    ) -> Result<Vec<AddressId>, crate::distribution::DistributionError> {
+        crate::distribution::payout_keys_in_play(&self.inner.pool, &self.inner.window).await
+    }
+
     /// The installed resolver, or the static-only default.
     fn identity_resolver(&self) -> Arc<dyn PayoutIdentityResolver> {
         self.inner.identity_resolver.get()

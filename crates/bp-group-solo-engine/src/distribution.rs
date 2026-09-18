@@ -28,7 +28,7 @@ use bp_coinbase_snapshot::{
     InstalledResolver, StoredWeightSnapshot,
 };
 use bp_common::{AddressId, Sats};
-use bp_db::{find_group, DbError};
+use bp_db::{find_group, list_active_pplns_groups, DbError, PplnsGroupRow};
 use bp_inflight_cache::InflightResultCache;
 use bp_pplns::{WeightBuildError, WeightDistribution, WithheldValue};
 use sqlx::PgPool;
@@ -211,6 +211,44 @@ impl DistributionBuilder {
 
 // ── Internals ────────────────────────────────────────────────────────
 
+/// A group's current payout shares, sanitized to `AddressId`s. Mode-aware: a
+/// PROP group reads its per-round aggregate; a Window group trims to the
+/// sliding window first, so the result is always fenster-current (even for an
+/// idle group).
+///
+/// Read here for a build and for the boot-time identity preload
+/// ([`payout_keys_in_play`]) alike, so the preload cannot come to ask about a
+/// different set of keys than a build does.
+async fn read_round_shares(
+    round: &GroupRoundStore,
+    group_row: &PplnsGroupRow,
+) -> Result<HashMap<AddressId, f64>, DistributionError> {
+    let (mode, window_ms) = crate::engine::group_mode_from_row(group_row);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let round_raw = round
+        .read_payout_shares(&group_row.id.to_string(), mode, now_ms, window_ms)
+        .await?;
+    Ok(share_map_from_redis_hash(
+        &round_raw,
+        "group-solo distribution: skipping invalid address in round state",
+    ))
+}
+
+/// Every member key a build of any non-dissolved group will ask the identity
+/// resolver about, for the boot-time preload of rotating identities. The
+/// finder is not among them: a build's finder is the miner the job is built
+/// for, which is connected, and the resolver holds a connected miner already.
+pub async fn payout_keys_in_play(
+    pool: &PgPool,
+    round: &GroupRoundStore,
+) -> Result<Vec<AddressId>, DistributionError> {
+    let mut keys = std::collections::HashSet::new();
+    for group_row in list_active_pplns_groups(pool).await? {
+        keys.extend(read_round_shares(round, &group_row).await?.into_keys());
+    }
+    Ok(keys.into_iter().collect())
+}
+
 async fn compute_distribution(
     pool: &PgPool,
     round: &GroupRoundStore,
@@ -228,18 +266,8 @@ async fn compute_distribution(
         .ok_or(DistributionError::GroupNotFound { group_id })?;
     let finder_bonus_ppm = group_row.finder_bonus_ppm.unwrap_or(0).max(0) as u32;
 
-    // 2. Round state from Redis. Mode-aware: a PROP group reads its per-round
-    //    aggregate; a Window group trims to the sliding window first, so the
-    //    built distribution is always fenster-current (even for an idle group).
-    let (mode, window_ms) = crate::engine::group_mode_from_row(&group_row);
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let round_raw = round
-        .read_payout_shares(&group_id.to_string(), mode, now_ms, window_ms)
-        .await?;
-    let address_shares = share_map_from_redis_hash(
-        &round_raw,
-        "group-solo distribution: skipping invalid address in round state",
-    );
+    // 2. Round state from Redis.
+    let address_shares = read_round_shares(round, &group_row).await?;
 
     // 3-5. No ledger to read: Group-Solo carries no balances (see the
     //      crate docs), so the empty map is what the shared builder

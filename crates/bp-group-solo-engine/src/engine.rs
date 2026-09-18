@@ -1081,6 +1081,16 @@ impl GroupSoloEngine {
     pub fn round(&self) -> &GroupRoundStore {
         &self.inner.round
     }
+
+    /// Every member key a distribution build will ask the identity resolver
+    /// about, across all non-dissolved groups, read the way a build reads
+    /// them. For the boot-time preload of rotating identities; see
+    /// [`crate::distribution::payout_keys_in_play`].
+    pub async fn payout_keys_in_play(
+        &self,
+    ) -> Result<Vec<AddressId>, crate::distribution::DistributionError> {
+        crate::distribution::payout_keys_in_play(&self.inner.pool, &self.inner.round).await
+    }
 }
 
 /// One `pplns_group` row's reset-config fields. Named to keep the
