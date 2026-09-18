@@ -12,6 +12,7 @@ pub(crate) mod downstream_report;
 pub(crate) mod email;
 pub(crate) mod external_share;
 pub(crate) mod groups;
+pub(crate) mod identity;
 pub(crate) mod info;
 pub(crate) mod invitation;
 pub(crate) mod pplns;
