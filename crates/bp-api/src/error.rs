@@ -241,6 +241,7 @@ impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
             "not-member" => "not-member",
             "invalid-name" => "invalid-name",
             "invalid-address" => "invalid-address",
+            "rotating-identity-not-supported" => "rotating-identity-not-supported",
             "invalid-email" => "invalid-email",
             "invalid-percent" => "invalid-percent",
             "invalid-splits-sum" => "invalid-splits-sum",
@@ -274,6 +275,7 @@ impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
             B::EmailNotVerified => StatusCode::FAILED_DEPENDENCY,
             B::InvalidName
             | B::InvalidAddress
+            | B::RotatingIdentity
             | B::InvalidEmail
             | B::InvalidPercent
             | B::InvalidSplitsSum

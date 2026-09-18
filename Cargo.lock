@@ -670,6 +670,7 @@ dependencies = [
  "bp-group-mgmt",
  "bp-group-mgmt-engine",
  "bp-mining-job",
+ "bp-payout-descriptor",
  "bp-regtest-harness",
  "bp-share",
  "bp-template-distribution",

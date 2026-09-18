@@ -541,6 +541,23 @@ fn payout_id_for(canonical: &str) -> AddressId {
         .expect("a base58 sha256 digest with a 3-char prefix fits the identity shape")
 }
 
+/// Whether `candidate` is spelled like a [`RotatingPayout::payout_id`]: the
+/// prefix, then base58 that decodes to exactly one sha256 digest.
+///
+/// For callers that must refuse a rotating identity where only a fixed address
+/// can be paid — Blockparty enrolment is the one today. A shape test, not a
+/// directory or `miner_identity` lookup, on purpose: an id that has never mined
+/// has no row yet and would pass a lookup, and it can start mining the moment it
+/// is enrolled. No address can match, which is what the prefix was chosen for:
+/// base58 addresses start with `1`, `3`, `m`, `n` or `2`, bech32 ones with
+/// their HRP.
+pub fn is_payout_id(candidate: &str) -> bool {
+    candidate
+        .strip_prefix(PAYOUT_ID_PREFIX)
+        .and_then(|rest| bitcoin::base58::decode(rest).ok())
+        .is_some_and(|bytes| bytes.len() == 32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,6 +776,26 @@ mod tests {
     ///
     /// So the width claim keeps only the assertions that are still true, and
     /// `payout_id_is_the_documented_spelling` carries what the control used to.
+    #[test]
+    fn is_payout_id_recognises_what_intake_mints_and_nothing_else() {
+        let id = RotatingPayout::from_xpub_str(XPUB).unwrap();
+        assert!(is_payout_id(id.payout_id().as_str()));
+        // Addresses of every kind, the xpub itself, and near misses.
+        for not_an_id in [
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+            XPUB,
+            "xpb",
+            // base58 of 20 bytes, not a sha256 digest
+            &format!("{PAYOUT_ID_PREFIX}{}", bitcoin::base58::encode(&[7u8; 20])),
+            // '0' is not in the base58 alphabet
+            &format!("{}0", &id.payout_id().as_str()[..46]),
+        ] {
+            assert!(!is_payout_id(not_an_id), "{not_an_id} is not a payout id");
+        }
+    }
+
     #[test]
     fn payout_id_is_base58_and_fits_the_identity_columns() {
         let p = RotatingPayout::from_xpub_str(XPUB).unwrap();
