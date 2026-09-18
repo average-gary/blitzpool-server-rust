@@ -155,14 +155,12 @@ async fn a_rotating_identity_round_trips_with_no_address() {
         bp_common::MAX_ADDRESS_LEN
     );
 
-    let all = find_rotating_identities(&pool).await.expect("bulk read");
+    let found = find_rotating_identities(&pool, &[ROTATING_ID.to_string()])
+        .await
+        .expect("batch read");
     assert!(
-        all.iter().any(|r| r.payout_id == ROTATING_ID),
-        "the rotating bulk read must find it"
-    );
-    assert!(
-        all.iter().all(|r| r.kind == KIND_ROTATING),
-        "the rotating bulk read must not return static rows"
+        found.iter().any(|r| r.payout_id == ROTATING_ID),
+        "the rotating batch read must find it"
     );
 
     cleanup(&pool, &[ROTATING_ID]).await;
@@ -348,7 +346,8 @@ async fn an_unknown_payout_id_reads_as_none() {
 /// *rotates*, never to discover where to pay a static one.
 ///
 /// So the two static miners below — one with a row, one without — must be
-/// indistinguishable to `find_rotating_identities`. If a later phase inverts
+/// indistinguishable to `find_rotating_identities`, even when asked for by name.
+/// If a later phase inverts
 /// this and starts resolving static payouts through this table, the miner
 /// covered by the backfill keeps working and the one who was never in
 /// `pplns_balance` stops being paid; this test is what makes that a failure now
@@ -376,7 +375,13 @@ async fn a_static_miner_is_absent_from_the_rotating_read_covered_by_the_backfill
          comparing a row against a row"
     );
 
-    let rotating = find_rotating_identities(&pool).await.expect("bulk read");
+    let asked: Vec<String> = [BACKFILLED, NEVER_SEEN, OTHER_ROTATING_ID]
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    let rotating = find_rotating_identities(&pool, &asked)
+        .await
+        .expect("batch read");
     for addr in [BACKFILLED, NEVER_SEEN] {
         assert!(
             !rotating.iter().any(|r| r.payout_id == addr),
@@ -389,7 +394,9 @@ async fn a_static_miner_is_absent_from_the_rotating_read_covered_by_the_backfill
     upsert_rotating_identity(&pool, OTHER_ROTATING_ID, DESCRIPTOR, 1_700_000_000_000)
         .await
         .expect("rotating upsert");
-    let rotating = find_rotating_identities(&pool).await.expect("bulk read");
+    let rotating = find_rotating_identities(&pool, &asked)
+        .await
+        .expect("batch read");
     assert!(
         rotating.iter().any(|r| r.payout_id == OTHER_ROTATING_ID),
         "the rotating read must find a rotating identity, or the assertions \
@@ -397,4 +404,50 @@ async fn a_static_miner_is_absent_from_the_rotating_read_covered_by_the_backfill
     );
 
     cleanup(&pool, &[BACKFILLED, OTHER_ROTATING_ID]).await;
+}
+
+/// **The batch read returns the rotating rows asked for and no others.**
+///
+/// Rows are never deleted, and an xpub login writes one for every key it
+/// resolves, so a read of the whole table grows with every xpub anyone ever
+/// presented. Settlement asks for the handful of keys it is missing; this is
+/// what keeps its read that size. Both rows exist and are rotating, so the one
+/// left out is absent because it was not asked for.
+#[tokio::test]
+async fn the_rotating_read_returns_only_the_keys_asked_for() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own keys: the other tests clean up `ROTATING_ID` / `OTHER_ROTATING_ID`
+    // concurrently, and a row deleted under this test would pass the
+    // "not returned" half for the wrong reason.
+    const ASKED: &str = "xpbBatchReadAskedForCoverageTest01";
+    const NOT_ASKED: &str = "xpbBatchReadNotAskedCoverageTest01";
+    cleanup(&pool, &[ASKED, NOT_ASKED]).await;
+    for id in [ASKED, NOT_ASKED] {
+        upsert_rotating_identity(&pool, id, DESCRIPTOR, 1_700_000_000_000)
+            .await
+            .expect("rotating upsert");
+    }
+    assert!(
+        find_miner_identity(&pool, NOT_ASKED)
+            .await
+            .expect("read")
+            .is_some_and(|row| row.kind == KIND_ROTATING),
+        "precondition: the row left out must exist and rotate, or its absence \
+         below proves nothing"
+    );
+
+    let got = find_rotating_identities(&pool, &[ASKED.to_string()])
+        .await
+        .expect("batch read");
+    let ids: Vec<&str> = got.iter().map(|r| r.payout_id.as_str()).collect();
+    assert_eq!(ids, vec![ASKED], "exactly the key asked for");
+
+    let none = find_rotating_identities(&pool, &[])
+        .await
+        .expect("batch read");
+    assert!(none.is_empty(), "asking for nothing reads nothing");
+
+    cleanup(&pool, &[ASKED, NOT_ASKED]).await;
 }

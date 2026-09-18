@@ -134,8 +134,17 @@ pub async fn upsert_rotating_identity(
     Ok(())
 }
 
-/// Every rotating identity, for the payout path to resolve descriptors in bulk.
-pub async fn find_rotating_identities(pool: &PgPool) -> Result<Vec<MinerIdentityRow>, DbError> {
+/// The rotating identities among `payout_ids`, in one query, for the payout
+/// path to resolve a batch of ledger keys.
+///
+/// Only the keys asked for, never the whole table: rows are never deleted, and
+/// an xpub login writes one for every key it resolves, so the table grows with
+/// every xpub anyone ever presented. A key with no rotating row is simply
+/// absent from the result.
+pub async fn find_rotating_identities(
+    pool: &PgPool,
+    payout_ids: &[String],
+) -> Result<Vec<MinerIdentityRow>, DbError> {
     let rows = sqlx::query_as!(
         MinerIdentityRow,
         r#"SELECT
@@ -146,7 +155,8 @@ pub async fn find_rotating_identities(pool: &PgPool) -> Result<Vec<MinerIdentity
              "createdAt" AS "created_at!",
              "updatedAt" AS "updated_at!"
            FROM miner_identity
-           WHERE kind = 'rotating'"#
+           WHERE kind = 'rotating' AND "payoutId" = ANY($1)"#,
+        payout_ids
     )
     .fetch_all(pool)
     .await?;

@@ -32,12 +32,11 @@
 //! would be two mechanisms for one question, which is `CLAUDE.md`'s opening
 //! failure mode with the ink still wet.
 //!
-//! Phase 2 already staged this shape: `bp_db::find_rotating_identities` exists
-//! and its doc says *"for the payout path to resolve descriptors in bulk"*. And
-//! the in-repo precedent is [`crate::engines::BlitzpoolModeGate`] — a
-//! payout-id-keyed, refcounted, in-memory map populated at authorize and read
-//! synchronously by the payout resolver. This is the same pattern for the
-//! adjacent fact.
+//! Phase 2 already staged this shape: `bp_db::find_rotating_identities` is the
+//! payout path's batch read of stored descriptors. And the in-repo precedent
+//! is [`crate::engines::BlitzpoolModeGate`] — a payout-id-keyed, refcounted,
+//! in-memory map populated at authorize and read synchronously by the payout
+//! resolver. This is the same pattern for the adjacent fact.
 //!
 //! ## Why it is refcounted the same way the mode gate is
 //!
@@ -76,7 +75,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bitcoin::Network;
@@ -84,6 +83,7 @@ use bp_coinbase_snapshot::{PaidAtHeight, PaidAtHeightError, PayoutIdentityResolv
 use bp_common::{IdentityRefused, PayoutIdentity, RotatingIntake};
 use bp_payout_descriptor::{intake_wire_identity, IntakeError};
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 /// How many disconnected-but-vouched identities the second tier keeps.
@@ -101,10 +101,32 @@ const VOUCHED_CAPACITY: usize = 4096;
 /// xpubs from growing the map without limit.
 const KNOWN_BY_ID_CAPACITY: usize = 4096;
 
-/// How long [`PoolRotatingIntake::warm`] may wait for its one row. It runs on
-/// the authorize / channel-open path of a single session, before that miner
-/// gets any job, and a stall must not hold it longer than this.
+/// How long [`PoolRotatingIntake::warm`] may wait for its one row, the wait
+/// for a read slot included. It runs on the authorize / channel-open path of a
+/// single session, before that miner gets any job, and a stall must not hold it
+/// longer than this.
 const WARM_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many [`PoolRotatingIntake::warm`] reads may be in flight at once.
+///
+/// Anyone can make up a well-formed payout id, and each unknown one costs a
+/// Postgres read on a pool shared with the rest of the process. The cap keeps
+/// a flood of them to these slots: past it, warm waits and then gives up, and
+/// the rest of the process keeps its connections.
+const WARM_CONCURRENT_READS: usize = 2;
+
+/// How long a payout id the store had no admissible row for is answered from
+/// memory before it is read again.
+///
+/// Makes a repeated unknown id cost one read, not one per attempt. Short,
+/// because the row can appear at any moment in another process: an xpub login
+/// on the API writes it, and a renter whose rig tried first then waits at most
+/// this long.
+const UNKNOWN_ID_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// How many unknown payout ids [`PoolRotatingIntake`] remembers. Evicting one
+/// early costs a read, never an admission.
+const UNKNOWN_ID_CAPACITY: usize = 4096;
 
 /// In-memory `payout_id → rotating identity`, in two tiers.
 ///
@@ -131,7 +153,7 @@ const WARM_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// hashes to it. A stale entry is a correct entry.
 pub(crate) struct PayoutIdentityDirectory {
     connected: Mutex<HashMap<String, RefcountedIdentity>>,
-    vouched: Mutex<BoundedIdentities>,
+    vouched: Mutex<BoundedMap<PayoutIdentity>>,
 }
 
 #[derive(Debug)]
@@ -140,29 +162,53 @@ struct RefcountedIdentity {
     count: usize,
 }
 
-/// FIFO-bounded `payout_id → identity`, used for the directory's vouched tier
-/// and for [`PoolRotatingIntake`]'s by-id lookup. `order` is insertion
-/// order, not use order: an LRU would need a write on every read of a map that is
-/// read once per template per connection, and the eviction penalty here is a store
-/// read rather than a wrong payment.
-#[derive(Debug, Default)]
-struct BoundedIdentities {
-    by_key: HashMap<String, PayoutIdentity>,
+/// FIFO-bounded map keyed by `payout_id`: the directory's vouched tier and
+/// [`PoolRotatingIntake`]'s by-id lookup hold identities, its unknown-id memory
+/// holds the time of the miss. `order` is insertion order, not use order: an LRU
+/// would need a write on every read of a map that is read once per template per
+/// connection, and the eviction penalty in every use is a store read rather than
+/// a wrong payment.
+#[derive(Debug)]
+struct BoundedMap<V> {
+    by_key: HashMap<String, V>,
     order: VecDeque<String>,
 }
 
-impl BoundedIdentities {
+impl<V> Default for BoundedMap<V> {
+    fn default() -> Self {
+        Self {
+            by_key: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl<V> BoundedMap<V> {
     /// Insert under `key`, evicting the oldest past `capacity`.
     ///
-    /// An existing entry is left as it is: the maps are content-addressed, so
-    /// an entry under this key IS this identity, and re-inserting would only
-    /// churn the eviction order.
-    fn insert(&mut self, key: String, identity: PayoutIdentity, capacity: usize) {
+    /// An existing entry is left as it is: the identity maps are
+    /// content-addressed, so an entry under this key IS this identity, and
+    /// re-inserting would only churn the eviction order.
+    fn insert(&mut self, key: String, value: V, capacity: usize) {
         if self.by_key.contains_key(&key) {
             return;
         }
+        self.push_new(key, value, capacity);
+    }
+
+    /// Insert under `key`, or replace the value of an existing entry in place.
+    /// A replaced entry keeps its position in the eviction order.
+    fn set(&mut self, key: String, value: V, capacity: usize) {
+        if let Some(slot) = self.by_key.get_mut(&key) {
+            *slot = value;
+            return;
+        }
+        self.push_new(key, value, capacity);
+    }
+
+    fn push_new(&mut self, key: String, value: V, capacity: usize) {
         self.order.push_back(key.clone());
-        self.by_key.insert(key, identity);
+        self.by_key.insert(key, value);
         while self.order.len() > capacity {
             if let Some(evicted) = self.order.pop_front() {
                 self.by_key.remove(&evicted);
@@ -175,7 +221,7 @@ impl PayoutIdentityDirectory {
     pub(crate) fn new() -> Self {
         Self {
             connected: Mutex::new(HashMap::new()),
-            vouched: Mutex::new(BoundedIdentities::default()),
+            vouched: Mutex::new(BoundedMap::default()),
         }
     }
 
@@ -335,7 +381,14 @@ pub(crate) struct PoolRotatingIntake {
     /// the xpub. Filled by every xpub it admits and by [`RotatingIntake::warm`]
     /// from `miner_identity`. Content-addressed like the directory, so a stale
     /// entry is still a correct one.
-    known_by_id: Mutex<BoundedIdentities>,
+    known_by_id: Mutex<BoundedMap<PayoutIdentity>>,
+    /// Payout ids a warm read found nothing admissible for, with the time of
+    /// that read. Answered from here for [`Self::unknown_id_retry_after`].
+    unknown_ids: Mutex<BoundedMap<Instant>>,
+    /// [`UNKNOWN_ID_RETRY_AFTER`]; a field so tests can shorten it.
+    unknown_id_retry_after: Duration,
+    /// The [`WARM_CONCURRENT_READS`] slots every warm read takes one of.
+    warm_reads: Semaphore,
 }
 
 impl PoolRotatingIntake {
@@ -355,7 +408,10 @@ impl PoolRotatingIntake {
             directory,
             allow_rotating,
             pool,
-            known_by_id: Mutex::new(BoundedIdentities::default()),
+            known_by_id: Mutex::new(BoundedMap::default()),
+            unknown_ids: Mutex::new(BoundedMap::default()),
+            unknown_id_retry_after: UNKNOWN_ID_RETRY_AFTER,
+            warm_reads: Semaphore::new(WARM_CONCURRENT_READS),
         }
     }
 
@@ -418,16 +474,28 @@ impl PoolRotatingIntake {
     }
 
     /// The one row [`RotatingIntake::warm`] needs, rehydrated and checked.
+    ///
+    /// The timeout covers the wait for one of the [`WARM_CONCURRENT_READS`]
+    /// slots as well as the read, so a warm queued behind a flood of made-up
+    /// ids gives up the way a slow read does. Every answer from the store that
+    /// admits nothing is remembered in `unknown_ids`; a failed or timed-out
+    /// read is not an answer, and the next attempt reads again.
     async fn load_by_id(&self, payout_id: &str) {
-        let row = match tokio::time::timeout(
-            WARM_READ_TIMEOUT,
-            bp_db::find_miner_identity(&self.pool, payout_id),
-        )
-        .await
-        {
+        let read = async {
+            let _slot = self
+                .warm_reads
+                .acquire()
+                .await
+                .expect("warm-read semaphore is never closed");
+            bp_db::find_miner_identity(&self.pool, payout_id).await
+        };
+        let row = match tokio::time::timeout(WARM_READ_TIMEOUT, read).await {
             Ok(Ok(Some(row))) => row,
             // Unknown id: intake refuses it next, with its own line.
-            Ok(Ok(None)) => return,
+            Ok(Ok(None)) => {
+                self.remember_unknown(payout_id);
+                return;
+            }
             Ok(Err(err)) => {
                 warn!(%err, payout_id, "payout-identity: miner_identity read failed while warming");
                 return;
@@ -443,21 +511,44 @@ impl PoolRotatingIntake {
         // `kind`, not `descriptor.is_some()`, for the reason the settlement read
         // gives: the presence of a per-kind field is not the kind.
         if row.kind != bp_db::KIND_ROTATING {
+            self.remember_unknown(payout_id);
             return;
         }
         let Some(descriptor) = row.descriptor.as_deref() else {
+            self.remember_unknown(payout_id);
             return;
         };
         match bp_payout_descriptor::rehydrate_stored_identity(payout_id, descriptor) {
             Ok(payout) => self.remember_by_id(&payout.into_payout_identity()),
             // `IntakeError` is `Copy` with a fixed `Display`: no descriptor text.
-            Err(refusal) => error!(
-                payout_id,
-                %refusal,
-                "payout-identity: the stored identity for a payout id was refused; not \
-                 admitting it by id"
-            ),
+            Err(refusal) => {
+                error!(
+                    payout_id,
+                    %refusal,
+                    "payout-identity: the stored identity for a payout id was refused; not \
+                     admitting it by id"
+                );
+                self.remember_unknown(payout_id);
+            }
         }
+    }
+
+    fn remember_unknown(&self, payout_id: &str) {
+        self.unknown_ids
+            .lock()
+            .expect("payout-identity mutex poisoned")
+            .set(payout_id.to_string(), Instant::now(), UNKNOWN_ID_CAPACITY);
+    }
+
+    /// Whether a warm read found nothing for `payout_id` less than
+    /// `unknown_id_retry_after` ago.
+    fn recently_unknown(&self, payout_id: &str) -> bool {
+        self.unknown_ids
+            .lock()
+            .expect("payout-identity mutex poisoned")
+            .by_key
+            .get(payout_id)
+            .is_some_and(|at| at.elapsed() < self.unknown_id_retry_after)
     }
 
     /// Persist an admitted identity so settlement can rehydrate it.
@@ -580,6 +671,9 @@ impl RotatingIntake for PoolRotatingIntake {
             {
                 return;
             }
+            if self.recently_unknown(payout_id) {
+                return;
+            }
             self.load_by_id(payout_id).await;
         })
     }
@@ -608,8 +702,8 @@ impl RotatingIntake for PoolRotatingIntake {
 ///
 /// 1. The directory, for a miner still connected — free, and content-addressed so
 ///    it cannot disagree with the row.
-/// 2. `miner_identity`, in **one** bulk read per settlement
-///    (`find_rotating_identities`), for everyone else. The descriptor is
+/// 2. `miner_identity`, in **one** read per settlement for exactly the keys the
+///    directory missed (`find_rotating_identities`). The descriptor is
 ///    rehydrated through `bp_payout_descriptor::rehydrate_stored_identity`, which
 ///    re-hashes it and refuses a row that does not reproduce the `payout_id` it
 ///    was fetched under.
@@ -649,9 +743,8 @@ impl PoolPaidAddresses {
     /// Rebuild the identities for keys the directory did not hold, from
     /// `miner_identity`.
     ///
-    /// One query for the whole batch, not one per entry — which is what
-    /// `find_rotating_identities`' own doc comment (*"for the payout path to
-    /// resolve descriptors in bulk"*) was written for.
+    /// One query for the whole batch, not one per entry, and only for the keys
+    /// in it: the table holds every xpub anyone ever presented.
     ///
     /// # Why the verdict is per key
     ///
@@ -670,7 +763,8 @@ impl PoolPaidAddresses {
         &self,
         keys: &[&String],
     ) -> Result<Vec<(String, StoredOutcome)>, PaidAtHeightError> {
-        let rows = bp_db::find_rotating_identities(&self.pool)
+        let wanted: Vec<String> = keys.iter().map(|key| (*key).clone()).collect();
+        let rows = bp_db::find_rotating_identities(&self.pool, &wanted)
             .await
             .map_err(|err| {
                 // The cause is logged HERE and dropped from the returned error:
@@ -1066,6 +1160,119 @@ mod tests {
                 .execute(&pool)
                 .await;
         }
+    }
+
+    /// A mainnet xpub of its own for a test that writes `miner_identity`. The
+    /// tests in this binary share one Postgres and run concurrently, so two
+    /// tests seeding and deleting the same key would pass or fail on timing.
+    fn own_xpub(seed_byte: u8) -> String {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let master = bitcoin::bip32::Xpriv::new_master(Network::Bitcoin, &[seed_byte; 32])
+            .expect("a 32-byte seed is a valid master seed");
+        bitcoin::bip32::Xpub::from_priv(&secp, &master).to_string()
+    }
+
+    async fn clear_identity_row(pool: &PgPool, payout_id: &str) {
+        sqlx::query(r#"DELETE FROM miner_identity WHERE "payoutId" = $1"#)
+            .bind(payout_id)
+            .execute(pool)
+            .await
+            .expect("clear the row");
+    }
+
+    /// A warm read takes one of the read slots, waits for one when all are
+    /// taken, and gives up at its time limit. That is what keeps a flood of
+    /// made-up ids from taking more of the process's Postgres connections than
+    /// the slots. Control on the same row: with a slot free the same warm
+    /// admits it, which also shows a timed-out read was not remembered as a
+    /// miss.
+    #[tokio::test]
+    async fn a_warm_read_waits_for_a_free_slot_and_gives_up_without_one() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let stored = bp_payout_descriptor::RotatingPayout::from_xpub_str(&own_xpub(0xA1))
+            .expect("a derived master xpub is a valid xpub");
+        let id = stored.payout_id().as_str().to_string();
+        clear_identity_row(&pool, &id).await;
+        bp_db::upsert_rotating_identity(&pool, &id, stored.canonical_descriptor(), 1)
+            .await
+            .expect("seed the row");
+
+        let intake =
+            PoolRotatingIntake::new(Arc::new(PayoutIdentityDirectory::new()), true, pool.clone());
+        let every_slot = intake
+            .warm_reads
+            .acquire_many(WARM_CONCURRENT_READS as u32)
+            .await
+            .expect("the semaphore is open");
+        let started = Instant::now();
+        intake.warm(&id).await;
+        assert!(
+            started.elapsed() >= WARM_READ_TIMEOUT,
+            "warm must have waited for a slot until its time limit"
+        );
+        assert_eq!(
+            intake.intake(&id),
+            Err(IdentityRefused),
+            "no free slot, no read, no admission"
+        );
+
+        drop(every_slot);
+        intake.warm(&id).await;
+        assert!(
+            matches!(intake.intake(&id), Ok(Some(_))),
+            "with a slot free the same stored row is admitted"
+        );
+
+        clear_identity_row(&pool, &id).await;
+    }
+
+    /// An id the store had no row for is answered from memory for the retry
+    /// window, and read again after it. The row appears between the warms, the
+    /// way an xpub login on the API writes it after a renter's rig already
+    /// tried: inside the window the intake still refuses, after it the same
+    /// intake admits.
+    #[tokio::test]
+    async fn an_unknown_id_is_read_again_only_after_the_retry_window() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let stored = bp_payout_descriptor::RotatingPayout::from_xpub_str(&own_xpub(0xA2))
+            .expect("a derived master xpub is a valid xpub");
+        let id = stored.payout_id().as_str().to_string();
+        clear_identity_row(&pool, &id).await;
+
+        let window = Duration::from_secs(2);
+        let mut intake =
+            PoolRotatingIntake::new(Arc::new(PayoutIdentityDirectory::new()), true, pool.clone());
+        intake.unknown_id_retry_after = window;
+
+        intake.warm(&id).await;
+        assert_eq!(
+            intake.intake(&id),
+            Err(IdentityRefused),
+            "precondition: no row yet"
+        );
+
+        bp_db::upsert_rotating_identity(&pool, &id, stored.canonical_descriptor(), 1)
+            .await
+            .expect("the row arrives");
+        intake.warm(&id).await;
+        assert_eq!(
+            intake.intake(&id),
+            Err(IdentityRefused),
+            "inside the window the miss is answered from memory, not read"
+        );
+
+        tokio::time::sleep(window + Duration::from_millis(200)).await;
+        intake.warm(&id).await;
+        assert!(
+            matches!(intake.intake(&id), Ok(Some(_))),
+            "after the window the row is read and admitted"
+        );
+
+        clear_identity_row(&pool, &id).await;
     }
 
     /// A store that cannot be reached costs the connection, not the session
