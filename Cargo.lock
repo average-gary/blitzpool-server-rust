@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -56,6 +62,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
+dependencies = [
+ "alloc-no-stdlib",
 ]
 
 [[package]]
@@ -159,6 +180,18 @@ dependencies = [
  "concurrent-queue",
  "event-listener 2.5.3",
  "futures-core",
+]
+
+[[package]]
+name = "async-compression"
+version = "0.4.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -309,9 +342,9 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
 name = "binary_sv2"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a33bcd3b361e9e673007054cba4d2ac03f326aa1260da556e9f95d66685b43ab"
+checksum = "6ec138d56d7501e4a365ce858465f827197835da7fda8b56f9a1ddc0f4aa012e"
 dependencies = [
  "buffer_sv2",
  "derive_codec_sv2",
@@ -420,8 +453,8 @@ dependencies = [
 
 [[package]]
 name = "bitcoin_core_sv2"
-version = "0.5.0"
-source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.7.0#d7d556d1a3c7e1c26dfccd076b491a38c038a5e0"
+version = "0.6.0"
+source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.8.0#7f49074357e54da4f5b13acfcc29dc3cbb9e541f"
 dependencies = [
  "async-channel",
  "bitcoin-capnp-types 0.1.2",
@@ -475,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "blitzpool"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -555,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "bp-api"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -604,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "bp-bitcoin"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bp-regtest-harness",
  "reqwest",
@@ -617,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "bp-blockparty"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bp-common",
  "bp-pplns",
@@ -626,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "bp-blockparty-engine"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -651,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "bp-client-live"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bp-common",
  "bp-test-support",
@@ -662,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "bp-coinbase-snapshot"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -682,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "bp-common"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "proptest",
  "serde",
@@ -694,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "bp-config"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -703,14 +736,14 @@ dependencies = [
 
 [[package]]
 name = "bp-cron-utils"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "bp-db"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bp-blockparty",
  "bp-common",
@@ -723,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "bp-geoip"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -736,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "bp-group-mgmt"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bp-common",
  "getrandom 0.2.17",
@@ -748,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "bp-group-mgmt-engine"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bp-common",
@@ -765,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "bp-group-solo-engine"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -799,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "bp-inflight-cache"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
@@ -807,11 +840,11 @@ dependencies = [
 
 [[package]]
 name = "bp-jobs-lifecycle"
-version = "2.3.2"
+version = "2.3.5"
 
 [[package]]
 name = "bp-metrics"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
@@ -823,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "bp-mining-job"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bitcoin",
  "bp-common",
@@ -842,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "bp-mining-mode"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bp-common",
@@ -851,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "bp-notifications"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -879,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "bp-payout-descriptor"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bitcoin",
  "bp-common",
@@ -890,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "bp-pplns"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bitcoin",
  "bp-common",
@@ -908,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "bp-pplns-engine"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -939,11 +972,11 @@ dependencies = [
 
 [[package]]
 name = "bp-protocol-detect"
-version = "2.3.2"
+version = "2.3.5"
 
 [[package]]
 name = "bp-regtest-harness"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bp-bitcoin",
  "reqwest",
@@ -957,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "bp-session-persistence"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bp-client-live",
@@ -976,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "bp-share"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "hex",
  "num-bigint",
@@ -990,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "bp-share-hook"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bp-common",
@@ -1001,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "bp-share-stats-sink"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bp-common",
@@ -1017,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "bp-share-stream"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bp-share-hook",
@@ -1034,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "bp-stats"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bp-common",
  "parking_lot",
@@ -1043,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "bp-stratum-v1"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -1072,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "bp-stratum-v2"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -1106,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "bp-template-distribution"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "async-channel",
  "bitcoin_core_sv2",
@@ -1121,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "bp-test-support"
-version = "2.3.2"
+version = "2.3.5"
 dependencies = [
  "bitcoin",
  "bp-mining-job",
@@ -1135,7 +1168,28 @@ dependencies = [
 
 [[package]]
 name = "bp-vardiff"
-version = "2.3.2"
+version = "2.3.5"
+
+[[package]]
+name = "brotli"
+version = "8.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "5.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+]
 
 [[package]]
 name = "bs58"
@@ -1294,9 +1348,9 @@ dependencies = [
 
 [[package]]
 name = "channels_sv2"
-version = "7.0.0"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dccaa7b6750388ed0769abcf6f1f7332e28d6e255ca4733023acf81fcbd49eac"
+checksum = "60bcd0f05005bf5474c4b2ff1f7bd74a61b1b000bc759dd8b72cc3bbe84fe032"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -1407,16 +1461,15 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codec_sv2"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec3f2eb964e9679808eed486de248ea1251addc2f643c83efedd0bdbf8c5253"
+checksum = "27fa7e278b547a7793e352ec2d9346147758a45d7f6e0354762c632a5ef1022b"
 dependencies = [
  "binary_sv2",
  "buffer_sv2",
  "framing_sv2",
  "noise_sv2",
  "rand 0.8.7",
- "tracing",
 ]
 
 [[package]]
@@ -1441,12 +1494,30 @@ dependencies = [
 
 [[package]]
 name = "common_messages_sv2"
-version = "8.0.0"
+version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dc0cc7206b4f8d31c38a0a693d24392a3ea9d55106254302fc4ef1c902d9a8d"
+checksum = "20fc74eef0c73f31e57bbe5ecbda80629bc98b2dd5ca8ba7fc9a145ec22166c6"
 dependencies = [
  "binary_sv2",
 ]
+
+[[package]]
+name = "compression-codecs"
+version = "0.4.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
+dependencies = [
+ "brotli",
+ "compression-core",
+ "flate2",
+ "memchr",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
 
 [[package]]
 name = "concurrent-queue"
@@ -1580,6 +1651,15 @@ name = "crc-catalog"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
+name = "crc32fast"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+dependencies = [
+ "cfg-if",
+]
 
 [[package]]
 name = "criterion"
@@ -1718,9 +1798,9 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "derive_codec_sv2"
-version = "1.1.3"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28ca1b57bc0bbc0a32af43d0a0430be887bf1c94ce1a25d3a885a9c17978342f"
+checksum = "05768350591ccb368bd0ec96dc9ca27ca6a04a4cc298718f139e323c27a89835"
 
 [[package]]
 name = "digest"
@@ -1886,9 +1966,9 @@ dependencies = [
 
 [[package]]
 name = "extensions_sv2"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfcb5d7a933245c095817ba8c46376f232af4d4b417d150de467f4d99a918bb7"
+checksum = "c963d2b6054e2ccd5269fceccd2e45beed952604d5d7ad53484bd35910116e91"
 dependencies = [
  "binary_sv2",
 ]
@@ -1925,6 +2005,16 @@ dependencies = [
  "rand 0.8.7",
  "rustc-hex",
  "static_assertions",
+]
+
+[[package]]
+name = "flate2"
+version = "1.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
 ]
 
 [[package]]
@@ -1971,13 +2061,12 @@ dependencies = [
 
 [[package]]
 name = "framing_sv2"
-version = "7.0.0"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a7763216b190464a6cdc09675f49bec208ed4c6eb09d5a464631a5fe2dd4ade"
+checksum = "8cedad16f0ac769b23506b19b0b1004a40d822d30b35106ffb51845e3b8da405"
 dependencies = [
  "binary_sv2",
  "buffer_sv2",
- "noise_sv2",
 ]
 
 [[package]]
@@ -2207,9 +2296,9 @@ dependencies = [
 
 [[package]]
 name = "handlers_sv2"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70afc90515bb46b4ab2ef37a5e18b2374a67bd76a883531b0210715d1e128e1a"
+checksum = "f3fc570e5f62ef8ce377c46c32d56a00c2f7339c857c826047de0cf5d6d0fdd7"
 dependencies = [
  "binary_sv2",
  "common_messages_sv2",
@@ -2708,12 +2797,11 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jd_server_sv2"
-version = "0.5.0"
-source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.7.0#d7d556d1a3c7e1c26dfccd076b491a38c038a5e0"
+version = "0.6.0"
+source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.8.0#7f49074357e54da4f5b13acfcc29dc3cbb9e541f"
 dependencies = [
  "async-channel",
  "async-trait",
- "dashmap",
  "hotpath",
  "serde",
  "stratum-apps",
@@ -2723,9 +2811,9 @@ dependencies = [
 
 [[package]]
 name = "job_declaration_sv2"
-version = "9.0.0"
+version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c4ca0773d5892ebf56dff86dabdb423e5e616c53a27d7a9b84349e56a72d90c"
+checksum = "8ae2fb1e157e72f6e42b7dbc864ef8d2a3d5d2a1e72e04a6f4f2b474812f7c9a"
 dependencies = [
  "binary_sv2",
 ]
@@ -2977,9 +3065,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "mining_sv2"
-version = "11.0.0"
+version = "12.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7f6b6e922450ed74d984a336009f632889a4e291aec90646f25b2f63b43deeb"
+checksum = "ab45eca584d0e0478ea87919f7c7f93d579bb453ecb1e772e46ffe9b20a89bdb"
 dependencies = [
  "binary_sv2",
 ]
@@ -2993,6 +3081,16 @@ dependencies = [
  "bech32",
  "bitcoin",
  "hex-conservative 1.2.0",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+ "simd-adler32",
 ]
 
 [[package]]
@@ -3034,14 +3132,14 @@ checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
 
 [[package]]
 name = "noise_sv2"
-version = "1.4.2"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "243bb5a64a040989aed517b500abd647bd10846bf8418ba281a5b4e126122f39"
+checksum = "21d54d5ba485f6a44a4195336cdbedca81e9afa875e656d7b28661ca9974c475"
 dependencies = [
- "aes-gcm",
  "chacha20poly1305",
  "rand 0.8.7",
  "secp256k1 0.28.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3250,9 +3348,9 @@ dependencies = [
 
 [[package]]
 name = "parsers_sv2"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c370fa26f93d55e7873b3ce0808da75f589bdb70f5e3c4a7ea15165b14cb710c"
+checksum = "18cf1edc2e739bdf576fff72445ffda51728587f17ca2f31c28f8c1e9ccd74cd"
 dependencies = [
  "binary_sv2",
  "common_messages_sv2",
@@ -4342,6 +4440,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
 name = "simple_asn1"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4647,8 +4751,8 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-apps"
-version = "0.7.0"
-source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.7.0#d7d556d1a3c7e1c26dfccd076b491a38c038a5e0"
+version = "0.8.0"
+source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.8.0#7f49074357e54da4f5b13acfcc29dc3cbb9e541f"
 dependencies = [
  "async-channel",
  "bitcoin_core_sv2",
@@ -4672,9 +4776,9 @@ dependencies = [
 
 [[package]]
 name = "stratum-core"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72fa00ca1fb8af001a56c8a6c36cda416237aa0d1c5e6805fc50d6d10c1181d7"
+checksum = "1019e84f066aa4c1e4fa33ba29f28db70699a011106a121851b13f116d2b5719"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -4773,9 +4877,9 @@ dependencies = [
 
 [[package]]
 name = "template_distribution_sv2"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40bf99cffcbfdc2ad6b8e3db75a530f4f9a7b6f4568c92454b45e6808494ce65"
+checksum = "859d37310c5802cfafdc1423c1e8fb0fec287a95ee19ac648424f3c811e98152"
 dependencies = [
  "binary_sv2",
 ]
@@ -5079,12 +5183,16 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "bitflags",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",

@@ -718,6 +718,16 @@ impl CommandHandler {
                 .await;
             return;
         }
+        // Second half of the reset: the per-session bests in Redis. Same
+        // best-effort treatment as the API endpoint — the miner has been
+        // told the reset succeeded, and it did; a stale worker row clears
+        // itself on the next share.
+        if let Err(e) =
+            bp_client_live::clear_address_best_difficulty(self.redis.as_ref(), &pending.address)
+                .await
+        {
+            warn!(target: "bp_notifications::command", error = %e, address = %pending.address, "bestdiff confirm: live clear");
+        }
         let _ = adapter
             .answer_callback_query(
                 callback_id,
@@ -1288,7 +1298,7 @@ mod tests {
         // "Oversized" is whatever `AddressId` says it is, read from the cap
         // rather than written as a literal. This line said `repeat(70)` until
         // 2026-08-12, when `MAX_ADDRESS_LEN` moved from 62 to 90
-        // (`0015_widen_identity_columns.sql`) and 70 became a *valid* length —
+        // (`0017_widen_identity_columns.sql`) and 70 became a *valid* length —
         // the test then failed, which is how it was found.
         assert!(parse_address(&"a".repeat(bp_common::MAX_ADDRESS_LEN + 1)).is_none());
         assert!(

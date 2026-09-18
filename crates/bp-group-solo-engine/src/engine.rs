@@ -509,6 +509,27 @@ impl GroupSoloEngine {
         }
     }
 
+    /// After a windowed append at `now_ms`: trim the group's window once per
+    /// hour-bucket (gated by [`Self::advance_trim_watermark`]), for both
+    /// lanes. The window sheds whole buckets at hour boundaries, so a trim
+    /// per append would be a no-op Redis round-trip ~99% of the time. The
+    /// payout read path trims with real wall-clock regardless, so this only
+    /// bounds Redis between reads.
+    async fn trim_window_at_bucket_boundary(
+        &self,
+        group_id: Uuid,
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Result<(), EngineError> {
+        if self.advance_trim_watermark(group_id, now_ms) {
+            self.inner
+                .round
+                .trim_window(&group_id.to_string(), now_ms, window_ms)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Hot path: an accepted Group-Solo share. Caller has resolved
     /// `group_id` (via the mode-gate adapter in `hooks.rs`).
     pub async fn record_share(
@@ -537,15 +558,8 @@ impl GroupSoloEngine {
                     .round
                     .record_share_windowed(share_id, &group_key, address, difficulty, timestamp_ms)
                     .await?;
-                // Trim only when this share opens a new hour-bucket — the window
-                // sheds whole buckets at hour boundaries, so per-share trimming
-                // would be a no-op Redis round-trip ~99% of the time. The payout
-                // read path trims with real wall-clock regardless, so this only
-                // bounds Redis between reads.
-                if applied && self.advance_trim_watermark(group_id, timestamp_ms) {
-                    self.inner
-                        .round
-                        .trim_window(&group_key, timestamp_ms, window_ms)
+                if applied {
+                    self.trim_window_at_bucket_boundary(group_id, timestamp_ms, window_ms)
                         .await?;
                 }
                 applied
@@ -579,7 +593,16 @@ impl GroupSoloEngine {
         Ok(())
     }
 
-    /// Per-rejected-share counter.
+    /// Per-rejected-share counter. PROP adds to the round's running tally
+    /// (wiped with the round); Window appends into the reject lane of the
+    /// sliding window and self-trims like [`Self::record_share`], so the
+    /// round-stats rate divides rejects by accepted work of the same period.
+    ///
+    /// Bucketed on wall-clock, not on a share timestamp: a rejected share
+    /// carries none (`SharedRejectedShare` has no accept time to report), and
+    /// the lane feeds only the stats view, so stream lag of a few seconds
+    /// moving a reject into the neighbouring hour-bucket changes nothing a
+    /// payout depends on.
     pub async fn record_reject(
         &self,
         group_id: Uuid,
@@ -587,11 +610,39 @@ impl GroupSoloEngine {
         shares: f64,
     ) -> Result<(), EngineError> {
         let group_key = group_id.to_string();
-        self.inner
-            .round
-            .record_reject(&group_key, address, shares)
-            .await?;
+        let (mode, window_ms) = self.resolve_group_mode(group_id).await;
+        match mode {
+            PayoutMode::Prop => {
+                self.inner
+                    .round
+                    .record_reject(&group_key, address, shares)
+                    .await?;
+            }
+            PayoutMode::Window => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                self.inner
+                    .round
+                    .record_reject_windowed(&group_key, address, shares, now_ms)
+                    .await?;
+                self.trim_window_at_bucket_boundary(group_id, now_ms, window_ms)
+                    .await?;
+            }
+        }
         Ok(())
+    }
+
+    /// Kick flow: drop the address from the group's payout source
+    /// (mode-aware, see [`GroupRoundStore::forget_member`]) and forget any
+    /// distribution built on it. Returns the diff-1-weighted amount removed.
+    pub async fn forget_member(&self, group_id: Uuid, address: &str) -> Result<f64, EngineError> {
+        let (mode, _window_ms) = self.resolve_group_mode(group_id).await;
+        let removed = self
+            .inner
+            .round
+            .forget_member(&group_id.to_string(), address, mode)
+            .await?;
+        self.inner.distribution_builder.invalidate_all();
+        Ok(removed)
     }
 
     /// Build the current distribution for `(group_id, reward, finder)`.

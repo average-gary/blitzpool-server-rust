@@ -73,14 +73,16 @@ use bp_stratum_v2::tokens::Token;
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
-use stratum_core::extensions_sv2::extensions_negotiation::RequestExtensions;
-use stratum_core::framing_sv2::framing::Frame;
-use stratum_core::job_declaration_sv2::{AllocateMiningJobToken, DeclareMiningJob, PushSolution};
+use stratum_core::codec_sv2::{EncodableFrame, MessageFrame};
+use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
+use stratum_core::extensions_sv2::extensions_negotiation::RequestExtensionsOwned;
+use stratum_core::framing_sv2::framing::SerializedFrame;
+use stratum_core::job_declaration_sv2::{
+    AllocateMiningJobTokenOwned, DeclareMiningJobOwned, PushSolutionOwned,
+};
 use stratum_core::parsers_sv2::{
-    parse_message_frame_with_tlvs, AnyMessage, CommonMessages, Extensions, ExtensionsNegotiation,
-    JobDeclaration,
+    parse_message_frame_with_tlvs, AnyMessageOwned, CommonMessagesOwned,
+    ExtensionsNegotiationOwned, ExtensionsOwned, JobDeclarationOwned,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -311,23 +313,22 @@ async fn jdp_push_distribution_end_to_end() {
     // Negotiate 0x0003.
     write_msg(
         &mut writer,
-        AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-            ExtensionsNegotiation::RequestExtensions(
-                RequestExtensions {
-                    request_id: 1,
-                    requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS]
-                        .try_into()
-                        .unwrap(),
-                }
-                .into_static(),
-            ),
+        AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
+            ExtensionsNegotiationOwned::RequestExtensions(RequestExtensionsOwned {
+                request_id: 1,
+                requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS]
+                    .try_into()
+                    .unwrap(),
+            }),
         )),
     )
     .await;
     match read_jdc(&mut reader).await {
-        JdcInbound::Message(AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-            ExtensionsNegotiation::RequestExtensionsSuccess(s),
-        ))) => {
+        JdcInbound::Message(AnyMessageOwned::Extensions(
+            ExtensionsOwned::ExtensionsNegotiation(
+                ExtensionsNegotiationOwned::RequestExtensionsSuccess(s),
+            ),
+        )) => {
             assert!(s
                 .supported_extensions
                 .clone()
@@ -372,18 +373,17 @@ async fn jdp_push_distribution_end_to_end() {
     // 0x0003 is on.
     write_msg(
         &mut writer,
-        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
-            AllocateMiningJobToken {
+        AnyMessageOwned::JobDeclaration(JobDeclarationOwned::AllocateMiningJobToken(
+            AllocateMiningJobTokenOwned {
                 request_id: 2,
                 user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
-            }
-            .into_static(),
+            },
         )),
     )
     .await;
     let token = match read_jdc(&mut reader).await {
-        JdcInbound::Message(AnyMessage::JobDeclaration(
-            JobDeclaration::AllocateMiningJobTokenSuccess(s),
+        JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::AllocateMiningJobTokenSuccess(s),
         )) => {
             assert_eq!(s.request_id, 2);
             assert!(
@@ -478,17 +478,14 @@ async fn jdp_push_distribution_end_to_end() {
     let extranonce = vec![0xEE; 8];
     write_msg(
         &mut writer,
-        AnyMessage::JobDeclaration(JobDeclaration::PushSolution(
-            PushSolution {
-                extranonce: extranonce.clone().try_into().unwrap(),
-                prev_hash: PREV_HASH.into(),
-                ntime: 0x6500_0001,
-                nonce: 0x1234_5678,
-                nbits: 0x1d00_ffff,
-                version: 0x2000_0000,
-            }
-            .into_static(),
-        )),
+        AnyMessageOwned::JobDeclaration(JobDeclarationOwned::PushSolution(PushSolutionOwned {
+            extranonce: extranonce.clone().try_into().unwrap(),
+            prev_hash: PREV_HASH.into(),
+            ntime: 0x6500_0001,
+            nonce: 0x1234_5678,
+            nbits: 0x1d00_ffff,
+            version: 0x2000_0000,
+        })),
     )
     .await;
     wait_until(Duration::from_secs(5), || {
@@ -546,18 +543,17 @@ async fn jdp_push_distribution_end_to_end() {
     expect_setup_success(read_jdc(&mut reader2).await);
     write_msg(
         &mut writer2,
-        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
-            AllocateMiningJobToken {
+        AnyMessageOwned::JobDeclaration(JobDeclarationOwned::AllocateMiningJobToken(
+            AllocateMiningJobTokenOwned {
                 request_id: 2,
                 user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
-            }
-            .into_static(),
+            },
         )),
     )
     .await;
     let token2 = match read_jdc(&mut reader2).await {
-        JdcInbound::Message(AnyMessage::JobDeclaration(
-            JobDeclaration::AllocateMiningJobTokenSuccess(s),
+        JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::AllocateMiningJobTokenSuccess(s),
         )) => {
             // SV2 JDP/AllocateMiningJobToken.Success on the wire: exactly one
             // designated payout output, sent with a 0 amount, paying this
@@ -627,7 +623,9 @@ async fn jdp_push_distribution_end_to_end() {
     let (mut reader3, mut writer3) = connect_jdc(addr).await;
     write_msg(&mut writer3, setup_connection_wrong_protocol(addr.port())).await;
     match read_jdc(&mut reader3).await {
-        JdcInbound::Message(AnyMessage::Common(CommonMessages::SetupConnectionError(e))) => {
+        JdcInbound::Message(AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionError(e),
+        )) => {
             assert_eq!(
                 std::str::from_utf8(e.error_code.as_ref()).unwrap(),
                 "unsupported-protocol"
@@ -659,18 +657,17 @@ async fn jdp_push_distribution_end_to_end() {
     expect_setup_success(read_jdc(&mut reader4).await);
     write_msg(
         &mut writer4,
-        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
-            AllocateMiningJobToken {
+        AnyMessageOwned::JobDeclaration(JobDeclarationOwned::AllocateMiningJobToken(
+            AllocateMiningJobTokenOwned {
                 request_id: 4,
                 user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
-            }
-            .into_static(),
+            },
         )),
     )
     .await;
     let token4 = match read_jdc(&mut reader4).await {
-        JdcInbound::Message(AnyMessage::JobDeclaration(
-            JobDeclaration::AllocateMiningJobTokenSuccess(s),
+        JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::AllocateMiningJobTokenSuccess(s),
         )) => {
             // SV2 JDP/AllocateMiningJobToken.Success on the wire: exactly ONE
             // designated payout output, sent with a 0 amount. The 0 is what
@@ -762,22 +759,19 @@ fn coinbase_prefix() -> Vec<u8> {
     p
 }
 
-fn setup_connection(port: u16) -> AnyMessage<'static> {
-    AnyMessage::Common(CommonMessages::SetupConnection(
-        SetupConnection {
-            protocol: Protocol::JobDeclarationProtocol,
-            min_version: 2,
-            max_version: 2,
-            flags: FLAG_DECLARE_TX_DATA,
-            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
-            endpoint_port: port,
-            vendor: "test-jdc".to_string().try_into().unwrap(),
-            hardware_version: "rev1".to_string().try_into().unwrap(),
-            firmware: "0.1".to_string().try_into().unwrap(),
-            device_id: "jdc-e2e".to_string().try_into().unwrap(),
-        }
-        .into_static(),
-    ))
+fn setup_connection(port: u16) -> AnyMessageOwned {
+    AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
+        protocol: Protocol::JobDeclarationProtocol,
+        min_version: 2,
+        max_version: 2,
+        flags: FLAG_DECLARE_TX_DATA,
+        endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+        endpoint_port: port,
+        vendor: "test-jdc".to_string().try_into().unwrap(),
+        hardware_version: "rev1".to_string().try_into().unwrap(),
+        firmware: "0.1".to_string().try_into().unwrap(),
+        device_id: "jdc-e2e".to_string().try_into().unwrap(),
+    }))
 }
 
 /// A coinbase suffix whose outputs are the ext 0x0003/Payout Computation
@@ -816,55 +810,49 @@ fn entry_with_id(id: u64) -> PayoutDistributionEntry {
 
 // ── Wire helpers ────────────────────────────────────────────────────
 
-type Reader = NoiseTcpReadHalf<AnyMessage<'static>>;
-type Writer = NoiseTcpWriteHalf<AnyMessage<'static>>;
+type Reader = NoiseTcpReadHalf;
+type Writer = NoiseTcpWriteHalf;
 
 /// A Coinbase-only `SetupConnection`: `DECLARE_TX_DATA` clear, so the JDC
 /// never declares and takes its allocate token straight to the mining
 /// connection (SV2 JDP/Coinbase-only Mode).
-fn setup_connection_coinbase_only(port: u16) -> AnyMessage<'static> {
-    AnyMessage::Common(CommonMessages::SetupConnection(
-        SetupConnection {
-            protocol: Protocol::JobDeclarationProtocol,
-            min_version: 2,
-            max_version: 2,
-            flags: 0,
-            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
-            endpoint_port: port,
-            vendor: "test-jdc".to_string().try_into().unwrap(),
-            hardware_version: "rev1".to_string().try_into().unwrap(),
-            firmware: "0.1".to_string().try_into().unwrap(),
-            device_id: "jdc-coinbase-only".to_string().try_into().unwrap(),
-        }
-        .into_static(),
-    ))
+fn setup_connection_coinbase_only(port: u16) -> AnyMessageOwned {
+    AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
+        protocol: Protocol::JobDeclarationProtocol,
+        min_version: 2,
+        max_version: 2,
+        flags: 0,
+        endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+        endpoint_port: port,
+        vendor: "test-jdc".to_string().try_into().unwrap(),
+        hardware_version: "rev1".to_string().try_into().unwrap(),
+        firmware: "0.1".to_string().try_into().unwrap(),
+        device_id: "jdc-coinbase-only".to_string().try_into().unwrap(),
+    }))
 }
 
 /// A `SetupConnection` the JDP server must refuse: the Mining
 /// sub-protocol on the job-declaration port.
-fn setup_connection_wrong_protocol(port: u16) -> AnyMessage<'static> {
-    AnyMessage::Common(CommonMessages::SetupConnection(
-        SetupConnection {
-            protocol: Protocol::MiningProtocol,
-            min_version: 2,
-            max_version: 2,
-            flags: FLAG_DECLARE_TX_DATA,
-            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
-            endpoint_port: port,
-            vendor: "test-jdc".to_string().try_into().unwrap(),
-            hardware_version: "rev1".to_string().try_into().unwrap(),
-            firmware: "0.1".to_string().try_into().unwrap(),
-            device_id: "jdc-wrong-protocol".to_string().try_into().unwrap(),
-        }
-        .into_static(),
-    ))
+fn setup_connection_wrong_protocol(port: u16) -> AnyMessageOwned {
+    AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
+        protocol: Protocol::MiningProtocol,
+        min_version: 2,
+        max_version: 2,
+        flags: FLAG_DECLARE_TX_DATA,
+        endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+        endpoint_port: port,
+        vendor: "test-jdc".to_string().try_into().unwrap(),
+        hardware_version: "rev1".to_string().try_into().unwrap(),
+        firmware: "0.1".to_string().try_into().unwrap(),
+        device_id: "jdc-wrong-protocol".to_string().try_into().unwrap(),
+    }))
 }
 
 async fn connect_jdc(addr: std::net::SocketAddr) -> (Reader, Writer) {
     let socket = TcpStream::connect(addr).await.expect("connect");
     socket.set_nodelay(true).ok();
     let pub_key: Secp256k1PublicKey = TEST_PUB.parse().expect("pub key");
-    let noise = connect_with_noise::<AnyMessage<'static>>(socket, Some(pub_key))
+    let noise = connect_with_noise(socket, Some(pub_key))
         .await
         .expect("noise handshake");
     noise.into_split()
@@ -872,7 +860,7 @@ async fn connect_jdc(addr: std::net::SocketAddr) -> (Reader, Writer) {
 
 #[derive(Debug)]
 enum JdcInbound {
-    Message(AnyMessage<'static>),
+    Message(AnyMessageOwned),
     PayoutDistribution(SetPayoutDistribution),
 }
 
@@ -881,11 +869,8 @@ async fn read_jdc(reader: &mut Reader) -> JdcInbound {
         .await
         .expect("read timeout")
         .expect("read_frame");
-    let mut sv2_frame = match frame {
-        Frame::Sv2(f) => f,
-        Frame::HandShake(_) => panic!("unexpected handshake frame"),
-    };
-    let header = sv2_frame.get_header().expect("header");
+    let mut sv2_frame = frame;
+    let header = sv2_frame.header();
     if header.ext_type_without_channel_msg() == SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS {
         assert_eq!(
             header.msg_type(),
@@ -898,12 +883,12 @@ async fn read_jdc(reader: &mut Reader) -> JdcInbound {
     }
     let (msg, _tlvs) =
         parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[]).expect("parse");
-    JdcInbound::Message(msg)
+    JdcInbound::Message(msg.into_owned())
 }
 
-async fn write_msg(writer: &mut Writer, msg: AnyMessage<'static>) {
-    let frame: StandardSv2Frame<AnyMessage<'static>> = msg.try_into().expect("frame");
-    writer.write_frame(Frame::Sv2(frame)).await.expect("write");
+async fn write_msg(writer: &mut Writer, msg: AnyMessageOwned) {
+    let frame: MessageFrame<AnyMessageOwned> = msg.try_into().expect("frame");
+    writer.write_frame(frame).await.expect("write");
 }
 
 /// Write a `DeclareMiningJob`, optionally with the
@@ -917,8 +902,8 @@ async fn write_declare(
     suffix: &[u8],
     distribution_id: Option<u64>,
 ) {
-    let msg = AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJob(
-        DeclareMiningJob {
+    let msg = AnyMessageOwned::JobDeclaration(JobDeclarationOwned::DeclareMiningJob(
+        DeclareMiningJobOwned {
             request_id,
             mining_job_token: token.to_vec().try_into().unwrap(),
             version: 0x2000_0000,
@@ -926,31 +911,31 @@ async fn write_declare(
             coinbase_tx_suffix: suffix.to_vec().try_into().unwrap(),
             wtxid_list: Vec::new().try_into().unwrap(),
             excess_data: Vec::new().try_into().unwrap(),
-        }
-        .into_static(),
+        },
     ));
-    let frame: StandardSv2Frame<AnyMessage<'static>> = msg.try_into().expect("frame");
+    let frame: MessageFrame<AnyMessageOwned> = msg.try_into().expect("frame");
     let Some(id) = distribution_id else {
-        writer.write_frame(Frame::Sv2(frame)).await.expect("write");
+        writer.write_frame(frame).await.expect("write");
         return;
     };
     // Serialize the frame, append the TLV tail, patch msg_length (u24
     // LE at header bytes 3..6), re-wrap as raw bytes.
     let mut bytes = vec![0u8; frame.encoded_length()];
-    frame.serialize(&mut bytes).expect("serialize");
+    frame.encode_into(&mut bytes).expect("serialize");
     bytes.extend_from_slice(&encode_distribution_id_tlv(id));
     let payload_len = (bytes.len() - 6) as u32;
     bytes[3] = (payload_len & 0xFF) as u8;
     bytes[4] = ((payload_len >> 8) & 0xFF) as u8;
     bytes[5] = ((payload_len >> 16) & 0xFF) as u8;
-    let raw: StandardSv2Frame<AnyMessage<'static>> =
-        StandardSv2Frame::from_bytes_unchecked(bytes.into());
-    writer.write_frame(Frame::Sv2(raw)).await.expect("write");
+    let raw = SerializedFrame::from_bytes(bytes).expect("patched frame header");
+    writer.write_frame(raw).await.expect("write");
 }
 
 fn expect_setup_success(inbound: JdcInbound) {
     match inbound {
-        JdcInbound::Message(AnyMessage::Common(CommonMessages::SetupConnectionSuccess(_))) => {}
+        JdcInbound::Message(AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionSuccess(_),
+        )) => {}
         other => panic!("expected SetupConnectionSuccess, got {other:?}"),
     }
 }
@@ -959,8 +944,8 @@ fn expect_setup_success(inbound: JdcInbound) {
 /// mining connection later presents in `SetCustomMiningJob`.
 fn expect_declare_success(inbound: JdcInbound, request_id: u32) -> Vec<u8> {
     match inbound {
-        JdcInbound::Message(AnyMessage::JobDeclaration(
-            JobDeclaration::DeclareMiningJobSuccess(s),
+        JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::DeclareMiningJobSuccess(s),
         )) => {
             assert_eq!(s.request_id, request_id);
             s.new_mining_job_token.as_bytes().to_vec()
@@ -971,9 +956,9 @@ fn expect_declare_success(inbound: JdcInbound, request_id: u32) -> Vec<u8> {
 
 fn expect_declare_error(inbound: JdcInbound, request_id: u32, code: &str) {
     match inbound {
-        JdcInbound::Message(AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJobError(
-            e,
-        ))) => {
+        JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::DeclareMiningJobError(e),
+        )) => {
             assert_eq!(e.request_id, request_id);
             assert_eq!(
                 std::str::from_utf8(e.error_code.as_ref()).unwrap(),
@@ -1056,11 +1041,8 @@ async fn try_read_jdc(reader: &mut Reader, within: Duration) -> Option<JdcInboun
     match tokio::time::timeout(within, reader.read_frame()).await {
         Err(_) => None,
         Ok(frame) => {
-            let mut sv2_frame = match frame.expect("read_frame") {
-                Frame::Sv2(f) => f,
-                Frame::HandShake(_) => panic!("unexpected handshake frame"),
-            };
-            let header = sv2_frame.get_header().expect("header");
+            let mut sv2_frame = frame.expect("read_frame");
+            let header = sv2_frame.header();
             if header.ext_type_without_channel_msg() == SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS {
                 let payload = sv2_frame.payload();
                 return Some(JdcInbound::PayoutDistribution(
@@ -1069,7 +1051,7 @@ async fn try_read_jdc(reader: &mut Reader, within: Duration) -> Option<JdcInboun
             }
             let (msg, _tlvs) =
                 parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[]).expect("parse");
-            Some(JdcInbound::Message(msg))
+            Some(JdcInbound::Message(msg.into_owned()))
         }
     }
 }
@@ -1136,21 +1118,18 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
 
     write_msg(
         &mut writer,
-        AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-            ExtensionsNegotiation::RequestExtensions(
-                RequestExtensions {
-                    request_id: 1,
-                    requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS]
-                        .try_into()
-                        .unwrap(),
-                }
-                .into_static(),
-            ),
+        AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
+            ExtensionsNegotiationOwned::RequestExtensions(RequestExtensionsOwned {
+                request_id: 1,
+                requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS]
+                    .try_into()
+                    .unwrap(),
+            }),
         )),
     )
     .await;
     match read_jdc(&mut reader).await {
-        JdcInbound::Message(AnyMessage::Extensions(_)) => {}
+        JdcInbound::Message(AnyMessageOwned::Extensions(_)) => {}
         other => panic!("expected RequestExtensionsSuccess, got {other:?}"),
     }
     // Before any allocate the pool does not know WHO this is, so the pool-wide
@@ -1166,18 +1145,17 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
     // ── Identity known, mode NOT known ────────────────────────────────
     write_msg(
         &mut writer,
-        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
-            AllocateMiningJobToken {
+        AnyMessageOwned::JobDeclaration(JobDeclarationOwned::AllocateMiningJobToken(
+            AllocateMiningJobTokenOwned {
                 request_id: 2,
                 user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
-            }
-            .into_static(),
+            },
         )),
     )
     .await;
     match read_jdc(&mut reader).await {
-        JdcInbound::Message(AnyMessage::JobDeclaration(
-            JobDeclaration::AllocateMiningJobTokenSuccess(_),
+        JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::AllocateMiningJobTokenSuccess(_),
         )) => {}
         other => panic!("expected AllocateMiningJobTokenSuccess, got {other:?}"),
     }
@@ -1196,12 +1174,11 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
     // JDC sends anyway, on its next tip change.
     write_msg(
         &mut writer,
-        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
-            AllocateMiningJobToken {
+        AnyMessageOwned::JobDeclaration(JobDeclarationOwned::AllocateMiningJobToken(
+            AllocateMiningJobTokenOwned {
                 request_id: 3,
                 user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
-            }
-            .into_static(),
+            },
         )),
     )
     .await;
@@ -1331,21 +1308,18 @@ async fn negotiated_jdc(addr: std::net::SocketAddr) -> (Reader, Writer, u64) {
     expect_setup_success(read_jdc(&mut reader).await);
     write_msg(
         &mut writer,
-        AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-            ExtensionsNegotiation::RequestExtensions(
-                RequestExtensions {
-                    request_id: 1,
-                    requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS]
-                        .try_into()
-                        .unwrap(),
-                }
-                .into_static(),
-            ),
+        AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
+            ExtensionsNegotiationOwned::RequestExtensions(RequestExtensionsOwned {
+                request_id: 1,
+                requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS]
+                    .try_into()
+                    .unwrap(),
+            }),
         )),
     )
     .await;
     match read_jdc(&mut reader).await {
-        JdcInbound::Message(AnyMessage::Extensions(_)) => {}
+        JdcInbound::Message(AnyMessageOwned::Extensions(_)) => {}
         other => panic!("expected RequestExtensionsSuccess, got {other:?}"),
     }
     let first = match read_jdc(&mut reader).await {
@@ -1360,18 +1334,17 @@ async fn negotiated_jdc(addr: std::net::SocketAddr) -> (Reader, Writer, u64) {
 async fn allocate(reader: &mut Reader, writer: &mut Writer, request_id: u32) -> Vec<u8> {
     write_msg(
         writer,
-        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
-            AllocateMiningJobToken {
+        AnyMessageOwned::JobDeclaration(JobDeclarationOwned::AllocateMiningJobToken(
+            AllocateMiningJobTokenOwned {
                 request_id,
                 user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
-            }
-            .into_static(),
+            },
         )),
     )
     .await;
     match read_jdc(reader).await {
-        JdcInbound::Message(AnyMessage::JobDeclaration(
-            JobDeclaration::AllocateMiningJobTokenSuccess(s),
+        JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::AllocateMiningJobTokenSuccess(s),
         )) => s.mining_job_token.as_bytes().to_vec(),
         other => panic!("expected AllocateMiningJobTokenSuccess #{request_id}, got {other:?}"),
     }
@@ -1681,8 +1654,8 @@ async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
         )
         .await;
         match read_declare_answer(&mut reader).await {
-            JdcInbound::Message(AnyMessage::JobDeclaration(
-                JobDeclaration::DeclareMiningJobError(e),
+            JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+                JobDeclarationOwned::DeclareMiningJobError(e),
             )) => assert_eq!(
                 e.error_code.as_utf8_or_hex(),
                 "stale-payout-distribution",
@@ -1733,9 +1706,9 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
     )
     .await;
     match read_jdc(&mut reader).await {
-        JdcInbound::Message(AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJobError(
-            e,
-        ))) => assert_eq!(
+        JdcInbound::Message(AnyMessageOwned::JobDeclaration(
+            JobDeclarationOwned::DeclareMiningJobError(e),
+        )) => assert_eq!(
             e.error_code.as_utf8_or_hex(),
             "stale-payout-distribution",
             "a coinbase paying the plan for the old mode must not be blessed"

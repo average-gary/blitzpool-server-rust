@@ -1294,8 +1294,8 @@ use jd_server_sv2::job_declarator::job_validation::{
 };
 use stratum_apps::tp_type::BitcoinNetwork as SriBitcoinNetwork;
 use stratum_core::job_declaration_sv2::{
-    DeclareMiningJob as Sv2DeclareMiningJob,
-    ProvideMissingTransactionsSuccess as Sv2ProvideMissingTransactionsSuccess,
+    DeclareMiningJobOwned as Sv2DeclareMiningJob,
+    ProvideMissingTransactionsSuccessOwned as Sv2ProvideMissingTransactionsSuccess,
 };
 
 pub(crate) struct ProductionJobValidator {
@@ -1405,12 +1405,12 @@ impl DeclaredJobValidator for ProductionJobValidator {
         // `excess_data` are not part of the consensus question, so a
         // placeholder token and empty excess keep the shape valid without
         // pretending to carry meaning.
-        let wtxids: Vec<stratum_core::binary_sv2::U256<'static>> = job
+        let wtxids: Vec<stratum_core::binary_sv2::U256Owned> = job
             .wtxid_list
             .iter()
-            .map(|w| stratum_core::binary_sv2::U256::from(*w))
+            .map(|w| stratum_core::binary_sv2::U256Owned::from(*w))
             .collect();
-        let Ok(wtxid_list) = stratum_core::binary_sv2::Seq064K::new(wtxids) else {
+        let Ok(wtxid_list) = stratum_core::binary_sv2::Seq064KOwned::new(wtxids) else {
             warn!("jdp: wtxid list too long to validate — rejecting");
             return JobVerdict::Rejected("invalid-job-declaration".to_string());
         };
@@ -1435,18 +1435,17 @@ impl DeclaredJobValidator for ProductionJobValidator {
 
         // Hand over every raw transaction we already hold, so the node only
         // reports what is genuinely missing rather than everything.
-        let provided: Vec<stratum_core::binary_sv2::B016M<'static>> = job
+        let provided: Vec<stratum_core::binary_sv2::B016MOwned> = job
             .known_raw_txs
             .iter()
             .filter_map(|tx| tx.clone().try_into().ok())
             .collect();
-        let provide =
-            stratum_core::binary_sv2::Seq064K::new(provided)
-                .ok()
-                .map(|transaction_list| Sv2ProvideMissingTransactionsSuccess {
-                    request_id: 0,
-                    transaction_list,
-                });
+        let provide = stratum_core::binary_sv2::Seq064KOwned::new(provided)
+            .ok()
+            .map(|transaction_list| Sv2ProvideMissingTransactionsSuccess {
+                request_id: 0,
+                transaction_list,
+            });
 
         match self
             .engine

@@ -29,17 +29,15 @@ use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use bp_template_distribution::TemplateUpdate;
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
-use stratum_core::framing_sv2::framing::Frame;
-use stratum_core::mining_sv2::OpenExtendedMiningChannel;
-use stratum_core::parsers_sv2::{
-    parse_message_frame_with_tlvs, AnyMessage, CommonMessages, Mining,
-};
+use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
+use stratum_core::mining_sv2::OpenExtendedMiningChannelOwned;
+use stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwned, MiningOwned};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
-const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+mod common;
+use common::{decode_label, read_any_message, wait_until, write_any_message, REGTEST_ADDR};
+
 const SRI_TEST_PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 
@@ -91,13 +89,13 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
     let miner_socket = TcpStream::connect(addr).await.expect("connect to server");
     miner_socket.set_nodelay(true).ok();
     let pub_key: Secp256k1PublicKey = SRI_TEST_PUB.parse().expect("parse pub key");
-    let noise = connect_with_noise::<AnyMessage<'static>>(miner_socket, Some(pub_key))
+    let noise = connect_with_noise(miner_socket, Some(pub_key))
         .await
         .expect("noise handshake (initiator)");
     let (mut reader, mut writer) = noise.into_split();
 
-    let setup = AnyMessage::Common(CommonMessages::SetupConnection(
-        SetupConnection {
+    let setup =
+        AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
@@ -108,31 +106,31 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
             hardware_version: "v1".to_string().try_into().unwrap(),
             firmware: "0.1".to_string().try_into().unwrap(),
             device_id: "test-release".to_string().try_into().unwrap(),
-        }
-        .into_static(),
-    ));
+        }));
     write_any_message(&mut writer, setup).await;
     match read_any_message(&mut reader).await {
-        AnyMessage::Common(CommonMessages::SetupConnectionSuccess(_)) => {}
-        other => panic!("expected SetupConnectionSuccess, got {}", label(&other)),
+        AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(_)) => {}
+        other => panic!(
+            "expected SetupConnectionSuccess, got {}",
+            decode_label(&other)
+        ),
     }
 
-    let open = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
-        OpenExtendedMiningChannel {
+    let open = AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(
+        OpenExtendedMiningChannelOwned {
             request_id: 1,
             user_identity: format!("{REGTEST_ADDR}.worker-release").try_into().unwrap(),
             nominal_hash_rate: 5.0e12,
             max_target: [0xFFu8; 32].into(),
             min_extranonce_size: 8,
-        }
-        .into_static(),
+        },
     ));
     write_any_message(&mut writer, open).await;
 
     // Drain until the channel is open — SetTarget and friends may interleave.
     let mut prefix_len = None;
     for _ in 0..16 {
-        if let AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) =
+        if let AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannelSuccess(s)) =
             read_any_message(&mut reader).await
         {
             prefix_len = Some(s.extranonce_prefix.as_ref().len());
@@ -172,51 +170,3 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
 }
 
 // ── Helpers (mirrors of the ones in regtest_extended.rs) ─────────────
-
-async fn write_any_message(
-    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf<
-        AnyMessage<'static>,
-    >,
-    msg: AnyMessage<'static>,
-) {
-    let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
-        msg.try_into().expect("AnyMessage → StandardSv2Frame");
-    writer
-        .write_frame(Frame::Sv2(sv2_frame))
-        .await
-        .expect("write_frame");
-}
-
-async fn read_any_message(
-    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf<AnyMessage<'static>>,
-) -> AnyMessage<'static> {
-    let frame = reader.read_frame().await.expect("read_frame");
-    let mut sv2_frame = match frame {
-        Frame::Sv2(f) => f,
-        Frame::HandShake(_) => panic!("unexpected handshake frame post-handshake"),
-    };
-    let header = sv2_frame.get_header().expect("frame must have header");
-    let (msg, _tlvs) = parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[])
-        .expect("parse_message_frame_with_tlvs");
-    msg
-}
-
-fn label(m: &AnyMessage<'_>) -> &'static str {
-    match m {
-        AnyMessage::Common(_) => "Common",
-        AnyMessage::Mining(_) => "Mining",
-        AnyMessage::JobDeclaration(_) => "JobDeclaration",
-        AnyMessage::TemplateDistribution(_) => "TemplateDistribution",
-        AnyMessage::Extensions(_) => "Extensions",
-    }
-}
-
-async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}

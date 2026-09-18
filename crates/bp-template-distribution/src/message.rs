@@ -3,15 +3,15 @@
 //! Public, owned, `Send`-able wrappers around the
 //! `stratum_core::parsers_sv2::TemplateDistribution` payloads.
 //!
-//! Why a local wrap instead of re-exporting `TemplateDistribution<'static>`
+//! Why a local wrap instead of re-exporting `TemplateDistributionOwned`
 //! directly:
 //!
-//! - **API stability.** The upstream `stratum-core` library is pulled in via
-//!   a git-branch dep through `bitcoin_core_sv2`. Decoupling our public API
+//! - **API stability.** The upstream `stratum-core` library is pinned to whatever
+//!   `bitcoin_core_sv2` pins, and its majors move. Decoupling our public API
 //!   shields downstream crates (`bp-stratum-v1`, `bp-stratum-v2`,
 //!   eventually `bp-api`) from breaking changes there.
-//! - **Owned bytes.** Upstream payloads carry `Cow`-shaped buffers tied to a
-//!   `'decoder` lifetime; `into_static()` normalises them but we still want a
+//! - **Owned bytes.** Upstream payloads come in a borrowed `'decoder` flavour and
+//!   an `*Owned` flavour; the owned one already copies, but we still want a
 //!   trivially-clonable `Vec<u8>` so `broadcast::Sender` can fan out without
 //!   reference counting tricks.
 //! - **Surface area.** Pool consumers only ever care about the four payloads
@@ -19,7 +19,7 @@
 //!   `RequestTransactionData` / `SubmitSolution` variants on the *outbound*
 //!   channel.
 
-use stratum_core::parsers_sv2::TemplateDistribution;
+use stratum_core::parsers_sv2::TemplateDistributionOwned;
 
 /// Updates that arrive **from** bitcoin-core via TDP and are fanned out to
 /// every pool consumer.
@@ -174,9 +174,9 @@ impl TemplateUpdate {
     /// (`CoinbaseOutputConstraints`, `RequestTransactionData`,
     /// `SubmitSolution`) which never travel outbound and so should never
     /// reach this code path; the worker logs and drops them instead.
-    pub fn from_upstream(msg: &TemplateDistribution<'static>) -> Option<Self> {
+    pub fn from_upstream(msg: &TemplateDistributionOwned) -> Option<Self> {
         match msg {
-            TemplateDistribution::NewTemplate(t) => Some(Self::NewTemplate(NewTemplate {
+            TemplateDistributionOwned::NewTemplate(t) => Some(Self::NewTemplate(NewTemplate {
                 template_id: t.template_id,
                 future_template: t.future_template,
                 version: t.version,
@@ -200,7 +200,7 @@ impl TemplateUpdate {
                     })
                     .collect(),
             })),
-            TemplateDistribution::SetNewPrevHash(p) => {
+            TemplateDistributionOwned::SetNewPrevHash(p) => {
                 let mut prev = [0u8; 32];
                 let pref = p.prev_hash.as_bytes();
                 let plen = pref.len().min(32);
@@ -219,7 +219,7 @@ impl TemplateUpdate {
                     target: tgt,
                 }))
             }
-            TemplateDistribution::RequestTransactionDataSuccess(s) => Some(
+            TemplateDistributionOwned::RequestTransactionDataSuccess(s) => Some(
                 Self::RequestTransactionDataSuccess(RequestTransactionDataSuccess {
                     template_id: s.template_id,
                     excess_data: s.excess_data.as_bytes().to_vec(),
@@ -230,15 +230,15 @@ impl TemplateUpdate {
                         .collect(),
                 }),
             ),
-            TemplateDistribution::RequestTransactionDataError(e) => Some(
+            TemplateDistributionOwned::RequestTransactionDataError(e) => Some(
                 Self::RequestTransactionDataError(RequestTransactionDataError {
                     template_id: e.template_id,
                     error_code: e.error_code.as_utf8_or_hex(),
                 }),
             ),
-            TemplateDistribution::CoinbaseOutputConstraints(_)
-            | TemplateDistribution::RequestTransactionData(_)
-            | TemplateDistribution::SubmitSolution(_) => None,
+            TemplateDistributionOwned::CoinbaseOutputConstraints(_)
+            | TemplateDistributionOwned::RequestTransactionData(_)
+            | TemplateDistributionOwned::SubmitSolution(_) => None,
         }
     }
 }
@@ -246,31 +246,32 @@ impl TemplateUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratum_core::binary_sv2::{Seq0255, B0255, B064K, U256};
+    use stratum_core::binary_sv2::{B0255Owned, B064KOwned, Seq0255Owned, U256Owned};
     use stratum_core::template_distribution_sv2::{
-        CoinbaseOutputConstraints, NewTemplate as TdNewTemplate, RequestTransactionData,
-        RequestTransactionDataError as TdRtdError, RequestTransactionDataSuccess as TdRtdSuccess,
-        SetNewPrevHash as TdSetNewPrevHash, SubmitSolution as TdSubmitSolution,
+        CoinbaseOutputConstraints, NewTemplateOwned as TdNewTemplate, RequestTransactionData,
+        RequestTransactionDataErrorOwned as TdRtdError,
+        RequestTransactionDataSuccessOwned as TdRtdSuccess,
+        SetNewPrevHashOwned as TdSetNewPrevHash, SubmitSolutionOwned as TdSubmitSolution,
     };
 
-    fn u256(byte: u8) -> U256<'static> {
+    fn u256(byte: u8) -> U256Owned {
         let mut buf = [0u8; 32];
         buf.fill(byte);
-        U256::from(buf)
+        U256Owned::from(buf)
     }
 
-    fn b0255(bytes: Vec<u8>) -> B0255<'static> {
-        B0255::try_from(bytes).expect("len ≤ 255")
+    fn b0255(bytes: Vec<u8>) -> B0255Owned {
+        B0255Owned::try_from(bytes).expect("len ≤ 255")
     }
 
-    fn b064k(bytes: Vec<u8>) -> B064K<'static> {
-        B064K::try_from(bytes).expect("len ≤ u16::MAX")
+    fn b064k(bytes: Vec<u8>) -> B064KOwned {
+        B064KOwned::try_from(bytes).expect("len ≤ u16::MAX")
     }
 
     #[test]
     fn maps_new_template() {
         let path = vec![u256(0x11), u256(0x22)];
-        let upstream = TemplateDistribution::NewTemplate(TdNewTemplate {
+        let upstream = TemplateDistributionOwned::NewTemplate(TdNewTemplate {
             template_id: 42,
             future_template: true,
             version: 0x2000_0000,
@@ -281,7 +282,7 @@ mod tests {
             coinbase_tx_outputs_count: 1,
             coinbase_tx_outputs: b064k(vec![0xde, 0xad, 0xbe, 0xef]),
             coinbase_tx_locktime: 0,
-            merkle_path: Seq0255::new(path).expect("len fits"),
+            merkle_path: Seq0255Owned::new(path).expect("len fits"),
         });
 
         let mapped = TemplateUpdate::from_upstream(&upstream).expect("NewTemplate maps");
@@ -305,7 +306,7 @@ mod tests {
 
     #[test]
     fn maps_set_new_prev_hash() {
-        let upstream = TemplateDistribution::SetNewPrevHash(TdSetNewPrevHash {
+        let upstream = TemplateDistributionOwned::SetNewPrevHash(TdSetNewPrevHash {
             template_id: 7,
             prev_hash: u256(0xa1),
             header_timestamp: 1_700_000_000,
@@ -325,12 +326,13 @@ mod tests {
 
     #[test]
     fn maps_request_tx_data_success() {
-        let txs = stratum_core::binary_sv2::Seq064K::new(vec![
-            stratum_core::binary_sv2::B016M::try_from(vec![0x01, 0x02, 0x03]).expect("len fits"),
-            stratum_core::binary_sv2::B016M::try_from(vec![0x04, 0x05]).expect("len fits"),
+        let txs = stratum_core::binary_sv2::Seq064KOwned::new(vec![
+            stratum_core::binary_sv2::B016MOwned::try_from(vec![0x01, 0x02, 0x03])
+                .expect("len fits"),
+            stratum_core::binary_sv2::B016MOwned::try_from(vec![0x04, 0x05]).expect("len fits"),
         ])
         .expect("len fits");
-        let upstream = TemplateDistribution::RequestTransactionDataSuccess(TdRtdSuccess {
+        let upstream = TemplateDistributionOwned::RequestTransactionDataSuccess(TdRtdSuccess {
             template_id: 99,
             excess_data: b064k(vec![0x77, 0x88]),
             transaction_list: txs,
@@ -348,9 +350,9 @@ mod tests {
 
     #[test]
     fn maps_request_tx_data_error() {
-        let upstream = TemplateDistribution::RequestTransactionDataError(TdRtdError {
+        let upstream = TemplateDistributionOwned::RequestTransactionDataError(TdRtdError {
             template_id: 13,
-            error_code: stratum_core::binary_sv2::Str0255::try_from(
+            error_code: stratum_core::binary_sv2::Str0255Owned::try_from(
                 "stale-template-id".to_string(),
             )
             .expect("ascii len fits"),
@@ -370,7 +372,7 @@ mod tests {
         assert!(snap.set_new_prev_hash.is_none());
 
         // First a NewTemplate — only `new_template` populated.
-        let upstream = TemplateDistribution::NewTemplate(TdNewTemplate {
+        let upstream = TemplateDistributionOwned::NewTemplate(TdNewTemplate {
             template_id: 1,
             future_template: true,
             version: 0x2000_0000,
@@ -381,7 +383,7 @@ mod tests {
             coinbase_tx_outputs_count: 0,
             coinbase_tx_outputs: b064k(vec![]),
             coinbase_tx_locktime: 0,
-            merkle_path: Seq0255::new(vec![]).unwrap(),
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
         });
         apply_to_snapshot(
             &mut snap,
@@ -391,7 +393,7 @@ mod tests {
         assert!(snap.set_new_prev_hash.is_none());
 
         // Then the paired SetNewPrevHash.
-        let upstream2 = TemplateDistribution::SetNewPrevHash(TdSetNewPrevHash {
+        let upstream2 = TemplateDistributionOwned::SetNewPrevHash(TdSetNewPrevHash {
             template_id: 1,
             prev_hash: u256(0xaa),
             header_timestamp: 1_700_000_000,
@@ -407,7 +409,7 @@ mod tests {
         assert_eq!(snap.new_template.as_ref().unwrap().template_id, 1);
 
         // A later NewTemplate replaces only `new_template`, prev_hash stays.
-        let upstream3 = TemplateDistribution::NewTemplate(TdNewTemplate {
+        let upstream3 = TemplateDistributionOwned::NewTemplate(TdNewTemplate {
             template_id: 2,
             future_template: false,
             version: 0x2000_0000,
@@ -418,7 +420,7 @@ mod tests {
             coinbase_tx_outputs_count: 0,
             coinbase_tx_outputs: b064k(vec![]),
             coinbase_tx_locktime: 0,
-            merkle_path: Seq0255::new(vec![]).unwrap(),
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
         });
         apply_to_snapshot(
             &mut snap,
@@ -446,12 +448,14 @@ mod tests {
     #[test]
     fn skips_inbound_only_variants() {
         let cases = [
-            TemplateDistribution::CoinbaseOutputConstraints(CoinbaseOutputConstraints {
+            TemplateDistributionOwned::CoinbaseOutputConstraints(CoinbaseOutputConstraints {
                 coinbase_output_max_additional_size: 100,
                 coinbase_output_max_additional_sigops: 0,
             }),
-            TemplateDistribution::RequestTransactionData(RequestTransactionData { template_id: 1 }),
-            TemplateDistribution::SubmitSolution(TdSubmitSolution {
+            TemplateDistributionOwned::RequestTransactionData(RequestTransactionData {
+                template_id: 1,
+            }),
+            TemplateDistributionOwned::SubmitSolution(TdSubmitSolution {
                 template_id: 1,
                 version: 0,
                 header_timestamp: 0,

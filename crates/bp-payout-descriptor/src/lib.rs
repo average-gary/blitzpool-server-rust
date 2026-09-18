@@ -100,7 +100,7 @@ use miniscript::ForEachKey;
 ///    characters against what was then a 62-character cap in `bp_common` and in
 ///    every identity column. **This reason is gone as of 2026-08-12** —
 ///    `bp_common::MAX_ADDRESS_LEN` is 90 and migration
-///    `0015_widen_identity_columns.sql` widened the columns, as its own change
+///    `0017_widen_identity_columns.sql` widened the columns, as its own change
 ///    with its own rollback story, exactly as `CLAUDE.md` requires.
 /// 2. *Weight.* A P2WPKH output is 124 WU against P2TR's 172, so the same
 ///    coinbase weight budget pays ~39 % more miners. **This reason stands**, and
@@ -152,7 +152,7 @@ pub const POOL_OUTPUT_WEIGHT_WU: usize = 124;
 /// The original reason was the fourth column not existing: hex would have forced
 /// a 32-column migration and base58 would not. **That reason is spent** — the
 /// columns are `varchar(90)` since 2026-08-12
-/// (`0015_widen_identity_columns.sql`), so hex would fit now. The tripwire that
+/// (`0017_widen_identity_columns.sql`), so hex would fit now. The tripwire that
 /// said so was the control assertion in
 /// `payout_id_is_base58_and_fits_the_identity_columns`, and it fired as designed.
 ///
@@ -277,7 +277,7 @@ impl RotatingPayout {
 
     /// The height-invariant ledger key. Safe to store in any identity column —
     /// they are `character varying(90)` since
-    /// `0015_widen_identity_columns.sql`, and a `payout_id` is 47 characters:
+    /// `0017_widen_identity_columns.sql`, and a `payout_id` is 47 characters:
     /// the crate-private `xpb` prefix plus a base58 sha256 digest. The prefix
     /// keeps the id out of the address namespace — no base58 hash can be
     /// mistaken for an address that anything would try to pay.
@@ -753,7 +753,7 @@ mod tests {
     /// the same digest did NOT fit, because that was the entire reason base58 was
     /// chosen, and it said in as many words: *"if it does, the 62-char cap moved
     /// and this decision needs revisiting"*. The cap moved on 2026-08-12
-    /// (`0015_widen_identity_columns.sql`), the control fired, and the revisiting
+    /// (`0017_widen_identity_columns.sql`), the control fired, and the revisiting
     /// is recorded at [`PAYOUT_ID_PREFIX`]: the decision stands, on the ground
     /// that the encoding is now the identity rather than because hex is too wide.
     ///
@@ -879,7 +879,7 @@ mod tests {
     /// derivation as taproot produces a 64-character `bcrt1p…` against a
     /// 62-character cap, documenting a pre-existing latent break that this feature
     /// was not allowed to fix. Phase 5 fixed it separately
-    /// (`0015_widen_identity_columns.sql`, `MAX_ADDRESS_LEN = 90`), so the same
+    /// (`0017_widen_identity_columns.sql`, `MAX_ADDRESS_LEN = 90`), so the same
     /// address is now asserted to *pass* — the break is closed, and this is the
     /// test that says so rather than a comment claiming it.
     ///

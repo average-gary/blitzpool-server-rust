@@ -1506,52 +1506,72 @@ where
                     .as_deref()
                     .ok_or(ApiError::Unavailable("group-solo-engine not wired"))?;
                 let stats = engine.reader().round_stats(id).await?;
-                let total_shares: f64 = stats.per_address.values().sum();
                 // Rejected shares are round-scoped — read from the same round
                 // store as the accepted shares so both describe the current
-                // round, not an all-time total.
-                let total_rejected: f64 = stats.total_rejected;
-                let rejected_by_addr = stats.rejected_per_address;
-                let addr_strings: Vec<String> = stats.per_address.keys().cloned().collect();
-                let labels = build_member_labels(&addr_strings);
-
-                let mut entries: Vec<DistributionEntry> = stats
-                    .per_address
-                    .into_iter()
-                    .map(|(address, shares)| {
-                        let percent = if total_shares > 0.0 {
-                            shares / total_shares * 100.0
-                        } else {
-                            0.0
-                        };
-                        let total_rejected_for_addr =
-                            rejected_by_addr.get(&address).copied().unwrap_or(0.0);
-                        DistributionEntry {
-                            member_id: member_id(id, &address),
-                            address_label: labels
-                                .get(&address)
-                                .cloned()
-                                .unwrap_or_else(|| mask_address_tail(&address, 5)),
-                            total_shares: shares,
-                            percent,
-                            total_rejected: total_rejected_for_addr,
-                        }
-                    })
-                    .collect();
-                entries.sort_by(|a, b| {
-                    b.total_shares
-                        .partial_cmp(&a.total_shares)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                // round (or the same sliding window), not an all-time total.
                 Ok(DistributionResponse {
-                    total_shares,
-                    total_rejected,
-                    per_address: entries,
+                    total_shares: stats.per_address.values().sum(),
+                    total_rejected: stats.total_rejected,
+                    per_address: distribution_entries(
+                        id,
+                        stats.per_address,
+                        stats.rejected_per_address,
+                    ),
                 })
             },
         )
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// One row per address the round store knows, accepted OR rejected.
+///
+/// A member whose accepted work fell out of the window (or who has only
+/// rejects this round) used to vanish from the rows while still counting
+/// in `total_rejected`, so the group-wide reject figure could not be
+/// reconciled against the table. Such an address now gets a row with zero
+/// shares. Sorted by shares, descending.
+fn distribution_entries(
+    group_id: Uuid,
+    per_address: HashMap<String, f64>,
+    rejected_per_address: HashMap<String, f64>,
+) -> Vec<DistributionEntry> {
+    let total_shares: f64 = per_address.values().sum();
+    let mut addresses: Vec<String> = per_address.keys().cloned().collect();
+    addresses.extend(
+        rejected_per_address
+            .keys()
+            .filter(|a| !per_address.contains_key(*a))
+            .cloned(),
+    );
+    let labels = build_member_labels(&addresses);
+    let mut entries: Vec<DistributionEntry> = addresses
+        .into_iter()
+        .map(|address| {
+            let shares = per_address.get(&address).copied().unwrap_or(0.0);
+            let percent = if total_shares > 0.0 {
+                shares / total_shares * 100.0
+            } else {
+                0.0
+            };
+            DistributionEntry {
+                member_id: member_id(group_id, &address),
+                address_label: labels
+                    .get(&address)
+                    .cloned()
+                    .unwrap_or_else(|| mask_address_tail(&address, 5)),
+                total_shares: shares,
+                percent,
+                total_rejected: rejected_per_address.get(&address).copied().unwrap_or(0.0),
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.total_shares
+            .partial_cmp(&a.total_shares)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries
 }
 
 // ─── GET /api/pplns/groups/:id/window-timeline ──────────────────
@@ -2497,6 +2517,29 @@ mod tests {
         let id = member_id(g1, a);
         assert_eq!(id.len(), 16);
         assert!(!id.contains("address"));
+    }
+
+    #[test]
+    fn distribution_entries_keep_a_reject_only_member_as_a_zero_share_row() {
+        let gid = Uuid::nil();
+        let per_address = HashMap::from([("bc1qAAAAAAAAA11111".to_string(), 75.0)]);
+        let rejected = HashMap::from([
+            ("bc1qAAAAAAAAA11111".to_string(), 5.0),
+            ("bc1qBBBBBBBBB22222".to_string(), 9.0),
+        ]);
+        let rows = distribution_entries(gid, per_address, rejected);
+        assert_eq!(rows.len(), 2, "the reject-only address gets a row");
+        assert_eq!(rows[0].member_id, member_id(gid, "bc1qAAAAAAAAA11111"));
+        assert_eq!(rows[0].total_shares, 75.0);
+        assert_eq!(rows[0].percent, 100.0);
+        assert_eq!(rows[0].total_rejected, 5.0);
+        assert_eq!(rows[1].member_id, member_id(gid, "bc1qBBBBBBBBB22222"));
+        assert_eq!(rows[1].total_shares, 0.0);
+        assert_eq!(rows[1].percent, 0.0);
+        assert_eq!(rows[1].total_rejected, 9.0);
+        // Sum of the rows is the figure the mini-card shows, in both columns.
+        let rejected_sum: f64 = rows.iter().map(|r| r.total_rejected).sum();
+        assert_eq!(rejected_sum, 14.0);
     }
 
     #[test]

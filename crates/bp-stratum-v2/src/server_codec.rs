@@ -15,56 +15,57 @@
 //! wire-shape types in `stratum_core::*` are lifetime-bound
 //! (`Str0255<'decoder>`, `U256<'decoder>`, `B032<'decoder>`, ...) because
 //! they borrow from the codec buffer at deserialization time. This
-//! module is the boundary that calls `into_static()` then converts to
-//! owned representations on the inbound path, and constructs the
-//! lifetime-bound types from owned data on the outbound path.
+//! module is the boundary that converts the borrowed wire types to
+//! owned representations on the inbound path, and builds the `*Owned`
+//! wire types from owned data on the outbound path.
 //!
 //! ## Shape
 //!
 //! - [`InboundMiningFrame`] enum wrapping every typed `Input` the
 //!   per-connection task can dispatch on. The variants mirror
 //!   [`crate::mining::client`]'s `handle_*` signatures.
-//! - [`decode_mining_inbound`] takes a `'static`-lifetime `AnyMessage`
-//!   (post-`into_static()` from the wire decoder) and returns an
+//! - [`decode_mining_inbound`] takes an `AnyMessage` borrowing the frame
+//!   payload (straight from the wire decoder) and returns an
 //!   [`InboundMiningFrame`]. Returns `Ok(None)` for messages that
 //!   aren't relevant to the mining server (e.g. JDP messages on the
 //!   wrong port) so the per-connection task can log + ignore.
 //! - [`encode_mining_outbound`] takes an
 //!   [`crate::mining::client::OutboundFrame`] and returns an
-//!   `AnyMessage<'static>` ready to wrap in an `Sv2Frame` for the
+//!   `AnyMessageOwned` ready to wrap in a `MessageFrame` for the
 //!   noise writer.
 //!
-//! ## Scope of this commit
-//!
-//! Covers the **mining-server**'s 9 inbound + 16 outbound variants.
-//! JDP wire-codec is a separate module (`jdp_server_codec.rs`) that
-//! lands with `jdp_server.rs`.
+//! The JDP sub-protocol has its own codec of the same shape,
+//! [`crate::jdp_server_codec`].
 
 use stratum_core::common_messages_sv2::{
-    SetupConnection as Sv2SetupConnection, SetupConnectionError as Sv2SetupConnError,
-    SetupConnectionSuccess as Sv2SetupConnSuccess,
+    SetupConnection as Sv2SetupConnection, SetupConnectionErrorOwned as Sv2SetupConnError,
+    SetupConnectionSuccessOwned as Sv2SetupConnSuccess,
 };
 use stratum_core::extensions_sv2::extensions_negotiation::{
-    RequestExtensions as Sv2RequestExtensions, RequestExtensionsError as Sv2ReqExtError,
-    RequestExtensionsSuccess as Sv2ReqExtSuccess,
+    RequestExtensions as Sv2RequestExtensions, RequestExtensionsErrorOwned as Sv2ReqExtError,
+    RequestExtensionsSuccessOwned as Sv2ReqExtSuccess,
 };
 use stratum_core::mining_sv2::{
-    CloseChannel as Sv2CloseChannel, NewExtendedMiningJob as Sv2NewExtMiningJob,
-    NewMiningJob as Sv2NewMiningJob, OpenExtendedMiningChannel as Sv2OpenExtChannel,
-    OpenExtendedMiningChannelSuccess as Sv2OpenExtChannelSuccess,
-    OpenMiningChannelError as Sv2OpenChannelError, OpenStandardMiningChannel as Sv2OpenStdChannel,
-    OpenStandardMiningChannelSuccess as Sv2OpenStdChannelSuccess,
+    CloseChannel as Sv2CloseChannel, NewExtendedMiningJobOwned as Sv2NewExtMiningJob,
+    NewMiningJobOwned as Sv2NewMiningJob, OpenExtendedMiningChannel as Sv2OpenExtChannel,
+    OpenExtendedMiningChannelSuccessOwned as Sv2OpenExtChannelSuccess,
+    OpenMiningChannelErrorOwned as Sv2OpenChannelError,
+    OpenStandardMiningChannel as Sv2OpenStdChannel,
+    OpenStandardMiningChannelSuccessOwned as Sv2OpenStdChannelSuccess,
     SetCustomMiningJob as Sv2SetCustomMiningJob,
-    SetCustomMiningJobError as Sv2SetCustomMiningJobError,
-    SetCustomMiningJobSuccess as Sv2SetCustomMiningJobSuccess,
-    SetExtranoncePrefix as Sv2SetExtranoncePrefix, SetNewPrevHash as Sv2MiningSetNewPrevHash,
-    SetTarget as Sv2SetTarget, SubmitSharesError as Sv2SubmitSharesError,
+    SetCustomMiningJobErrorOwned as Sv2SetCustomMiningJobError,
+    SetCustomMiningJobSuccessOwned as Sv2SetCustomMiningJobSuccess,
+    SetExtranoncePrefixOwned as Sv2SetExtranoncePrefix,
+    SetNewPrevHashOwned as Sv2MiningSetNewPrevHash, SetTargetOwned as Sv2SetTarget,
+    SubmitSharesErrorOwned as Sv2SubmitSharesError,
     SubmitSharesExtended as Sv2SubmitSharesExtended,
-    SubmitSharesStandard as Sv2SubmitSharesStandard, SubmitSharesSuccess as Sv2SubmitSharesSuccess,
-    UpdateChannel as Sv2UpdateChannel, UpdateChannelError as Sv2UpdateChannelError,
+    SubmitSharesStandard as Sv2SubmitSharesStandard,
+    SubmitSharesSuccessOwned as Sv2SubmitSharesSuccess, UpdateChannel as Sv2UpdateChannel,
+    UpdateChannelErrorOwned as Sv2UpdateChannelError,
 };
 use stratum_core::parsers_sv2::{
-    AnyMessage, CommonMessages, Extensions, ExtensionsNegotiation, Mining,
+    AnyMessage, AnyMessageOwned, CommonMessages, CommonMessagesOwned, Extensions,
+    ExtensionsNegotiation, ExtensionsNegotiationOwned, ExtensionsOwned, Mining, MiningOwned,
 };
 
 use crate::codec_common::{bytes_to_32, str0255, token_from_bytes, utf8_from_bytes, CodecError};
@@ -96,8 +97,8 @@ pub enum InboundMiningFrame {
 
 /// Translate one wire-shape SV2 message into an
 /// [`InboundMiningFrame`]. Caller wraps this in the per-connection
-/// task: read a frame, parse to `AnyMessage`, call
-/// `.into_static()`, hand off here, dispatch the result to the
+/// task: read a frame, parse to `AnyMessage`, hand off here,
+/// dispatch the result to the
 /// matching `handle_*` in [`crate::mining::client`].
 ///
 /// `Ok(None)` means "not a mining-server message" (log + ignore).
@@ -105,7 +106,7 @@ pub enum InboundMiningFrame {
 /// failed; caller logs + drops the frame (the connection survives —
 /// SV2 spec is forgiving here).
 pub fn decode_mining_inbound(
-    msg: AnyMessage<'static>,
+    msg: AnyMessage<'_>,
 ) -> Result<Option<InboundMiningFrame>, CodecError> {
     match msg {
         AnyMessage::Common(CommonMessages::SetupConnection(m)) => Ok(Some(
@@ -121,7 +122,7 @@ pub fn decode_mining_inbound(
     }
 }
 
-fn decode_mining_message(m: Mining<'static>) -> Result<InboundMiningFrame, CodecError> {
+fn decode_mining_message(m: Mining<'_>) -> Result<InboundMiningFrame, CodecError> {
     match m {
         Mining::OpenStandardMiningChannel(m) => {
             let (input, prefix) = decode_open_std_channel(m)?;
@@ -178,9 +179,7 @@ fn mining_variant_name(m: &Mining<'_>) -> &'static str {
 
 // ── Per-variant decoders ────────────────────────────────────────────
 
-fn decode_setup_connection(
-    m: Sv2SetupConnection<'static>,
-) -> Result<SetupConnectionInput, CodecError> {
+fn decode_setup_connection(m: Sv2SetupConnection<'_>) -> Result<SetupConnectionInput, CodecError> {
     Ok(SetupConnectionInput {
         protocol: m.protocol as u8,
         min_version: m.min_version,
@@ -194,7 +193,7 @@ fn decode_setup_connection(
 }
 
 fn decode_request_extensions(
-    m: Sv2RequestExtensions<'static>,
+    m: Sv2RequestExtensions<'_>,
 ) -> Result<LocalRequestExtensions, CodecError> {
     Ok(LocalRequestExtensions {
         request_id: m.request_id,
@@ -203,7 +202,7 @@ fn decode_request_extensions(
 }
 
 fn decode_open_std_channel(
-    m: Sv2OpenStdChannel<'static>,
+    m: Sv2OpenStdChannel<'_>,
 ) -> Result<(OpenStandardMiningChannelInput, Vec<u8>), CodecError> {
     let extranonce_prefix = Vec::new(); // OpenChannel.request doesn't carry one — pool allocates
     Ok((
@@ -218,7 +217,7 @@ fn decode_open_std_channel(
 }
 
 fn decode_open_ext_channel(
-    m: Sv2OpenExtChannel<'static>,
+    m: Sv2OpenExtChannel<'_>,
 ) -> Result<(OpenExtendedMiningChannelInput, Vec<u8>), CodecError> {
     let extranonce_prefix = Vec::new();
     Ok((
@@ -233,7 +232,7 @@ fn decode_open_ext_channel(
     ))
 }
 
-fn decode_update_channel(m: Sv2UpdateChannel<'static>) -> Result<UpdateChannelInput, CodecError> {
+fn decode_update_channel(m: Sv2UpdateChannel<'_>) -> Result<UpdateChannelInput, CodecError> {
     Ok(UpdateChannelInput {
         channel_id: m.channel_id,
         nominal_hash_rate: m.nominal_hash_rate,
@@ -241,7 +240,7 @@ fn decode_update_channel(m: Sv2UpdateChannel<'static>) -> Result<UpdateChannelIn
     })
 }
 
-fn decode_close_channel(m: Sv2CloseChannel<'static>) -> Result<CloseChannelInput, CodecError> {
+fn decode_close_channel(m: Sv2CloseChannel<'_>) -> Result<CloseChannelInput, CodecError> {
     Ok(CloseChannelInput {
         channel_id: m.channel_id,
         reason_code: utf8_from_bytes(m.reason_code.as_bytes())?,
@@ -260,7 +259,7 @@ fn decode_submit_shares_standard(m: Sv2SubmitSharesStandard) -> SubmitSharesStan
 }
 
 fn decode_submit_shares_extended(
-    m: Sv2SubmitSharesExtended<'static>,
+    m: Sv2SubmitSharesExtended<'_>,
 ) -> Result<SubmitSharesExtendedInput, CodecError> {
     Ok(SubmitSharesExtendedInput {
         channel_id: m.channel_id,
@@ -281,7 +280,7 @@ fn decode_submit_shares_extended(
 }
 
 fn decode_set_custom_mining_job(
-    m: Sv2SetCustomMiningJob<'static>,
+    m: Sv2SetCustomMiningJob<'_>,
 ) -> Result<SetCustomMiningJobInput, CodecError> {
     Ok(SetCustomMiningJobInput {
         // ext 0x0003/distribution_id TLV Field — IO-layer-extracted from the
@@ -306,51 +305,46 @@ fn decode_set_custom_mining_job(
 // ── encode_mining_outbound ──────────────────────────────────────────
 
 /// Translate an [`OutboundFrame`] into a wire-shape
-/// `AnyMessage<'static>` ready for `Sv2Frame` wrapping. The
-/// per-connection task wraps this in
-/// `Sv2Frame::from_message(any, msg_type, ext_type, channel_bit)`
+/// `AnyMessageOwned` ready for `MessageFrame` wrapping. The
+/// per-connection task wraps this via `MessageFrame::try_from(any_message)`
 /// and writes to the noise stream.
-pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static>, CodecError> {
+pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessageOwned, CodecError> {
     match frame {
         OutboundFrame::SetupConnectionSuccess {
             used_version,
             flags,
-        } => Ok(AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
-            Sv2SetupConnSuccess {
+        } => Ok(AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionSuccess(Sv2SetupConnSuccess {
                 used_version,
                 flags,
-            },
-        ))),
-        OutboundFrame::SetupConnectionError { flags, error_code } => {
-            Ok(AnyMessage::Common(CommonMessages::SetupConnectionError(
-                Sv2SetupConnError {
-                    flags,
-                    error_code: str0255(error_code)?,
-                }
-                .into_static(),
-            )))
-        }
+            }),
+        )),
+        OutboundFrame::SetupConnectionError { flags, error_code } => Ok(AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionError(Sv2SetupConnError {
+                flags,
+                error_code: str0255(error_code)?,
+            }),
+        )),
         OutboundFrame::RequestExtensionsSuccess {
             request_id,
             supported_extensions,
-        } => Ok(AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-            ExtensionsNegotiation::RequestExtensionsSuccess(
-                Sv2ReqExtSuccess {
+        } => Ok(AnyMessageOwned::Extensions(
+            ExtensionsOwned::ExtensionsNegotiation(
+                ExtensionsNegotiationOwned::RequestExtensionsSuccess(Sv2ReqExtSuccess {
                     request_id,
                     supported_extensions: supported_extensions
                         .try_into()
                         .map_err(CodecError::from_conv)?,
-                }
-                .into_static(),
+                }),
             ),
-        ))),
+        )),
         OutboundFrame::RequestExtensionsError {
             request_id,
             unsupported_extensions,
             required_extensions,
-        } => Ok(AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-            ExtensionsNegotiation::RequestExtensionsError(
-                Sv2ReqExtError {
+        } => Ok(AnyMessageOwned::Extensions(
+            ExtensionsOwned::ExtensionsNegotiation(
+                ExtensionsNegotiationOwned::RequestExtensionsError(Sv2ReqExtError {
                     request_id,
                     unsupported_extensions: unsupported_extensions
                         .try_into()
@@ -358,29 +352,25 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
                     required_extensions: required_extensions
                         .try_into()
                         .map_err(CodecError::from_conv)?,
-                }
-                .into_static(),
+                }),
             ),
-        ))),
+        )),
         OutboundFrame::OpenStandardMiningChannelSuccess {
             request_id,
             channel_id,
             target,
             extranonce_prefix,
             group_channel_id,
-        } => Ok(AnyMessage::Mining(
-            Mining::OpenStandardMiningChannelSuccess(
-                Sv2OpenStdChannelSuccess {
-                    request_id,
-                    channel_id,
-                    target: target.into(),
-                    extranonce_prefix: extranonce_prefix
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                    group_channel_id,
-                }
-                .into_static(),
-            ),
+        } => Ok(AnyMessageOwned::Mining(
+            MiningOwned::OpenStandardMiningChannelSuccess(Sv2OpenStdChannelSuccess {
+                request_id,
+                channel_id,
+                target: target.into(),
+                extranonce_prefix: extranonce_prefix
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+                group_channel_id,
+            }),
         )),
         OutboundFrame::OpenExtendedMiningChannelSuccess {
             request_id,
@@ -389,57 +379,51 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             extranonce_size,
             extranonce_prefix,
             group_channel_id,
-        } => Ok(AnyMessage::Mining(
-            Mining::OpenExtendedMiningChannelSuccess(
-                Sv2OpenExtChannelSuccess {
-                    request_id,
-                    channel_id,
-                    target: target.into(),
-                    extranonce_size,
-                    extranonce_prefix: extranonce_prefix
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                    // Group this channel belongs to
-                    // (SV2 Mining/Group Channel), or 0 when un-grouped. Set by
-                    // the Extended-open handler's eager group assignment for
-                    // non-REQUIRES_STANDARD_JOBS connections; the downstream
-                    // infers membership from it.
-                    group_channel_id,
-                }
-                .into_static(),
-            ),
+        } => Ok(AnyMessageOwned::Mining(
+            MiningOwned::OpenExtendedMiningChannelSuccess(Sv2OpenExtChannelSuccess {
+                request_id,
+                channel_id,
+                target: target.into(),
+                extranonce_size,
+                extranonce_prefix: extranonce_prefix
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+                // Group this channel belongs to
+                // (SV2 Mining/Group Channel), or 0 when un-grouped. Set by
+                // the Extended-open handler's eager group assignment for
+                // non-REQUIRES_STANDARD_JOBS connections; the downstream
+                // infers membership from it.
+                group_channel_id,
+            }),
         )),
         OutboundFrame::OpenMiningChannelError {
             request_id,
             error_code,
-        } => Ok(AnyMessage::Mining(Mining::OpenMiningChannelError(
-            Sv2OpenChannelError {
+        } => Ok(AnyMessageOwned::Mining(
+            MiningOwned::OpenMiningChannelError(Sv2OpenChannelError {
                 request_id,
                 error_code: str0255(error_code)?,
-            }
-            .into_static(),
-        ))),
+            }),
+        )),
         OutboundFrame::SetTarget {
             channel_id,
             maximum_target,
-        } => Ok(AnyMessage::Mining(Mining::SetTarget(
+        } => Ok(AnyMessageOwned::Mining(MiningOwned::SetTarget(
             Sv2SetTarget {
                 channel_id,
                 maximum_target: maximum_target.into(),
-            }
-            .into_static(),
+            },
         ))),
         OutboundFrame::SetExtranoncePrefix {
             channel_id,
             extranonce_prefix,
-        } => Ok(AnyMessage::Mining(Mining::SetExtranoncePrefix(
+        } => Ok(AnyMessageOwned::Mining(MiningOwned::SetExtranoncePrefix(
             Sv2SetExtranoncePrefix {
                 channel_id,
                 extranonce_prefix: extranonce_prefix
                     .try_into()
                     .map_err(CodecError::from_conv)?,
-            }
-            .into_static(),
+            },
         ))),
         OutboundFrame::SetNewPrevHash {
             channel_id,
@@ -447,15 +431,14 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             prev_hash,
             min_ntime,
             n_bits,
-        } => Ok(AnyMessage::Mining(Mining::SetNewPrevHash(
+        } => Ok(AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(
             Sv2MiningSetNewPrevHash {
                 channel_id,
                 job_id,
                 prev_hash: prev_hash.into(),
                 min_ntime,
                 nbits: n_bits,
-            }
-            .into_static(),
+            },
         ))),
         OutboundFrame::NewMiningJob {
             channel_id,
@@ -463,15 +446,14 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             version,
             merkle_root,
             min_ntime,
-        } => Ok(AnyMessage::Mining(Mining::NewMiningJob(
+        } => Ok(AnyMessageOwned::Mining(MiningOwned::NewMiningJob(
             Sv2NewMiningJob {
                 channel_id,
                 job_id,
-                min_ntime: stratum_core::binary_sv2::Sv2Option::new(min_ntime),
+                min_ntime: stratum_core::binary_sv2::Sv2OptionOwned::new(min_ntime),
                 version,
                 merkle_root: merkle_root.into(),
-            }
-            .into_static(),
+            },
         ))),
         OutboundFrame::NewExtendedMiningJob {
             channel_id,
@@ -482,11 +464,11 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             coinbase_tx_prefix,
             coinbase_tx_suffix,
             min_ntime,
-        } => Ok(AnyMessage::Mining(Mining::NewExtendedMiningJob(
+        } => Ok(AnyMessageOwned::Mining(MiningOwned::NewExtendedMiningJob(
             Sv2NewExtMiningJob {
                 channel_id,
                 job_id,
-                min_ntime: stratum_core::binary_sv2::Sv2Option::new(min_ntime),
+                min_ntime: stratum_core::binary_sv2::Sv2OptionOwned::new(min_ntime),
                 version,
                 version_rolling_allowed,
                 merkle_path: seq_from_merkle_path(merkle_path)?,
@@ -496,15 +478,14 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
                 coinbase_tx_suffix: coinbase_tx_suffix
                     .try_into()
                     .map_err(CodecError::from_conv)?,
-            }
-            .into_static(),
+            },
         ))),
         OutboundFrame::SubmitSharesSuccess {
             channel_id,
             last_sequence_number,
             new_submits_accepted_count,
             new_shares_sum,
-        } => Ok(AnyMessage::Mining(Mining::SubmitSharesSuccess(
+        } => Ok(AnyMessageOwned::Mining(MiningOwned::SubmitSharesSuccess(
             Sv2SubmitSharesSuccess {
                 channel_id,
                 last_sequence_number,
@@ -516,47 +497,44 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             channel_id,
             sequence_number,
             error_code,
-        } => Ok(AnyMessage::Mining(Mining::SubmitSharesError(
+        } => Ok(AnyMessageOwned::Mining(MiningOwned::SubmitSharesError(
             Sv2SubmitSharesError {
                 channel_id,
                 sequence_number,
                 error_code: str0255(error_code)?,
-            }
-            .into_static(),
+            },
         ))),
         OutboundFrame::UpdateChannelError {
             channel_id,
             error_code,
-        } => Ok(AnyMessage::Mining(Mining::UpdateChannelError(
+        } => Ok(AnyMessageOwned::Mining(MiningOwned::UpdateChannelError(
             Sv2UpdateChannelError {
                 channel_id,
                 error_code: str0255(error_code)?,
-            }
-            .into_static(),
+            },
         ))),
         OutboundFrame::SetCustomMiningJobSuccess {
             channel_id,
             request_id,
             job_id,
-        } => Ok(AnyMessage::Mining(Mining::SetCustomMiningJobSuccess(
-            Sv2SetCustomMiningJobSuccess {
+        } => Ok(AnyMessageOwned::Mining(
+            MiningOwned::SetCustomMiningJobSuccess(Sv2SetCustomMiningJobSuccess {
                 channel_id,
                 request_id,
                 job_id,
-            },
-        ))),
+            }),
+        )),
         OutboundFrame::SetCustomMiningJobError {
             channel_id,
             request_id,
             error_code,
-        } => Ok(AnyMessage::Mining(Mining::SetCustomMiningJobError(
-            Sv2SetCustomMiningJobError {
+        } => Ok(AnyMessageOwned::Mining(
+            MiningOwned::SetCustomMiningJobError(Sv2SetCustomMiningJobError {
                 channel_id,
                 request_id,
                 error_code: str0255(error_code)?,
-            }
-            .into_static(),
-        ))),
+            }),
+        )),
     }
 }
 
@@ -574,11 +552,9 @@ fn merkle_path_from_seq(
 
 fn seq_from_merkle_path(
     path: Vec<[u8; 32]>,
-) -> Result<
-    stratum_core::binary_sv2::Seq0255<'static, stratum_core::binary_sv2::U256<'static>>,
-    CodecError,
-> {
-    let items: Vec<stratum_core::binary_sv2::U256<'static>> =
+) -> Result<stratum_core::binary_sv2::Seq0255Owned<stratum_core::binary_sv2::U256Owned>, CodecError>
+{
+    let items: Vec<stratum_core::binary_sv2::U256Owned> =
         path.into_iter().map(Into::into).collect();
     items.try_into().map_err(CodecError::from_conv)
 }
@@ -586,7 +562,7 @@ fn seq_from_merkle_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratum_core::binary_sv2::{Seq0255, Seq064K, Str0255, U256};
+    use stratum_core::binary_sv2::Seq064K;
     use stratum_core::common_messages_sv2::Protocol;
 
     // ── decode_setup_connection ────────────────────────────────────
@@ -597,12 +573,12 @@ mod tests {
             min_version: 2,
             max_version: 2,
             flags: 0,
-            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+            endpoint_host: "127.0.0.1".try_into().unwrap(),
             endpoint_port: 3333,
-            vendor: "test-vendor".to_string().try_into().unwrap(),
-            hardware_version: "rev1".to_string().try_into().unwrap(),
-            firmware: "0.1".to_string().try_into().unwrap(),
-            device_id: "dev-1".to_string().try_into().unwrap(),
+            vendor: "test-vendor".try_into().unwrap(),
+            hardware_version: "rev1".try_into().unwrap(),
+            firmware: "0.1".try_into().unwrap(),
+            device_id: "dev-1".try_into().unwrap(),
         }
     }
 
@@ -676,9 +652,9 @@ mod tests {
     fn decode_open_std_channel_maps_fields() {
         let msg = AnyMessage::Mining(Mining::OpenStandardMiningChannel(Sv2OpenStdChannel {
             request_id: 42u32,
-            user_identity: "miner.worker1".to_string().try_into().unwrap(),
+            user_identity: "miner.worker1".try_into().unwrap(),
             nominal_hash_rate: 1_000_000.0,
-            max_target: [0xFFu8; 32].into(),
+            max_target: (&[0xFFu8; 32]).into(),
         }));
         let out = decode_mining_inbound(msg).unwrap().unwrap();
         match out {
@@ -698,9 +674,9 @@ mod tests {
     fn decode_open_ext_channel_maps_fields() {
         let msg = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(Sv2OpenExtChannel {
             request_id: 99,
-            user_identity: "miner.ext".to_string().try_into().unwrap(),
+            user_identity: "miner.ext".try_into().unwrap(),
             nominal_hash_rate: 5.0e12,
-            max_target: [0xAAu8; 32].into(),
+            max_target: (&[0xAAu8; 32]).into(),
             min_extranonce_size: 8,
         }));
         let out = decode_mining_inbound(msg).unwrap().unwrap();
@@ -722,7 +698,7 @@ mod tests {
         let msg = AnyMessage::Mining(Mining::UpdateChannel(Sv2UpdateChannel {
             channel_id: 5,
             nominal_hash_rate: 2.0e12,
-            maximum_target: [0xCCu8; 32].into(),
+            maximum_target: (&[0xCCu8; 32]).into(),
         }));
         let out = decode_mining_inbound(msg).unwrap().unwrap();
         match out {
@@ -738,7 +714,7 @@ mod tests {
     fn decode_close_channel_maps_fields() {
         let msg = AnyMessage::Mining(Mining::CloseChannel(Sv2CloseChannel {
             channel_id: 9,
-            reason_code: "shutdown".to_string().try_into().unwrap(),
+            reason_code: "shutdown".try_into().unwrap(),
         }));
         let out = decode_mining_inbound(msg).unwrap().unwrap();
         match out {
@@ -760,7 +736,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s)) => {
+            AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(s)) => {
                 assert_eq!(s.used_version, 2);
                 assert_eq!(s.flags, 0);
             }
@@ -776,7 +752,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Common(CommonMessages::SetupConnectionError(e)) => {
+            AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionError(e)) => {
                 assert_eq!(
                     utf8_from_bytes(e.error_code.as_bytes()).unwrap(),
                     "unsupported-protocol"
@@ -796,7 +772,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::SubmitSharesSuccess(s)) => {
+            AnyMessageOwned::Mining(MiningOwned::SubmitSharesSuccess(s)) => {
                 assert_eq!(s.channel_id, 1);
                 assert_eq!(s.last_sequence_number, 42);
                 assert_eq!(s.new_shares_sum, 1024);
@@ -814,7 +790,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::SubmitSharesError(e)) => {
+            AnyMessageOwned::Mining(MiningOwned::SubmitSharesError(e)) => {
                 assert_eq!(e.channel_id, 1);
                 assert_eq!(e.sequence_number, 7);
                 assert_eq!(
@@ -834,7 +810,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::SetTarget(s)) => {
+            AnyMessageOwned::Mining(MiningOwned::SetTarget(s)) => {
                 assert_eq!(s.channel_id, 1);
                 assert_eq!(s.maximum_target.as_bytes(), &[0xAA; 32]);
             }
@@ -850,7 +826,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::SetExtranoncePrefix(s)) => {
+            AnyMessageOwned::Mining(MiningOwned::SetExtranoncePrefix(s)) => {
                 assert_eq!(s.channel_id, 4);
                 assert_eq!(s.extranonce_prefix.as_bytes(), &[0xDE, 0xAD, 0xBE, 0xEF]);
             }
@@ -869,7 +845,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
+            AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(p)) => {
                 assert_eq!(p.channel_id, 1);
                 assert_eq!(p.job_id, 7);
                 assert_eq!(p.prev_hash.as_bytes(), &[0xAB; 32]);
@@ -891,7 +867,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::NewMiningJob(j)) => {
+            AnyMessageOwned::Mining(MiningOwned::NewMiningJob(j)) => {
                 assert_eq!(j.channel_id, 1);
                 assert_eq!(j.job_id, 7);
                 assert_eq!(j.version, 0x2000_0000);
@@ -916,7 +892,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) => {
+            AnyMessageOwned::Mining(MiningOwned::NewExtendedMiningJob(j)) => {
                 assert_eq!(j.channel_id, 1);
                 assert!(j.version_rolling_allowed);
                 assert_eq!(j.merkle_path.as_slice().len(), 2);
@@ -938,7 +914,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::OpenStandardMiningChannelSuccess(s)) => {
+            AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannelSuccess(s)) => {
                 assert_eq!(s.request_id, 42);
                 assert_eq!(s.channel_id, 1);
                 assert_eq!(s.target.as_bytes(), &[0xCC; 32]);
@@ -957,7 +933,7 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Mining(Mining::SetCustomMiningJobSuccess(s)) => {
+            AnyMessageOwned::Mining(MiningOwned::SetCustomMiningJobSuccess(s)) => {
                 assert_eq!(s.channel_id, 1);
                 assert_eq!(s.request_id, 5);
                 assert_eq!(s.job_id, 9);
@@ -974,8 +950,8 @@ mod tests {
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
-            AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-                ExtensionsNegotiation::RequestExtensionsSuccess(s),
+            AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
+                ExtensionsNegotiationOwned::RequestExtensionsSuccess(s),
             )) => {
                 assert_eq!(s.request_id, 7);
                 assert_eq!(s.supported_extensions.into_inner(), vec![0x0002, 0x0003]);
@@ -992,10 +968,16 @@ mod tests {
             used_version: 2,
             flags: 1,
         };
-        let msg = encode_mining_outbound(frame).unwrap();
+        let AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(s)) =
+            encode_mining_outbound(frame).unwrap()
+        else {
+            panic!("expected SetupConnectionSuccess");
+        };
         // SetupConnectionSuccess isn't part of InboundMiningFrame (it
         // flows server→client) — confirm decode_mining_inbound returns
-        // None for it (not a server-inbound message).
+        // None for it (not a server-inbound message). The message has no
+        // borrowed fields, so the owned value IS the wire-shape value.
+        let msg = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s));
         assert!(decode_mining_inbound(msg).unwrap().is_none());
     }
 
@@ -1010,19 +992,5 @@ mod tests {
         );
         let out = decode_mining_inbound(msg).unwrap();
         assert!(out.is_none(), "TDP frames silently ignored on mining port");
-    }
-
-    // ── Unused-import marker for Seq0255 + U256 + Str0255 ──────────
-
-    /// `Seq0255` / `U256` / `Str0255` are part of the internal API
-    /// surface — the encode functions construct them via `.into()` /
-    /// `.try_into()`, but importing the type names directly is the
-    /// stable path for callers who want to peek at the field shapes.
-    #[allow(dead_code)]
-    fn _surface_check(
-        _s: Seq0255<'static, U256<'static>>,
-        _t: U256<'static>,
-        _u: Str0255<'static>,
-    ) {
     }
 }

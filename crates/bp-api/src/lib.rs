@@ -47,6 +47,7 @@ pub use state::{AppState, SharedState};
 
 use axum::Router;
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 /// Build the root router from a [`SharedState`]. The state is shared
@@ -71,4 +72,6 @@ where
         .merge(controllers::push::routes())
         .with_state(state)
         .layer(CorsLayer::permissive())
+        // Compress responses (gzip/br/deflate) for clients that accept it.
+        .layer(CompressionLayer::new())
 }

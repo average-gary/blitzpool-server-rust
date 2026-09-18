@@ -1694,12 +1694,12 @@ CREATE INDEX IF NOT EXISTS "IDX_pplns_extranonce_challenge_expiresAt"
 --
 -- Payout identity: one row per miner, either a fixed address ('static') or a
 -- rotating xpub-derived descriptor ('rotating'). The database half of
--- `bp_common::PayoutIdentity`. See crates/bp-db/migrations/0014_add_miner_identity.sql
+-- `bp_common::PayoutIdentity`. See crates/bp-db/migrations/0016_add_miner_identity.sql
 -- for the full reasoning, including why there is no `addr(<address>)` sentinel.
 -- The ledger key is base58: hex would not have fit the varchar(62) these columns
 -- were when 0010 was written, and it is frozen there now for a better reason —
 -- a payout_id is content-addressed, so changing the encoding orphans every
--- balance already keyed by it. 0015_widen_identity_columns.sql took every
+-- balance already keyed by it. 0017_widen_identity_columns.sql took every
 -- identity column to varchar(90); see it for why 90.
 --
 

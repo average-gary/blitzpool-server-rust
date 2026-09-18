@@ -51,10 +51,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bp_common::AddressId;
 use bp_vardiff::{Clock, SystemClock};
-use stratum_core::codec_sv2::StandardSv2Frame;
-use stratum_core::framing_sv2::framing::Frame;
 use stratum_core::job_declaration_sv2::MESSAGE_TYPE_DECLARE_MINING_JOB;
-use stratum_core::parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage};
+use stratum_core::parsers_sv2::parse_message_frame_with_tlvs;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -64,7 +62,7 @@ use crate::bridge::{
     AllocatedTokenRef, AllocationKind, DistributionAcceptance, DistributionAccounting,
     DistributionScope, JdpDeclaredJobRegistry, PayoutDistributionEntry, RegisteredDeclaredJob,
 };
-use crate::codec_common::CodecError;
+use crate::codec_common::{write_message, write_raw_frame, WriteError};
 use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
@@ -79,7 +77,7 @@ use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::payout_distribution::WeightedOutput;
 use crate::jdp::tx_validation::{merge_provided_with_known, partition_against_template};
 use crate::jdp_server_codec::{
-    decode_jdp_inbound, encode_jdp_outbound, encode_jdp_outbound_ext_0x0003, InboundJdpFrame,
+    decode_jdp_inbound, encode_jdp_outbound, InboundJdpFrame, JdpWireFrame,
 };
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
 
@@ -907,7 +905,7 @@ impl SessionPlan {
 async fn republish_tailored(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
-    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    writer: &mut NoiseTcpWriteHalf,
     session_id: u32,
     session_id_hex: &str,
     miner: &AddressId,
@@ -945,7 +943,7 @@ async fn republish_tailored(
 async fn rebuild_tailored_plan(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
-    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    writer: &mut NoiseTcpWriteHalf,
     session_id: u32,
     session_id_hex: &str,
     miner: &AddressId,
@@ -1142,7 +1140,7 @@ async fn run_jdp_connection(
 ) -> std::io::Result<()> {
     let session_id_hex = format!("jdp-{session_id:08x}");
 
-    let noise = match accept_pool_noise::<AnyMessage<'static>>(socket, &noise_config).await {
+    let noise = match accept_pool_noise(socket, &noise_config).await {
         Ok(n) => n,
         Err(err) => {
             debug!("jdp {session_id_hex} noise handshake failed: {err:?}");
@@ -1254,20 +1252,8 @@ async fn run_jdp_connection(
                         break;
                     }
                 };
-                let mut sv2_frame = match frame {
-                    Frame::Sv2(f) => f,
-                    Frame::HandShake(_) => {
-                        warn!("jdp {session_id_hex} unexpected HandShakeFrame post-setup");
-                        continue;
-                    }
-                };
-                let header = match sv2_frame.get_header() {
-                    Some(h) => h,
-                    None => {
-                        warn!("jdp {session_id_hex} frame missing header");
-                        continue;
-                    }
-                };
+                let mut sv2_frame = frame;
+                let header = sv2_frame.header();
                 // The push model defines no inbound ext-0x0003 frames
                 // (`SetPayoutDistribution` is JDS→JDC only;
                 // ext 0x0003/distribution_id TLV Field references arrive as
@@ -1943,78 +1929,27 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
 }
 
 /// Serialise + write each [`JdpOutboundFrame`] through the noise
-/// stream. Same pattern as `server::write_outbound_frames`. ext 0x0003
-/// frames (RequestPayoutOutputs Success/Error) take the manual raw-bytes
-/// path below (they're not in `AnyMessage`); all other frames go through
-/// `encode_jdp_outbound`.
+/// stream. Same pattern as `server::write_outbound_frames`, plus the
+/// hand-framed path for ext 0x0003 (`stratum-core` has no type for it).
 async fn write_jdp_outbound_frames(
-    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    writer: &mut NoiseTcpWriteHalf,
     outbound: Vec<JdpOutboundFrame>,
 ) -> Result<(), WriteError> {
     for frame in outbound {
-        // ext 0x0003 (Non-Custodial Pool Payouts) frames take the
-        // raw-bytes path — they're not in `AnyMessage`. Build the SV2
-        // frame manually: 6-byte header (ext_type LE16 + msg_type +
-        // msg_length LE24) + payload.
-        if let Some((msg_type, payload)) = encode_jdp_outbound_ext_0x0003(&frame) {
-            let mut bytes = Vec::with_capacity(6 + payload.len());
-            // ext_type = 0x0003 LE
-            bytes.extend_from_slice(&0x0003u16.to_le_bytes());
-            bytes.push(msg_type);
-            // msg_length = payload.len() as LE U24 (3 bytes)
-            let msg_len = payload.len() as u32;
-            if msg_len > 0x00FF_FFFF {
-                return Err(WriteError::Codec(CodecError::Conversion(format!(
-                    "ext 0x0003 payload too large: {} bytes (max 16M-1)",
-                    payload.len()
-                ))));
+        match encode_jdp_outbound(frame)? {
+            JdpWireFrame::Message(message) => write_message(writer, message).await?,
+            JdpWireFrame::Ext0x0003 { msg_type, payload } => {
+                write_raw_frame(
+                    writer,
+                    SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
+                    msg_type,
+                    payload,
+                )
+                .await?
             }
-            bytes.push((msg_len & 0xFF) as u8);
-            bytes.push(((msg_len >> 8) & 0xFF) as u8);
-            bytes.push(((msg_len >> 16) & 0xFF) as u8);
-            bytes.extend_from_slice(&payload);
-
-            // Sv2Frame::from_bytes_unchecked wraps pre-serialised
-            // bytes; the phantom `AnyMessage` type isn't actually
-            // touched because `serialized = Some(...)` short-circuits
-            // the encoder.
-            let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
-                StandardSv2Frame::from_bytes_unchecked(bytes.into());
-            writer
-                .write_frame(Frame::Sv2(sv2_frame))
-                .await
-                .map_err(WriteError::Io)?;
-            continue;
         }
-
-        let any_message = match encode_jdp_outbound(frame) {
-            Ok(m) => m,
-            Err(CodecError::EncodeUnimplemented(what)) => {
-                debug!("jdp write: skipping unimplemented frame ({what})");
-                continue;
-            }
-            Err(e) => return Err(WriteError::Codec(e)),
-        };
-        let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
-            any_message
-                .try_into()
-                .map_err(|e: stratum_core::parsers_sv2::ParserError| {
-                    WriteError::Codec(CodecError::from_conv(e))
-                })?;
-        writer
-            .write_frame(Frame::Sv2(sv2_frame))
-            .await
-            .map_err(WriteError::Io)?;
     }
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum WriteError {
-    #[error("codec: {0}")]
-    Codec(#[from] CodecError),
-    #[error("noise io: {0:?}")]
-    Io(crate::noise::NoiseError),
 }
 
 /// What the bridge does with an allocate token.

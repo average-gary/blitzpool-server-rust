@@ -10,6 +10,7 @@
 //! - `groupsolo:{groupId}:total` — float string, Σ diff in round
 //! - `groupsolo:{groupId}:by-address` — hash `addr → diff` aggregate
 //! - `groupsolo:{groupId}:rejected-shares` — hash `addr → diff` rejected
+//!   (PROP only — a `Window` group buckets its rejects, see below)
 //! - `groupsolo:{groupId}:last-accepted-share-at` — hash `addr → epoch_ms`
 //! - `groupsolo:{groupId}:best-share` — hash `{address, difficulty, timestamp_ms}`
 //! - `groupsolo:{groupId}:snapshot:{finder_address}` — see [`snapshot`]
@@ -17,8 +18,11 @@
 //! A `Prop`-mode group (the default) is a PROP round with no trim. A
 //! `Window`-mode group instead keeps a time-bucketed sliding window
 //! (`wbuckets` / `wbucket:{bid}` / `window:by-address`) that trims itself by
-//! age and never block-resets — see the window-mode keys + Lua below. The
-//! reset paths clean both layouts.
+//! age and never block-resets — see the window-mode keys + Lua below. Its
+//! rejects live in a second lane of the same shape (`wrbuckets` /
+//! `wrbucket:{bid}` / `window:rejected`), trimmed by the same window, so the
+//! round-stats view divides rejected by accepted work of the SAME period.
+//! The reset paths clean both layouts.
 //!
 //! Two reset paths exist (PROP semantics; `Window` groups skip the per-block
 //! gate entirely):
@@ -96,33 +100,77 @@ pub fn key_applied(group_id: &str) -> String {
 // PPLNS window but is **time-bucketed** (bucket id = `floor(now_ms /
 // WINDOW_BUCKET_MS)`) and trimmed by AGE, all under the per-group
 // `groupsolo:{id}:` prefix so backup/restore (SCAN MATCH `groupsolo:*`)
-// covers it automatically:
+// covers it automatically. The window has two lanes of identical shape:
 //
 // - `groupsolo:{id}:wbuckets` — zset, score = member = bucket id (FIFO by time)
 // - `groupsolo:{id}:wbucket:{bid}` — hash `addr → Σdiff` for that time bucket
 // - `groupsolo:{id}:window:by-address` — hash `addr → Σdiff`, the AUTHORITATIVE
 //   window aggregate, maintained lock-step with the buckets in Lua
 //
+// and, for rejected work, `wrbuckets` / `wrbucket:{bid}` / `window:rejected`.
+// The rejected lane feeds only the round-stats view, never a payout, but it
+// is trimmed by the same window as the accepted lane: a rate computed from
+// a windowed numerator and an unbounded denominator (what the plain
+// `rejected-shares` tally would give) is not a rate of anything.
+//
 // `applied` (the dedup set) is reused from the PROP layout so the
 // exactly-once contract is identical across modes.
 
+/// The two sliding-window lanes of a `Window`-mode group. Same bucket /
+/// index / aggregate layout, same trim; only the key suffixes differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowLane {
+    /// Accepted work — feeds the payout distribution.
+    Accepted,
+    /// Rejected work — feeds only the round-stats view.
+    Rejected,
+}
+
+impl WindowLane {
+    const ALL: [WindowLane; 2] = [WindowLane::Accepted, WindowLane::Rejected];
+
+    /// Index zset of live time-bucket ids.
+    pub fn index_key(self, group_id: &str) -> String {
+        match self {
+            WindowLane::Accepted => key(group_id, "wbuckets"),
+            WindowLane::Rejected => key(group_id, "wrbuckets"),
+        }
+    }
+
+    /// Per-time-bucket `addr → Σdiff` hash key for bucket `bid`.
+    pub fn bucket_key(self, group_id: &str, bid: i64) -> String {
+        format!("{}{bid}", self.bucket_prefix(group_id))
+    }
+
+    /// Authoritative `addr → Σdiff` window aggregate.
+    pub fn aggregate_key(self, group_id: &str) -> String {
+        match self {
+            WindowLane::Accepted => key(group_id, "window:by-address"),
+            WindowLane::Rejected => key(group_id, "window:rejected"),
+        }
+    }
+
+    /// Bucket-key prefix passed to the trim script so it can build the
+    /// bucket key for each dropped bucket inside Lua.
+    fn bucket_prefix(self, group_id: &str) -> String {
+        match self {
+            WindowLane::Accepted => key(group_id, "wbucket:"),
+            WindowLane::Rejected => key(group_id, "wrbucket:"),
+        }
+    }
+}
+
 /// Index zset of live time-bucket ids for a `Window`-mode group.
 pub fn key_window_buckets(group_id: &str) -> String {
-    key(group_id, "wbuckets")
+    WindowLane::Accepted.index_key(group_id)
 }
 /// Per-time-bucket `addr → Σdiff` hash key for bucket `bid`.
 pub fn key_window_bucket(group_id: &str, bid: i64) -> String {
-    key(group_id, &format!("wbucket:{bid}"))
+    WindowLane::Accepted.bucket_key(group_id, bid)
 }
 /// Authoritative `addr → Σdiff` window aggregate for a `Window`-mode group.
 pub fn key_window_by_address(group_id: &str) -> String {
-    key(group_id, "window:by-address")
-}
-
-/// Bucket-key prefix passed to the trim script so it can build
-/// `groupsolo:{id}:wbucket:{bid}` for each dropped bucket inside Lua.
-fn window_bucket_prefix(group_id: &str) -> String {
-    format!("groupsolo:{group_id}:wbucket:")
+    WindowLane::Accepted.aggregate_key(group_id)
 }
 
 /// Time-bucket granularity for the sliding window: 1 hour. A 1-day window is
@@ -225,6 +273,22 @@ for i = 1, #flat, 2 do
 end
 redis.call('DEL', bkey)
 redis.call('ZREM', KEYS[1], bid)
+return 1
+"#;
+
+/// Append one rejected share into its TIME bucket for a `Window`-mode group.
+/// `KEYS[1]`=wrbuckets (index zset), `[2]`=window:rejected, `[3]`=wrbucket:{bid}.
+/// `ARGV[1]`=difficulty (string), `[2]`=address, `[3]`=bucket_id.
+///
+/// The rejected lane has no dedup (rejects carry no share id — the pool
+/// never acks them, so nothing redelivers them) and no `last-accepted`
+/// touch (a reject is not an accepted share). That is why this is not
+/// `RECORD_SHARE_WINDOWED_LUA` with empty arguments: those two steps are
+/// what the accepted lane does on top of the bucket append.
+const RECORD_REJECT_WINDOWED_LUA: &str = r#"
+redis.call('HINCRBYFLOAT', KEYS[3], ARGV[2], ARGV[1])
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[3])
+redis.call('HINCRBYFLOAT', KEYS[2], ARGV[2], ARGV[1])
 return 1
 "#;
 
@@ -350,7 +414,8 @@ impl GroupRoundStore {
     }
 
     /// Trim the sliding window: drop every time bucket older than
-    /// `window_ms` relative to `now_ms`. Idempotent — a no-op when the window
+    /// `window_ms` relative to `now_ms`, in BOTH lanes (accepted and
+    /// rejected — one window, one age). Idempotent — a no-op when the window
     /// is empty or all buckets are still fresh. Loops one bucket per script
     /// call (like the PPLNS window) so any single Redis-blocking script stays
     /// small while keeping per-bucket atomicity.
@@ -368,20 +433,22 @@ impl GroupRoundStore {
         // Keep buckets in (cutoff, now_bucket]; drop ids ≤ cutoff. With a
         // 24-bucket window and now_bucket=N, that keeps N-23..=N (24 buckets).
         let cutoff_bucket = now_bucket - window_buckets;
-        let prefix = window_bucket_prefix(group_id);
 
         let mut conn = self.conn.clone();
         let trim = redis::Script::new(TRIM_WINDOW_LUA);
-        loop {
-            let dropped: i64 = trim
-                .key(key_window_buckets(group_id))
-                .key(key_window_by_address(group_id))
-                .arg(cutoff_bucket)
-                .arg(&prefix)
-                .invoke_async(&mut conn)
-                .await?;
-            if dropped == 0 {
-                break;
+        for lane in WindowLane::ALL {
+            let prefix = lane.bucket_prefix(group_id);
+            loop {
+                let dropped: i64 = trim
+                    .key(lane.index_key(group_id))
+                    .key(lane.aggregate_key(group_id))
+                    .arg(cutoff_bucket)
+                    .arg(&prefix)
+                    .invoke_async(&mut conn)
+                    .await?;
+                if dropped == 0 {
+                    break;
+                }
             }
         }
         Ok(())
@@ -394,8 +461,28 @@ impl GroupRoundStore {
         &self,
         group_id: &str,
     ) -> Result<HashMap<String, f64>, RoundError> {
+        self.read_window_aggregate(WindowLane::Accepted, group_id)
+            .await
+    }
+
+    /// Read the rejected-lane window aggregate (`addr → diff-1 sum` of
+    /// rejects still inside the window). Does NOT trim, same as
+    /// [`Self::read_window_by_address`].
+    pub async fn read_window_rejected(
+        &self,
+        group_id: &str,
+    ) -> Result<HashMap<String, f64>, RoundError> {
+        self.read_window_aggregate(WindowLane::Rejected, group_id)
+            .await
+    }
+
+    async fn read_window_aggregate(
+        &self,
+        lane: WindowLane,
+        group_id: &str,
+    ) -> Result<HashMap<String, f64>, RoundError> {
         let mut conn = self.conn.clone();
-        let hash: HashMap<String, String> = conn.hgetall(key_window_by_address(group_id)).await?;
+        let hash: HashMap<String, String> = conn.hgetall(lane.aggregate_key(group_id)).await?;
         Ok(hash
             .into_iter()
             .filter_map(|(addr, diff_str)| {
@@ -482,20 +569,20 @@ impl GroupRoundStore {
         conn: &mut ConnectionManager,
         group_id: &str,
     ) -> Result<(), RoundError> {
-        let bucket_ids: Vec<i64> = conn.zrange(key_window_buckets(group_id), 0, -1).await?;
-        let mut keys: Vec<String> = bucket_ids
-            .iter()
-            .map(|bid| key_window_bucket(group_id, *bid))
-            .collect();
-        keys.push(key_window_buckets(group_id));
-        keys.push(key_window_by_address(group_id));
+        let mut keys: Vec<String> = Vec::new();
+        for lane in WindowLane::ALL {
+            let bucket_ids: Vec<i64> = conn.zrange(lane.index_key(group_id), 0, -1).await?;
+            keys.extend(bucket_ids.iter().map(|bid| lane.bucket_key(group_id, *bid)));
+            keys.push(lane.index_key(group_id));
+            keys.push(lane.aggregate_key(group_id));
+        }
         let _: i64 = conn.del(keys).await?;
         Ok(())
     }
 
-    /// Per-rejected-share counter for the address. `shares` is the
-    /// diff-1-equivalent value the stratum layer reports per reject
-    /// reason (typically 1.0).
+    /// Per-rejected-share counter for the address of a PROP group. `shares`
+    /// is the diff-1-equivalent value the stratum layer reports per reject
+    /// reason (typically 1.0). Wiped with the round by both reset paths.
     pub async fn record_reject(
         &self,
         group_id: &str,
@@ -505,6 +592,31 @@ impl GroupRoundStore {
         let mut conn = self.conn.clone();
         let _: f64 = conn
             .hincr(key_rejected_shares(group_id), address, shares)
+            .await?;
+        Ok(())
+    }
+
+    /// Append one rejected share into its time bucket for a `Window`-mode
+    /// group (`RECORD_REJECT_WINDOWED_LUA`). Does NOT trim — the caller trims
+    /// via [`Self::trim_window`], which sheds both lanes together.
+    pub async fn record_reject_windowed(
+        &self,
+        group_id: &str,
+        address: &str,
+        shares: f64,
+        timestamp_ms: i64,
+    ) -> Result<(), RoundError> {
+        let mut conn = self.conn.clone();
+        let bucket_id = timestamp_ms.div_euclid(WINDOW_BUCKET_MS);
+        let lane = WindowLane::Rejected;
+        let _: i64 = redis::Script::new(RECORD_REJECT_WINDOWED_LUA)
+            .key(lane.index_key(group_id))
+            .key(lane.aggregate_key(group_id))
+            .key(lane.bucket_key(group_id, bucket_id))
+            .arg(shares.to_string())
+            .arg(address)
+            .arg(bucket_id)
+            .invoke_async(&mut conn)
             .await?;
         Ok(())
     }
@@ -680,9 +792,10 @@ impl GroupRoundStore {
     }
 
     /// Mode-aware composed view for `/api/pplns/groups/:groupId/round-stats`.
-    /// In `Window` mode the per-address contribution is the trimmed sliding
-    /// window; the rejected counters stay a plain running tally (they don't
-    /// feed payouts and there is no round to reset them against).
+    /// In `Window` mode both the per-address contribution and the rejected
+    /// counters are the trimmed sliding window (the payout read below trims
+    /// both lanes), so `rejected / (shares + rejected)` compares one period
+    /// with itself. In `Prop` mode both are the round, wiped together.
     pub async fn read_round_stats_for(
         &self,
         group_id: &str,
@@ -693,7 +806,10 @@ impl GroupRoundStore {
         let by_address = self
             .read_payout_shares(group_id, mode, now_ms, window_ms)
             .await?;
-        let rejected_map = self.read_rejected(group_id).await?;
+        let rejected_map = match mode {
+            PayoutMode::Prop => self.read_rejected(group_id).await?,
+            PayoutMode::Window => self.read_window_rejected(group_id).await?,
+        };
         let total_shares: f64 = by_address.values().sum();
         let total_rejected: f64 = rejected_map.values().sum();
         Ok(RoundStats {
@@ -717,41 +833,78 @@ impl GroupRoundStore {
         self.conn.clone()
     }
 
-    pub async fn forget_member(&self, group_id: &str, address: &str) -> Result<f64, RoundError> {
+    /// Subtract the address's contribution from the group (kick flow),
+    /// mode-aware like [`Self::read_payout_shares`]: a PROP member leaves
+    /// the round aggregate, a Window member leaves every live bucket of both
+    /// lanes plus the two aggregates. Returns the diff-1-weighted amount
+    /// removed from the payout source so the caller can log it; the rest of
+    /// the group then splits proportionally between whoever is left.
+    ///
+    /// The mode has to come from the caller: this store has no group row,
+    /// and a kick that only cleans the PROP keys leaves a Window member in
+    /// the coinbase until their buckets age out — that is what this replaced.
+    pub async fn forget_member(
+        &self,
+        group_id: &str,
+        address: &str,
+        mode: PayoutMode,
+    ) -> Result<f64, RoundError> {
         let mut conn = self.conn.clone();
 
-        // 1. The member's round contribution IS their by-address aggregate —
-        //    no per-share scan needed.
-        let removed_diff: f64 = conn
-            .hget::<_, _, Option<String>>(key_by_address(group_id), address)
-            .await?
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|d| d.is_finite() && *d > 0.0)
-            .unwrap_or(0.0);
+        let removed_diff = match mode {
+            PayoutMode::Prop => {
+                // The member's round contribution IS their by-address
+                // aggregate — no per-share scan needed.
+                let removed_diff =
+                    read_hash_f64(&mut conn, key_by_address(group_id), address).await?;
+                // Decrement total + drop the address's slots. Single pipeline
+                // for cross-key coherence (MULTI/EXEC not necessary because no
+                // concurrent caller mutates these for the same address during
+                // a kick — admin flow is serialized at the engine level).
+                let mut pipe = redis::pipe();
+                if removed_diff > 0.0 {
+                    pipe.cmd("INCRBYFLOAT")
+                        .arg(key_total(group_id))
+                        .arg(-removed_diff)
+                        .ignore();
+                }
+                pipe.hdel(key_by_address(group_id), address)
+                    .ignore()
+                    .hdel(key_rejected_shares(group_id), address)
+                    .ignore();
+                pipe.query_async::<()>(&mut conn).await?;
+                removed_diff
+            }
+            PayoutMode::Window => {
+                let removed_diff = read_hash_f64(
+                    &mut conn,
+                    WindowLane::Accepted.aggregate_key(group_id),
+                    address,
+                )
+                .await?;
+                // Every live bucket of both lanes, then the aggregates. The
+                // aggregate stays lock-step with its buckets: a later trim of
+                // a bucket that no longer holds the address decrements
+                // nothing for it.
+                let mut pipe = redis::pipe();
+                for lane in WindowLane::ALL {
+                    let bucket_ids: Vec<i64> = conn.zrange(lane.index_key(group_id), 0, -1).await?;
+                    for bid in bucket_ids {
+                        pipe.hdel(lane.bucket_key(group_id, bid), address).ignore();
+                    }
+                    pipe.hdel(lane.aggregate_key(group_id), address).ignore();
+                }
+                pipe.query_async::<()>(&mut conn).await?;
+                removed_diff
+            }
+        };
 
-        if removed_diff == 0.0 {
-            return Ok(0.0);
-        }
-
-        // 2. Decrement total + drop the address's by-address / last-accepted
-        //    slots + best-share if it referenced this address. Single pipeline
-        //    for cross-key coherence (MULTI/EXEC not necessary because no
-        //    concurrent caller mutates these for the same address during a
-        //    kick — admin flow is serialized at the engine level).
-        let mut pipe = redis::pipe();
-        pipe.cmd("INCRBYFLOAT")
-            .arg(key_total(group_id))
-            .arg(-removed_diff)
-            .ignore()
-            .hdel(key_by_address(group_id), address)
-            .ignore()
+        // Shared tail: the inactivity clock and, if it pointed at this
+        // address, the best share (next share sets a fresh one; losing a
+        // best-share record is cosmetic, so read-then-DEL is enough).
+        let _: i64 = conn
             .hdel(key_last_accepted_share_at(group_id), address)
-            .ignore();
-        pipe.query_async::<()>(&mut conn).await?;
-
-        // Best-share: if it was for this address, delete (next share
-        // sets a fresh one). Read-then-DEL is the simpler shape than
-        // WATCH/CAS — losing a best-share record is cosmetic.
+            .await?;
         if let Some(best) = self.read_best_share(group_id).await? {
             if best.address == address {
                 let _: i64 = conn.del(key_best_share(group_id)).await?;
@@ -760,6 +913,20 @@ impl GroupRoundStore {
 
         Ok(removed_diff)
     }
+}
+
+/// One `addr → diff` field of a hash as a finite, positive number, else 0.
+async fn read_hash_f64(
+    conn: &mut ConnectionManager,
+    key: String,
+    field: &str,
+) -> Result<f64, RoundError> {
+    Ok(conn
+        .hget::<_, _, Option<String>>(key, field)
+        .await?
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(0.0))
 }
 
 #[cfg(test)]
@@ -788,8 +955,16 @@ mod tests {
             "groupsolo:g1:window:by-address"
         );
         // The trim-script prefix must reproduce the bucket key for any id.
-        let prefix = window_bucket_prefix("g1");
+        let prefix = WindowLane::Accepted.bucket_prefix("g1");
         assert_eq!(format!("{prefix}42"), key_window_bucket("g1", 42));
+        let rejected = WindowLane::Rejected;
+        assert_eq!(rejected.index_key("g1"), "groupsolo:g1:wrbuckets");
+        assert_eq!(rejected.bucket_key("g1", 42), "groupsolo:g1:wrbucket:42");
+        assert_eq!(rejected.aggregate_key("g1"), "groupsolo:g1:window:rejected");
+        assert_eq!(
+            format!("{}42", rejected.bucket_prefix("g1")),
+            rejected.bucket_key("g1", 42)
+        );
     }
 
     #[test]

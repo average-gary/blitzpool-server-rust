@@ -230,7 +230,7 @@ pub fn normalized_address_id(raw: &str) -> Result<AddressId, InvalidAddressError
 /// address with zero spare. A **regtest** taproot address (`bcrt1p…`) is 64, so
 /// the first attempt to pay one met `TooLong(64)` — a latent break with nothing
 /// to do with xpubs, fixed in its own commit with migration
-/// `0015_widen_identity_columns.sql`, which widens the 32 identity columns to
+/// `0017_widen_identity_columns.sql`, which widens the 32 identity columns to
 /// match. The two numbers are one fact and must move together: this cap is what
 /// keeps an over-long value from reaching a column, and the column width is what
 /// makes the cap load-bearing rather than decorative.
@@ -920,7 +920,7 @@ mod tests {
     ///
     /// It was 62 until 2026-08-12 — exactly a mainnet `bc1p…` — which made a
     /// **regtest** taproot address (64) unpayable. See [`MAX_ADDRESS_LEN`] and
-    /// migration `0015_widen_identity_columns.sql`. Both assertions below fail
+    /// migration `0017_widen_identity_columns.sql`. Both assertions below fail
     /// against the old cap: the first because 64 > 62, the second because the
     /// arithmetic it states was false.
     #[test]
