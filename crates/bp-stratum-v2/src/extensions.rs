@@ -3,9 +3,8 @@
 //! Wire codecs for the SV2 extensions used by Blitzpool. Three
 //! extensions:
 //!
-//! - **0x0001 Extensions Negotiation** —
-//!   [`RequestExtensions`] / [`RequestExtensionsSuccess`] /
-//!   [`RequestExtensionsError`].
+//! - **0x0001 Extensions Negotiation** — [`RequestExtensions`], the decoded
+//!   shape; the wire codec is `stratum-core`'s.
 //! - **0x0002 Worker-Specific Hashrate Tracking** — Worker-ID TLV
 //!   piggy-backed on `SubmitSharesExtended` (extension_type stays
 //!   0x0000). See [`encode_worker_id_tlv`], [`parse_worker_id_tlv`],
@@ -120,14 +119,6 @@ impl<'a> Reader<'a> {
         self.pos += len;
         Ok(v)
     }
-    fn read_seq0_64k_u16(&mut self) -> Result<Vec<u16>, ExtensionsParseError> {
-        let count = self.read_u16_le()? as usize;
-        let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            out.push(self.read_u16_le()?);
-        }
-        Ok(out)
-    }
     fn read_seq0_64k_u32(&mut self) -> Result<Vec<u32>, ExtensionsParseError> {
         let count = self.read_u16_le()? as usize;
         let mut out = Vec::with_capacity(count);
@@ -160,13 +151,6 @@ fn write_b0_64k(dst: &mut Vec<u8>, bytes: &[u8]) {
     write_u16_le(dst, bytes.len() as u16);
     dst.extend_from_slice(bytes);
 }
-fn write_seq0_64k_u16(dst: &mut Vec<u8>, items: &[u16]) {
-    debug_assert!(items.len() <= u16::MAX as usize);
-    write_u16_le(dst, items.len() as u16);
-    for &v in items {
-        write_u16_le(dst, v);
-    }
-}
 fn write_seq0_64k_u32(dst: &mut Vec<u8>, items: &[u32]) {
     debug_assert!(items.len() <= u16::MAX as usize);
     write_u16_le(dst, items.len() as u16);
@@ -184,91 +168,14 @@ fn write_seq0_64k_b0_64k(dst: &mut Vec<u8>, items: &[Vec<u8>]) {
 
 // ── 0x0001 Extensions Negotiation ──────────────────────────────────
 
-/// `RequestExtensions` — JDC/Mining-client → server.
-/// Frame: `extension_type = 0x0001`, `msg_type = 0x00`.
+/// `RequestExtensions` — JDC/Mining-client → server, as the handlers take it.
+/// Frame: `extension_type = 0x0001`, `msg_type = 0x00`. The wire codec for
+/// this and its `.Success` / `.Error` replies is `stratum-core`'s; see
+/// [`crate::codec_common`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestExtensions {
     pub request_id: u16,
     pub requested_extensions: Vec<u16>,
-}
-
-impl RequestExtensions {
-    pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
-        let mut r = Reader::new(buf);
-        let request_id = r.read_u16_le()?;
-        let requested_extensions = r.read_seq0_64k_u16()?;
-        Ok(Self {
-            request_id,
-            requested_extensions,
-        })
-    }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + 2 * self.requested_extensions.len());
-        write_u16_le(&mut out, self.request_id);
-        write_seq0_64k_u16(&mut out, &self.requested_extensions);
-        out
-    }
-}
-
-/// `RequestExtensions.Success` — server → client.
-/// Frame: `extension_type = 0x0001`, `msg_type = 0x01`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestExtensionsSuccess {
-    pub request_id: u16,
-    pub supported_extensions: Vec<u16>,
-}
-
-impl RequestExtensionsSuccess {
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + 2 * self.supported_extensions.len());
-        write_u16_le(&mut out, self.request_id);
-        write_seq0_64k_u16(&mut out, &self.supported_extensions);
-        out
-    }
-
-    pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
-        let mut r = Reader::new(buf);
-        let request_id = r.read_u16_le()?;
-        let supported_extensions = r.read_seq0_64k_u16()?;
-        Ok(Self {
-            request_id,
-            supported_extensions,
-        })
-    }
-}
-
-/// `RequestExtensions.Error` — server → client.
-/// Frame: `extension_type = 0x0001`, `msg_type = 0x02`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestExtensionsError {
-    pub request_id: u16,
-    pub unsupported_extensions: Vec<u16>,
-    pub required_extensions: Vec<u16>,
-}
-
-impl RequestExtensionsError {
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            6 + 2 * (self.unsupported_extensions.len() + self.required_extensions.len()),
-        );
-        write_u16_le(&mut out, self.request_id);
-        write_seq0_64k_u16(&mut out, &self.unsupported_extensions);
-        write_seq0_64k_u16(&mut out, &self.required_extensions);
-        out
-    }
-
-    pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
-        let mut r = Reader::new(buf);
-        let request_id = r.read_u16_le()?;
-        let unsupported_extensions = r.read_seq0_64k_u16()?;
-        let required_extensions = r.read_seq0_64k_u16()?;
-        Ok(Self {
-            request_id,
-            unsupported_extensions,
-            required_extensions,
-        })
-    }
 }
 
 // ── 0x0003 Non-Custodial Payouts (push model) ──────────────────────
@@ -519,80 +426,6 @@ pub fn resolve_share_worker_name_from_tlv(opts: &ResolveWorkerNameInput<'_>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── 0x0001 RequestExtensions ───────────────────────────────────
-
-    /// `round-trips a request with multiple requested extensions`
-    #[test]
-    fn request_extensions_roundtrip_multiple() {
-        let buf = [
-            0x05, 0x00, // request_id = 5
-            0x02, 0x00, // count = 2
-            0x02, 0x00, // ext 0x0002
-            0x03, 0x00, // ext 0x0003
-        ];
-        let msg = RequestExtensions::deserialize(&buf).unwrap();
-        assert_eq!(msg.request_id, 5);
-        assert_eq!(msg.requested_extensions, vec![0x0002, 0x0003]);
-    }
-
-    /// `handles empty requested list`
-    #[test]
-    fn request_extensions_handles_empty_list() {
-        let buf = [0x07, 0x00, 0x00, 0x00];
-        let msg = RequestExtensions::deserialize(&buf).unwrap();
-        assert_eq!(msg.request_id, 7);
-        assert!(msg.requested_extensions.is_empty());
-    }
-
-    /// `serializes Success with the supported subset`
-    #[test]
-    fn request_extensions_success_serialize() {
-        let buf = RequestExtensionsSuccess {
-            request_id: 9,
-            supported_extensions: vec![0x0003],
-        }
-        .serialize();
-        assert_eq!(buf, vec![0x09, 0x00, 0x01, 0x00, 0x03, 0x00]);
-    }
-
-    /// `serializes Error with unsupported + required lists`
-    #[test]
-    fn request_extensions_error_serialize() {
-        let buf = RequestExtensionsError {
-            request_id: 0x1234,
-            unsupported_extensions: vec![0x0002],
-            required_extensions: vec![0x0005, 0x0006],
-        }
-        .serialize();
-        assert_eq!(
-            buf,
-            vec![0x34, 0x12, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x05, 0x00, 0x06, 0x00,]
-        );
-    }
-
-    /// Round-trip Success.
-    #[test]
-    fn request_extensions_success_roundtrip() {
-        let original = RequestExtensionsSuccess {
-            request_id: 9,
-            supported_extensions: vec![0x0003],
-        };
-        let parsed = RequestExtensionsSuccess::deserialize(&original.serialize()).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    /// Round-trip Error.
-    #[test]
-    fn request_extensions_error_roundtrip() {
-        let original = RequestExtensionsError {
-            request_id: 0x1234,
-            unsupported_extensions: vec![0x0002],
-            required_extensions: vec![0x0005, 0x0006],
-        };
-        let parsed = RequestExtensionsError::deserialize(&original.serialize()).unwrap();
-        assert_eq!(parsed, original);
-    }
 
     // ── 0x0003 SetPayoutDistribution (push model) ──────────────────
 

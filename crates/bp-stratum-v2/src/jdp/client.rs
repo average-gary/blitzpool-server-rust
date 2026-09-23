@@ -53,6 +53,7 @@ use std::collections::{HashMap, HashSet};
 use bp_common::normalize_btc_address;
 use bp_common::AddressId;
 
+use crate::codec_common::SetupConnectionInput;
 use crate::extensions::{RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS};
 use crate::protocol_version::{negotiate_version, MIN_PROTOCOL_VERSION};
 use crate::tokens::{Token, TokenAllocError, TokenStore};
@@ -148,21 +149,6 @@ pub const ERR_INVALID_PAYOUT_DISTRIBUTION: &str =
 pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 
 // ── Inputs (typed wrappers over deserialized SV2 frames) ────────────
-
-/// Inputs from a deserialized JDP `SetupConnection` frame. Analogous to
-/// [`crate::mining::client::SetupConnectionInput`] but scoped to the
-/// JDP sub-protocol.
-#[derive(Clone, Debug)]
-pub struct SetupConnectionInput {
-    pub protocol: u8,
-    pub min_version: u16,
-    pub max_version: u16,
-    pub flags: u32,
-    pub vendor: String,
-    pub firmware: String,
-    pub hardware_version: String,
-    pub device_id: String,
-}
 
 /// Inputs from a deserialized `AllocateMiningJobToken` frame.
 #[derive(Clone, Debug)]

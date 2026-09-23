@@ -2140,8 +2140,8 @@ mod tests {
         s
     }
 
-    fn jdp_setup() -> crate::jdp::client::SetupConnectionInput {
-        crate::jdp::client::SetupConnectionInput {
+    fn jdp_setup() -> crate::codec_common::SetupConnectionInput {
+        crate::codec_common::SetupConnectionInput {
             protocol: crate::jdp::client::PROTOCOL_JOB_DECLARATION,
             min_version: 2,
             max_version: 2,

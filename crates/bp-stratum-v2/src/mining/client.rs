@@ -58,6 +58,7 @@ use bp_share::{
 use bp_stats::MAX_REASONABLE_DIFFICULTY;
 use bp_vardiff::{Clock, VarDiffEngine};
 
+use crate::codec_common::SetupConnectionInput;
 use crate::extensions::{
     RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS, SV2_EXTENSION_TYPE_WORKER_ID,
 };
@@ -313,20 +314,6 @@ fn is_mining_extension_supported(ext: u16) -> bool {
 }
 
 // ── Inputs (typed wrappers over deserialized SV2 frames) ────────────
-
-/// Inputs from a deserialized `SetupConnection` frame, narrowed to
-/// what the handler actually reads.
-#[derive(Clone, Debug)]
-pub struct SetupConnectionInput {
-    pub protocol: u8,
-    pub min_version: u16,
-    pub max_version: u16,
-    pub flags: u32,
-    pub vendor: String,
-    pub firmware: String,
-    pub hardware_version: String,
-    pub device_id: String,
-}
 
 /// Inputs from a deserialized `OpenStandardMiningChannel` frame.
 #[derive(Clone, Debug)]

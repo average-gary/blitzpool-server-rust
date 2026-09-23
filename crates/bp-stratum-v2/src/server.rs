@@ -2621,10 +2621,9 @@ mod tests {
 
     // ── dispatch_inbound_frame ─────────────────────────────────────
 
+    use crate::codec_common::SetupConnectionInput;
     use crate::extranonce::SV2_WORKER_ID;
-    use crate::mining::client::{
-        SetupConnectionInput, FLAG_REQUIRES_VERSION_ROLLING, PROTOCOL_MINING,
-    };
+    use crate::mining::client::{FLAG_REQUIRES_VERSION_ROLLING, PROTOCOL_MINING};
     use crate::mining::submit::SubmitSharesStandardInput;
     use crate::server_codec::InboundMiningFrame;
 

@@ -27,14 +27,6 @@
 //! - **DeclareMiningJob.excess_data** is dropped on decode — reserved
 //!   for future pool-side metadata.
 
-use stratum_core::common_messages_sv2::{
-    SetupConnection as Sv2SetupConnection, SetupConnectionErrorOwned as Sv2SetupConnError,
-    SetupConnectionSuccessOwned as Sv2SetupConnSuccess,
-};
-use stratum_core::extensions_sv2::extensions_negotiation::{
-    RequestExtensions as Sv2RequestExtensions, RequestExtensionsErrorOwned as Sv2ReqExtError,
-    RequestExtensionsSuccessOwned as Sv2ReqExtSuccess,
-};
 use stratum_core::job_declaration_sv2::{
     AllocateMiningJobToken as Sv2AllocateMiningJobToken,
     AllocateMiningJobTokenSuccessOwned as Sv2AllocateMiningJobTokenSuccess,
@@ -46,17 +38,19 @@ use stratum_core::job_declaration_sv2::{
     PushSolution as Sv2PushSolution,
 };
 use stratum_core::parsers_sv2::{
-    AnyMessage, AnyMessageOwned, CommonMessages, CommonMessagesOwned, Extensions,
-    ExtensionsNegotiation, ExtensionsNegotiationOwned, ExtensionsOwned, JobDeclaration,
+    AnyMessage, AnyMessageOwned, CommonMessages, Extensions, ExtensionsNegotiation, JobDeclaration,
     JobDeclarationOwned,
 };
 
-use crate::codec_common::{bytes_to_32, str0255, token_from_bytes, utf8_from_bytes, CodecError};
+use crate::codec_common::{
+    bytes_to_32, decode_request_extensions, decode_setup_connection, request_extensions_error,
+    request_extensions_success, setup_connection_error, setup_connection_success, str0255,
+    token_from_bytes, utf8_from_bytes, CodecError, SetupConnectionInput,
+};
 use crate::extensions::RequestExtensions as LocalRequestExtensions;
 use crate::jdp::client::{
     AllocateMiningJobTokenInput, DeclareMiningJobInput, JdpOutboundFrame,
-    ProvideMissingTransactionsSuccessInput, PushSolutionInput, SetupConnectionInput,
-    SolutionHeader,
+    ProvideMissingTransactionsSuccessInput, PushSolutionInput, SolutionHeader,
 };
 
 // ── InboundJdpFrame ─────────────────────────────────────────────────
@@ -88,7 +82,7 @@ pub fn decode_jdp_inbound(msg: AnyMessage<'_>) -> Result<Option<InboundJdpFrame>
         AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
             ExtensionsNegotiation::RequestExtensions(m),
         )) => Ok(Some(InboundJdpFrame::RequestExtensions(
-            decode_request_extensions(m)?,
+            decode_request_extensions(m),
         ))),
         AnyMessage::JobDeclaration(m) => decode_job_declaration(m).map(Some),
         _ => Ok(None),
@@ -127,28 +121,6 @@ fn jdp_variant_name(m: &JobDeclaration<'_>) -> &'static str {
 }
 
 // ── Per-variant decoders ────────────────────────────────────────────
-
-fn decode_setup_connection(m: Sv2SetupConnection<'_>) -> Result<SetupConnectionInput, CodecError> {
-    Ok(SetupConnectionInput {
-        protocol: m.protocol as u8,
-        min_version: m.min_version,
-        max_version: m.max_version,
-        flags: m.flags,
-        vendor: utf8_from_bytes(m.vendor.as_bytes())?,
-        firmware: utf8_from_bytes(m.firmware.as_bytes())?,
-        hardware_version: utf8_from_bytes(m.hardware_version.as_bytes())?,
-        device_id: utf8_from_bytes(m.device_id.as_bytes())?,
-    })
-}
-
-fn decode_request_extensions(
-    m: Sv2RequestExtensions<'_>,
-) -> Result<LocalRequestExtensions, CodecError> {
-    Ok(LocalRequestExtensions {
-        request_id: m.request_id,
-        requested_extensions: m.requested_extensions.into_inner(),
-    })
-}
 
 fn decode_allocate(
     m: Sv2AllocateMiningJobToken<'_>,
@@ -223,44 +195,19 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<JdpWireFrame, Code
         JdpOutboundFrame::SetupConnectionSuccess {
             used_version,
             flags,
-        } => AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(
-            Sv2SetupConnSuccess {
-                used_version,
-                flags,
-            },
-        )),
-        JdpOutboundFrame::SetupConnectionError { flags, error_code } => AnyMessageOwned::Common(
-            CommonMessagesOwned::SetupConnectionError(Sv2SetupConnError {
-                flags,
-                error_code: str0255(error_code)?,
-            }),
-        ),
+        } => setup_connection_success(used_version, flags),
+        JdpOutboundFrame::SetupConnectionError { flags, error_code } => {
+            setup_connection_error(flags, error_code)?
+        }
         JdpOutboundFrame::RequestExtensionsSuccess {
             request_id,
             supported_extensions,
-        } => AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
-            ExtensionsNegotiationOwned::RequestExtensionsSuccess(Sv2ReqExtSuccess {
-                request_id,
-                supported_extensions: supported_extensions
-                    .try_into()
-                    .map_err(CodecError::from_conv)?,
-            }),
-        )),
+        } => request_extensions_success(request_id, supported_extensions)?,
         JdpOutboundFrame::RequestExtensionsError {
             request_id,
             unsupported_extensions,
             required_extensions,
-        } => AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
-            ExtensionsNegotiationOwned::RequestExtensionsError(Sv2ReqExtError {
-                request_id,
-                unsupported_extensions: unsupported_extensions
-                    .try_into()
-                    .map_err(CodecError::from_conv)?,
-                required_extensions: required_extensions
-                    .try_into()
-                    .map_err(CodecError::from_conv)?,
-            }),
-        )),
+        } => request_extensions_error(request_id, unsupported_extensions, required_extensions)?,
         JdpOutboundFrame::AllocateMiningJobTokenSuccess {
             request_id,
             mining_job_token,
@@ -332,6 +279,8 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<JdpWireFrame, Code
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stratum_core::common_messages_sv2::SetupConnection as Sv2SetupConnection;
+    use stratum_core::parsers_sv2::CommonMessagesOwned;
     // Named only here: the production path reaches `Token` through
     // `codec_common::token_from_bytes` without spelling the type.
     use crate::tokens::Token;
