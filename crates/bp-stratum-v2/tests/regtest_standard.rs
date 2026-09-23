@@ -104,6 +104,7 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
         Vec::new(),
         MiningServerHooks::no_op(),
         bridge,
+        common::sv2_extranonce(),
         std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 

@@ -43,6 +43,7 @@ use bp_share::Difficulty;
 use bp_share_hook::SharedSessionPersistence;
 use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
+use bp_stratum_v2::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
 use bp_stratum_v2::hooks::{
     AcceptedShareSink as Sv2AcceptedSink, BlockSubmissionSink as Sv2BlockSink, MiningServerHooks,
     PayoutResolver, RejectedShareSink as Sv2RejectedSink, SessionPersistence as Sv2SessionPersist,
@@ -245,6 +246,12 @@ pub(crate) fn build_per_port_servers(
     };
 
     let mut out: Vec<Sv2PortServer> = Vec::with_capacity(sv1_port_configs.len());
+
+    // One extranonce allocator shared across every SV2 port, as SV1 does —
+    // a separate one per port starts each at the same prefix, and two PPLNS
+    // ports hash the same coinbase.
+    let extranonce = SharedExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
+
     for sv1_port_config in sv1_port_configs {
         let hooks = build_port_hooks(
             sv1_port_config.payout_mode,
@@ -280,6 +287,7 @@ pub(crate) fn build_per_port_servers(
             alt_streams,
             hooks,
             bridge.clone(),
+            extranonce.clone(),
             job_cache.clone(),
         );
         // Same per-port toml block drives both SV1 + SV2. start_difficulty

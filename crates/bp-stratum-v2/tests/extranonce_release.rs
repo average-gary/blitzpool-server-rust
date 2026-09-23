@@ -22,6 +22,7 @@ use std::time::Duration;
 use bitcoin::Network;
 use bp_share::Difficulty;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
+use bp_stratum_v2::extranonce::SharedExtranonceAllocator;
 use bp_stratum_v2::hooks::MiningServerHooks;
 use bp_stratum_v2::mining::client::{PortConfig, FLAG_REQUIRES_VERSION_ROLLING};
 use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
@@ -29,6 +30,7 @@ use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use bp_template_distribution::TemplateUpdate;
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
+use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
 use stratum_core::common_messages_sv2::{Protocol, SetupConnectionOwned};
 use stratum_core::mining_sv2::OpenExtendedMiningChannelOwned;
 use stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwned, MiningOwned};
@@ -36,7 +38,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
 mod common;
-use common::{decode_label, read_any_message, wait_until, write_any_message, REGTEST_ADDR};
+use common::{
+    decode_label, read_any_message, sv2_extranonce, wait_until, write_any_message, REGTEST_ADDR,
+};
 
 const SRI_TEST_PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
@@ -47,7 +51,81 @@ const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 /// lifetime of the process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ungraceful_disconnect_releases_extranonce_prefix() {
-    let (_updates_tx, updates_rx) = broadcast::channel::<TemplateUpdate>(8);
+    let (server, _updates_tx) = spawn_server(sv2_extranonce());
+
+    assert_eq!(
+        server.allocated_prefix_count(),
+        0,
+        "fresh server must hold no prefixes"
+    );
+
+    let (prefix, reader, writer) = open_extended_channel(&server).await;
+    assert_eq!(prefix.len(), 4, "pool hands out a 4-byte prefix");
+
+    wait_until(Duration::from_secs(5), || {
+        server.allocated_prefix_count() == 1
+    })
+    .await;
+    assert_eq!(
+        server.allocated_prefix_count(),
+        1,
+        "open Extended channel must hold exactly one prefix"
+    );
+
+    // ── The point of the test: drop the socket. No CloseChannel, no ──
+    // ── shutdown handshake — exactly what a power-cut miner does.   ──
+    drop(reader);
+    drop(writer);
+
+    wait_until(Duration::from_secs(5), || {
+        server.allocated_prefix_count() == 0
+    })
+    .await;
+    assert_eq!(
+        server.allocated_prefix_count(),
+        0,
+        "prefix must return to the allocator when the connection dies without \
+         CloseChannel — otherwise it is stranded until the process restarts"
+    );
+
+    server.shutdown().await;
+}
+
+/// The binary builds one SV2 server per port, all on one allocator. Their
+/// first channels must get distinct prefixes: two PPLNS ports hash the same
+/// coinbase, so a shared prefix there means two miners searching the same
+/// space. Each server used to build its own allocator, and both handed out
+/// `00 00 00 01`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_ports_hand_out_distinct_prefixes() {
+    let extranonce = sv2_extranonce();
+    let (port_a, _updates_a) = spawn_server(extranonce.clone());
+    let (port_b, _updates_b) = spawn_server(extranonce);
+
+    let (prefix_a, _reader_a, _writer_a) = open_extended_channel(&port_a).await;
+    let (prefix_b, _reader_b, _writer_b) = open_extended_channel(&port_b).await;
+
+    assert_eq!(
+        prefix_a.len(),
+        4,
+        "precondition: a real prefix was allocated"
+    );
+    assert_ne!(
+        prefix_a, prefix_b,
+        "channels on two ports of one pool must never share an extranonce prefix"
+    );
+
+    port_a.shutdown().await;
+    port_b.shutdown().await;
+}
+
+/// Spawn a server on `extranonce` with an empty template snapshot. The
+/// template sender is handed back so the caller keeps it alive for the whole
+/// test.
+fn spawn_server(
+    extranonce: SharedExtranonceAllocator,
+) -> (StratumV2MiningServer, broadcast::Sender<TemplateUpdate>) {
+    let (updates_tx, updates_rx) = broadcast::channel::<TemplateUpdate>(8);
     let noise_config =
         NoiseConfig::parse_strings(SRI_TEST_PUB, SRI_TEST_PRV, DEFAULT_CERT_VALIDITY)
             .expect("noise config");
@@ -59,15 +137,18 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
         Vec::new(),
         MiningServerHooks::no_op(),
         Arc::new(RwLock::new(JdpDeclaredJobRegistry::new())),
+        extranonce,
         Arc::new(bp_mining_job::MiningJobCache::new()),
     );
+    (server, updates_tx)
+}
 
-    assert_eq!(
-        server.allocated_prefix_count(),
-        0,
-        "fresh server must hold no prefixes"
-    );
-
+/// Connect a miner to `server` and open one Extended channel. Returns the
+/// prefix the pool assigned plus both socket halves, which the caller keeps
+/// alive for as long as the channel should stay open.
+async fn open_extended_channel(
+    server: &StratumV2MiningServer,
+) -> (Vec<u8>, NoiseTcpReadHalf, NoiseTcpWriteHalf) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let port_config = PortConfig {
@@ -128,45 +209,14 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
     write_any_message(&mut writer, open).await;
 
     // Drain until the channel is open — SetTarget and friends may interleave.
-    let mut prefix_len = None;
     for _ in 0..16 {
         if let AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannelSuccess(s)) =
             read_any_message(&mut reader).await
         {
-            prefix_len = Some(s.extranonce_prefix.as_ref().len());
-            break;
+            return (s.extranonce_prefix.as_ref().to_vec(), reader, writer);
         }
     }
-    let prefix_len = prefix_len.expect("OpenExtendedMiningChannelSuccess within 16 frames");
-    assert_eq!(prefix_len, 4, "pool hands out a 4-byte prefix");
-
-    wait_until(Duration::from_secs(5), || {
-        server.allocated_prefix_count() == 1
-    })
-    .await;
-    assert_eq!(
-        server.allocated_prefix_count(),
-        1,
-        "open Extended channel must hold exactly one prefix"
-    );
-
-    // ── The point of the test: drop the socket. No CloseChannel, no ──
-    // ── shutdown handshake — exactly what a power-cut miner does.   ──
-    drop(reader);
-    drop(writer);
-
-    wait_until(Duration::from_secs(5), || {
-        server.allocated_prefix_count() == 0
-    })
-    .await;
-    assert_eq!(
-        server.allocated_prefix_count(),
-        0,
-        "prefix must return to the allocator when the connection dies without \
-         CloseChannel — otherwise it is stranded until the process restarts"
-    );
-
-    server.shutdown().await;
+    panic!("OpenExtendedMiningChannelSuccess within 16 frames");
 }
 
 // ── Helpers (mirrors of the ones in regtest_extended.rs) ─────────────

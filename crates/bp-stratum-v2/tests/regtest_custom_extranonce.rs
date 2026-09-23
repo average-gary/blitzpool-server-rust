@@ -138,6 +138,7 @@ async fn sv2_custom_extranonce_applies_at_open_and_live_and_leaves_others_untouc
         )],
         hooks,
         bridge,
+        common::sv2_extranonce(),
         Arc::new(bp_mining_job::MiningJobCache::new()),
     );
     wait_until(Duration::from_secs(8), || {

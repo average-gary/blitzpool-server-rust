@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub mod display;
 pub use display::{short_address, short_address_with_tail};
 pub mod extranonce;
-pub use extranonce::{ExtranonceAllocator, ExtranonceError};
+pub use extranonce::{ExtranonceError, SharedExtranonceAllocator};
 
 pub mod live_client_key;
 

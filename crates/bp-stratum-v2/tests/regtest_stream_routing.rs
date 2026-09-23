@@ -374,6 +374,7 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
         vec![(case.stream, alt_updates_rx, tdp_alt.current_snapshot())],
         hooks,
         bridge,
+        common::sv2_extranonce(),
         std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
     wait_until(Duration::from_secs(8), || {

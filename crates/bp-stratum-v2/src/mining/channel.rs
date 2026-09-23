@@ -54,7 +54,7 @@ pub struct ChannelState {
 
     /// Pool-assigned extranonce prefix. 4 bytes typical for Standard
     /// (the entire prefix); 4–8 bytes for Extended (variable, allocated
-    /// by [`crate::extranonce::ExtranonceAllocator`]).
+    /// by [`crate::extranonce::ConnectionExtranonce`]).
     pub extranonce_prefix: Vec<u8>,
     /// Miner-controlled bytes after the prefix. `0` for Standard;
     /// `(12 - prefix.len)`-clamped for Extended (BitAxe/NerdQAxe quirk
@@ -245,7 +245,7 @@ impl ChannelState {
 
     /// Total bytes the miner sees as the "coinbase extranonce slot"
     /// (`prefix + miner-rollable`). Always 12 by design; the constant is
-    /// implicit in the [`crate::extranonce::ExtranonceAllocator`] default.
+    /// set by [`bp_mining_job::EXTRANONCE_SLOT_LEN`].
     pub fn full_extranonce_size(&self) -> usize {
         self.extranonce_prefix.len() + self.extranonce_size as usize
     }

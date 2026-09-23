@@ -31,10 +31,9 @@
 //! and exit.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bp_common::ExtranonceAllocator;
+use bp_common::SharedExtranonceAllocator;
 use bp_common::StreamKind;
 use bp_template_distribution::TemplateUpdate;
 use futures::StreamExt;
@@ -70,17 +69,14 @@ use bp_vardiff::{Clock, SystemClock};
 /// and shared into every [`StratumV1Server`] so two miners — even on
 /// different ports — can never be handed the same extranonce1.
 ///
-/// Cheap to clone (both fields are `Arc`). Each connection calls
+/// Cheap to clone. Each connection calls
 /// [`allocate`](Self::allocate) exactly once at accept time; the returned
 /// `PrefixGuard` releases the prefix back to the pool when the
 /// connection task ends (any exit path — EOF, cancel, IO error).
 #[derive(Clone)]
 pub struct SharedExtranonce {
-    allocator: Arc<Mutex<ExtranonceAllocator>>,
-    /// Monotonic per-connection key. The allocator only needs the key to
-    /// be unique within this (SV1) instance, so a plain counter suffices
-    /// — SV2's separate instance never shares this map.
-    next_key: Arc<AtomicU64>,
+    /// One key per connection: SV1 holds exactly one prefix per connection.
+    shared: SharedExtranonceAllocator,
 }
 
 impl SharedExtranonce {
@@ -89,10 +85,9 @@ impl SharedExtranonce {
     /// into every port.
     pub fn new() -> Self {
         Self {
-            allocator: Arc::new(Mutex::new(ExtranonceAllocator::new_default_on_worker(
+            shared: SharedExtranonceAllocator::new_default_on_worker(
                 bp_common::extranonce::SV1_WORKER_ID,
-            ))),
-            next_key: Arc::new(AtomicU64::new(1)),
+            ),
         }
     }
 
@@ -102,36 +97,23 @@ impl SharedExtranonce {
     /// is exhausted — the caller then keeps the session-id-derived
     /// extranonce1, i.e. the pre-unification random behaviour.
     pub fn allocate(&self) -> PrefixGuard {
-        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
-        // Recover a poisoned lock rather than degrading silently: the
-        // allocator is never left half-updated (its ops don't panic
-        // mid-mutation), so a panic elsewhere must NOT permanently force
-        // every future connection onto the non-unique session-id-derived
-        // fallback. A `None` prefix below therefore means genuine
-        // partition exhaustion, which the caller logs.
-        let mut alloc = self
-            .allocator
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let prefix = alloc
+        let key = self.shared.next_key();
+        let prefix = self
+            .shared
             .allocate(key)
             .ok()
             .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok());
-        drop(alloc);
         PrefixGuard {
             key,
             prefix,
-            allocator: self.allocator.clone(),
+            shared: self.shared.clone(),
         }
     }
 
     /// Number of extranonce1 prefixes currently checked out (one per live
     /// connection). Exposed for tests + potential metrics.
     pub fn allocated_count(&self) -> usize {
-        self.allocator
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .allocated_count()
+        self.shared.allocated_count()
     }
 }
 
@@ -146,7 +128,7 @@ impl Default for SharedExtranonce {
 pub struct PrefixGuard {
     key: u64,
     prefix: Option<[u8; 4]>,
-    allocator: Arc<Mutex<ExtranonceAllocator>>,
+    shared: SharedExtranonceAllocator,
 }
 
 impl PrefixGuard {
@@ -159,13 +141,7 @@ impl PrefixGuard {
 
 impl Drop for PrefixGuard {
     fn drop(&mut self) {
-        // Recover a poisoned lock so the prefix is always returned to the
-        // pool — otherwise a single panic elsewhere would leak prefixes
-        // toward exhaustion.
-        self.allocator
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .release(self.key);
+        self.shared.release(self.key);
     }
 }
 

@@ -1020,8 +1020,8 @@ pub fn handle_request_extensions<C: Clock>(
 // ── Handler: OpenStandardMiningChannel ──────────────────────────────
 
 /// Handle `OpenStandardMiningChannel`. The `extranonce_prefix` is
-/// allocated by the IO layer (via the global
-/// `ExtranonceAllocator`) and passed in; the handler doesn't own the
+/// allocated by the IO layer (via the pool-wide allocator behind
+/// `crate::extranonce::ConnectionExtranonce`) and passed in; the handler doesn't own the
 /// allocator because allocations are pool-global, not session-local.
 ///
 /// Flow:

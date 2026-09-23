@@ -47,13 +47,18 @@
 //! prefix returns to the pool; reuse is allowed.
 //!
 //! The worker partition is what lets the SV1 and SV2 servers share this
-//! allocator without ever handing out overlapping prefixes: each server
-//! constructs its own instance on a distinct worker id, so an SV1 prefix
-//! (`0x01…`) and an SV2 prefix (`0x00…`) can never collide even though
-//! the two protocols run separate instances. The partition is a namespace
-//! split, not a rationing device — it buys the two instances freedom from
-//! having to coordinate (no shared instance, no shared lock, no
-//! cross-crate wiring), and uniqueness falls out by construction.
+//! allocator without ever handing out overlapping prefixes: each protocol
+//! builds ONE [`SharedExtranonceAllocator`] on its own worker id and hands
+//! it to every one of its port servers, so an SV1 prefix (`0x01…`) and an
+//! SV2 prefix (`0x00…`) can never collide even though the two protocols run
+//! separate instances. The partition is a namespace split, not a rationing
+//! device — it buys the two instances freedom from having to coordinate (no
+//! shared instance, no shared lock, no cross-crate wiring), and uniqueness
+//! falls out by construction.
+//!
+//! Within a protocol the instance must be shared across ports: an allocator
+//! per port starts every port at the same prefix, and two PPLNS ports hash
+//! the same coinbase.
 //!
 //! Only workers 0 and 1 are assigned; **workers 2..=255 are unowned**, so
 //! nothing is ever emitted from `0x02…`..`0xFF…`. That is headroom, not
@@ -64,13 +69,19 @@
 //! same property makes the unowned range the natural home for a
 //! hand-administered prefix: no counter will ever reach it.
 //!
-//! `total_extranonce_size` defaults to 12 bytes (4 prefix + 8
-//! miner-controlled) to match `bp_mining_job`'s coinbase slot size and
-//! SV1's fixed 4-byte extranonce1 + 8-byte extranonce2. The bump from
-//! 8 → 12 came from the Braiins Hashpower marketplace, which requires
+//! The 4-byte prefix is the pool's part of `bp_mining_job`'s 12-byte
+//! coinbase extranonce slot (`EXTRANONCE_SLOT_LEN`), leaving 8 for the
+//! miner — SV1's fixed 4-byte extranonce1 + 8-byte extranonce2. The bump
+//! from 8 → 12 came from the Braiins Hashpower marketplace, which requires
 //! `extranonce2_size >= 7` on the miner side.
+//!
+//! `ExtranonceAllocator` is crate-private on purpose: the only way in is
+//! [`SharedExtranonceAllocator`], so no server can build an allocator of
+//! its own — the per-port copy that handed every port the same prefixes.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Errors returned by the allocator.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -88,20 +99,18 @@ pub enum ExtranonceError {
 /// cross-protocol uniqueness invariant lives in one place rather than as
 /// magic numbers spread across the protocol crates.
 ///
-/// SV2 builds its allocator via [`ExtranonceAllocator::new_default`]
-/// (worker 0 → `0x00…` prefixes); SV1 uses
-/// [`ExtranonceAllocator::new_default_on_worker`] with [`SV1_WORKER_ID`]
+/// Each protocol builds one [`SharedExtranonceAllocator`] on its id: SV2 on
+/// this one (worker 0 → `0x00…` prefixes), SV1 on [`SV1_WORKER_ID`]
 /// (worker 1 → `0x01…`).
 pub const SV2_WORKER_ID: u32 = 0;
 /// See [`SV2_WORKER_ID`]. SV1's partition (`0x01…`), disjoint from SV2's.
 pub const SV1_WORKER_ID: u32 = 1;
 
-/// Pool-side extranonce-prefix allocator. **Not thread-safe** —
-/// wrap in `Mutex` if the calling layer is multi-threaded.
+/// Pool-side extranonce-prefix allocator. **Not thread-safe**; reached only
+/// through [`SharedExtranonceAllocator`], which holds it behind a `Mutex`.
 #[derive(Debug)]
-pub struct ExtranonceAllocator {
+pub(crate) struct ExtranonceAllocator {
     prefix_size: usize,
-    total_extranonce_size: usize,
     worker_offset: u32,
     max_prefix: u32,
     next_prefix: u32,
@@ -110,45 +119,24 @@ pub struct ExtranonceAllocator {
 }
 
 impl ExtranonceAllocator {
-    /// Construct with the default configuration on **worker 0**: 4-byte
-    /// prefix inside a 12-byte total extranonce slot.
-    pub fn new_default() -> Self {
-        Self::new(4, 12).expect("default sizes are valid")
+    /// A 4-byte prefix on the given worker partition: the top byte of the
+    /// prefix carries the worker id, so two partitions never collide.
+    pub(crate) fn new_default_on_worker(worker_id: u32) -> Self {
+        Self::new_on_worker(4, worker_id).expect("default sizes are valid")
     }
 
-    /// Construct with the default sizes (4-byte prefix / 12-byte total)
-    /// on the given worker partition. Use this to give a second server
-    /// (e.g. the SV1 translator) a prefix space disjoint from worker 0
-    /// (e.g. the SV2 server): the two never collide because the top byte
-    /// of the prefix carries the worker id.
-    pub fn new_default_on_worker(worker_id: u32) -> Self {
-        Self::new_on_worker(4, 12, worker_id).expect("default sizes are valid")
-    }
-
-    /// Construct with explicit sizes on worker 0.
+    /// An explicit prefix size on a chosen worker partition. Production only
+    /// ever uses 4 bytes; a smaller size is what makes the exhausted
+    /// partition reachable in a test.
     ///
     /// `prefix_size` must be ≥ 1 and ≤ 4 (we use `u32` internally for
-    /// the partition counter; values > 4 would silently overflow).
-    /// `total_extranonce_size` must be ≥ `prefix_size`.
-    pub fn new(prefix_size: usize, total_extranonce_size: usize) -> Result<Self, &'static str> {
-        Self::new_on_worker(prefix_size, total_extranonce_size, 0)
-    }
-
-    /// Construct with explicit sizes on a chosen worker partition.
-    ///
-    /// The worker id occupies the top 8 bits of the prefix, so it must
-    /// be in `0..=255`; a value whose partition would not fit inside
+    /// the partition counter; values > 4 would silently overflow). The
+    /// worker id occupies the top 8 bits of the prefix, so it must be in
+    /// `0..=255`; a value whose partition would not fit inside
     /// `prefix_size` bytes is rejected.
-    pub fn new_on_worker(
-        prefix_size: usize,
-        total_extranonce_size: usize,
-        worker_id: u32,
-    ) -> Result<Self, &'static str> {
+    pub(crate) fn new_on_worker(prefix_size: usize, worker_id: u32) -> Result<Self, &'static str> {
         if prefix_size == 0 || prefix_size > 4 {
             return Err("prefix_size must be in 1..=4");
-        }
-        if total_extranonce_size < prefix_size {
-            return Err("total_extranonce_size must be ≥ prefix_size");
         }
         let bits_per_worker = (prefix_size - 1) as u32 * 8;
         // partition_size = 2^bits_per_worker; max_prefix = partition_size - 1.
@@ -178,7 +166,6 @@ impl ExtranonceAllocator {
         }
         Ok(Self {
             prefix_size,
-            total_extranonce_size,
             worker_offset,
             max_prefix,
             next_prefix: 1,
@@ -187,29 +174,18 @@ impl ExtranonceAllocator {
         })
     }
 
-    /// Miner-controlled extranonce length in bytes
-    /// (`total_extranonce_size - prefix_size`).
-    pub fn miner_extranonce_size(&self) -> usize {
-        self.total_extranonce_size - self.prefix_size
-    }
-
-    /// Pool-assigned prefix length in bytes.
-    pub fn prefix_size(&self) -> usize {
-        self.prefix_size
-    }
-
     /// Count of currently-allocated channels.
-    pub fn allocated_count(&self) -> usize {
+    pub(crate) fn allocated_count(&self) -> usize {
         self.allocated.len()
     }
 
-    /// Allocate (or re-return) the prefix for `channel_key` — a
-    /// GLOBALLY-unique key (the allocator is shared pool-wide, so the
-    /// per-connection wire `channel_id` is not unique on its own; the
-    /// caller combines it with the session id). Big-endian
+    /// Allocate (or re-return) the prefix for `channel_key` — a key unique
+    /// among every live allocation on this instance (see
+    /// [`SharedExtranonceAllocator::next_key`]); a repeated key gets the SAME
+    /// prefix back. Big-endian
     /// `prefix_size`-byte buffer. Returns `Err(Exhausted)` only when
     /// every prefix in the worker partition is in use.
-    pub fn allocate(&mut self, channel_key: u64) -> Result<Vec<u8>, ExtranonceError> {
+    pub(crate) fn allocate(&mut self, channel_key: u64) -> Result<Vec<u8>, ExtranonceError> {
         if let Some(&existing) = self.allocated.get(&channel_key) {
             return Ok(prefix_to_be_bytes(existing, self.prefix_size));
         }
@@ -242,18 +218,67 @@ impl ExtranonceAllocator {
     }
 
     /// Drop the channel's allocation. Idempotent for unknown keys.
-    pub fn release(&mut self, channel_key: u64) {
+    pub(crate) fn release(&mut self, channel_key: u64) {
         if let Some(prefix) = self.allocated.remove(&channel_key) {
             self.used.remove(&prefix);
         }
     }
+}
 
-    /// Look up the prefix for a channel key without allocating. Returns
-    /// `None` if unknown.
-    pub fn get_prefix(&self, channel_key: u64) -> Option<Vec<u8>> {
-        self.allocated
-            .get(&channel_key)
-            .map(|&p| prefix_to_be_bytes(p, self.prefix_size))
+/// One protocol's allocator, shared by all of its port servers, plus the
+/// counter its callers draw allocation keys from.
+///
+/// The allocator needs keys that are unique among live allocations; a
+/// counter gives that by construction, where anything derived from a random
+/// session id only does so with high probability. Cheap to clone (both
+/// fields are `Arc`).
+#[derive(Clone, Debug)]
+pub struct SharedExtranonceAllocator {
+    allocator: Arc<Mutex<ExtranonceAllocator>>,
+    next_key: Arc<AtomicU64>,
+}
+
+impl SharedExtranonceAllocator {
+    /// A 4-byte prefix on `worker_id`. Build
+    /// once per protocol and clone into every port.
+    pub fn new_default_on_worker(worker_id: u32) -> Self {
+        Self {
+            allocator: Arc::new(Mutex::new(ExtranonceAllocator::new_default_on_worker(
+                worker_id,
+            ))),
+            next_key: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// A key no earlier call returned.
+    pub fn next_key(&self) -> u64 {
+        self.next_key.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The prefix for `key`, big-endian; the same one again for a repeated
+    /// key. `Err(Exhausted)` only when every prefix in the partition is in
+    /// use.
+    pub fn allocate(&self, key: u64) -> Result<Vec<u8>, ExtranonceError> {
+        self.lock().allocate(key)
+    }
+
+    /// Return `key`'s prefix. A no-op for a key holding none.
+    pub fn release(&self, key: u64) {
+        self.lock().release(key);
+    }
+
+    /// How many prefixes are currently held.
+    pub fn allocated_count(&self) -> usize {
+        self.lock().allocated_count()
+    }
+
+    /// Recovers a poisoned lock instead of panicking: the allocator's
+    /// operations never leave it half-updated, and giving up on it would
+    /// either strand every prefix it holds or refuse every new channel.
+    fn lock(&self) -> MutexGuard<'_, ExtranonceAllocator> {
+        self.allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -277,7 +302,7 @@ mod tests {
     /// Different channel keys get distinct prefixes.
     #[test]
     fn allocates_unique_prefixes_for_different_channels() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         let p1 = mgr.allocate(1).unwrap();
         let p2 = mgr.allocate(2).unwrap();
         let p3 = mgr.allocate(3).unwrap();
@@ -289,7 +314,7 @@ mod tests {
     /// Re-allocating the same channel key returns the same prefix.
     #[test]
     fn returns_same_prefix_for_same_channel_on_realloc() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         let p1a = mgr.allocate(1).unwrap();
         let p1b = mgr.allocate(1).unwrap();
         assert_eq!(p1a, p1b);
@@ -298,37 +323,19 @@ mod tests {
     /// The default prefix is 4 bytes.
     #[test]
     fn prefix_is_four_bytes_by_default() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         let p = mgr.allocate(1).unwrap();
         assert_eq!(p.len(), 4);
-    }
-
-    /// miner_extranonce_size == total - prefix.
-    #[test]
-    fn miner_extranonce_size_is_total_minus_prefix() {
-        assert_eq!(
-            ExtranonceAllocator::new(4, 8)
-                .unwrap()
-                .miner_extranonce_size(),
-            4
-        );
-        assert_eq!(
-            ExtranonceAllocator::new(2, 6)
-                .unwrap()
-                .miner_extranonce_size(),
-            4
-        );
     }
 
     /// Releasing a prefix returns it to the pool for reuse.
     #[test]
     fn releases_prefix_and_allows_reuse() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         let _p1 = mgr.allocate(1).unwrap();
         assert_eq!(mgr.allocated_count(), 1);
         mgr.release(1);
         assert_eq!(mgr.allocated_count(), 0);
-        assert_eq!(mgr.get_prefix(1), None);
         let p2 = mgr.allocate(10).unwrap();
         assert_eq!(p2.len(), 4);
         assert_eq!(mgr.allocated_count(), 1);
@@ -337,30 +344,15 @@ mod tests {
     /// Releasing an unknown channel key is a no-op.
     #[test]
     fn release_is_idempotent_for_unknown_channels() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         mgr.release(999); // must not panic
         assert_eq!(mgr.allocated_count(), 0);
-    }
-
-    /// get_prefix returns None for an unallocated channel key.
-    #[test]
-    fn get_prefix_none_for_unallocated() {
-        let mgr = ExtranonceAllocator::new_default();
-        assert_eq!(mgr.get_prefix(42), None);
-    }
-
-    /// get_prefix returns the currently-allocated prefix.
-    #[test]
-    fn get_prefix_returns_allocated() {
-        let mut mgr = ExtranonceAllocator::new_default();
-        let p = mgr.allocate(1).unwrap();
-        assert_eq!(mgr.get_prefix(1).as_deref(), Some(p.as_slice()));
     }
 
     /// A thousand allocations yield no duplicate prefixes.
     #[test]
     fn handles_many_allocations_without_collision() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         for i in 1..=1000 {
             let p = mgr.allocate(i).unwrap();
@@ -372,16 +364,15 @@ mod tests {
     /// A 2-byte prefix size produces 2-byte prefixes.
     #[test]
     fn works_with_two_byte_prefix() {
-        let mut mgr = ExtranonceAllocator::new(2, 4).unwrap();
+        let mut mgr = ExtranonceAllocator::new_on_worker(2, 0).unwrap();
         let p = mgr.allocate(1).unwrap();
         assert_eq!(p.len(), 2);
-        assert_eq!(mgr.miner_extranonce_size(), 2);
     }
 
     /// A released prefix slot is handed out again on the next allocation.
     #[test]
     fn reuses_released_prefix_slot() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         let _p1 = mgr.allocate(1).unwrap();
         let _p2 = mgr.allocate(2).unwrap();
         mgr.release(1);
@@ -393,7 +384,7 @@ mod tests {
     /// allocated_count tracks live allocations across allocate/release.
     #[test]
     fn tracks_allocated_count_correctly() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         assert_eq!(mgr.allocated_count(), 0);
         mgr.allocate(1).unwrap();
         assert_eq!(mgr.allocated_count(), 1);
@@ -411,7 +402,7 @@ mod tests {
     /// Skips 0 so the first allocation lands at 1.
     #[test]
     fn first_allocation_is_one_big_endian() {
-        let mut mgr = ExtranonceAllocator::new_default();
+        let mut mgr = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
         let p = mgr.allocate(7).unwrap();
         assert_eq!(p, vec![0x00, 0x00, 0x00, 0x01]);
     }
@@ -419,7 +410,7 @@ mod tests {
     /// 2-byte prefix BE encoding.
     #[test]
     fn two_byte_prefix_big_endian() {
-        let mut mgr = ExtranonceAllocator::new(2, 6).unwrap();
+        let mut mgr = ExtranonceAllocator::new_on_worker(2, 0).unwrap();
         let _ = mgr.allocate(1).unwrap();
         let p2 = mgr.allocate(2).unwrap();
         assert_eq!(p2, vec![0x00, 0x02]);
@@ -434,7 +425,7 @@ mod tests {
     /// `Exhausted`.
     #[test]
     fn tiny_partition_reports_exhausted_after_one() {
-        let mut mgr = ExtranonceAllocator::new(1, 9).unwrap();
+        let mut mgr = ExtranonceAllocator::new_on_worker(1, 0).unwrap();
         assert_eq!(mgr.allocate(1), Ok(vec![0x01]));
         assert_eq!(mgr.allocate(2), Err(ExtranonceError::Exhausted));
     }
@@ -442,9 +433,8 @@ mod tests {
     /// Constructor argument validation.
     #[test]
     fn rejects_invalid_construction() {
-        assert!(ExtranonceAllocator::new(0, 12).is_err());
-        assert!(ExtranonceAllocator::new(5, 12).is_err());
-        assert!(ExtranonceAllocator::new(4, 3).is_err());
+        assert!(ExtranonceAllocator::new_on_worker(0, 0).is_err());
+        assert!(ExtranonceAllocator::new_on_worker(5, 0).is_err());
     }
 
     // ── Worker-partition invariants (SV1 / SV2 disjointness) ─────────
@@ -454,7 +444,7 @@ mod tests {
     /// prefix can ever appear in both — even across many allocations.
     #[test]
     fn worker_partitions_never_overlap() {
-        let mut sv2 = ExtranonceAllocator::new_default(); // worker 0
+        let mut sv2 = ExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID); // worker 0
         let mut sv1 = ExtranonceAllocator::new_default_on_worker(1); // worker 1
         let mut worker0: HashSet<Vec<u8>> = HashSet::new();
         let mut worker1: HashSet<Vec<u8>> = HashSet::new();
@@ -486,8 +476,8 @@ mod tests {
     /// not fit and is rejected.
     #[test]
     fn worker_id_bounds_for_four_byte_prefix() {
-        assert!(ExtranonceAllocator::new_on_worker(4, 12, 255).is_ok());
-        assert!(ExtranonceAllocator::new_on_worker(4, 12, 256).is_err());
+        assert!(ExtranonceAllocator::new_on_worker(4, 255).is_ok());
+        assert!(ExtranonceAllocator::new_on_worker(4, 256).is_err());
     }
 
     /// The single-slot partition (`prefix_size == 1` → `max_prefix == 0`)
@@ -497,8 +487,8 @@ mod tests {
     /// valid and emits `0x01` (never the reserved `0x00`).
     #[test]
     fn single_slot_partition_rejects_overflowing_worker() {
-        assert!(ExtranonceAllocator::new_on_worker(1, 9, 255).is_err());
-        let mut w0 = ExtranonceAllocator::new_on_worker(1, 9, 0).unwrap();
+        assert!(ExtranonceAllocator::new_on_worker(1, 255).is_err());
+        let mut w0 = ExtranonceAllocator::new_on_worker(1, 0).unwrap();
         assert_eq!(w0.allocate(1), Ok(vec![0x01]));
     }
 
