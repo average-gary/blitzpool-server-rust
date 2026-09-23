@@ -377,11 +377,11 @@ struct PayoutInfoEntry {
 #[serde(rename_all = "camelCase")]
 struct ClientBlockTemplateResponse {
     block_template: serde_json::Value,
-    /// `solo` / `pplns` / `group-solo` — drives the UI's
+    /// `solo` / `pplns` / `group-solo` / `blockparty` — drives the UI's
     /// distribution-preview labelling.
     mode: &'static str,
     payout_information: Vec<PayoutInfoEntry>,
-    /// Set only when `mode == "group-solo"`.
+    /// Set for the two group modes, `group-solo` and `blockparty`.
     #[serde(skip_serializing_if = "Option::is_none")]
     group_id: Option<String>,
     /// Full block hex (header + per-address coinbase + template txs)
@@ -405,7 +405,7 @@ where
 {
     use bp_common::AddressId;
 
-    let addr = AddressId::new(address.clone()).map_err(|_| ApiError::InvalidAddress)?;
+    let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let key = format!("CLIENT_BLOCK_TEMPLATE_{}", addr.as_str());
     let s = state.clone();
     let bytes = state
@@ -429,33 +429,15 @@ where
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
 
-                // Mode resolution: group membership wins, then
-                // Blockparty admin routing, then PPLNS window presence,
-                // else solo (matches /api/pplns/mode/:address).
-                let mut mode: &'static str = "solo";
-                let mut group_id: Option<uuid::Uuid> = None;
-                if let Some(member) = bp_db::find_group_member_by_address(&s.pool, &addr).await? {
-                    mode = "group-solo";
-                    group_id = Some(member.group_id);
-                } else if let Some(bp) = s.blockparty.as_ref() {
-                    if let Some(gid) = bp.routable_group_id_for_admin(&addr).await {
-                        mode = "blockparty";
-                        group_id = Some(gid);
-                    }
-                }
-                if mode == "solo" {
-                    if let Some(engine) = s.pplns.as_ref() {
-                        if let Ok(Some(status)) = engine.reader().address_status(&address).await {
-                            if status.current_window_shares > 0.0 {
-                                mode = "pplns";
-                            }
-                        }
-                    }
-                }
+                // The same resolution `/api/pplns/mode/:address` reports, so
+                // the preview shows the mode the pool is actually using.
+                let resolved = crate::mode::resolve_address_mode(&s, &addr).await?;
 
-                let payouts: Vec<PayoutInfoEntry> = match mode {
-                    "group-solo" => {
-                        let gid = group_id.expect("set when mode == group-solo");
+                let payouts: Vec<PayoutInfoEntry> = match resolved.mode {
+                    MiningMode::GroupSolo => {
+                        let gid = resolved
+                            .group_id
+                            .expect("group-solo resolves with its group");
                         match s.group_solo.as_ref() {
                             Some(engine) => {
                                 match engine.build_distribution(gid, reward_sats, &addr).await {
@@ -485,8 +467,10 @@ where
                             None => Vec::new(),
                         }
                     }
-                    "blockparty" => {
-                        let gid = group_id.expect("set when mode == blockparty");
+                    MiningMode::Blockparty => {
+                        let gid = resolved
+                            .group_id
+                            .expect("blockparty resolves with its group");
                         match s.blockparty.as_ref() {
                             Some(bp) => match bp
                                 .build_payouts(gid, bp_common::Sats(reward_sats as i64))
@@ -506,7 +490,7 @@ where
                             None => Vec::new(),
                         }
                     }
-                    "pplns" => match s.pplns.as_ref() {
+                    MiningMode::Pplns => match s.pplns.as_ref() {
                         Some(engine) => match engine.build_distribution(reward_sats).await {
                             // The §4 evaluation at this template's revenue —
                             // exactly what the real coinbase build runs.
@@ -532,7 +516,7 @@ where
                         },
                         None => Vec::new(),
                     },
-                    _ => {
+                    MiningMode::Solo => {
                         // Solo: exactly what the payout resolver would build.
                         // This used to be a second implementation reading the
                         // PPLNS fee config, so a solo miner saw a fee output
@@ -564,9 +548,9 @@ where
                 };
                 Ok(ClientBlockTemplateResponse {
                     block_template: template,
-                    mode,
+                    mode: resolved.mode.as_str(),
                     payout_information: payouts,
-                    group_id: group_id.map(|g| g.to_string()),
+                    group_id: resolved.group_id.map(|g| g.to_string()),
                     block_hex,
                     coinbase_tx_hex,
                 })

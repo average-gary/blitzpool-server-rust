@@ -10,7 +10,6 @@ use axum::{
 };
 use bp_common::AddressId;
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -246,85 +245,16 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let addr = AddressId::new(address.clone()).map_err(|_| ApiError::InvalidAddress)?;
+    let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let key = format!("PPLNS_MODE_{}", addr.as_str());
     let s = state.clone();
     let bytes = state
         .cache
         .get_or_fetch::<ModeResponse, _, ApiError>(key, TtlKind::PplnsMode, async move {
-            // Live port-marker wins — 5-min TTL key written by stratum on every
-            // accepted share. Reflects the actual port in use right now.
-            if let Some(mut redis) = s.redis.clone() {
-                let marker_key = format!("miner:{}:mode", addr.as_str());
-                if let Ok(Some(raw)) = redis.get::<_, Option<String>>(&marker_key).await {
-                    match raw.as_str() {
-                        "solo" => {
-                            return Ok(ModeResponse {
-                                mode: "solo",
-                                group_id: None,
-                            })
-                        }
-                        "pplns" => {
-                            return Ok(ModeResponse {
-                                mode: "pplns",
-                                group_id: None,
-                            })
-                        }
-                        "blockparty" => {
-                            if let Some(bp) = s.blockparty.as_ref() {
-                                if let Some(gid) = bp.routable_group_id_for_admin(&addr).await {
-                                    return Ok(ModeResponse {
-                                        mode: "blockparty",
-                                        group_id: Some(gid.to_string()),
-                                    });
-                                }
-                            }
-                            // Group dissolved between mark and read — fall through.
-                        }
-                        "group-solo" => {
-                            if let Some(member) =
-                                bp_db::find_group_member_by_address(&s.pool, &addr).await?
-                            {
-                                return Ok(ModeResponse {
-                                    mode: "group-solo",
-                                    group_id: Some(member.group_id.to_string()),
-                                });
-                            }
-                            // Group dissolved between mark and read — fall through.
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Steps 2-5: state-based fallback (no live marker or marker expired).
-            if let Some(member) = bp_db::find_group_member_by_address(&s.pool, &addr).await? {
-                return Ok(ModeResponse {
-                    mode: "group-solo",
-                    group_id: Some(member.group_id.to_string()),
-                });
-            }
-            if let Some(bp) = s.blockparty.as_ref() {
-                if let Some(group_id) = bp.routable_group_id_for_admin(&addr).await {
-                    return Ok(ModeResponse {
-                        mode: "blockparty",
-                        group_id: Some(group_id.to_string()),
-                    });
-                }
-            }
-            if let Some(engine) = s.pplns.as_ref() {
-                if let Ok(Some(status)) = engine.reader().address_status(&address).await {
-                    if status.current_window_shares > 0.0 {
-                        return Ok(ModeResponse {
-                            mode: "pplns",
-                            group_id: None,
-                        });
-                    }
-                }
-            }
+            let resolved = crate::mode::resolve_address_mode(&s, &addr).await?;
             Ok(ModeResponse {
-                mode: "solo",
-                group_id: None,
+                mode: resolved.mode.as_str(),
+                group_id: resolved.group_id.map(|g| g.to_string()),
             })
         })
         .await?;

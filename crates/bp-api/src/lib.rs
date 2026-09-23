@@ -32,6 +32,7 @@ mod controllers;
 pub mod email_hooks;
 pub mod error;
 pub mod middleware;
+mod mode;
 pub mod push_hooks;
 pub mod response_cache;
 pub mod state;
