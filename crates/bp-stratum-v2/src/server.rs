@@ -31,9 +31,9 @@
 //! - Translator task: consumes
 //!   [`bp_template_distribution::TemplateUpdate`] via the
 //!   `broadcast::Receiver` returned by `TdpHandle::subscribe()`, drives
-//!   an [`crate::mining::translator::SV2TemplateAssembler`], re-broadcasts
+//!   a [`bp_template_distribution::TemplateAssembler`], re-broadcasts
 //!   `TemplateBroadcast` to per-connection tasks. Maintains
-//!   `Arc<Mutex<Option<Arc<ActiveSV2Template>>>>` snapshot so freshly-accepted
+//!   `Arc<Mutex<Option<Arc<ActiveTemplate>>>>` snapshot so freshly-accepted
 //!   connections can boot from the current state without waiting for
 //!   the next TDP update.
 //! - Per-connection-task: Noise-XK handshake on accept, then a
@@ -109,9 +109,9 @@ use crate::mining::client::{
     handle_submit_shares_extended, handle_submit_shares_standard, handle_update_channel,
     HandlerOutcome, MiningJobInputs, MiningSessionState, OutboundFrame, PortConfig, SessionEvent,
 };
-use crate::mining::translator::{
-    ActiveSV2Template, SV2TemplateAssembler, TemplateBroadcast, TemplateChange,
-};
+use bp_template_distribution::{ActiveTemplate, TemplateAssembler, TemplateChange};
+
+use crate::mining::translator::TemplateBroadcast;
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
 use crate::server_codec::{decode_mining_inbound, encode_mining_outbound, InboundMiningFrame};
 
@@ -192,7 +192,7 @@ struct Inner {
     // PPLNS stream (PPLNS-autoscaled) — every connection boots here before
     // its payout mode is resolved.
     template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<Arc<ActiveSV2Template>>>>,
+    current_template: Arc<Mutex<Option<Arc<ActiveTemplate>>>>,
     // Fixed-reservation alt streams (Solo / GroupSolo / Blockparty) keyed by
     // StreamKind — a connection switches onto one when its OpenChannel address
     // resolves to that mode. Each fed by its own translator off its TDP handle.
@@ -220,7 +220,7 @@ struct Inner {
 /// boots from. Mirrors the PPLNS stream's `template_tx` / `current_template`.
 struct AltStream {
     template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<Arc<ActiveSV2Template>>>>,
+    current_template: Arc<Mutex<Option<Arc<ActiveTemplate>>>>,
 }
 
 /// A single connection's claim on one alt stream — its own broadcast receiver
@@ -229,7 +229,7 @@ struct AltStream {
 /// it swaps onto that stream.
 struct AltStreamHandle {
     rx: broadcast::Receiver<TemplateBroadcast>,
-    initial: Option<Arc<ActiveSV2Template>>,
+    initial: Option<Arc<ActiveTemplate>>,
 }
 
 impl StratumV2MiningServer {
@@ -261,7 +261,7 @@ impl StratumV2MiningServer {
     ) -> Self {
         let server_config = Arc::new(server_config);
         let (template_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
-        let current_template = Arc::new(Mutex::new(None::<Arc<ActiveSV2Template>>));
+        let current_template = Arc::new(Mutex::new(None::<Arc<ActiveTemplate>>));
         let cancel = CancellationToken::new();
 
         let translator_join = tokio::spawn(run_translator(
@@ -277,7 +277,7 @@ impl StratumV2MiningServer {
         let mut alt_joins = Vec::with_capacity(alt_streams.len());
         for (kind, alt_updates_rx, alt_initial_snapshot) in alt_streams {
             let (alt_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
-            let alt_current = Arc::new(Mutex::new(None::<Arc<ActiveSV2Template>>));
+            let alt_current = Arc::new(Mutex::new(None::<Arc<ActiveTemplate>>));
             alt_joins.push(tokio::spawn(run_translator(
                 alt_updates_rx,
                 alt_initial_snapshot,
@@ -319,7 +319,7 @@ impl StratumV2MiningServer {
 
     /// Snapshot of the latest assembled template. `None` until the
     /// translator pairs its first `NewTemplate` + `SetNewPrevHash`.
-    pub fn current_template(&self) -> Option<Arc<ActiveSV2Template>> {
+    pub fn current_template(&self) -> Option<Arc<ActiveTemplate>> {
         self.inner
             .current_template
             .lock()
@@ -461,7 +461,7 @@ impl StratumV2MiningServer {
 
 // ── Translator task ─────────────────────────────────────────────────
 
-/// Consume TDP updates, feed an `SV2TemplateAssembler`, re-broadcast
+/// Consume TDP updates, feed a `TemplateAssembler`, re-broadcast
 /// the resulting `(template, change)` pairs. Maintains
 /// `current_template` so freshly-accepted connections boot from the
 /// most recent state without waiting for the next TDP message.
@@ -474,20 +474,17 @@ async fn run_translator(
     mut updates_rx: broadcast::Receiver<TemplateUpdate>,
     initial_snapshot: bp_template_distribution::TemplateSnapshot,
     template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<Arc<ActiveSV2Template>>>>,
+    current_template: Arc<Mutex<Option<Arc<ActiveTemplate>>>>,
     job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
 ) {
-    let mut assembler = SV2TemplateAssembler::new();
+    let mut assembler = TemplateAssembler::<ActiveTemplate>::new();
 
     // Bootstrap the assembler from the TdpHandle snapshot — same race
     // as SV1: the bitcoin-core startup pair is broadcast by bridge_out
     // BEFORE this per-server subscriber installs. The handle's internal
     // tap captures the pair into the snapshot so we can replay it here.
-    if let Some((active, change)) = bp_template_distribution::bootstrap_assembler_from_snapshot(
-        &mut assembler,
-        initial_snapshot,
-    ) {
+    if let Some((active, change)) = assembler.bootstrap_from_snapshot(initial_snapshot) {
         // Wrap once; the snapshot store and every broadcast subscriber
         // then share this allocation via Arc refcounting.
         let active = Arc::new(active);
@@ -562,7 +559,7 @@ async fn run_mining_connection(
     hooks: MiningServerHooks,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     mut template_rx: broadcast::Receiver<TemplateBroadcast>,
-    initial_template: Option<Arc<ActiveSV2Template>>,
+    initial_template: Option<Arc<ActiveTemplate>>,
     mut alt_streams: HashMap<StreamKind, AltStreamHandle>,
     extranonce: ConnectionExtranonce,
     job_cache: Arc<MiningJobCache>,
@@ -1535,7 +1532,7 @@ async fn run_vardiff_check(
 async fn resolve_template_mining_job_inputs(
     address: &Option<AddressId>,
     server_config: &ServerConfig,
-    template: &ActiveSV2Template,
+    template: &ActiveTemplate,
     hooks: &MiningServerHooks,
     job_cache: &Arc<MiningJobCache>,
 ) -> Result<Option<MiningJobInputs>, MiningJobError> {
@@ -2484,8 +2481,8 @@ mod tests {
 
     // ── resolve_template_mining_job_inputs ────────────────────────
 
-    fn active_template_fixture() -> ActiveSV2Template {
-        ActiveSV2Template {
+    fn active_template_fixture() -> ActiveTemplate {
+        ActiveTemplate {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],

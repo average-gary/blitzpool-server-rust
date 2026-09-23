@@ -73,7 +73,8 @@ use super::submit::{
     ShareAccept, ShareReject, ShareValidation, StandardJobContext, SubmitSharesExtendedInput,
     SubmitSharesStandardInput,
 };
-use super::translator::{TemplateBroadcast, TemplateChange};
+use super::translator::TemplateBroadcast;
+use bp_template_distribution::TemplateChange;
 
 // ── SetupConnection flags ──────────────────────────────────────────
 // (BIP-310 / SV2 Mining/SetupConnection Flags for Mining Protocol)
@@ -3241,7 +3242,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             difficulty: channel.session_difficulty,
             // Custom (JDC-declared) job: derive the block-found gate's network
             // difficulty from the declared job's own n_bits (no pool template).
-            network_difficulty: crate::mining::translator::network_difficulty_from_n_bits(
+            network_difficulty: bp_template_distribution::network_difficulty_from_n_bits(
                 input.n_bits,
             ),
             // No pool template → no reward to thread; the JDC builds and
@@ -4910,8 +4911,9 @@ pub(crate) mod tests {
 
     // ── apply_template_broadcast ───────────────────────────────────
 
-    use crate::mining::translator::{ActiveSV2Template, TemplateBroadcast, TemplateChange};
+    use crate::mining::translator::TemplateBroadcast;
     use bp_mining_job::PayoutEntry;
+    use bp_template_distribution::{ActiveTemplate, TemplateChange};
 
     fn payouts() -> Vec<PayoutEntry> {
         vec![PayoutEntry {
@@ -4956,8 +4958,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn active_template(template_id: u64, prev: [u8; 32]) -> ActiveSV2Template {
-        ActiveSV2Template {
+    fn active_template(template_id: u64, prev: [u8; 32]) -> ActiveTemplate {
+        ActiveTemplate {
             template_id,
             version: 0x2000_0000,
             prev_hash: prev,

@@ -12,7 +12,7 @@
 //! 2. **Translator task** — consumes
 //!    [`bp_template_distribution::TemplateUpdate`] from a
 //!    `broadcast::Receiver` (= `TdpHandle::subscribe()` in production),
-//!    feeds them to an [`SV1TemplateAssembler`], and re-broadcasts the
+//!    feeds them to a [`TemplateAssembler`], and re-broadcasts the
 //!    resulting `(ActiveSV1Template, TemplateChange)` pairs to every
 //!    per-connection task. Also maintains a `Mutex<Option<ActiveSV1Template>>`
 //!    snapshot so freshly-accepted connections can boot from the current
@@ -60,8 +60,9 @@ use crate::client::{
 use crate::config::{PortConfig, ServerConfig};
 use crate::hooks::ServerHooks;
 use crate::jobs::JobRegistry;
-use crate::notify::{ActiveSV1Template, SV1TemplateAssembler, TemplateChange};
+use crate::notify::ActiveSV1Template;
 use bp_mining_job::{MiningJobCache, ResolvedPayouts};
+use bp_template_distribution::{TemplateAssembler, TemplateChange};
 use bp_vardiff::{Clock, SystemClock};
 
 /// Pool-wide (across every SV1 port) collision-free extranonce1 allocator
@@ -221,7 +222,7 @@ struct AltStreamHandle {
 impl StratumV1Server {
     /// Spawn the server. `updates_rx` is typically
     /// `tdp_handle.subscribe()`; the translator drives an internal
-    /// [`SV1TemplateAssembler`] and re-broadcasts pair-completed
+    /// [`TemplateAssembler`] and re-broadcasts pair-completed
     /// templates.
     ///
     /// `initial_snapshot` should be the result of
@@ -416,7 +417,7 @@ impl StratumV1Server {
 
 // ── Translator task ──────────────────────────────────────────────────
 
-/// Consume TDP updates, feed an `SV1TemplateAssembler`, and re-broadcast
+/// Consume TDP updates, feed a `TemplateAssembler`, and re-broadcast
 /// the resulting `(template, change)` pairs. Maintains
 /// `current_template` so freshly-accepted connections can boot from the
 /// most recent state without waiting for the next TDP message.
@@ -432,7 +433,7 @@ async fn run_translator(
     job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
 ) {
-    let mut assembler = SV1TemplateAssembler::new();
+    let mut assembler = TemplateAssembler::<ActiveSV1Template>::new();
 
     // Bootstrap the assembler from the TdpHandle snapshot. The handle's
     // internal tap subscribes BEFORE the worker thread starts so it
@@ -442,10 +443,7 @@ async fn run_translator(
     // takes long enough that bridge_out emits the pair before this
     // subscribe gets installed. Without the bootstrap, current_template
     // stays None until the next on-chain block arrives.
-    if let Some((active, change)) = bp_template_distribution::bootstrap_assembler_from_snapshot(
-        &mut assembler,
-        initial_snapshot,
-    ) {
+    if let Some((active, change)) = assembler.bootstrap_from_snapshot(initial_snapshot) {
         // Wrap once; the snapshot store and every broadcast subscriber
         // then share this allocation via Arc refcounting.
         let active = Arc::new(active);
@@ -1478,14 +1476,14 @@ mod tests {
         use bp_mining_job::{
             build_mining_job_from_tdp, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
         };
-        let active = ActiveSV1Template {
+        let active = ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 42,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
             header_timestamp: 0x65a1_b2c3,
             network_target: [0xff; 32],
-            network_difficulty: 1.0,
+            network_difficulty: bp_share::Difficulty(1.0),
             coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -1500,12 +1498,7 @@ mod tests {
             coinbase_tx_outputs_count: 1,
             coinbase_tx_locktime: 0,
             merkle_path: vec![[0x11; 32]],
-            merkle_branch_hex: vec![],
-            prev_hash_hex: String::new(),
-            version_hex: String::new(),
-            n_bits_hex: String::new(),
-            header_timestamp_hex: String::new(),
-        };
+        });
         let template = TdpCoinbaseTemplate {
             coinbase_prefix: &active.coinbase_prefix,
             coinbase_tx_version: active.coinbase_tx_version,

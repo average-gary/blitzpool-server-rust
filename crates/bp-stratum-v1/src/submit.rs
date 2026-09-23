@@ -502,7 +502,7 @@ pub fn validate_submit(
     // 7. Accepted. Block-find gate uses the (unclamped) submission diff
     // against the network diff — a stale-creditable hit during a reorg
     // can still find a valid alternative tip.
-    let is_block_candidate = submission_difficulty >= lookup.template.network_difficulty;
+    let is_block_candidate = submission_difficulty >= lookup.template.network_difficulty.as_f64();
     // Block found marker at
     // INFO when the share also clears network diff. Always-on, no
     // debug flag — block events are too important to gate.
@@ -513,7 +513,7 @@ pub fn validate_submit(
             height = lookup.template.template_id,
             "🎉🎉🎉 !!! BLOCK FOUND !!! (SV1) — submission_diff={:.2}, network_diff={:.2}",
             submission_difficulty,
-            lookup.template.network_difficulty
+            lookup.template.network_difficulty.as_f64()
         );
     } else if session.share_logs {
         // Per-share accept trace, gated by `stratum_share_logs`.
@@ -637,14 +637,14 @@ mod tests {
     }
 
     fn template_with_network_diff(network_difficulty: f64) -> ActiveSV1Template {
-        ActiveSV1Template {
+        ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
             header_timestamp: 0x65a1_b2c3,
             network_target: [0xFF; 32],
-            network_difficulty,
+            network_difficulty: bp_share::Difficulty(network_difficulty),
             coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -659,12 +659,7 @@ mod tests {
             coinbase_tx_outputs_count: 1,
             coinbase_tx_locktime: 0,
             merkle_path: vec![[0x11; 32]],
-            merkle_branch_hex: vec![],
-            prev_hash_hex: String::new(),
-            version_hex: String::new(),
-            n_bits_hex: String::new(),
-            header_timestamp_hex: String::new(),
-        }
+        })
     }
 
     fn mining_job_from(active: &ActiveSV1Template) -> MiningJob {
@@ -980,7 +975,8 @@ mod tests {
 
         let reg = JobRegistry::from_server_config(&server_config());
         let mut active = template_with_network_diff(1.0);
-        active.version = DIRTY_TEMPLATE;
+        active.template.version = DIRTY_TEMPLATE;
+        active.recompute_notify_header_hex();
         let tid = reg.add_template(active.clone(), 1_000);
         let jid = reg.add_job(mining_job_from(&active), tid, 1_000);
 

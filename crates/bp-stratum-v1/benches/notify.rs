@@ -75,22 +75,17 @@ fn make_job() -> MiningJob {
     .expect("build_mining_job")
 }
 
-/// A realistic active template with the header hex cache populated the way the
-/// production constructor does. `recompute_notify_header_hex` is `pub(crate)`
-/// and this bench is a separate crate, so it can't call it and must fill the
-/// cache by hand below — **the encoding here MUST mirror
-/// `ActiveSV1Template::recompute_notify_header_hex` exactly** (prev_hash
-/// word-swap + `{:08x}` padding); if that convention changes, update both or
-/// the bench silently measures a frame shape production no longer emits.
+/// A realistic active template, its hex caches derived the way production
+/// derives them.
 fn make_template(merkle_depth: usize) -> ActiveSV1Template {
-    let mut t = ActiveSV1Template {
+    ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
         template_id: 1,
         version: 0x2000_0000,
         prev_hash: [0x11; 32],
         n_bits: 0x1d00_ffff,
         header_timestamp: 0x6500_0001,
         network_target: [0xFF; 32],
-        network_difficulty: 1.0,
+        network_difficulty: bp_share::Difficulty(1.0),
         coinbase_prefix: vec![0xAA; 64],
         coinbase_tx_version: 2,
         coinbase_tx_input_sequence: 0xffff_ffff,
@@ -99,19 +94,7 @@ fn make_template(merkle_depth: usize) -> ActiveSV1Template {
         coinbase_tx_outputs_count: 1,
         coinbase_tx_locktime: 0,
         merkle_path: vec![[0x33; 32]; merkle_depth],
-        merkle_branch_hex: (0..merkle_depth)
-            .map(|_| hex::encode([0x33u8; 32]))
-            .collect(),
-        prev_hash_hex: String::new(),
-        version_hex: String::new(),
-        n_bits_hex: String::new(),
-        header_timestamp_hex: String::new(),
-    };
-    t.prev_hash_hex = hex::encode(swap_endian_words(&t.prev_hash));
-    t.version_hex = format!("{:08x}", t.version);
-    t.n_bits_hex = format!("{:08x}", t.n_bits);
-    t.header_timestamp_hex = format!("{:08x}", t.header_timestamp);
-    t
+    })
 }
 
 /// Allocations of one `build_notify_frame` call (cached header hex).

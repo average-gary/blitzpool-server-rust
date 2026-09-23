@@ -68,10 +68,7 @@ pub use hooks::{
     RejectedShareSink, ServerHooks, SessionPersistence,
 };
 pub use jobs::{lifecycle_from_server_config, JobClassification, JobLookup, JobRegistry};
-pub use notify::{
-    build_notify_frame, network_difficulty_from_n_bits, swap_endian_words, ActiveSV1Template,
-    SV1TemplateAssembler, TemplateChange,
-};
+pub use notify::{build_notify_frame, swap_endian_words, ActiveSV1Template};
 pub use server::{SharedExtranonce, StratumV1Server, TemplateBroadcast};
 pub use submit::{
     validate_submit, RejectReason, SessionContext, SessionShareCache, ShareAccept, ShareReject,

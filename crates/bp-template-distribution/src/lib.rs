@@ -47,6 +47,7 @@
 //! See `memory/project-tdp-direct-architecture.md` for the rationale and
 //! `MIGRATION_PLAN.md` §4 step 7b for the larger picture.
 
+mod assembler;
 mod config;
 mod error;
 mod handle;
@@ -54,6 +55,10 @@ mod message;
 mod tx_cache;
 mod worker;
 
+pub use assembler::{
+    network_difficulty_from_n_bits, ActiveFromTemplate, ActiveTemplate, TemplateAssembler,
+    TemplateChange,
+};
 pub use config::{
     TdpCoinbaseConstraints, TdpConfig, DEFAULT_BROADCAST_CAPACITY, DEFAULT_FEE_THRESHOLD,
     DEFAULT_MIN_INTERVAL_SECS, DEFAULT_RECONNECT_BACKOFF_SECS, DEFAULT_SUBMIT_CAPACITY,
@@ -61,8 +66,7 @@ pub use config::{
 pub use error::TdpError;
 pub use handle::TdpHandle;
 pub use message::{
-    apply_to_snapshot, bootstrap_assembler_from_snapshot, NewTemplate, RequestTransactionDataError,
-    RequestTransactionDataSuccess, SetNewPrevHash, TdpRequest, TemplateAssembler, TemplateSnapshot,
-    TemplateUpdate,
+    apply_to_snapshot, NewTemplate, RequestTransactionDataError, RequestTransactionDataSuccess,
+    SetNewPrevHash, TdpRequest, TemplateSnapshot, TemplateUpdate,
 };
 pub use tx_cache::{TemplateTxCache, DEFAULT_TEMPLATE_FIFO};

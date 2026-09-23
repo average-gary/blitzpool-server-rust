@@ -820,7 +820,7 @@ pub fn apply_vardiff_check<C: Clock>(
 // ── New-template event (server-driven; see translator in notify.rs) ──
 
 /// Push a fresh mining.notify when the assembler produces an
-/// [`crate::notify::TemplateChange`]. `clean_jobs` boolean is true on
+/// [`bp_template_distribution::TemplateChange`]. `clean_jobs` boolean is true on
 /// `SetNewPrevHash`, false on `NewTemplate(future=false)` refreshes.
 ///
 /// Side-effects:
@@ -971,14 +971,14 @@ mod tests {
     /// mined — no handshake, or no template ever issued. Tests that want a
     /// retarget have to satisfy both.
     fn mineable_template() -> Arc<ActiveSV1Template> {
-        let mut t = ActiveSV1Template {
+        let t = ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
             header_timestamp: 0x65a1_b2c3,
             network_target: [0xFF; 32],
-            network_difficulty: 1.0,
+            network_difficulty: bp_share::Difficulty(1.0),
             coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -987,13 +987,7 @@ mod tests {
             coinbase_tx_outputs_count: 0,
             coinbase_tx_locktime: 0,
             merkle_path: vec![],
-            merkle_branch_hex: vec![],
-            prev_hash_hex: String::new(),
-            version_hex: String::new(),
-            n_bits_hex: String::new(),
-            header_timestamp_hex: String::new(),
-        };
-        t.recompute_notify_header_hex();
+        });
         Arc::new(t)
     }
 
@@ -1061,14 +1055,14 @@ mod tests {
     }
 
     fn template_for_regtest() -> ActiveSV1Template {
-        let mut active = ActiveSV1Template {
+        ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x207f_ffff, // regtest easy bits
             header_timestamp: 1_700_000_000,
             network_target: [0xff; 32],
-            network_difficulty: 1.0,
+            network_difficulty: bp_share::Difficulty(1.0),
             coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -1083,18 +1077,7 @@ mod tests {
             coinbase_tx_outputs_count: 1,
             coinbase_tx_locktime: 0,
             merkle_path: vec![[0x11; 32]],
-            merkle_branch_hex: vec![
-                "1111111111111111111111111111111111111111111111111111111111111111".into(),
-            ],
-            prev_hash_hex: String::new(),
-            version_hex: String::new(),
-            n_bits_hex: String::new(),
-            header_timestamp_hex: String::new(),
-        };
-        // Sync the header-hex cache the way the production constructor does —
-        // build_notify_frame borrows it and its debug guard rejects a stale one.
-        active.recompute_notify_header_hex();
-        active
+        })
     }
 
     // Real regtest bech32 — accepted by `address_to_script(Network::Regtest, ...)`.
