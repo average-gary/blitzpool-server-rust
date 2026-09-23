@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! BTC address → scriptPubKey derivation. Normalization lives in
-//! [`bp_common::normalize_btc_address`].
+//! `bp_common::normalize_btc_address`.
 
 use std::str::FromStr;
 
