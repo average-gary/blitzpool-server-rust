@@ -182,6 +182,9 @@ pub(crate) async fn spawn(
     ));
     let live_publisher = crate::live_sessions::spawn_publisher(Arc::clone(&live_sessions));
 
+    let (sv1_device_status, sv2_device_status) =
+        crate::device_status::stratum_sinks(gate, foundation.redis.clone());
+
     let sv1_servers = stratum_v1::build_per_port_servers(
         cfg,
         foundation,
@@ -189,7 +192,7 @@ pub(crate) async fn spawn(
         group_service,
         sv1_resolver,
         dispatcher.clone(),
-        gate.clone(),
+        sv1_device_status,
         Arc::clone(&live_sessions),
         job_cache.clone(),
         settle.clone(),
@@ -209,7 +212,7 @@ pub(crate) async fn spawn(
         sv2_resolver,
         custom_extranonce,
         dispatcher,
-        gate,
+        sv2_device_status,
         Arc::clone(&live_sessions),
         job_cache,
         settle,
@@ -397,8 +400,48 @@ async fn peek_first_byte(socket: &TcpStream) -> std::io::Result<Option<u8>> {
     }
 }
 
-// Silence the `Arc` import warning when no other module needs it.
-fn _silence_arc<T>(_: Arc<T>) {}
+/// One Stratum port's template subscriptions: the default stream plus every
+/// alt stream, each with the snapshot that covers what the broadcast missed.
+/// SV1 and SV2 build their per-port servers from the same set.
+pub(crate) struct PortTemplates {
+    pub(crate) updates_rx:
+        tokio::sync::broadcast::Receiver<bp_template_distribution::TemplateUpdate>,
+    pub(crate) initial_snapshot: bp_template_distribution::TemplateSnapshot,
+    pub(crate) alt_streams: Vec<(
+        bp_common::StreamKind,
+        tokio::sync::broadcast::Receiver<bp_template_distribution::TemplateUpdate>,
+        bp_template_distribution::TemplateSnapshot,
+    )>,
+}
+
+impl PortTemplates {
+    /// Subscribe BEFORE snapshotting: anything broadcast between the two ends
+    /// up in both, and the assembler dedupes on template_id. The snapshot
+    /// covers the bitcoin-core bootstrap pair (NewTemplate + SetNewPrevHash)
+    /// the broadcast usually sends before a per-port subscriber exists; see
+    /// `feedback-tdp-initial-template-drain` for the race.
+    ///
+    /// Every port carries ALL alt streams — mode is per-address, not per-port,
+    /// so a Group-Solo / Blockparty member can connect on any port and must be
+    /// routable onto its stream.
+    pub(crate) fn subscribe(
+        tdp: &bp_template_distribution::TdpHandle,
+        foundation: &FoundationHandles,
+    ) -> Self {
+        let updates_rx = tdp.subscribe();
+        let initial_snapshot = tdp.current_snapshot();
+        let alt_streams = foundation
+            .alt_tdp
+            .iter()
+            .map(|(kind, handle)| (*kind, handle.subscribe(), handle.current_snapshot()))
+            .collect();
+        Self {
+            updates_rx,
+            initial_snapshot,
+            alt_streams,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -138,6 +138,35 @@ fn build_event(
     })
 }
 
+/// The device-status sink Stratum feeds, handed to both protocols. With an
+/// in-process dispatcher (a front co-located with the `notify` role) events
+/// go straight to its gate; without one the front publishes to the
+/// `device:status` stream so the Satellite fans them out — never a silent
+/// drop. Stratum only spawns on the front, so no `gate` means "no co-located
+/// dispatcher", not "notifications off".
+///
+/// One instance serves both protocols: it holds only shared handles (the
+/// gate `Arc`, the stream producer), so neither side can end up wired to the
+/// other destination.
+pub(crate) fn stratum_sinks(
+    gate: Option<(
+        Arc<crate::device_status_gate::Gate>,
+        crate::device_status_gate::SubscribedAddresses,
+    )>,
+    redis: ConnectionManager,
+) -> (Arc<dyn Sv1DeviceStatusSink>, Arc<dyn Sv2DeviceStatusSink>) {
+    match gate {
+        Some((gate, subscribers)) => {
+            let sink = Arc::new(DispatcherDeviceStatusSink::new(gate, subscribers));
+            (sink.clone(), sink)
+        }
+        None => {
+            let sink = Arc::new(ProducingDeviceStatusSink::new(redis));
+            (sink.clone(), sink)
+        }
+    }
+}
+
 /// Feeds both SV1 + SV2 device-status events into the shared
 /// [`Gate`](crate::device_status_gate::Gate). Cheap to clone
 /// (`Arc`-internal).

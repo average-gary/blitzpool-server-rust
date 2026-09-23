@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bp_common::{AddressId, MiningMode, StreamKind};
+use bp_common::{AddressId, MiningMode};
 use bp_config::AppConfig;
 use bp_group_mgmt_engine::{GroupService, GroupServiceHooks};
 use bp_mining_mode::MiningModeResult;
@@ -101,10 +101,7 @@ pub(crate) fn build_per_port_servers(
     group_service: &SharedGroupService,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
-    gate: Option<(
-        Arc<crate::device_status_gate::Gate>,
-        crate::device_status_gate::SubscribedAddresses,
-    )>,
+    device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
     settle: crate::settlement::SettlementSignal,
@@ -143,20 +140,6 @@ pub(crate) fn build_per_port_servers(
     }
 
     let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
-    // Phase 7.7: device-status sink forwards Authorized/Disconnect events. With
-    // an in-process dispatcher (a front co-located with the `notify` role) it
-    // fires directly; without one the front publishes to the `device:status`
-    // stream so the Satellite can fan it out — never a silent drop. (Stratum
-    // only spawns on the front, so `None` here means "no co-located dispatcher",
-    // not "notifications off".)
-    let device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink> = match gate {
-        Some((g, subs)) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
-            g, subs,
-        )),
-        None => Arc::new(crate::device_status::ProducingDeviceStatusSink::new(
-            foundation.redis.clone(),
-        )),
-    };
     let mut out: Vec<Sv1PortServer> = Vec::with_capacity(port_configs.len());
 
     // One pool-wide extranonce1 allocator shared across every SV1 port, so
@@ -172,33 +155,16 @@ pub(crate) fn build_per_port_servers(
             payout_resolver.clone(),
             engines,
             lookup.clone(),
-            engines.mode_gate.clone(),
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
         );
 
-        // Subscribe BEFORE snapshotting — anything broadcast between the
-        // two ends up in both, the assembler dedupes on template_id.
-        // Snapshot covers the bitcoin-core bootstrap pair (NewTemplate +
-        // SetNewPrevHash) that bridge_out usually broadcasts BEFORE the
-        // per-port subscriber here exists; the broadcast misses it but
-        // TdpHandle's internal tap-task captures it into the snapshot.
-        // See `feedback-tdp-initial-template-drain` for the race.
-        let updates_rx = tdp.subscribe();
-        let initial_snapshot = tdp.current_snapshot();
-        // Every port carries ALL alt streams — mode is per-address, not
-        // per-port, so a Group-Solo / Blockparty member can connect on any
-        // port and must be routable onto its stream.
-        let alt_streams: Vec<(StreamKind, _, _)> = foundation
-            .alt_tdp
-            .iter()
-            .map(|(kind, handle)| (*kind, handle.subscribe(), handle.current_snapshot()))
-            .collect();
+        let templates = crate::stratum::PortTemplates::subscribe(tdp, foundation);
         let server = StratumV1Server::spawn(
             server_config.clone(),
-            updates_rx,
-            initial_snapshot,
-            alt_streams,
+            templates.updates_rx,
+            templates.initial_snapshot,
+            templates.alt_streams,
             hooks,
             extranonce.clone(),
             job_cache.clone(),
@@ -298,7 +264,6 @@ fn build_port_hooks(
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
-    mode_gate: Arc<BlitzpoolModeGate>,
     device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> ServerHooks {
@@ -317,19 +282,12 @@ fn build_port_hooks(
             .expect("front mode builds the rejected composite"),
     );
 
-    let blockparty_lookup: Option<Arc<dyn BlockpartyAdminLookup>> = engines
-        .blockparty
-        .clone()
-        .map(|bp| Arc::new(BlockpartyApiAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
-    let mode_gate_persistence: Arc<dyn SharedSessionPersistence> =
-        Arc::new(ModeGatePopulatingPersistence::new(
-            port_payout_mode,
-            mode_gate,
-            group_lookup,
-            blockparty_lookup,
-            live_sessions,
-        ));
-    let session = Sv1SessionPersistenceAdapter::new(mode_gate_persistence);
+    let session = Sv1SessionPersistenceAdapter::new(ModeGatePopulatingPersistence::for_port(
+        port_payout_mode,
+        engines,
+        group_lookup,
+        live_sessions,
+    ));
 
     ServerHooks {
         block_sink,
@@ -397,8 +355,10 @@ impl BlockpartyAdminLookup for BlockpartyApiAdminLookup {
 /// `MiningModeResult` into the shared [`BlitzpoolModeGate`].
 ///
 /// **Per-port** — the `port_payout_mode` field captures the fallback
-/// mode for addresses that aren't in any active group. Each of the
-/// 4 SV1 ports gets its own instance.
+/// mode for addresses that aren't in any active group. Every port gets
+/// its own instance per protocol, built by [`Self::for_port`]: SV1 and
+/// SV2 must not share one, because `sessions` is keyed by session ids
+/// each protocol mints on its own.
 ///
 /// **session→address tracking**: the SV1
 /// `SessionPersistence::deregister_session` API only carries the
@@ -418,6 +378,28 @@ pub(crate) struct ModeGatePopulatingPersistence {
 }
 
 impl ModeGatePopulatingPersistence {
+    /// The instance a Stratum port registers its sessions through — the one
+    /// place the SV1 and SV2 port builders get it from, so the two cannot
+    /// resolve a connection's mode from different inputs.
+    pub(crate) fn for_port(
+        port_payout_mode: MiningMode,
+        engines: &EngineHandles,
+        group_lookup: Arc<dyn GroupLookup>,
+        live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
+    ) -> Arc<dyn SharedSessionPersistence> {
+        let blockparty: Option<Arc<dyn BlockpartyAdminLookup>> = engines
+            .blockparty
+            .clone()
+            .map(|bp| Arc::new(BlockpartyApiAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
+        Arc::new(Self::new(
+            port_payout_mode,
+            engines.mode_gate.clone(),
+            group_lookup,
+            blockparty,
+            live_sessions,
+        ))
+    }
+
     pub(crate) fn new(
         port_payout_mode: MiningMode,
         mode_gate: Arc<BlitzpoolModeGate>,
