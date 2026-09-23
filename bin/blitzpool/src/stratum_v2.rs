@@ -36,12 +36,10 @@
 
 use std::sync::{Arc, RwLock};
 
-use bitcoin::Network as BitcoinNetwork;
 use bp_common::{MiningMode, StreamKind};
-use bp_config::{AppConfig, Role};
+use bp_config::AppConfig;
 use bp_share::Difficulty;
 use bp_share_hook::SharedSessionPersistence;
-use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
 use bp_stratum_v2::hooks::{
@@ -140,26 +138,13 @@ pub(crate) fn build_noise_config(cfg: &AppConfig) -> Result<NoiseConfig, Stratum
 /// Build the SV2 [`ServerConfig`](Sv2ServerConfig) from the network +
 /// pool identifier in the toplevel `AppConfig`.
 pub(crate) fn build_server_config(cfg: &AppConfig) -> Sv2ServerConfig {
-    let network = config_network_to_bitcoin(cfg.network);
+    let network = crate::boot::bitcoin_network(cfg.network);
     let mut sc = Sv2ServerConfig::defaults_for(network);
     sc.pool_identifier = cfg.pool_identifier.clone();
     sc.debug_messages = cfg.debug.stratum_wire_logs;
     sc.share_logs = cfg.debug.stratum_share_logs;
     sc.log_submit_latency = cfg.debug.submit_latency;
     sc
-}
-
-pub(crate) fn config_network_to_bitcoin(n: bp_config::Network) -> BitcoinNetwork {
-    match n {
-        bp_config::Network::Mainnet => BitcoinNetwork::Bitcoin,
-        // testnet4 shares the `tb` HRP + address byte set with
-        // testnet3, so the bitcoin-crate's Testnet variant covers
-        // both for address parsing / script generation purposes.
-        // rust-bitcoin 0.32 doesn't have a dedicated Testnet4
-        // variant yet.
-        bp_config::Network::Testnet | bp_config::Network::Testnet4 => BitcoinNetwork::Testnet,
-        bp_config::Network::Regtest => BitcoinNetwork::Regtest,
-    }
 }
 
 /// Build one [`StratumV2MiningServer`] per SV1 port (so SV1 and SV2
@@ -193,7 +178,7 @@ pub(crate) fn build_per_port_servers(
     };
 
     let server_config = build_server_config(cfg);
-    let network = config_network_to_bitcoin(cfg.network);
+    let network = crate::boot::bitcoin_network(cfg.network);
     // Use SV1's port enumeration as the canonical port list (same TCP
     // listener serves SV1 + SV2 — protocol-detect dispatches in
     // `crate::stratum`).
@@ -204,31 +189,15 @@ pub(crate) fn build_per_port_servers(
     // fan-out. The SV2 ShareAccept now carries the per-job pinned
     // `coinbase_tx_value_remaining`, so the engine ledger-write fires for
     // SV2-found blocks just like SV1; the dispatcher notification fires too.
-    let mut sink = crate::block_sink::TdpBlockSubmissionSink::new(tdp.clone())
-        .with_network(network)
-        .with_alt_streams(foundation.alt_tdp.clone())
-        .with_fanout(
-            mode_gate.clone(),
-            engines.pplns.clone(),
-            engines.group_solo.clone(),
-            dispatcher.clone(),
-            foundation.bitcoin_rpc.clone(),
-        )
-        .with_blockparty(engines.blockparty.clone())
-        .with_pool(foundation.db.pool().clone())
-        .with_redis(foundation.redis.clone())
-        .with_settle_handle(settle);
-    // The front routes block-found events to the stream — the payout Satellite
-    // applies the ledger and the notify Satellite fans out the push. A front
-    // always produces (front + payout can't share a process; see the boot
-    // guard in main.rs), so this gates on the front role alone.
-    if cfg.has_role(Role::Front) {
-        sink = sink.with_block_found_producer(StreamProducer::new(
-            foundation.redis.clone(),
-            BLOCK_FOUND_STREAM_KEY,
-        ));
-    }
-    let block_sink: Arc<dyn Sv2BlockSink> = sink.into_sv2_arc();
+    let block_sink: Arc<dyn Sv2BlockSink> = crate::block_sink::TdpBlockSubmissionSink::wired(
+        tdp.clone(),
+        cfg,
+        foundation,
+        engines,
+        dispatcher.clone(),
+        settle,
+    )
+    .into_sv2_arc();
 
     // Device-status sink. Forwards ChannelOpened / ChannelClosed.
     // With an in-process dispatcher (a front co-located with the `notify` role)

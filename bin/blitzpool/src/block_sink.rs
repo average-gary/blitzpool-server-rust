@@ -45,10 +45,11 @@ use async_trait::async_trait;
 use bp_bitcoin::BitcoinRpc;
 use bp_coinbase_snapshot::ActualCoinbase;
 use bp_common::{AddressId, MiningMode, StreamKind};
+use bp_config::{AppConfig, Role};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_notifications::dispatcher::NotificationDispatcher;
 use bp_pplns_engine::engine::PplnsEngine;
-use bp_share_stream::StreamProducer;
+use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
 use bp_stratum_v1::{BlockSubmissionSink as Sv1BlockSubmissionSink, ShareAccept as Sv1ShareAccept};
 use bp_stratum_v2::hooks::BlockSubmissionSink as Sv2BlockSubmissionSink;
 use bp_stratum_v2::mining::submit::ShareAccept as Sv2ShareAccept;
@@ -57,7 +58,8 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
-use crate::engines::BlitzpoolModeGate;
+use crate::boot::FoundationHandles;
+use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::pending_blocks::{put_pending_block, PendingBlock, PendingGroup};
 
 /// Accounting inputs for a found block, bundled so the block-found fan-out
@@ -279,6 +281,50 @@ impl TdpBlockSubmissionSink {
             applier: BlockFoundApplier::default(),
             block_found_producer: None,
             network: bitcoin::Network::Bitcoin,
+        }
+    }
+
+    /// The sink as the binary wires it: the ONE way SV1, SV2 and the JDP
+    /// ledger booker build theirs, so a block books the same way whichever of
+    /// them found it. They used to be three hand-copied builder chains, and
+    /// the JDP copy had lost `with_settle_handle` — a block it booked on the
+    /// immediate path (parking failed) never invalidated the published
+    /// distributions.
+    ///
+    /// On the front the sink also produces onto the block-found stream: the
+    /// payout satellite applies the ledger and the notify satellite fans out
+    /// the push. A front always produces (front + payout can't share a
+    /// process; see the boot guard in main.rs), so this gates on the front
+    /// role alone.
+    pub(crate) fn wired(
+        tdp: TdpHandle,
+        cfg: &AppConfig,
+        foundation: &FoundationHandles,
+        engines: &EngineHandles,
+        dispatcher: Option<Arc<NotificationDispatcher>>,
+        settle: crate::settlement::SettlementSignal,
+    ) -> Self {
+        let sink = Self::new(tdp)
+            .with_network(crate::boot::bitcoin_network(cfg.network))
+            .with_alt_streams(foundation.alt_tdp.clone())
+            .with_fanout(
+                engines.mode_gate.clone(),
+                engines.pplns.clone(),
+                engines.group_solo.clone(),
+                dispatcher,
+                foundation.bitcoin_rpc.clone(),
+            )
+            .with_blockparty(engines.blockparty.clone())
+            .with_pool(foundation.db.pool().clone())
+            .with_redis(foundation.redis.clone())
+            .with_settle_handle(settle);
+        if cfg.has_role(Role::Front) {
+            sink.with_block_found_producer(StreamProducer::new(
+                foundation.redis.clone(),
+                BLOCK_FOUND_STREAM_KEY,
+            ))
+        } else {
+            sink
         }
     }
 

@@ -350,6 +350,18 @@ const TDP_COINBASE_SIZE_HEADROOM_BYTES: u32 = 256;
 /// This conversion couples the trimmer's budget to the IPC-advertised
 /// constraint so the two can never drift apart through a TOML edit on one
 /// side alone.
+/// The `bitcoin` network a configured [`bp_config::Network`] parses and
+/// builds addresses for. testnet4 shares the `tb` HRP and address bytes with
+/// testnet3, and rust-bitcoin 0.32 has no Testnet4 variant, so both map to
+/// `Testnet`.
+pub(crate) fn bitcoin_network(n: bp_config::Network) -> bitcoin::Network {
+    match n {
+        bp_config::Network::Mainnet => bitcoin::Network::Bitcoin,
+        bp_config::Network::Testnet | bp_config::Network::Testnet4 => bitcoin::Network::Testnet,
+        bp_config::Network::Regtest => bitcoin::Network::Regtest,
+    }
+}
+
 /// Derive the bitcoin-core `CoinbaseOutputConstraints` for a given coinbase
 /// weight budget. **Single source of truth** for the budget→reservation
 /// mapping — both the boot path and the runtime autoscaler
@@ -479,6 +491,15 @@ fn spawn_metrics(cfg: &bp_config::MetricsConfig) -> Option<MetricsServiceHandle>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_network_maps_to_bitcoin_network() {
+        use bp_config::Network as Config;
+        assert_eq!(bitcoin_network(Config::Mainnet), bitcoin::Network::Bitcoin);
+        assert_eq!(bitcoin_network(Config::Testnet), bitcoin::Network::Testnet);
+        assert_eq!(bitcoin_network(Config::Testnet4), bitcoin::Network::Testnet);
+        assert_eq!(bitcoin_network(Config::Regtest), bitcoin::Network::Regtest);
+    }
 
     #[test]
     fn pg_url_build_round_trips_simple_values() {

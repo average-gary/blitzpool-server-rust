@@ -986,32 +986,19 @@ async fn main() -> ExitCode {
                     None
                 };
                 // Ledger fan-out for JDC-found blocks. Its own sink instance
-                // (all cheap handle clones) wired exactly like the Stratum
-                // ones, so a declared block books through the same path a
-                // pool-built one does.
-                let jdp_ledger_booker = {
-                    let mut sink =
-                        crate::block_sink::TdpBlockSubmissionSink::new(tdp_handle.clone())
-                            .with_network(crate::stratum_v2::config_network_to_bitcoin(cfg.network))
-                            .with_fanout(
-                                engines.mode_gate.clone(),
-                                engines.pplns.clone(),
-                                engines.group_solo.clone(),
-                                dispatcher.clone(),
-                                handles.bitcoin_rpc.clone(),
-                            )
-                            .with_blockparty(engines.blockparty.clone())
-                            .with_pool(handles.db.pool().clone())
-                            .with_redis(handles.redis.clone());
-                    if is_front {
-                        sink =
-                            sink.with_block_found_producer(bp_share_stream::StreamProducer::new(
-                                handles.redis.clone(),
-                                bp_share_stream::BLOCK_FOUND_STREAM_KEY,
-                            ));
-                    }
-                    Some(std::sync::Arc::new(sink))
-                };
+                // (all cheap handle clones), built by the same constructor as
+                // the Stratum ones, so a declared block books through the same
+                // path a pool-built one does.
+                let jdp_ledger_booker = Some(std::sync::Arc::new(
+                    crate::block_sink::TdpBlockSubmissionSink::wired(
+                        tdp_handle.clone(),
+                        &cfg,
+                        &handles,
+                        &engines,
+                        dispatcher.clone(),
+                        settle_signal.clone(),
+                    ),
+                ));
                 let jdp = match jdp::spawn(
                     &cfg,
                     jdp_bridge,

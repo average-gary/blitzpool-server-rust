@@ -45,13 +45,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bitcoin::Network as BitcoinNetwork;
 use bp_common::{AddressId, MiningMode, StreamKind};
-use bp_config::{AppConfig, Network as ConfigNetwork, Role};
+use bp_config::AppConfig;
 use bp_group_mgmt_engine::{GroupService, GroupServiceHooks};
 use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
-use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
 use bp_stratum_v1::{
     PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
     Sv1AcceptedShareAdapter, Sv1RejectedShareAdapter, Sv1SessionPersistenceAdapter,
@@ -125,31 +123,15 @@ pub(crate) fn build_per_port_servers(
     // engine ledger (PPLNS / Group-Solo `on_block_found`) +
     // notification dispatcher, in addition to the existing TDP
     // submit_solution path.
-    let mut sink = TdpBlockSubmissionSink::new(tdp.clone())
-        .with_network(config_network_to_bitcoin(cfg.network))
-        .with_alt_streams(foundation.alt_tdp.clone())
-        .with_fanout(
-            engines.mode_gate.clone(),
-            engines.pplns.clone(),
-            engines.group_solo.clone(),
-            dispatcher.clone(),
-            foundation.bitcoin_rpc.clone(),
-        )
-        .with_blockparty(engines.blockparty.clone())
-        .with_pool(foundation.db.pool().clone())
-        .with_redis(foundation.redis.clone())
-        .with_settle_handle(settle);
-    // The front routes block-found events to the stream — the payout Satellite
-    // applies the ledger and the notify Satellite fans out the push. A front
-    // always produces (front + payout can't share a process; see the boot
-    // guard in main.rs), so this gates on the front role alone.
-    if cfg.has_role(Role::Front) {
-        sink = sink.with_block_found_producer(StreamProducer::new(
-            foundation.redis.clone(),
-            BLOCK_FOUND_STREAM_KEY,
-        ));
-    }
-    let block_sink = sink.into_sv1_arc();
+    let block_sink = TdpBlockSubmissionSink::wired(
+        tdp.clone(),
+        cfg,
+        foundation,
+        engines,
+        dispatcher.clone(),
+        settle,
+    )
+    .into_sv1_arc();
 
     let port_configs = build_port_configs(cfg);
     for pc in &port_configs {
@@ -233,7 +215,7 @@ pub(crate) fn build_per_port_servers(
 // ─── ServerConfig + PortConfig builders ──────────────────────────
 
 pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
-    let network = config_network_to_bitcoin(cfg.network);
+    let network = crate::boot::bitcoin_network(cfg.network);
     let mut sc = ServerConfig::defaults_for(network);
     sc.pool_identifier = cfg.pool_identifier.clone();
     // Solo dev-fee is applied by `ProductionPayoutResolver` (reads
@@ -245,17 +227,6 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
     sc.share_logs = cfg.debug.stratum_share_logs;
     sc.log_submit_latency = cfg.debug.submit_latency;
     sc
-}
-
-fn config_network_to_bitcoin(n: ConfigNetwork) -> BitcoinNetwork {
-    match n {
-        ConfigNetwork::Mainnet => BitcoinNetwork::Bitcoin,
-        // testnet4 shares the `tb` HRP + address byte set with
-        // testnet3 — rust-bitcoin 0.32's Testnet variant covers
-        // both.
-        ConfigNetwork::Testnet | ConfigNetwork::Testnet4 => BitcoinNetwork::Testnet,
-        ConfigNetwork::Regtest => BitcoinNetwork::Regtest,
-    }
 }
 
 /// Build the per-port configs from `[stratum]` + (optional)
@@ -689,29 +660,13 @@ mod tests {
     }
 
     #[test]
-    fn config_network_maps_to_bitcoin_network() {
-        assert_eq!(
-            config_network_to_bitcoin(ConfigNetwork::Mainnet),
-            BitcoinNetwork::Bitcoin
-        );
-        assert_eq!(
-            config_network_to_bitcoin(ConfigNetwork::Testnet),
-            BitcoinNetwork::Testnet
-        );
-        assert_eq!(
-            config_network_to_bitcoin(ConfigNetwork::Regtest),
-            BitcoinNetwork::Regtest
-        );
-    }
-
-    #[test]
     fn build_server_config_carries_pool_identifier() {
         let mut cfg = min_cfg(None);
         cfg.pool_identifier = "MyPool".into();
         let sc = build_server_config(&cfg);
         assert_eq!(sc.pool_identifier, "MyPool");
         assert_eq!(sc.job_retention_ms, 600_000);
-        assert_eq!(sc.network, BitcoinNetwork::Regtest);
+        assert_eq!(sc.network, bitcoin::Network::Regtest);
     }
 
     // ── ModeGatePopulatingPersistence behaviour ───────────────────
