@@ -158,12 +158,48 @@ impl AddressId {
         Ok(AddressId(s))
     }
 
+    /// [`normalize_btc_address`] a user-supplied address, then validate its
+    /// shape. The one way raw input becomes an `AddressId` wherever it is
+    /// compared against stored rows: normalizing first is what lets a
+    /// mixed-case bech32 or a verbatim Base58 address find its row.
+    pub fn normalized(raw: &str) -> Result<Self, InvalidAddressError> {
+        Self::new(normalize_btc_address(raw))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     pub fn into_inner(self) -> String {
         self.0
+    }
+}
+
+/// Normalize a BTC address for storage / equality comparison.
+///
+/// Bech32 / bech32m (BIP-173 / BIP-350) are case-insensitive by spec —
+/// wallets may present them uppercase (QR-code optimization) but the
+/// canonical wire form is lowercase. Legacy P2PKH / P2SH (base58) IS
+/// case-sensitive — different cases are different addresses with
+/// different checksums — and is left untouched. Lowercasing everything
+/// instead once mangled Base58 addresses, so a verified legacy address
+/// never matched its own row.
+///
+/// Whitespace is trimmed. Empty input maps to empty output.
+pub fn normalize_btc_address(address: &str) -> String {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("bc1")
+        || lower.starts_with("tb1")
+        || lower.starts_with("bcrt1")
+        || lower.starts_with("sb1")
+    {
+        lower
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -466,6 +502,66 @@ pub use tracing;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── normalize_btc_address / AddressId::normalized ────────────────
+
+    #[test]
+    fn bech32_normalized_to_lowercase() {
+        assert_eq!(
+            normalize_btc_address("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4"),
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
+        assert_eq!(
+            normalize_btc_address("TB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KXPJZSX"),
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+        );
+        assert_eq!(
+            normalize_btc_address("BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080"),
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+        );
+        assert_eq!(normalize_btc_address("SB1qFooBarBaz"), "sb1qfoobarbaz");
+    }
+
+    #[test]
+    fn legacy_base58_preserves_case() {
+        assert_eq!(
+            normalize_btc_address("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"),
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+        );
+        assert_eq!(
+            normalize_btc_address("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"),
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"
+        );
+    }
+
+    #[test]
+    fn whitespace_trimmed_before_the_prefix_check() {
+        assert_eq!(
+            normalize_btc_address("  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  "),
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
+        assert_eq!(normalize_btc_address("   BC1qabc   "), "bc1qabc");
+        assert_eq!(normalize_btc_address("   1BvBMSEY   "), "1BvBMSEY");
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert_eq!(normalize_btc_address(""), "");
+        assert_eq!(normalize_btc_address("   "), "");
+    }
+
+    #[test]
+    fn normalized_address_id_normalizes_then_validates() {
+        let a = AddressId::normalized("  BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4  ")
+            .expect("valid bech32");
+        assert_eq!(a.as_str(), "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        let b = AddressId::normalized("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").expect("base58");
+        assert_eq!(b.as_str(), "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2");
+        assert_eq!(
+            AddressId::normalized("   "),
+            Err(InvalidAddressError::Empty)
+        );
+    }
 
     // ---- StreamKind ----
 
