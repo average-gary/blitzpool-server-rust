@@ -57,11 +57,6 @@ pub const DEFAULT_CPUMINER_FALLBACK_DIFFICULTY: f64 = 0.1;
 /// test, not a real CPU miner).
 pub const DEFAULT_CPUMINER_HIGH_DIFF_THRESHOLD: f64 = 1_000_000.0;
 
-/// External-share-submission minimum difficulty. When external sharing
-/// is enabled, only shares meeting at least this difficulty are forwarded
-/// (typically 1T to match real block-finder hash work).
-pub const DEFAULT_EXTERNAL_SHARE_MIN_DIFFICULTY: f64 = 1.0e12;
-
 /// Default vardiff target submission rate per minute. Used when the
 /// port doesn't override it.
 pub const DEFAULT_TARGET_SHARES_PER_MINUTE: f64 = 6.0;
@@ -110,11 +105,6 @@ pub struct ServerConfig {
     pub version_rolling_mask: u32,
     /// Extranonce-2 size announced in `mining.subscribe` response.
     pub extranonce2_size: u8,
-    /// Whether to forward high-difficulty shares to an external pool/API.
-    pub external_share_submission_enabled: bool,
-    /// Minimum share difficulty for external submission (only meaningful
-    /// when `external_share_submission_enabled` is `true`).
-    pub external_share_min_difficulty: f64,
     /// When `true`, every inbound JSON-RPC line and every outbound
     /// frame the per-connection task writes is logged at DEBUG with
     /// `📨 RX:` / `📤 TX:` prefixes. Heavy — only enable in staging.
@@ -147,8 +137,6 @@ impl ServerConfig {
             cpuminer_high_diff_threshold: DEFAULT_CPUMINER_HIGH_DIFF_THRESHOLD,
             version_rolling_mask: DEFAULT_VERSION_ROLLING_MASK,
             extranonce2_size: EXTRANONCE2_SIZE,
-            external_share_submission_enabled: false,
-            external_share_min_difficulty: DEFAULT_EXTERNAL_SHARE_MIN_DIFFICULTY,
             protocol_debug: false,
             share_logs: false,
             log_submit_latency: false,
@@ -199,15 +187,6 @@ impl ServerConfig {
             return Err(StratumV1Error::InvalidConfig(
                 "extranonce2_size must be > 0".into(),
             ));
-        }
-        if self.external_share_submission_enabled
-            && !(self.external_share_min_difficulty > 0.0
-                && self.external_share_min_difficulty.is_finite())
-        {
-            return Err(StratumV1Error::InvalidConfig(format!(
-                "external_share_min_difficulty {} must be > 0 and finite when external_share_submission_enabled",
-                self.external_share_min_difficulty
-            )));
         }
         Ok(())
     }
@@ -338,8 +317,6 @@ mod tests {
         assert_eq!(c.cpuminer_high_diff_threshold, 1_000_000.0);
         assert_eq!(c.version_rolling_mask, 0x1fffe000);
         assert_eq!(c.extranonce2_size, 8);
-        assert!(!c.external_share_submission_enabled);
-        assert_eq!(c.external_share_min_difficulty, 1.0e12);
     }
 
     #[test]
@@ -376,20 +353,6 @@ mod tests {
     fn rejects_zero_extranonce2_size() {
         let mut c = cfg();
         c.extranonce2_size = 0;
-        assert!(matches!(
-            c.validate(),
-            Err(StratumV1Error::InvalidConfig(_))
-        ));
-    }
-
-    #[test]
-    fn external_share_min_diff_only_required_when_enabled() {
-        let mut c = cfg();
-        c.external_share_submission_enabled = false;
-        c.external_share_min_difficulty = 0.0; // ignored
-        c.validate().expect("disabled path ignores min diff");
-
-        c.external_share_submission_enabled = true;
         assert!(matches!(
             c.validate(),
             Err(StratumV1Error::InvalidConfig(_))

@@ -504,7 +504,6 @@ mod tests {
     #[test]
     fn pg_url_build_round_trips_simple_values() {
         let cfg = DatabaseConfig {
-            driver: "postgres".into(),
             host: "127.0.0.1".into(),
             port: 5432,
             user: "postgres".into(),
@@ -512,10 +511,8 @@ mod tests {
             database: "public_pool".into(),
             ssl: false,
             pool_size: 10,
-            max_query_time_ms: 30_000,
             acquire_timeout_ms: 60_000,
             idle_timeout_ms: 10_000,
-            run_migrations: false,
         };
         let url = build_pg_url(&cfg);
         assert_eq!(url, "postgres://postgres:secret@127.0.0.1:5432/public_pool");
@@ -524,7 +521,6 @@ mod tests {
     #[test]
     fn pg_url_build_escapes_separators_in_password() {
         let mut cfg = DatabaseConfig {
-            driver: "postgres".into(),
             host: "h".into(),
             port: 5432,
             user: "u".into(),
@@ -533,10 +529,8 @@ mod tests {
             database: "d".into(),
             ssl: false,
             pool_size: 10,
-            max_query_time_ms: 30_000,
             acquire_timeout_ms: 60_000,
             idle_timeout_ms: 10_000,
-            run_migrations: false,
         };
         let url = build_pg_url(&cfg);
         assert_eq!(url, "postgres://u:p%40ss%3Aword@h:5432/d");
@@ -552,7 +546,6 @@ mod tests {
             port: 6379,
             password: None,
             db: 3,
-            ttl_secs: 600,
         };
         assert_eq!(build_redis_url(&cfg), "redis://h:6379/3");
     }
@@ -564,7 +557,6 @@ mod tests {
             port: 6379,
             password: Some("redis".into()),
             db: 0,
-            ttl_secs: 600,
         };
         assert_eq!(build_redis_url(&cfg), "redis://:redis@h:6379/0");
     }

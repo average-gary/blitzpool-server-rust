@@ -861,7 +861,6 @@ mod tests {
         socket_path = "/var/run/bitcoind/bp-tdp.sock"
 
         [database]
-        driver = "postgres"
         host = "localhost"
         user = "postgres"
         password = "postgres"

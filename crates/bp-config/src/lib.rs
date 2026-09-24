@@ -46,11 +46,6 @@ pub struct AppConfig {
     /// Required when SMTP + email features are enabled.
     #[serde(default)]
     pub pool_base_url: Option<String>,
-    /// `true` ⇒ the `/api` HTTP server expects to be fronted by a
-    /// TLS-terminating proxy and emits `Strict-Transport-Security`
-    /// + secure-cookie hints. `false` ⇒ plain HTTP.
-    #[serde(default)]
-    pub api_secure: bool,
 
     /// The roles this process runs — the single source of deployment topology.
     /// Required: set it here or, more commonly, via `--roles` /
@@ -62,8 +57,6 @@ pub struct AppConfig {
     pub roles: Vec<Role>,
 
     pub bitcoin_rpc: BitcoinRpcConfig,
-    #[serde(default)]
-    pub bitcoin_zmq: Option<BitcoinZmqConfig>,
     pub tdp: TdpConfig,
     pub database: DatabaseConfig,
     pub redis: RedisConfig,
@@ -89,20 +82,18 @@ pub struct AppConfig {
     #[serde(default)]
     pub smtp: Option<SmtpConfig>,
     #[serde(default)]
-    pub aggregation: AggregationConfig,
-    #[serde(default)]
     pub metrics: MetricsConfig,
 
     /// Optional `[debug]` section. Holds the protocol-level debug
-    /// switches (frame dumps, per-share traces, Noise-handshake debug).
+    /// switches (frame dumps, per-share traces, submit latency).
     #[serde(default)]
     pub debug: DebugConfig,
 }
 
-/// Protocol-level debug logging switches. Both default to `false`
+/// Protocol-level debug logging switches. All default to `false`
 /// because the SV1+SV2 share traces are noisy under production load
 /// — flip to `true` in staging / regtest when diagnosing a miner
-/// rejection rate or a Noise handshake.
+/// rejection rate.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
@@ -119,11 +110,6 @@ pub struct DebugConfig {
     /// regardless of this flag.
     #[serde(default)]
     pub stratum_share_logs: bool,
-    /// `true` ⇒ SV2 Noise handshake byte-level logging (Act1/Act2
-    /// hex dumps, first-chunk preview). Very noisy — only enable when
-    /// diagnosing handshake-layer issues.
-    #[serde(default)]
-    pub noise_debug: bool,
     /// `true` ⇒ log the pool-internal submit→ack latency for **both**
     /// SV1 and SV2 (µs from the inbound submit line/frame being read to
     /// its response being written) at INFO, one line per share.
@@ -224,16 +210,6 @@ pub struct BitcoinRpcConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BitcoinZmqConfig {
-    /// e.g. `"tcp://192.168.1.100:28332"` — matches Core's
-    /// `zmqpubrawblock` socket. Optional in the Rust port (TDP is
-    /// the primary template source); kept here for operators still
-    /// wiring a ZMQ source during cut-over.
-    pub host: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TdpConfig {
     /// Path to the bitcoin-core IPC Unix-domain socket. The Rust port
     /// uses TDP-direkt (see memory `project-tdp-direct-architecture`)
@@ -266,10 +242,6 @@ pub struct TdpConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
-    /// Currently always `"postgres"` for the Rust port. The schema
-    /// uses PG-only types (BIGINT-epoch-ms etc.); SQLite is not
-    /// supported.
-    pub driver: String,
     pub host: String,
     #[serde(default = "default_pg_port")]
     pub port: u16,
@@ -280,18 +252,10 @@ pub struct DatabaseConfig {
     pub ssl: bool,
     #[serde(default = "default_pg_pool_size")]
     pub pool_size: u32,
-    #[serde(default = "default_pg_max_query_time_ms")]
-    pub max_query_time_ms: u64,
     #[serde(default = "default_pg_acquire_timeout_ms")]
     pub acquire_timeout_ms: u64,
     #[serde(default = "default_pg_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
-    /// `true` ⇒ run pending migrations on startup. **Note**: the Rust
-    /// port reads from the existing schema and doesn't ship migrations
-    /// itself; this flag is honoured by the deployment stack that owns
-    /// the migration set against the same DB.
-    #[serde(default)]
-    pub run_migrations: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,8 +268,6 @@ pub struct RedisConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub db: u8,
-    #[serde(default = "default_redis_ttl_secs")]
-    pub ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -520,14 +482,6 @@ pub struct Sv2Config {
     /// pin a pool identity that way — fine for staging, not prod).
     #[serde(default)]
     pub authority_privkey_hex: Option<String>,
-    /// 32-byte Ed25519 seed in hex for the SV2 certificate-signing
-    /// authority key.
-    #[serde(default)]
-    pub ed25519_authority_seed_hex: Option<String>,
-    /// SV2 certificate `signed_part` byte — operator-tunable for
-    /// future cert-rotation flows.
-    #[serde(default)]
-    pub cert_signed_part: Option<u8>,
     #[serde(default)]
     pub jdp_enabled: bool,
     #[serde(default)]
@@ -1036,29 +990,6 @@ pub struct SmtpConfig {
     pub from: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AggregationConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// `pool_stats` aggregation tick (ms). Default 600 000.
-    #[serde(default = "default_pool_stats_interval_ms")]
-    pub pool_stats_interval_ms: u64,
-    /// `chart_data` aggregation tick (ms). Default 300 000.
-    #[serde(default = "default_chart_data_interval_ms")]
-    pub chart_data_interval_ms: u64,
-}
-
-impl Default for AggregationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            pool_stats_interval_ms: default_pool_stats_interval_ms(),
-            chart_data_interval_ms: default_chart_data_interval_ms(),
-        }
-    }
-}
-
 /// Prometheus `/metrics` exporter configuration.
 ///
 /// Default `enabled = false`. Flip `[metrics] enabled = true` in the TOML
@@ -1091,9 +1022,6 @@ fn default_tdp_staleness_threshold_secs() -> u64 {
 fn default_pg_pool_size() -> u32 {
     10
 }
-fn default_pg_max_query_time_ms() -> u64 {
-    30_000
-}
 fn default_pg_acquire_timeout_ms() -> u64 {
     60_000
 }
@@ -1102,9 +1030,6 @@ fn default_pg_idle_timeout_ms() -> u64 {
 }
 fn default_redis_port() -> u16 {
     6379
-}
-fn default_redis_ttl_secs() -> u64 {
-    600
 }
 fn default_true() -> bool {
     true
@@ -1117,12 +1042,6 @@ fn default_confirmation_depth() -> u32 {
 }
 fn default_bucket_shares() -> u64 {
     10_000
-}
-fn default_pool_stats_interval_ms() -> u64 {
-    600_000
-}
-fn default_chart_data_interval_ms() -> u64 {
-    300_000
 }
 
 // ─── loader + errors ──────────────────────────────────────────────
@@ -1210,7 +1129,6 @@ mod tests {
         socket_path = "/var/run/bitcoind/bp-tdp.sock"
 
         [database]
-        driver = "postgres"
         host = "localhost"
         user = "postgres"
         password = "postgres"
@@ -1460,7 +1378,6 @@ mod tests {
         let text = r#"
             network = "mainnet"
             pool_identifier = "blitzpool"
-            api_secure = false
             stratum_garbage = 42
 
             [bitcoin_rpc]
@@ -1473,7 +1390,6 @@ mod tests {
             socket_path = "/var/run/bitcoind/bp-tdp.sock"
 
             [database]
-            driver = "postgres"
             host = "localhost"
             user = "postgres"
             password = "postgres"
@@ -1518,7 +1434,6 @@ mod tests {
             socket_path = "/var/run/bitcoind/bp-tdp.sock"
 
             [database]
-            driver = "postgres"
             host = "localhost"
             user = "postgres"
             password = "postgres"
@@ -1545,7 +1460,6 @@ mod tests {
         assert!(cfg.notifications.fcm.is_none());
         assert!(cfg.smtp.is_none());
         assert_eq!(cfg.solo.coinbase_weight_budget, 4_000);
-        assert_eq!(cfg.aggregation.pool_stats_interval_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);
         // §6.4.9 makes propagating a pushed solution a MUST for the JDS, and

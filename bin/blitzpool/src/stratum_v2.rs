@@ -308,7 +308,6 @@ mod tests {
             network: Network::Regtest,
             pool_identifier: "Blitzpool-Test".into(),
             pool_base_url: None,
-            api_secure: false,
             roles: Vec::new(),
             bitcoin_rpc: BitcoinRpcConfig {
                 url: "http://127.0.0.1".into(),
@@ -317,7 +316,6 @@ mod tests {
                 port: 18443,
                 timeout_ms: 1000,
             },
-            bitcoin_zmq: None,
             tdp: TomlTdpConfig {
                 socket_path: PathBuf::from("/tmp/bp-tdp.sock"),
                 fee_threshold_sats: None,
@@ -326,7 +324,6 @@ mod tests {
                 staleness_threshold_secs: 120,
             },
             database: DatabaseConfig {
-                driver: "postgres".into(),
                 host: "h".into(),
                 port: 5432,
                 user: "u".into(),
@@ -334,17 +331,14 @@ mod tests {
                 database: "d".into(),
                 ssl: false,
                 pool_size: 1,
-                max_query_time_ms: 30_000,
                 acquire_timeout_ms: 1_000,
                 idle_timeout_ms: 1_000,
-                run_migrations: false,
             },
             redis: RedisConfig {
                 host: "h".into(),
                 port: 6379,
                 password: None,
                 db: 0,
-                ttl_secs: 60,
             },
             api: ApiConfig {
                 port: 3334,
@@ -364,8 +358,6 @@ mod tests {
             sv2: Sv2Config {
                 jdp_validation_socket_path: None,
                 authority_privkey_hex: privkey,
-                ed25519_authority_seed_hex: None,
-                cert_signed_part: None,
                 jdp_enabled: false,
                 jdp_port: None,
                 jdp_orphan_submitblock: false,
@@ -393,7 +385,6 @@ mod tests {
             blockparty: None,
             notifications: Default::default(),
             smtp: None,
-            aggregation: Default::default(),
             metrics: Default::default(),
         }
     }
