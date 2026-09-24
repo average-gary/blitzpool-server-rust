@@ -259,7 +259,6 @@ fn encode_pg_url_component(s: &str) -> String {
 // ─── Redis ─────────────────────────────────────────────────────────
 
 pub(crate) async fn spawn_redis(cfg: &RedisConfig) -> Result<ConnectionManager, redis::RedisError> {
-    let url = build_redis_url(cfg);
     info!(
         host = %cfg.host,
         port = cfg.port,
@@ -267,27 +266,23 @@ pub(crate) async fn spawn_redis(cfg: &RedisConfig) -> Result<ConnectionManager, 
         password_set = cfg.password.is_some(),
         "redis: connecting"
     );
-    let client = redis::Client::open(url)?;
+    let client = redis::Client::open(redis_connection_info(cfg))?;
     let manager = ConnectionManager::new(client).await?;
     info!("redis: connected");
     Ok(manager)
 }
 
-fn build_redis_url(cfg: &RedisConfig) -> String {
-    match &cfg.password {
-        Some(pw) => format!(
-            "redis://:{password}@{host}:{port}/{db}",
-            password = encode_pg_url_component(pw),
-            host = cfg.host,
-            port = cfg.port,
-            db = cfg.db,
-        ),
-        None => format!(
-            "redis://{host}:{port}/{db}",
-            host = cfg.host,
-            port = cfg.port,
-            db = cfg.db,
-        ),
+/// Typed connection info, so a password needs no URL encoding. An empty
+/// password means none, the same as an empty password in a `redis://` URL.
+fn redis_connection_info(cfg: &RedisConfig) -> redis::ConnectionInfo {
+    redis::ConnectionInfo {
+        addr: redis::ConnectionAddr::Tcp(cfg.host.clone(), cfg.port),
+        redis: redis::RedisConnectionInfo {
+            db: i64::from(cfg.db),
+            username: None,
+            password: cfg.password.clone().filter(|pw| !pw.is_empty()),
+            protocol: redis::ProtocolVersion::RESP2,
+        },
     }
 }
 
@@ -539,26 +534,72 @@ mod tests {
         assert!(url.ends_with("?sslmode=require"));
     }
 
+    /// Parses the `redis://` URL the connection used to be opened from, so
+    /// the typed info is checked against the URL semantics it replaced.
+    fn redis_info_from_url(url: &str) -> redis::ConnectionInfo {
+        redis::IntoConnectionInfo::into_connection_info(url).unwrap()
+    }
+
+    fn assert_same_redis_info(a: &redis::ConnectionInfo, b: &redis::ConnectionInfo) {
+        assert_eq!(a.addr, b.addr);
+        assert_eq!(a.redis.db, b.redis.db);
+        assert_eq!(a.redis.username, b.redis.username);
+        assert_eq!(a.redis.password, b.redis.password);
+        assert_eq!(a.redis.protocol, b.redis.protocol);
+    }
+
     #[test]
-    fn redis_url_build_omits_password_when_absent() {
+    fn redis_info_omits_password_when_absent() {
         let cfg = RedisConfig {
             host: "h".into(),
             port: 6379,
             password: None,
             db: 3,
         };
-        assert_eq!(build_redis_url(&cfg), "redis://h:6379/3");
+        let info = redis_connection_info(&cfg);
+        assert_same_redis_info(&info, &redis_info_from_url("redis://h:6379/3"));
+        assert_eq!(info.redis.password, None);
     }
 
     #[test]
-    fn redis_url_build_includes_password_when_present() {
+    fn redis_info_includes_password_when_present() {
         let cfg = RedisConfig {
             host: "h".into(),
             port: 6379,
             password: Some("redis".into()),
             db: 0,
         };
-        assert_eq!(build_redis_url(&cfg), "redis://:redis@h:6379/0");
+        let info = redis_connection_info(&cfg);
+        assert_same_redis_info(&info, &redis_info_from_url("redis://:redis@h:6379/0"));
+    }
+
+    #[test]
+    fn redis_info_keeps_url_separators_in_password_verbatim() {
+        let cfg = RedisConfig {
+            host: "h".into(),
+            port: 6379,
+            password: Some("p@ss:w/o?r#d%20 x".into()),
+            db: 1,
+        };
+        let info = redis_connection_info(&cfg);
+        assert_eq!(info.redis.password.as_deref(), Some("p@ss:w/o?r#d%20 x"));
+        assert_same_redis_info(
+            &info,
+            &redis_info_from_url("redis://:p%40ss%3Aw%2Fo%3Fr%23d%2520%20x@h:6379/1"),
+        );
+    }
+
+    #[test]
+    fn redis_info_treats_empty_password_as_none_like_the_url_did() {
+        let cfg = RedisConfig {
+            host: "h".into(),
+            port: 6379,
+            password: Some(String::new()),
+            db: 0,
+        };
+        let info = redis_connection_info(&cfg);
+        assert_same_redis_info(&info, &redis_info_from_url("redis://:@h:6379/0"));
+        assert_eq!(info.redis.password, None);
     }
 
     // ── TDP coinbase constraints coupling ─────────────────────────

@@ -16,7 +16,6 @@ use tracing::{debug, warn};
 
 use crate::command::ChatLanguageMap;
 
-use super::config::DispatcherConfig;
 use crate::adapter::{
     AdapterError, FcmAdapter, NtfyAdapter, PushKind, PushPayload, TelegramAdapter, WebPushAdapter,
 };
@@ -32,6 +31,9 @@ use super::device_gate::{DeviceAggregate, DeviceNotice, DevicePartial};
 // case-insensitive so any historical casing still routes.
 const PUSH_TYPE_UNIFIED: &str = "unified_push";
 const PUSH_TYPE_FCM: &str = "fcm";
+
+/// Timezone device-status timestamps are rendered in.
+const DEVICE_TIMEZONE: chrono_tz::Tz = chrono_tz::Europe::Zurich;
 
 /// Engine-side description of a worker connect / disconnect event. The
 /// dispatcher converts this to per-language text and routes to whichever
@@ -52,7 +54,6 @@ pub struct DeviceStatusEvent {
 /// Telegram bot token).
 pub struct NotificationDispatcher {
     pool: PgPool,
-    config: DispatcherConfig,
     telegram: Option<Arc<TelegramAdapter>>,
     ntfy: Option<Arc<NtfyAdapter>>,
     fcm: Option<Arc<FcmAdapter>>,
@@ -63,7 +64,6 @@ pub struct NotificationDispatcher {
 impl NotificationDispatcher {
     pub fn new(
         pool: PgPool,
-        config: DispatcherConfig,
         telegram: Option<Arc<TelegramAdapter>>,
         ntfy: Option<Arc<NtfyAdapter>>,
         fcm: Option<Arc<FcmAdapter>>,
@@ -72,7 +72,6 @@ impl NotificationDispatcher {
     ) -> Self {
         Self {
             pool,
-            config,
             telegram,
             ntfy,
             fcm,
@@ -218,7 +217,6 @@ impl NotificationDispatcher {
                     self.chat_languages.clone(),
                     partial.clone(),
                     telegram_dev,
-                    self.config.timezone,
                 )) as TaskFuture);
             }
         }
@@ -280,7 +278,6 @@ impl NotificationDispatcher {
                     self.chat_languages.clone(),
                     agg.clone(),
                     telegram_dev,
-                    self.config.timezone,
                 )) as TaskFuture);
             }
         }
@@ -348,7 +345,6 @@ impl NotificationDispatcher {
                     self.chat_languages.clone(),
                     event.clone(),
                     telegram_dev,
-                    self.config.timezone,
                 )) as TaskFuture);
             }
         }
@@ -369,7 +365,6 @@ impl NotificationDispatcher {
                     self.pool.clone(),
                     event.clone(),
                     fcm_dev,
-                    self.config.timezone,
                 )) as TaskFuture);
             }
         }
@@ -522,7 +517,6 @@ async fn send_telegram_device_status(
     chat_languages: ChatLanguageMap,
     event: DeviceStatusEvent,
     subs: Vec<TelegramSubscriptionRow>,
-    tz: chrono_tz::Tz,
 ) {
     let fmt_addr = short_address(event.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
@@ -535,7 +529,7 @@ async fn send_telegram_device_status(
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
             let include_address = chat_count > 1;
-            let time_str = format_device_time(tz, event.timestamp, lang);
+            let time_str = format_device_time(DEVICE_TIMEZONE, event.timestamp, lang);
             let address_suffix_de = if include_address {
                 Some(format!(" – Adresse {fmt_addr}"))
             } else {
@@ -576,7 +570,6 @@ async fn send_telegram_device_partial(
     chat_languages: ChatLanguageMap,
     partial: DevicePartial,
     subs: Vec<TelegramSubscriptionRow>,
-    tz: chrono_tz::Tz,
 ) {
     let fmt_addr = short_address(partial.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
@@ -588,7 +581,7 @@ async fn send_telegram_device_partial(
         async move {
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
-            let time_str = format_device_time(tz, partial.timestamp, lang);
+            let time_str = format_device_time(DEVICE_TIMEZONE, partial.timestamp, lang);
             let suffix = (chat_count > 1).then(|| match lang {
                 Language::De => format!(" – Adresse {fmt_addr}"),
                 Language::En => format!(" – address {fmt_addr}"),
@@ -685,7 +678,6 @@ async fn send_telegram_device_aggregate(
     chat_languages: ChatLanguageMap,
     agg: DeviceAggregate,
     subs: Vec<TelegramSubscriptionRow>,
-    tz: chrono_tz::Tz,
 ) {
     let fmt_addr = short_address(agg.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
@@ -697,7 +689,7 @@ async fn send_telegram_device_aggregate(
         async move {
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
-            let time_str = format_device_time(tz, agg.timestamp, lang);
+            let time_str = format_device_time(DEVICE_TIMEZONE, agg.timestamp, lang);
             let suffix = (chat_count > 1).then(|| match lang {
                 Language::De => format!(" – Adresse {fmt_addr}"),
                 Language::En => format!(" – address {fmt_addr}"),
@@ -872,11 +864,9 @@ async fn send_fcm_device_status(
     pool: PgPool,
     event: DeviceStatusEvent,
     subs: Vec<PushSubscriptionRow>,
-    tz: chrono_tz::Tz,
 ) {
-    // FCM device-status payload uses UTC + plain locale ("en-US").
-    // Timezone is for telegram + ntfy paths.
-    let _ = tz;
+    // FCM device-status payload uses UTC + plain locale ("en-US");
+    // `DEVICE_TIMEZONE` is for the telegram + ntfy paths.
     let worker = event
         .worker_name
         .clone()

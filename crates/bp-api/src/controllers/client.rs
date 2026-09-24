@@ -56,12 +56,14 @@ where
 
 // ─── time-range chart endpoints ──────────────────────────────────
 
+use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
 use crate::time_range::{
-    bucket_key, chart_slot_boundaries, ChartPoint, Range, SlotCounts, SlotDataResponse,
+    accepted_slot_data, chart_slot_boundaries, fold_into_slots, sum_into_slots, ChartPoint, Range,
+    SlotDataResponse,
 };
 use axum::extract::Query;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,28 +92,29 @@ where
         .get_or_fetch::<Vec<ChartPoint>, _, ApiError>(key, TtlKind::ClientChart, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
             let rows =
                 bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
-            let mut buckets: BTreeMap<i64, f64> = boundaries.iter().map(|&b| (b, 0.0)).collect();
-            for r in &rows {
-                let k = bucket_key(r.time, range.slot_size_ms());
-                if let Some(v) = buckets.get_mut(&k) {
-                    *v += r.shares as f64;
-                }
-            }
-            Ok(boundaries
-                .iter()
-                .map(|&b| ChartPoint {
-                    label: crate::time_range::format_slot_label(b),
-                    data: (buckets.get(&b).copied().unwrap_or(0.0) * HASHES_PER_DIFFICULTY_1
-                        / SLOT_SECONDS)
-                        .round(),
-                })
-                .collect())
+            Ok(chart_points(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.shares as f64)),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// Hashrate per slot, rounded to a whole H/s, one point per boundary.
+fn chart_points(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, f64)>,
+) -> Vec<ChartPoint> {
+    sum_into_slots(boundaries, samples)
+        .into_iter()
+        .map(|(b, shares)| ChartPoint {
+            label: crate::time_range::format_iso_ms(b),
+            data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
+        })
+        .collect()
 }
 
 async fn accepted<H, M>(
@@ -134,33 +137,16 @@ where
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut buckets: BTreeMap<i64, f64> = boundaries.iter().map(|&b| (b, 0.0)).collect();
-            for r in rows {
-                let k = bucket_key(r.time, range.slot_size_ms());
-                if let Some(v) = buckets.get_mut(&k) {
-                    // Diff-1-weighted accepted shares (sum of share difficulty),
-                    // NOT the raw share count: this tracks actual work, so the
-                    // chart stays flat when vardiff trades share size for share
-                    // rate at constant hashrate. The raw count (`accepted_count`)
-                    // would drift up as per-share difficulty drops. (The rejected
-                    // endpoint intentionally still reports raw full-share counts.)
-                    *v += r.shares as f64;
-                }
-            }
-            Ok(SlotDataResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts = BTreeMap::new();
-                        counts.insert("accepted".into(), buckets.get(&b).copied().unwrap_or(0.0));
-                        SlotCounts {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
+            // Diff-1-weighted accepted shares (sum of share difficulty),
+            // NOT the raw share count: this tracks actual work, so the
+            // chart stays flat when vardiff trades share size for share
+            // rate at constant hashrate. The raw count (`accepted_count`)
+            // would drift up as per-share difficulty drops. (The rejected
+            // endpoint intentionally still reports raw full-share counts.)
+            Ok(accepted_slot_data(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.shares as f64)),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
@@ -186,40 +172,36 @@ where
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut sessions: BTreeMap<i64, std::collections::HashSet<String>> = BTreeMap::new();
-            let mut workers_set: BTreeMap<i64, std::collections::HashSet<String>> = BTreeMap::new();
-            for r in &rows {
-                let k = bucket_key(r.time, range.slot_size_ms());
-                sessions.entry(k).or_default().insert(r.session_id.clone());
-                workers_set
-                    .entry(k)
-                    .or_default()
-                    .insert(r.client_name.clone());
-            }
-            Ok(SlotDataResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts = BTreeMap::new();
-                        counts.insert(
-                            "workers".into(),
-                            workers_set.get(&b).map(|s| s.len()).unwrap_or(0) as f64,
-                        );
-                        counts.insert(
-                            "sessions".into(),
-                            sessions.get(&b).map(|s| s.len()).unwrap_or(0) as f64,
-                        );
-                        SlotCounts {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
+            Ok(worker_slots(
+                &chart_slot_boundaries(since),
+                rows.iter()
+                    .map(|r| (r.time, (r.client_name.as_str(), r.session_id.as_str()))),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// `(time, (worker, session))` samples → distinct workers + sessions per slot.
+fn worker_slots<'a>(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, (&'a str, &'a str))>,
+) -> SlotDataResponse {
+    type Seen = (HashSet<String>, HashSet<String>);
+    let slots = fold_into_slots(
+        boundaries,
+        samples,
+        |(workers, sessions): &mut Seen, (worker, session)| {
+            workers.insert(worker.to_string());
+            sessions.insert(session.to_string());
+        },
+    );
+    SlotDataResponse::from_slots(slots, |(workers, sessions)| {
+        BTreeMap::from([
+            ("workers".to_string(), workers.len() as f64),
+            ("sessions".to_string(), sessions.len() as f64),
+        ])
+    })
 }
 
 async fn rejected<H, M>(
@@ -237,70 +219,24 @@ where
     let s = state.clone();
     let bytes = state
         .cache
-        .get_or_fetch::<RejectedResponse, _, ApiError>(key, TtlKind::ClientRejected, async move {
-            let now = bp_common::now_ms();
-            let since = now - range.window_ms();
-            let rows =
-                bp_db::find_client_rejected_statistics_since_for_address(&s.pool, &addr, since)
-                    .await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut buckets: BTreeMap<i64, BTreeMap<String, RejectCounts>> = BTreeMap::new();
-            for r in rows {
-                let k = bucket_key(r.time, range.slot_size_ms());
-                let key = crate::controllers::info::normalise_reject_reason(&r.reason).to_string();
-                let entry = buckets.entry(k).or_default().entry(key).or_default();
-                entry.count += r.count as f64;
-                entry.diff_minus_one += r.shares as f64;
-            }
-            Ok(RejectedResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts: BTreeMap<String, RejectCounts> =
-                            crate::controllers::info::REJECT_REASON_KEYS
-                                .iter()
-                                .map(|&k| (k.to_string(), RejectCounts::default()))
-                                .collect();
-                        if let Some(seen) = buckets.remove(&b) {
-                            for (k, v) in seen {
-                                counts.insert(k, v);
-                            }
-                        }
-                        RejectedSlot {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
-        })
+        .get_or_fetch::<RejectSlotsResponse, _, ApiError>(
+            key,
+            TtlKind::ClientRejected,
+            async move {
+                let now = bp_common::now_ms();
+                let since = now - range.window_ms();
+                let rows =
+                    bp_db::find_client_rejected_statistics_since_for_address(&s.pool, &addr, since)
+                        .await?;
+                Ok(rejected_by_reason_slots(
+                    &chart_slot_boundaries(since),
+                    rows.iter()
+                        .map(|r| (r.time, (r.reason.as_str(), r.count as f64, r.shares as f64))),
+                ))
+            },
+        )
         .await?;
     Ok(JsonBytes(bytes))
-}
-
-/// Per-reason rejected-share bucket — `count` is the raw rejection
-/// count, `diffMinusOne` is the share-difficulty sum at the moment
-/// of rejection.
-#[derive(Serialize, Default, Clone)]
-#[serde(rename_all = "camelCase")]
-struct RejectCounts {
-    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
-    count: f64,
-    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
-    diff_minus_one: f64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RejectedSlot {
-    time: String,
-    counts: BTreeMap<String, RejectCounts>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RejectedResponse {
-    slot_data: Vec<RejectedSlot>,
 }
 
 // ─── GET /api/client/:address ────────────────────────────────────
@@ -398,10 +334,10 @@ where
                             hash_rate: lf.hash_rate,
                             current_difficulty: lf.current_difficulty,
                             channel_count: lf.channel_count.unwrap_or(1),
-                            start_time: crate::time_range::format_slot_label(c.start_time),
+                            start_time: crate::time_range::format_iso_ms(c.start_time),
                             // No live hash → the freshest thing known is
                             // the session's own start.
-                            last_seen: crate::time_range::format_slot_label(
+                            last_seen: crate::time_range::format_iso_ms(
                                 lf.updated_at_ms.unwrap_or(c.start_time),
                             ),
                         }
@@ -563,7 +499,7 @@ where
                 .filter(|r| r.client_name == worker && r.time < cutoff)
             {
                 let entry = grouped.entry(r.time).or_insert_with(|| WorkerChartEntry {
-                    label: crate::time_range::format_slot_label(r.time),
+                    label: crate::time_range::format_iso_ms(r.time),
                     ..Default::default()
                 });
                 entry.accepted += r.shares as f64;
@@ -658,7 +594,7 @@ where
                 let chart_data: Vec<ChartPoint> = grouped
                     .into_iter()
                     .map(|(t, shares)| ChartPoint {
-                        label: crate::time_range::format_slot_label(t),
+                        label: crate::time_range::format_iso_ms(t),
                         data: shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS,
                     })
                     .collect();
@@ -668,7 +604,7 @@ where
                     name: row.client_name,
                     best_difficulty: live_best.floor() as i64,
                     chart_data,
-                    start_time: crate::time_range::format_slot_label(row.start_time),
+                    start_time: crate::time_range::format_iso_ms(row.start_time),
                 })
             },
         )
@@ -929,7 +865,7 @@ where
             let mut t = start_slot;
             while t <= end_slot {
                 slot_data.push(DiffScoreSlot {
-                    time: crate::time_range::format_slot_label(t),
+                    time: crate::time_range::format_iso_ms(t),
                     difficulty: by_slot.get(&t).copied().unwrap_or(0.0),
                 });
                 t += one_hour_ms;
@@ -938,4 +874,87 @@ where
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: i64 = 600_000;
+    const T0: i64 = 1_700_000_400_000;
+    const BOUNDARIES: [i64; 3] = [T0, T0 + S, T0 + 2 * S];
+
+    fn json<T: Serialize>(v: &T) -> String {
+        serde_json::to_string(v).unwrap()
+    }
+
+    /// Accepted-share samples: a slot with two rows (one f32-derived), a
+    /// row inside the second slot but off its boundary, an empty third
+    /// slot, and rows either side of the window that must be dropped.
+    fn share_samples() -> Vec<(i64, f64)> {
+        vec![
+            (T0, 1.5),
+            (T0, 0.1_f32 as f64),
+            (T0 + S + 123, 2.0),
+            (T0 - S, 99.0),
+            (T0 + 3 * S, 77.0),
+        ]
+    }
+
+    /// `/api/client/:address/chart` — dense, one point per slot, hashrate
+    /// rounded to a whole number.
+    #[test]
+    fn chart_json_is_unchanged() {
+        assert_eq!(
+            json(&chart_points(&BOUNDARIES, share_samples())),
+            r#"[{"label":"2023-11-14T22:20:00.000Z","data":11453246},{"label":"2023-11-14T22:30:00.000Z","data":14316558},{"label":"2023-11-14T22:40:00.000Z","data":0}]"#
+        );
+    }
+
+    /// `/api/client/:address/accepted`.
+    #[test]
+    fn accepted_json_is_unchanged() {
+        assert_eq!(
+            json(&accepted_slot_data(&BOUNDARIES, share_samples())),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"accepted":1.6000000014901161}},{"time":"2023-11-14T22:30:00.000Z","counts":{"accepted":2}},{"time":"2023-11-14T22:40:00.000Z","counts":{"accepted":0}}]}"#
+        );
+    }
+
+    /// `/api/client/:address/workers` — distinct workers and sessions.
+    #[test]
+    fn workers_json_is_unchanged() {
+        let samples = vec![
+            (T0, ("w1", "s1")),
+            (T0, ("w1", "s2")),
+            (T0, ("w1", "s1")),
+            (T0 + S, ("w2", "s3")),
+            (T0 + S + 5, ("w1", "s1")),
+            (T0 + 3 * S, ("w9", "s9")),
+        ];
+        assert_eq!(
+            json(&worker_slots(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"sessions":2,"workers":1}},{"time":"2023-11-14T22:30:00.000Z","counts":{"sessions":2,"workers":2}},{"time":"2023-11-14T22:40:00.000Z","counts":{"sessions":0,"workers":0}}]}"#
+        );
+    }
+
+    /// `/api/client/:address/rejected` — every known reason pre-filled,
+    /// legacy kebab-case folded into its camel-case key, unknown reasons
+    /// into `OtherUnknown`.
+    #[test]
+    fn rejected_json_is_unchanged() {
+        assert_eq!(
+            json(&rejected_by_reason_slots(&BOUNDARIES, reject_samples())),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"DuplicateShare":{"count":0,"diffMinusOne":0},"JobNotFound":{"count":3,"diffMinusOne":1.75},"LowDifficultyShare":{"count":0,"diffMinusOne":0},"NotSubscribed":{"count":0,"diffMinusOne":0},"OtherUnknown":{"count":3,"diffMinusOne":3},"Stale":{"count":0,"diffMinusOne":0},"UnauthorizedWorker":{"count":0,"diffMinusOne":0},"VersionRollingNotAllowed":{"count":0,"diffMinusOne":0}}},{"time":"2023-11-14T22:30:00.000Z","counts":{"DuplicateShare":{"count":0,"diffMinusOne":0},"JobNotFound":{"count":0,"diffMinusOne":0},"LowDifficultyShare":{"count":0,"diffMinusOne":0},"NotSubscribed":{"count":0,"diffMinusOne":0},"OtherUnknown":{"count":0,"diffMinusOne":0},"Stale":{"count":4,"diffMinusOne":0.10000000149011612},"UnauthorizedWorker":{"count":0,"diffMinusOne":0},"VersionRollingNotAllowed":{"count":0,"diffMinusOne":0}}},{"time":"2023-11-14T22:40:00.000Z","counts":{"DuplicateShare":{"count":0,"diffMinusOne":0},"JobNotFound":{"count":0,"diffMinusOne":0},"LowDifficultyShare":{"count":0,"diffMinusOne":0},"NotSubscribed":{"count":0,"diffMinusOne":0},"OtherUnknown":{"count":0,"diffMinusOne":0},"Stale":{"count":0,"diffMinusOne":0},"UnauthorizedWorker":{"count":0,"diffMinusOne":0},"VersionRollingNotAllowed":{"count":0,"diffMinusOne":0}}}]}"#
+        );
+    }
+
+    fn reject_samples() -> Vec<(i64, (&'static str, f64, f64))> {
+        vec![
+            (T0, ("job-not-found", 2.0, 0.25)),
+            (T0, ("JobNotFound", 1.0, 1.5)),
+            (T0, ("something-new", 3.0, 3.0)),
+            (T0 + S + 7, ("Stale", 4.0, 0.1_f32 as f64)),
+            (T0 + 3 * S, ("Stale", 50.0, 50.0)),
+        ]
+    }
 }

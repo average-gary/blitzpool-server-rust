@@ -2331,9 +2331,21 @@ pub fn apply_template_broadcast<C: Clock>(
     // Build the group's shared coinbase template (coinbase parts + header
     // fields) for `full_size`. The `difficulty` and `extranonce_prefix`
     // placeholders are overridden per member — members share the job but each
-    // holds its own prefix. `None` if the mining-job build fails.
-    let build_group_template = |full_size: usize| -> Option<GroupTemplateParts> {
-        let mining_job = mining_job_inputs.build(full_size).ok()?;
+    // holds its own prefix. `None` (logged here) if the mining-job build fails.
+    let session_id = state.session_id;
+    let build_group_template = |gid: u32, full_size: usize| -> Option<GroupTemplateParts> {
+        let mining_job = mining_job_inputs
+            .build(full_size)
+            .inspect_err(|err| {
+                tracing::warn!(
+                    ?err,
+                    session_id,
+                    gid,
+                    full_size,
+                    "skipping group: mining-job build failed"
+                );
+            })
+            .ok()?;
         let tx_prefix = mining_job.coinbase_prefix().to_vec();
         let tx_suffix = mining_job.coinbase_suffix().to_vec();
         let merkle_path = template.merkle_path.clone();
@@ -2389,7 +2401,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     match (current_job_id, current_job_template) {
                         (Some(jid), Some(tmpl)) => Some((jid, tmpl)),
                         _ => match (
-                            build_group_template(full_size),
+                            build_group_template(gid, full_size),
                             state.groups.alloc_job_id(gid),
                         ) {
                             (Some((tmpl, _, _, _)), Some(jid)) => {
@@ -2450,9 +2462,8 @@ pub fn apply_template_broadcast<C: Clock>(
 
         // ── TEMPLATE broadcast (only_channel == None): ONE group job. ──
         let Some((group_template, tx_prefix, tx_suffix, merkle_path)) =
-            build_group_template(full_size)
+            build_group_template(gid, full_size)
         else {
-            tracing::warn!(gid, full_size, "skipping group: mining-job build failed");
             continue;
         };
         let group_job_id = match state.groups.alloc_job_id(gid) {

@@ -131,7 +131,7 @@ impl Default for DeviceGateConfig {
 
 /// What the subscriber was last told about a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Notified {
+pub(crate) enum Notified {
     /// Nothing has ever been sent for this device.
     Unknown,
     /// How many sessions the subscriber was last told about. Zero is
@@ -202,17 +202,6 @@ pub trait ReportedStateStore: Send + Sync {
     /// persistence of state nobody reads ahead of the notification
     /// somebody is waiting for.
     async fn store(&self, updates: &[(DeviceKey, usize)]);
-}
-
-/// A no-op store — the gate degrades to its pre-persistence behaviour.
-pub struct NoReportedStateStore;
-
-#[async_trait]
-impl ReportedStateStore for NoReportedStateStore {
-    async fn load(&self) -> HashMap<DeviceKey, usize> {
-        HashMap::new()
-    }
-    async fn store(&self, _updates: &[(DeviceKey, usize)]) {}
 }
 
 /// A confirmed, ready-to-send device-status message.

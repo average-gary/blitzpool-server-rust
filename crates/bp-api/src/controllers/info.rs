@@ -929,10 +929,12 @@ fn format_uptime(ms: u64) -> String {
 // (the in-progress slot) are excluded so the tail of the chart never
 // shows a half-filled bucket.
 
-use crate::time_range::{chart_slot_boundaries, ChartPoint, Range, SlotCounts, SlotDataResponse};
+use crate::time_range::{
+    accepted_slot_data, chart_slot_boundaries, fold_into_slots, ChartPoint, Range, SlotDataResponse,
+};
 use axum::extract::Query;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -967,7 +969,7 @@ where
                 .into_iter()
                 .filter(|r| r.time < cutoff)
                 .map(|r| ChartPoint {
-                    label: crate::time_range::format_slot_label(r.time),
+                    label: crate::time_range::format_iso_ms(r.time),
                     data: (r.accepted as f64 * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
                 })
                 .collect())
@@ -994,27 +996,10 @@ where
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Accepted, async move {
             let since = bp_common::now_ms() - range.window_ms();
             let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut buckets: BTreeMap<i64, f64> = boundaries.iter().map(|&b| (b, 0.0)).collect();
-            for r in rows {
-                let k = crate::time_range::bucket_key(r.time, range.slot_size_ms());
-                if let Some(v) = buckets.get_mut(&k) {
-                    *v += r.accepted as f64;
-                }
-            }
-            Ok(SlotDataResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts = BTreeMap::new();
-                        counts.insert("accepted".into(), buckets.get(&b).copied().unwrap_or(0.0));
-                        SlotCounts {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
+            Ok(accepted_slot_data(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.accepted as f64)),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
@@ -1047,45 +1032,36 @@ where
             // distinct counting stays in-process; we just avoid shipping the
             // full 17-column stats row for every session in the window.
             let rows = bp_db::find_pool_worker_rows_since(&s.pool, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut addresses_by_slot: BTreeMap<i64, std::collections::HashSet<String>> =
-                BTreeMap::new();
-            let mut workers_by_slot: BTreeMap<i64, std::collections::HashSet<(String, String)>> =
-                BTreeMap::new();
-            for r in &rows {
-                let k = crate::time_range::bucket_key(r.time, range.slot_size_ms());
-                addresses_by_slot
-                    .entry(k)
-                    .or_default()
-                    .insert(r.address.clone());
-                workers_by_slot
-                    .entry(k)
-                    .or_default()
-                    .insert((r.address.clone(), r.client_name.clone()));
-            }
-            Ok(SlotDataResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts = BTreeMap::new();
-                        counts.insert(
-                            "addresses".into(),
-                            addresses_by_slot.get(&b).map(|s| s.len()).unwrap_or(0) as f64,
-                        );
-                        counts.insert(
-                            "workers".into(),
-                            workers_by_slot.get(&b).map(|s| s.len()).unwrap_or(0) as f64,
-                        );
-                        SlotCounts {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
+            Ok(worker_slots(
+                &chart_slot_boundaries(since),
+                rows.iter()
+                    .map(|r| (r.time, (r.address.as_str(), r.client_name.as_str()))),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// `(time, (address, worker))` samples → distinct addresses + workers per slot.
+fn worker_slots<'a>(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, (&'a str, &'a str))>,
+) -> SlotDataResponse {
+    type Seen = (HashSet<String>, HashSet<(String, String)>);
+    let slots = fold_into_slots(
+        boundaries,
+        samples,
+        |(addresses, workers): &mut Seen, (address, worker)| {
+            addresses.insert(address.to_string());
+            workers.insert((address.to_string(), worker.to_string()));
+        },
+    );
+    SlotDataResponse::from_slots(slots, |(addresses, workers)| {
+        BTreeMap::from([
+            ("addresses".to_string(), addresses.len() as f64),
+            ("workers".to_string(), workers.len() as f64),
+        ])
+    })
 }
 
 // ─── /api/info/rejected ───────────────────────────────────────────
@@ -1147,36 +1123,95 @@ where
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Rejected, async move {
             let since = bp_common::now_ms() - range.window_ms();
             let rows = bp_db::find_pool_rejected_statistics_since(&s.pool, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut buckets: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
-            for r in rows {
-                let k = crate::time_range::bucket_key(r.time, range.slot_size_ms());
-                let key = normalise_reject_reason(&r.reason).to_string();
-                *buckets.entry(k).or_default().entry(key).or_default() += r.count as f64;
-            }
-            Ok(SlotDataResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts: BTreeMap<String, f64> = REJECT_REASON_KEYS
-                            .iter()
-                            .map(|&k| (k.to_string(), 0.0))
-                            .collect();
-                        if let Some(seen) = buckets.remove(&b) {
-                            for (k, v) in seen {
-                                counts.insert(k, v);
-                            }
-                        }
-                        SlotCounts {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
+            Ok(rejected_slots(
+                &chart_slot_boundaries(since),
+                rows.iter()
+                    .map(|r| (r.time, (r.reason.as_str(), r.count as f64))),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// `(time, (reason, count))` samples → per-reason counts per slot.
+fn rejected_slots<'a>(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, (&'a str, f64))>,
+) -> SlotDataResponse {
+    let slots = fold_into_slots(
+        boundaries,
+        samples,
+        |seen: &mut BTreeMap<String, f64>, (reason, count)| {
+            *seen
+                .entry(normalise_reject_reason(reason).to_string())
+                .or_default() += count;
+        },
+    );
+    SlotDataResponse::from_slots(slots, with_all_reasons)
+}
+
+/// Every key of [`REJECT_REASON_KEYS`], holding what `seen` recorded for
+/// it or the default, plus anything else `seen` recorded.
+fn with_all_reasons<X: Default>(seen: BTreeMap<String, X>) -> BTreeMap<String, X> {
+    let mut counts: BTreeMap<String, X> = REJECT_REASON_KEYS
+        .iter()
+        .map(|&k| (k.to_string(), X::default()))
+        .collect();
+    counts.extend(seen);
+    counts
+}
+
+/// Per-reason rejected-share bucket of the per-address and per-group
+/// `/rejected` endpoints — `count` is the raw rejection count,
+/// `diffMinusOne` is the share-difficulty sum at the moment of rejection.
+#[derive(Serialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RejectCounts {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    count: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    diff_minus_one: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RejectedSlot {
+    time: String,
+    counts: BTreeMap<String, RejectCounts>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RejectSlotsResponse {
+    slot_data: Vec<RejectedSlot>,
+}
+
+/// `(time, (reason, count, diff1))` samples → per-reason counts and
+/// diff-1 sums per slot, every known reason present.
+pub(crate) fn rejected_by_reason_slots<'a>(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, (&'a str, f64, f64))>,
+) -> RejectSlotsResponse {
+    let slots = fold_into_slots(
+        boundaries,
+        samples,
+        |seen: &mut BTreeMap<String, RejectCounts>, (reason, count, diff1)| {
+            let entry = seen
+                .entry(normalise_reject_reason(reason).to_string())
+                .or_default();
+            entry.count += count;
+            entry.diff_minus_one += diff1;
+        },
+    );
+    RejectSlotsResponse {
+        slot_data: slots
+            .into_iter()
+            .map(|(b, seen)| RejectedSlot {
+                time: crate::time_range::format_iso_ms(b),
+                counts: with_all_reasons(seen),
+            })
+            .collect(),
+    }
 }
 
 // ─── /api/info/shares ─────────────────────────────────────────────
@@ -1435,6 +1470,69 @@ where
             })
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod slot_json_tests {
+    use super::*;
+
+    const S: i64 = 600_000;
+    const T0: i64 = 1_700_000_400_000;
+    const BOUNDARIES: [i64; 3] = [T0, T0 + S, T0 + 2 * S];
+
+    fn json<T: serde::Serialize>(v: &T) -> String {
+        serde_json::to_string(v).unwrap()
+    }
+
+    /// `/api/info/accepted`.
+    #[test]
+    fn accepted_json_is_unchanged() {
+        let samples = vec![
+            (T0, 1.5),
+            (T0, 0.1_f32 as f64),
+            (T0 + S + 123, 2.0),
+            (T0 - S, 99.0),
+            (T0 + 3 * S, 77.0),
+        ];
+        assert_eq!(
+            json(&accepted_slot_data(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"accepted":1.6000000014901161}},{"time":"2023-11-14T22:30:00.000Z","counts":{"accepted":2}},{"time":"2023-11-14T22:40:00.000Z","counts":{"accepted":0}}]}"#
+        );
+    }
+
+    /// `/api/info/workers` — distinct addresses and (address, worker) pairs.
+    #[test]
+    fn workers_json_is_unchanged() {
+        let samples = vec![
+            (T0, ("a1", "w1")),
+            (T0, ("a1", "w2")),
+            (T0, ("a2", "w1")),
+            (T0, ("a1", "w1")),
+            (T0 + S + 9, ("a3", "w1")),
+            (T0 + 3 * S, ("a9", "w9")),
+        ];
+        assert_eq!(
+            json(&worker_slots(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"addresses":2,"workers":3}},{"time":"2023-11-14T22:30:00.000Z","counts":{"addresses":1,"workers":1}},{"time":"2023-11-14T22:40:00.000Z","counts":{"addresses":0,"workers":0}}]}"#
+        );
+    }
+
+    /// `/api/info/rejected` — counts only, every known reason pre-filled.
+    #[test]
+    fn rejected_json_is_unchanged() {
+        let samples = vec![
+            (T0, ("job-not-found", 2.0)),
+            (T0, ("JobNotFound", 1.0)),
+            (T0, ("low-difficulty", 0.1_f32 as f64)),
+            (T0, ("something-new", 3.0)),
+            (T0 + S + 7, ("Stale", 4.0)),
+            (T0 + 3 * S, ("Stale", 50.0)),
+        ];
+        assert_eq!(
+            json(&rejected_slots(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":3,"LowDifficultyShare":0.10000000149011612,"NotSubscribed":0,"OtherUnknown":3,"Stale":0,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}},{"time":"2023-11-14T22:30:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":0,"LowDifficultyShare":0,"NotSubscribed":0,"OtherUnknown":0,"Stale":4,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}},{"time":"2023-11-14T22:40:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":0,"LowDifficultyShare":0,"NotSubscribed":0,"OtherUnknown":0,"Stale":0,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}}]}"#
+        );
+    }
 }
 
 #[cfg(test)]

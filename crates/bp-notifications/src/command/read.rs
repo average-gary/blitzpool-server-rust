@@ -67,10 +67,10 @@ pub(super) async fn build_pool_hashrate(
 }
 
 fn format_pool_hashrate(lang: Language, total_h_per_s: f64) -> String {
-    let th = total_h_per_s / 1e12;
+    let th = format_hashrate_th(total_h_per_s);
     match lang {
-        Language::De => format!("Aktuelle Pool-Hashrate: {th:.2} TH/s"),
-        Language::En => format!("Current pool hashrate: {th:.2} TH/s"),
+        Language::De => format!("Aktuelle Pool-Hashrate: {th}"),
+        Language::En => format!("Current pool hashrate: {th}"),
     }
 }
 
@@ -232,7 +232,7 @@ pub(crate) async fn build_stats(
     }
     let live = live_fields_for_workers(redis, &workers).await;
     let total_hashrate: f64 = live.iter().flatten().map(|lf| lf.hash_rate).sum();
-    let total_th = total_hashrate / 1e12;
+    let total_th = format_hashrate_th(total_hashrate);
     let now_ms = Utc::now().timestamp_millis();
     // Freshness = the freshest accepted share across the address's live
     // hashes; a session without one falls back to its start.
@@ -259,7 +259,7 @@ pub(crate) async fn build_stats(
     match lang {
         Language::De => format!(
             "\u{1f4c8} Stats für deine Adresse:\n\
-            - Aktuelle Hashrate: {total_th:.2} TH/s\n\
+            - Aktuelle Hashrate: {total_th}\n\
             - Gesamt-Shares: {shares}\n\
             - Letzter Share: vor {last_seen_seconds} Sekunden\n\
             - Beste Difficulty: {best_g:.2} G",
@@ -267,7 +267,7 @@ pub(crate) async fn build_stats(
         ),
         Language::En => format!(
             "\u{1f4c8} Stats for your address:\n\
-            - Current hashrate: {total_th:.2} TH/s\n\
+            - Current hashrate: {total_th}\n\
             - Total shares: {shares}\n\
             - Last share: {last_seen_seconds} seconds ago\n\
             - Best difficulty: {best_g:.2} G",

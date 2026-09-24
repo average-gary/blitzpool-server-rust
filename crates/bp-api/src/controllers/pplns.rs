@@ -38,7 +38,7 @@ where
 // Hashrate timeseries for the PPLNS mining mode, sourced from the
 // `pool_mode_hashrate` table.
 
-use crate::time_range::{aggregate_to_chart, chart_slot_boundaries, ChartPoint, Range};
+use crate::time_range::{chart_slot_boundaries, sum_into_slots, ChartPoint, Range};
 use bp_common::MiningMode;
 
 #[derive(Deserialize)]
@@ -65,16 +65,27 @@ where
             let since = now_ms - range.window_ms();
             let rows =
                 bp_db::find_pool_mode_hashrate_since(&s.pool, MiningMode::Pplns, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let samples = rows.iter().map(|r| (r.time, r.diff as f64));
-            Ok(aggregate_to_chart(
-                &boundaries,
-                samples,
-                range.slot_size_ms(),
+            Ok(chart_points(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.diff as f64)),
             ))
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// Per-slot sum of the PPLNS accepted diff, one point per boundary.
+fn chart_points(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, f64)>,
+) -> Vec<ChartPoint> {
+    sum_into_slots(boundaries, samples)
+        .into_iter()
+        .map(|(b, diff)| ChartPoint {
+            label: crate::time_range::format_iso_ms(b),
+            data: diff,
+        })
+        .collect()
 }
 
 // ─── helpers ──────────────────────────────────────────────────────
@@ -596,7 +607,7 @@ where
                         paid_sats: r.paid_sats,
                         percent: r.percent,
                         row_type: r.row_type,
-                        created_at: crate::time_range::format_slot_label(r.created_at),
+                        created_at: crate::time_range::format_iso_ms(r.created_at),
                     })
                     .collect())
             },
@@ -609,6 +620,25 @@ where
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    /// `/api/pplns/chart` — dense, raw diff sum per slot, not rounded.
+    #[test]
+    fn chart_json_is_unchanged() {
+        const S: i64 = 600_000;
+        const T0: i64 = 1_700_000_400_000;
+        let samples = vec![
+            (T0, 1.5),
+            (T0, 0.1_f32 as f64),
+            (T0 + S + 123, 2.0),
+            (T0 - S, 99.0),
+            (T0 + 3 * S, 77.0),
+        ];
+        let points = chart_points(&[T0, T0 + S, T0 + 2 * S], samples);
+        assert_eq!(
+            serde_json::to_string(&points).unwrap(),
+            r#"[{"label":"2023-11-14T22:20:00.000Z","data":1.6000000014901161},{"label":"2023-11-14T22:30:00.000Z","data":2},{"label":"2023-11-14T22:40:00.000Z","data":0}]"#
+        );
+    }
 
     /// The fees endpoint reports the live autoscaled budget only while the
     /// autoscaler is on. Both directions against the same stored value: with

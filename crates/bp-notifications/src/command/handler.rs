@@ -58,14 +58,6 @@ pub enum Transport {
     Ntfy { address: AddressId },
 }
 
-/// Marker for callers that want to provide their own response sink
-/// instead of going through the built-in [`Transport`] dispatch (e.g.
-/// tests, or a future bp-bot-commands crate that owns its own
-/// adapter handles).
-pub trait ResponseSink: Send + Sync {
-    fn transport_kind(&self) -> &'static str;
-}
-
 /// A `/bestdiff_reset` confirmation awaiting the user's yes/no tap,
 /// keyed by `"chat_id:message_id"`. Expires so a stale prompt can't
 /// reset much later.

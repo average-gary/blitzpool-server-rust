@@ -117,7 +117,7 @@ mod tests {
 
     use bp_common::MiningMode;
     use bp_notifications::command::ChatLanguageMap;
-    use bp_notifications::dispatcher::{DispatcherConfig, NotificationDispatcher};
+    use bp_notifications::dispatcher::NotificationDispatcher;
     use bp_share_stream::{Consumed, StreamConsumer, StreamProducer, BLOCK_FOUND_STREAM_KEY};
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
@@ -168,13 +168,7 @@ mod tests {
         let chat: ChatLanguageMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         Arc::new(NotificationDispatcher::new(
-            pool,
-            DispatcherConfig::default_zurich(),
-            None,
-            None,
-            None,
-            None,
-            chat,
+            pool, None, None, None, None, chat,
         ))
     }
 
