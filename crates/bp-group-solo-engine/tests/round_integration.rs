@@ -13,8 +13,8 @@
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
     key_applied, key_best_share, key_by_address, key_counter, key_last_accepted_share_at,
-    key_rejected_shares, key_total, key_window_buckets, snapshot, GroupRoundStore, WindowLane,
-    WINDOW_BUCKET_MS,
+    key_rejected_shares, key_total, key_window_buckets, key_window_by_address, snapshot,
+    GroupRoundStore, WindowLane, WINDOW_BUCKET_MS,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -727,6 +727,67 @@ async fn windowed_record_aggregates_into_buckets() {
 // Buckets older than `window_ms` relative to `now_ms` are dropped, and the
 // `window:by-address` aggregate is decremented by exactly the dropped bucket's
 // per-address contribution (hDel-ing addresses that hit zero).
+/// MONEY. A trim that decrements an address below zero — a bucket ahead of
+/// the aggregate, which the per-key Redis backup can restore — must remove
+/// the field, as the PPLNS trim does. Left at a negative value it reads as
+/// absent AND swallows the address's next shares until they climb back
+/// over zero: work in the window that the payout never sees.
+#[tokio::test]
+async fn windowed_trim_does_not_strand_a_negative_entry() {
+    let conn = match connect_or_skip(21).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_win_underflow";
+    let bkt = WINDOW_BUCKET_MS;
+    store
+        .record_share_windowed(None, group, "bc1qold", 40.0, 0)
+        .await
+        .unwrap();
+    store
+        .record_share_windowed(None, group, "bc1qfresh", 60.0, 5 * bkt)
+        .await
+        .unwrap();
+    // Forge the restore skew: the aggregate holds LESS for bc1qold than
+    // its bucket does.
+    let mut conn = conn;
+    let _: () = conn
+        .hset(key_window_by_address(group), "bc1qold", "10")
+        .await
+        .unwrap();
+    assert!(
+        (store.read_window_by_address(group).await.unwrap()["bc1qold"] - 10.0).abs() < 1e-9,
+        "precondition: the aggregate must be BEHIND the bucket's 40"
+    );
+
+    store.trim_window(group, 5 * bkt, 2 * bkt).await.unwrap();
+
+    let raw: Option<String> = conn
+        .hget(key_window_by_address(group), "bc1qold")
+        .await
+        .unwrap();
+    assert!(
+        raw.is_none(),
+        "the underflowed entry must be removed, found {raw:?}"
+    );
+    // What the field would have cost: the address mines on, and that work
+    // must count in full, not first pay off a phantom -30.
+    store
+        .record_share_windowed(None, group, "bc1qold", 20.0, 5 * bkt)
+        .await
+        .unwrap();
+    let after = store.read_window_by_address(group).await.unwrap();
+    assert!(
+        (after["bc1qold"] - 20.0).abs() < 1e-9,
+        "new work counts in full after the trim: {after:?}"
+    );
+    assert!(
+        (after["bc1qfresh"] - 60.0).abs() < 1e-9,
+        "the trim took no one else down: {after:?}"
+    );
+}
+
 #[tokio::test]
 async fn windowed_trim_drops_aged_buckets() {
     let conn = match connect_or_skip(13).await {
