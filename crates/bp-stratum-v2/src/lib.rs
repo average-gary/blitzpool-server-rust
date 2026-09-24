@@ -47,7 +47,7 @@ pub mod noise;
 pub mod protocol_version;
 pub mod server;
 pub mod server_codec;
-pub mod shared_adapter;
+mod shared_adapter;
 pub mod tokens;
 
 pub mod jdp;

@@ -34,10 +34,6 @@ mod server;
 mod shared_adapter;
 mod submit;
 
-pub use shared_adapter::{
-    Sv1AcceptedShareAdapter, Sv1RejectedShareAdapter, Sv1SessionPersistenceAdapter,
-};
-
 pub use client::{
     apply_destroy, apply_new_template, apply_vardiff_check, dispatch, handle_authorize,
     handle_configure, handle_extranonce_subscribe, handle_submit, handle_subscribe,
@@ -63,10 +59,7 @@ pub use frame::{
     VALIDATION_INVALID_AUTHORIZE, VALIDATION_INVALID_CONFIGURE, VALIDATION_INVALID_SUBMIT,
     VALIDATION_INVALID_SUBSCRIBE, VALIDATION_INVALID_SUGGEST,
 };
-pub use hooks::{
-    AcceptedShareSink, BlockSubmissionSink, NoOpHooks, PayoutResolver, RejectedShareSink,
-    ServerHooks, SessionPersistence,
-};
+pub use hooks::{BlockSubmissionSink, NoOpHooks, PayoutResolver, ServerHooks};
 pub use jobs::{lifecycle_from_server_config, JobClassification, JobLookup, JobRegistry};
 pub use notify::{build_notify_frame, swap_endian_words, ActiveSV1Template};
 pub use server::{SharedExtranonce, StratumV1Server, TemplateBroadcast};

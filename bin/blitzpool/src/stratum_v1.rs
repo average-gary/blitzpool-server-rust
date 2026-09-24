@@ -50,10 +50,7 @@ use bp_config::AppConfig;
 use bp_group_mgmt_engine::{GroupService, GroupServiceHooks};
 use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
-use bp_stratum_v1::{
-    PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
-    Sv1AcceptedShareAdapter, Sv1RejectedShareAdapter, Sv1SessionPersistenceAdapter,
-};
+use bp_stratum_v1::{PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
 use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
@@ -269,31 +266,22 @@ fn build_port_hooks(
 ) -> ServerHooks {
     // Front-only path: `build_per_port_servers` runs only when Stratum spawns
     // (the front), where `engines::spawn` always builds these.
-    let accepted = Sv1AcceptedShareAdapter::new(
-        engines
+    ServerHooks {
+        block_sink,
+        accepted_sink: engines
             .accepted_sink
             .clone()
             .expect("front mode builds the accepted composite"),
-    );
-    let rejected = Sv1RejectedShareAdapter::new(
-        engines
+        rejected_sink: engines
             .rejected_sink
             .clone()
             .expect("front mode builds the rejected composite"),
-    );
-
-    let session = Sv1SessionPersistenceAdapter::new(ModeGatePopulatingPersistence::for_port(
-        port_payout_mode,
-        engines,
-        group_lookup,
-        live_sessions,
-    ));
-
-    ServerHooks {
-        block_sink,
-        accepted_sink: Arc::new(accepted),
-        rejected_sink: Arc::new(rejected),
-        session_persistence: Arc::new(session),
+        session_persistence: ModeGatePopulatingPersistence::for_port(
+            port_payout_mode,
+            engines,
+            group_lookup,
+            live_sessions,
+        ),
         payout_resolver,
         device_status_sink,
     }

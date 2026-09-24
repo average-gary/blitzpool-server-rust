@@ -1099,14 +1099,14 @@ pub(crate) async fn process_event_generic<C: bp_vardiff::Clock>(
                 .unwrap_or(("", ""));
             hooks
                 .accepted_sink
-                .record_accepted(
+                .record_accepted(crate::shared_adapter::shared_accepted(
                     address,
                     worker,
                     &state.session_id_hex,
                     state.subscription.as_ref().map(|s| s.user_agent.as_str()),
                     &accept,
                     state.hash_rate,
-                )
+                ))
                 .await;
             if accept.is_block_candidate {
                 hooks
@@ -1127,7 +1127,13 @@ pub(crate) async fn process_event_generic<C: bp_vardiff::Clock>(
             let worker = state.authorization.as_ref().map(|a| a.worker.as_str());
             hooks
                 .rejected_sink
-                .record_rejected(address, worker, &state.session_id_hex, reason, difficulty)
+                .record_rejected(crate::shared_adapter::shared_rejected(
+                    address,
+                    worker,
+                    &state.session_id_hex,
+                    reason,
+                    difficulty,
+                ))
                 .await;
             true
         }

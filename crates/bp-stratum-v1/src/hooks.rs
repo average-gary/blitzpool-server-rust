@@ -8,11 +8,12 @@
 //!
 //! - **Block submission**: a `TdpHandle::submit_solution` adapter for
 //!   the SV1-as-translator topology (TDP-direct, no JDP for SV1).
-//! - **Accepted / rejected share stats**: `bp_stats` accumulators
-//!   (`PoolShares`, `PoolModeHashrate`, `PoolRejected`,
-//!   `ClientStatistics`, `ClientRejected`, `ShareTotals`).
-//! - **Session persistence**: `bp-db` writer for the `client` row, plus
-//!   the device-online/offline notification path.
+//! - **Payout resolution**: the mode-aware coinbase distribution.
+//!
+//! Accepted / rejected shares, session lifecycle and device status go to
+//! the protocol-agnostic `bp_share_hook` traits, which SV2 shares — the
+//! server projects its own types into them at the call site
+//! (`crate::shared_adapter`).
 //!
 //! Trait-object dispatch is deliberate: each hook fires once per
 //! event (subscribe / authorize / share / block-change) — single-digit
@@ -22,9 +23,9 @@
 //! `feedback-design-principles`: *"dyn nur wenn echte Heterogenität
 //! nötig"*.
 //!
-//! All four traits have a [`NoOpHooks`] default impl exposed via
-//! [`ServerHooks::no_op`] so the crate is usable end-to-end without
-//! full production wiring. Tests inject recording impls to assert
+//! [`ServerHooks::no_op`] fills every slot with a no-op ([`NoOpHooks`] for
+//! the SV1 traits, `bp_share_hook::NoOpSink` for the shared ones) so the
+//! crate is usable end-to-end without full production wiring. Tests inject recording impls to assert
 //! the fan-out triggers correctly.
 
 use std::sync::Arc;
@@ -33,9 +34,12 @@ use async_trait::async_trait;
 use bp_mining_job::{PayoutEntry, ResolvedPayouts};
 
 use bp_common::StreamKind;
-use bp_share_hook::DeviceStatusSink;
+use bp_share_hook::{
+    DeviceStatusSink, NoOpSink, SharedAcceptedShareSink, SharedRejectedShareSink,
+    SharedSessionPersistence,
+};
 
-use crate::submit::{RejectReason, ShareAccept};
+use crate::submit::ShareAccept;
 
 // ── PayoutResolver ───────────────────────────────────────────────────
 
@@ -101,90 +105,16 @@ pub trait BlockSubmissionSink: Send + Sync {
     );
 }
 
-// ── Accepted share fan-out ───────────────────────────────────────────
-
-/// Fires for every accepted share. Production impl fans out to:
-/// - `PoolShareStatisticsService.addAcceptedShare(effective_diff)`
-/// - `ClientStatisticsService.addAcceptedShare(entity, effective_diff)`
-/// - `MinerActiveModeService.mark(address, effective_mode)`
-/// - `PoolModeHashrateService.incrementAccepted(effective_mode,
-///   effective_diff)`
-/// - `ShareTotalsCacheService.increment(address, worker, effective_diff)`
-/// - `ClientDifficultyStatisticsService.recordShareDifficulty(...)`
-///
-/// The PPLNS / group-solo `recordShare` calls live with the payout-mode
-/// adapter, not this sink (different wiring, different rate-limit
-/// semantics).
-#[async_trait]
-pub trait AcceptedShareSink: Send + Sync {
-    /// `hash_rate` is the session-wide H/s snapshot the vardiff
-    /// engine reports right after consuming this share — written
-    /// to client_entity.hashRate by the persistence sink. `user_agent`
-    /// is the miner's firmware/vendor string (same source as
-    /// `register_session`), used to stamp the all-time best-difficulty row.
-    async fn record_accepted(
-        &self,
-        address: &str,
-        worker: &str,
-        session_id: &str,
-        user_agent: Option<&str>,
-        accept: &ShareAccept,
-        hash_rate: f64,
-    );
-}
-
-// ── Rejected share fan-out ───────────────────────────────────────────
-
-/// Fires for every rejected share. Forwards to the pool-wide +
-/// per-client rejected-share accumulators (pool reject totals, pool
-/// share stats, per-client reject totals, per-client share stats).
-///
-/// `address` is `None` for shares rejected before the worker authorized
-/// (only possible for `Stale` / `JobNotFound` if the framing layer ever
-/// lets one through — defensive).
-#[async_trait]
-pub trait RejectedShareSink: Send + Sync {
-    async fn record_rejected(
-        &self,
-        address: Option<&str>,
-        worker: Option<&str>,
-        session_id: &str,
-        reason: RejectReason,
-        difficulty: f64,
-    );
-}
-
-// ── Session persistence ──────────────────────────────────────────────
-
-/// Per-session bookkeeping — `client` row insert + device-online/offline
-/// notifications:
-///
-/// - `register_session` inserts the `client` row and fires the
-///   device-online notification.
-/// - `deregister_session` deletes the row and fires the device-offline
-///   notification.
-#[async_trait]
-pub trait SessionPersistence: Send + Sync {
-    async fn register_session(
-        &self,
-        session_id: &str,
-        address: &str,
-        worker: &str,
-        user_agent: Option<&str>,
-    );
-    async fn deregister_session(&self, session_id: &str);
-}
-
 // ── ServerHooks ──────────────────────────────────────────────────────
 
-/// Composite of all six trait boundaries. Cheap to clone (each field is
+/// Composite of every hook the server fires. Cheap to clone (each field is
 /// an `Arc`); the server task clones once per connection.
 #[derive(Clone)]
 pub struct ServerHooks {
     pub block_sink: Arc<dyn BlockSubmissionSink>,
-    pub accepted_sink: Arc<dyn AcceptedShareSink>,
-    pub rejected_sink: Arc<dyn RejectedShareSink>,
-    pub session_persistence: Arc<dyn SessionPersistence>,
+    pub accepted_sink: Arc<dyn SharedAcceptedShareSink>,
+    pub rejected_sink: Arc<dyn SharedRejectedShareSink>,
+    pub session_persistence: Arc<dyn SharedSessionPersistence>,
     pub payout_resolver: Arc<dyn PayoutResolver>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
 }
@@ -197,64 +127,27 @@ impl ServerHooks {
     /// persistence side-effects are silent.
     pub fn no_op() -> Self {
         let n: Arc<NoOpHooks> = Arc::new(NoOpHooks);
+        let shared: Arc<NoOpSink> = Arc::new(NoOpSink);
         Self {
             block_sink: n.clone(),
-            accepted_sink: n.clone(),
-            rejected_sink: n.clone(),
-            session_persistence: n.clone(),
-            payout_resolver: n.clone(),
-            device_status_sink: n,
+            accepted_sink: shared.clone(),
+            rejected_sink: shared.clone(),
+            session_persistence: shared.clone(),
+            payout_resolver: n,
+            device_status_sink: shared,
         }
     }
 }
 
 // ── Default no-op impl ───────────────────────────────────────────────
 
-/// Stub impl satisfying every hook trait. Useful as a placeholder
+/// Stub impl of the SV1-specific hook traits. Useful as a placeholder
 /// without full production wiring + for unit-testing the dispatch layer.
 pub struct NoOpHooks;
 
 #[async_trait]
 impl BlockSubmissionSink for NoOpHooks {
     async fn submit_block(&self, _: &ShareAccept, _: &str, _: &str, _: &str, _: StreamKind) {}
-}
-
-#[async_trait]
-impl AcceptedShareSink for NoOpHooks {
-    async fn record_accepted(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: &ShareAccept,
-        _: f64,
-    ) {
-    }
-}
-
-#[async_trait]
-impl RejectedShareSink for NoOpHooks {
-    async fn record_rejected(
-        &self,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: &str,
-        _: RejectReason,
-        _: f64,
-    ) {
-    }
-}
-
-#[async_trait]
-impl SessionPersistence for NoOpHooks {
-    async fn register_session(&self, _: &str, _: &str, _: &str, _: Option<&str>) {}
-    async fn deregister_session(&self, _: &str) {}
-}
-
-#[async_trait]
-impl DeviceStatusSink for NoOpHooks {
-    async fn on_device_event(&self, _: &str, _: &str, _: &str, _: Option<&str>, _: bool) {}
 }
 
 #[async_trait]
@@ -276,10 +169,11 @@ impl PayoutResolver for NoOpHooks {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
     use std::sync::Mutex;
 
     /// `(address, worker, reason, difficulty)` captured per rejected share.
-    type RejectedRecord = (Option<String>, Option<String>, RejectReason, f64);
+    type RejectedRecord = (Option<String>, Option<String>, RejectedReason, f64);
 
     pub(crate) struct RecordingHooks {
         pub registered: Mutex<Vec<(String, String, String)>>,
@@ -351,38 +245,23 @@ pub(crate) mod test_support {
     }
 
     #[async_trait]
-    impl AcceptedShareSink for RecordingHooks {
-        async fn record_accepted(
-            &self,
-            address: &str,
-            _worker: &str,
-            _session_id: &str,
-            _user_agent: Option<&str>,
-            accept: &ShareAccept,
-            _hash_rate: f64,
-        ) {
+    impl SharedAcceptedShareSink for RecordingHooks {
+        async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
             self.accepted
                 .lock()
                 .unwrap()
-                .push((address.to_string(), accept.effective_difficulty));
+                .push((share.address.to_string(), share.effective_difficulty));
         }
     }
 
     #[async_trait]
-    impl RejectedShareSink for RecordingHooks {
-        async fn record_rejected(
-            &self,
-            address: Option<&str>,
-            worker: Option<&str>,
-            _: &str,
-            reason: RejectReason,
-            difficulty: f64,
-        ) {
+    impl SharedRejectedShareSink for RecordingHooks {
+        async fn record_rejected(&self, share: SharedRejectedShare<'_>) {
             self.rejected.lock().unwrap().push((
-                address.map(String::from),
-                worker.map(String::from),
-                reason,
-                difficulty,
+                share.address.map(String::from),
+                share.worker.map(String::from),
+                share.reason,
+                share.difficulty,
             ));
         }
     }
@@ -398,7 +277,7 @@ pub(crate) mod test_support {
     }
 
     #[async_trait]
-    impl SessionPersistence for RecordingHooks {
+    impl SharedSessionPersistence for RecordingHooks {
         async fn register_session(
             &self,
             session_id: &str,

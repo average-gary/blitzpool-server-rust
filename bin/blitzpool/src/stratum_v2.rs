@@ -42,15 +42,11 @@ use bp_share::Difficulty;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
 use bp_stratum_v2::hooks::{
-    AcceptedShareSink as Sv2AcceptedSink, BlockSubmissionSink as Sv2BlockSink, MiningServerHooks,
-    PayoutResolver, RejectedShareSink as Sv2RejectedSink, SessionPersistence as Sv2SessionPersist,
+    BlockSubmissionSink as Sv2BlockSink, MiningServerHooks, PayoutResolver,
 };
 use bp_stratum_v2::mining::client::PortConfig as Sv2PortConfig;
 use bp_stratum_v2::noise::{NoiseConfig, NoiseConfigError, DEFAULT_CERT_VALIDITY};
 use bp_stratum_v2::server::{ServerConfig as Sv2ServerConfig, StratumV2MiningServer};
-use bp_stratum_v2::shared_adapter::{
-    Sv2AcceptedShareAdapter, Sv2RejectedShareAdapter, Sv2SessionPersistenceAdapter,
-};
 use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -276,34 +272,23 @@ fn build_port_hooks(
 ) -> MiningServerHooks {
     // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
-    let accepted: Arc<dyn Sv2AcceptedSink> = Arc::new(Sv2AcceptedShareAdapter::new(
-        engines
+    MiningServerHooks {
+        payout_resolver,
+        block_sink,
+        accepted_sink: engines
             .accepted_sink
             .clone()
             .expect("front mode builds the accepted composite"),
-    ));
-    let rejected: Arc<dyn Sv2RejectedSink> = Arc::new(Sv2RejectedShareAdapter::new(
-        engines
+        rejected_sink: engines
             .rejected_sink
             .clone()
             .expect("front mode builds the rejected composite"),
-    ));
-
-    let session: Arc<dyn Sv2SessionPersist> = Arc::new(Sv2SessionPersistenceAdapter::new(
-        ModeGatePopulatingPersistence::for_port(
+        session_persistence: ModeGatePopulatingPersistence::for_port(
             port_payout_mode,
             engines,
             group_lookup,
             live_sessions,
         ),
-    ));
-
-    MiningServerHooks {
-        payout_resolver,
-        block_sink,
-        accepted_sink: accepted,
-        rejected_sink: rejected,
-        session_persistence: session,
         device_status_sink,
         custom_extranonce,
     }

@@ -193,7 +193,7 @@ pub struct SessionPersistenceEngineHandle {
 }
 
 impl SessionPersistenceEngineHandle {
-    /// Hook impl for `bp_stratum_v1::SessionPersistence`. Wire into
+    /// Hook impl for `bp_share_hook::SharedSessionPersistence`. Wire into
     /// `ServerHooks::session_persistence`. All clones share the one
     /// debounce, so SV1 and SV2 sessions pend into the same map.
     pub fn session_persistence_hook(&self) -> SessionPersistenceHook {

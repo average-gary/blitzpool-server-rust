@@ -767,7 +767,7 @@ async fn run_mining_connection(
                 // is set ONLY when the swap succeeds, so the submit handle (driven
                 // by `state.stream`) can never route to a stream whose template_id
                 // the job doesn't carry.
-                if let Some((channel_id, _)) = newly_opened_channel {
+                if newly_opened_channel.is_some() {
                     if let Some(addr) = state.address.as_ref() {
                         // Publish the address's mode into the mode-gate
                         // BEFORE the stream routing below. resolve_stream
@@ -791,7 +791,6 @@ async fn run_mining_connection(
                                 &session_id_hex,
                                 address.as_str(),
                                 &worker,
-                                channel_id,
                                 Some(user_agent.as_str()),
                             )
                             .await;
@@ -1743,7 +1742,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 };
                 hooks
                     .accepted_sink
-                    .record_accepted(
+                    .record_accepted(crate::shared_adapter::shared_accepted(
                         address_str,
                         effective_worker,
                         session_id_hex,
@@ -1755,7 +1754,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                         // connection, several channels) it is the rig total.
                         state.vardiff.values().map(|v| v.hash_rate()).sum::<f64>(),
                         state.channels.len() as u32,
-                    )
+                    ))
                     .await;
                 if accept.is_block_candidate {
                     // Route the solution to the handle of the stream this
@@ -1781,16 +1780,15 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 let address_opt = state.address.as_ref().map(|a| a.as_str());
                 let worker_opt = state.address.as_ref().map(|_| state.worker_name.as_str());
                 let _ = channel_id;
-                hooks
-                    .rejected_sink
-                    .record_rejected(
-                        address_opt,
-                        worker_opt,
-                        session_id_hex,
-                        reject.reason,
-                        state.session_difficulty,
-                    )
-                    .await;
+                if let Some(share) = crate::shared_adapter::shared_rejected(
+                    address_opt,
+                    worker_opt,
+                    session_id_hex,
+                    reject.reason,
+                    state.session_difficulty,
+                ) {
+                    hooks.rejected_sink.record_rejected(share).await;
+                }
             }
         }
     }
@@ -2435,7 +2433,10 @@ mod tests {
         apply_session_events_generic(events, "sess-1", &state, &hooks).await;
         let records = recording.rejected.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].reason, RejectReason::StaleShare);
+        assert_eq!(
+            records[0].reason,
+            bp_share_hook::RejectedReason::JobNotFound
+        );
         assert_eq!(records[0].address.as_deref(), Some(ADDR));
     }
 
