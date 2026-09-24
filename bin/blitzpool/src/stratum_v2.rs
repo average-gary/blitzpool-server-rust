@@ -160,7 +160,7 @@ pub(crate) fn build_per_port_servers(
     payout_resolver: Arc<dyn PayoutResolver>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
-    device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
+    device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
     settle: crate::settlement::SettlementSignal,
@@ -270,7 +270,7 @@ fn build_port_hooks(
     block_sink: Arc<dyn Sv2BlockSink>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
-    device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
+    device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
 ) -> MiningServerHooks {

@@ -64,8 +64,8 @@ pub use frame::{
     VALIDATION_INVALID_SUBSCRIBE, VALIDATION_INVALID_SUGGEST,
 };
 pub use hooks::{
-    AcceptedShareSink, BlockSubmissionSink, DeviceStatusSink, NoOpHooks, PayoutResolver,
-    RejectedShareSink, ServerHooks, SessionPersistence,
+    AcceptedShareSink, BlockSubmissionSink, NoOpHooks, PayoutResolver, RejectedShareSink,
+    ServerHooks, SessionPersistence,
 };
 pub use jobs::{lifecycle_from_server_config, JobClassification, JobLookup, JobRegistry};
 pub use notify::{build_notify_frame, swap_endian_words, ActiveSV1Template};

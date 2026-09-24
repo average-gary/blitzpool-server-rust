@@ -49,6 +49,7 @@ use std::sync::Arc;
 use bp_common::{AddressId, StreamKind};
 use bp_mining_job::{PayoutEntry, ResolvedPayouts};
 use bp_share::Difficulty;
+use bp_share_hook::DeviceStatusSink;
 
 use crate::mining::submit::{RejectReason, ShareAccept};
 
@@ -186,24 +187,6 @@ pub trait SessionPersistence: Send + Sync {
     );
 
     async fn deregister_session(&self, session_id_hex: &str);
-}
-
-// ── DeviceStatusSink ────────────────────────────────────────────────
-
-/// Fired on per-channel ChannelOpened (online) + ChannelClosed (offline)
-/// transitions. Production wiring forwards to
-/// `bp_notifications::dispatcher::NotificationDispatcher::notify_device_status`
-/// so subscribers receive per-worker connect / disconnect pushes.
-#[async_trait::async_trait]
-pub trait DeviceStatusSink: Send + Sync {
-    async fn on_device_event(
-        &self,
-        address: &str,
-        worker: &str,
-        session_id_hex: &str,
-        user_agent: Option<&str>,
-        is_online: bool,
-    );
 }
 
 // ── CustomExtranonceSource ──────────────────────────────────────────

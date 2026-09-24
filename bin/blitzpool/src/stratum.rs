@@ -182,8 +182,7 @@ pub(crate) async fn spawn(
     ));
     let live_publisher = crate::live_sessions::spawn_publisher(Arc::clone(&live_sessions));
 
-    let (sv1_device_status, sv2_device_status) =
-        crate::device_status::stratum_sinks(gate, foundation.redis.clone());
+    let device_status = crate::device_status::stratum_sinks(gate, foundation.redis.clone());
 
     let sv1_servers = stratum_v1::build_per_port_servers(
         cfg,
@@ -192,7 +191,7 @@ pub(crate) async fn spawn(
         group_service,
         sv1_resolver,
         dispatcher.clone(),
-        sv1_device_status,
+        Arc::clone(&device_status),
         Arc::clone(&live_sessions),
         job_cache.clone(),
         settle.clone(),
@@ -212,7 +211,7 @@ pub(crate) async fn spawn(
         sv2_resolver,
         custom_extranonce,
         dispatcher,
-        sv2_device_status,
+        device_status,
         Arc::clone(&live_sessions),
         job_cache,
         settle,

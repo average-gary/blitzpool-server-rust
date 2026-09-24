@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use bp_mining_job::{PayoutEntry, ResolvedPayouts};
 
 use bp_common::StreamKind;
+use bp_share_hook::DeviceStatusSink;
 
 use crate::submit::{RejectReason, ShareAccept};
 
@@ -172,24 +173,6 @@ pub trait SessionPersistence: Send + Sync {
         user_agent: Option<&str>,
     );
     async fn deregister_session(&self, session_id: &str);
-}
-
-// ── Device status ────────────────────────────────────────────────────
-
-/// Fired on per-session online (`Authorized`) + offline (`Disconnect`)
-/// transitions. Production wiring forwards to
-/// `bp_notifications::dispatcher::NotificationDispatcher::notify_device_status`
-/// so subscribers get per-worker connect / disconnect pushes.
-#[async_trait]
-pub trait DeviceStatusSink: Send + Sync {
-    async fn on_device_event(
-        &self,
-        address: &str,
-        worker: &str,
-        session_id: &str,
-        user_agent: Option<&str>,
-        is_online: bool,
-    );
 }
 
 // ── ServerHooks ──────────────────────────────────────────────────────

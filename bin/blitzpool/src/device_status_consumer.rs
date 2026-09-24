@@ -74,8 +74,8 @@ pub(crate) fn spawn(
 mod tests {
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
+    use bp_share_hook::DeviceStatusSink;
     use bp_share_stream::{StreamConsumer, DEVICE_STATUS_STREAM_KEY};
-    use bp_stratum_v1::DeviceStatusSink;
 
     use crate::device_status::{DeviceStatusStreamEvent, ProducingDeviceStatusSink};
 

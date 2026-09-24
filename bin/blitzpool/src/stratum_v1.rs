@@ -101,7 +101,7 @@ pub(crate) fn build_per_port_servers(
     group_service: &SharedGroupService,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
-    device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink>,
+    device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
     settle: crate::settlement::SettlementSignal,
@@ -264,7 +264,7 @@ fn build_port_hooks(
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
-    device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink>,
+    device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> ServerHooks {
     // Front-only path: `build_per_port_servers` runs only when Stratum spawns

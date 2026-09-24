@@ -389,6 +389,22 @@ pub trait SharedSessionPersistence: Send + Sync {
     async fn deregister_session(&self, session_id: &str);
 }
 
+/// Protocol-agnostic per-device online/offline transition. SV1 fires it on
+/// authorize and disconnect, SV2 on channel open and close, with the same
+/// payload, so both servers take this one trait. Production wiring forwards
+/// to the device-status gate (in-process) or the `device:status` stream.
+#[async_trait]
+pub trait DeviceStatusSink: Send + Sync {
+    async fn on_device_event(
+        &self,
+        address: &str,
+        worker: &str,
+        session_id: &str,
+        user_agent: Option<&str>,
+        is_online: bool,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

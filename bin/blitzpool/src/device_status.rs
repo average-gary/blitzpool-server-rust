@@ -2,8 +2,7 @@
 
 //! `DeviceStatusSink` implementations — Phase 7.7.
 //!
-//! Both SV1 (`bp_stratum_v1::DeviceStatusSink`) and SV2
-//! (`bp_stratum_v2::hooks::DeviceStatusSink`) define a small fire-on-
+//! SV1 and SV2 both fire [`bp_share_hook::DeviceStatusSink`], a small
 //! online/offline trait. The bin builds one of two concrete impls:
 //!
 //! - [`DispatcherDeviceStatusSink`] — feeds the in-process
@@ -38,9 +37,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bp_common::AddressId;
 use bp_notifications::dispatcher::DeviceStatusEvent;
+use bp_share_hook::DeviceStatusSink;
 use bp_share_stream::{StreamProducer, DEVICE_STATUS_STREAM_KEY};
-use bp_stratum_v1::DeviceStatusSink as Sv1DeviceStatusSink;
-use bp_stratum_v2::hooks::DeviceStatusSink as Sv2DeviceStatusSink;
 use chrono::{TimeZone, Utc};
 use redis::aio::ConnectionManager;
 use tracing::warn;
@@ -154,16 +152,10 @@ pub(crate) fn stratum_sinks(
         crate::device_status_gate::SubscribedAddresses,
     )>,
     redis: ConnectionManager,
-) -> (Arc<dyn Sv1DeviceStatusSink>, Arc<dyn Sv2DeviceStatusSink>) {
+) -> Arc<dyn DeviceStatusSink> {
     match gate {
-        Some((gate, subscribers)) => {
-            let sink = Arc::new(DispatcherDeviceStatusSink::new(gate, subscribers));
-            (sink.clone(), sink)
-        }
-        None => {
-            let sink = Arc::new(ProducingDeviceStatusSink::new(redis));
-            (sink.clone(), sink)
-        }
+        Some((gate, subscribers)) => Arc::new(DispatcherDeviceStatusSink::new(gate, subscribers)),
+        None => Arc::new(ProducingDeviceStatusSink::new(redis)),
     }
 }
 
@@ -202,26 +194,12 @@ impl DispatcherDeviceStatusSink {
 }
 
 #[async_trait]
-impl Sv1DeviceStatusSink for DispatcherDeviceStatusSink {
+impl DeviceStatusSink for DispatcherDeviceStatusSink {
     async fn on_device_event(
         &self,
         address: &str,
         worker: &str,
         _session_id: &str,
-        user_agent: Option<&str>,
-        is_online: bool,
-    ) {
-        self.forward(address, worker, user_agent, is_online);
-    }
-}
-
-#[async_trait]
-impl Sv2DeviceStatusSink for DispatcherDeviceStatusSink {
-    async fn on_device_event(
-        &self,
-        address: &str,
-        worker: &str,
-        _session_id_hex: &str,
         user_agent: Option<&str>,
         is_online: bool,
     ) {
@@ -267,26 +245,12 @@ impl ProducingDeviceStatusSink {
 }
 
 #[async_trait]
-impl Sv1DeviceStatusSink for ProducingDeviceStatusSink {
+impl DeviceStatusSink for ProducingDeviceStatusSink {
     async fn on_device_event(
         &self,
         address: &str,
         worker: &str,
         _session_id: &str,
-        user_agent: Option<&str>,
-        is_online: bool,
-    ) {
-        self.forward(address, worker, user_agent, is_online).await;
-    }
-}
-
-#[async_trait]
-impl Sv2DeviceStatusSink for ProducingDeviceStatusSink {
-    async fn on_device_event(
-        &self,
-        address: &str,
-        worker: &str,
-        _session_id_hex: &str,
         user_agent: Option<&str>,
         is_online: bool,
     ) {
