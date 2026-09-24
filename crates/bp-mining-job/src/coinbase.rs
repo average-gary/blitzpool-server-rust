@@ -188,43 +188,46 @@ impl MiningJob {
         enonce1: &[u8; 4],
         enonce2: &[u8; 8],
     ) -> Vec<u8> {
-        // Non-witness layout (what we have stored, split around the slot):
-        //   prefix = [version:4][input_count:1][prev_txid:32][prev_vout:4]
-        //            [scriptsig_len:varint][scriptsig: prefix_part]
-        //   slot    = [enonce1:4][enonce2:8]
-        //   suffix = [scriptsig: suffix_part][sequence:4][output_count:varint]
-        //            [outputs...][locktime:4]
-        //
-        // Witness layout differs only at two points:
-        //   - bytes 4..4: insert [marker=0x00][flag=0x01] (right after version)
-        //   - before the trailing locktime: insert
-        //     [witness_count=0x01][witness_len=0x20][32 zero bytes]
-        let prefix = &self.coinbase_prefix;
-        let suffix = &self.coinbase_suffix;
-        let locktime_at = suffix.len() - 4;
-
-        let total = prefix.len() + 2 + EXTRANONCE_SLOT_LEN + locktime_at + 1 + 1 + 32 + 4;
-        let mut buf = Vec::with_capacity(total);
-        // version
-        buf.extend_from_slice(&prefix[..4]);
-        // BIP-141 marker + flag
-        buf.push(0x00);
-        buf.push(0x01);
-        // rest of the non-witness prefix (input_count onwards)
-        buf.extend_from_slice(&prefix[4..]);
-        // extranonce slot
-        buf.extend_from_slice(enonce1);
-        buf.extend_from_slice(enonce2);
-        // non-witness suffix up to (not including) locktime
-        buf.extend_from_slice(&suffix[..locktime_at]);
-        // witness stack: 1 item of 32 bytes (the coinbase's mandatory reserved value)
-        buf.push(0x01);
-        buf.push(0x20);
-        buf.extend_from_slice(&[0u8; 32]);
-        // locktime
-        buf.extend_from_slice(&suffix[locktime_at..]);
-        buf
+        let mut stratum = Vec::with_capacity(
+            self.coinbase_prefix.len() + EXTRANONCE_SLOT_LEN + self.coinbase_suffix.len(),
+        );
+        stratum.extend_from_slice(&self.coinbase_prefix);
+        stratum.extend_from_slice(enonce1);
+        stratum.extend_from_slice(enonce2);
+        stratum.extend_from_slice(&self.coinbase_suffix);
+        assemble_witness_coinbase(&stratum)
     }
+}
+
+/// Convert a non-witness (stratum) coinbase into the witness form Bitcoin
+/// Core's `submitblock` expects: BIP-141 marker `0x00` + flag `0x01` right
+/// after `version`, and a single 32-zero-byte witness item (the coinbase
+/// input's mandatory reserved value) right before `locktime`.
+///
+/// The one implementation of that layout. SV1 reaches it through
+/// [`MiningJob::witness_coinbase_with_extranonce`]; SV2 and the JDP block
+/// path hold already-assembled stratum bytes and call it directly.
+pub fn assemble_witness_coinbase(stratum_coinbase: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        stratum_coinbase.len() >= 8,
+        "stratum coinbase smaller than version+locktime"
+    );
+    let locktime_at = stratum_coinbase.len() - 4;
+    let mut buf = Vec::with_capacity(stratum_coinbase.len() + 2 + 1 + 1 + 32);
+    // version
+    buf.extend_from_slice(&stratum_coinbase[..4]);
+    // BIP-141 marker + flag
+    buf.push(0x00);
+    buf.push(0x01);
+    // everything between version and locktime (input + outputs)
+    buf.extend_from_slice(&stratum_coinbase[4..locktime_at]);
+    // witness stack: 1 item of 32 zero bytes
+    buf.push(0x01);
+    buf.push(0x20);
+    buf.extend_from_slice(&[0u8; 32]);
+    // locktime
+    buf.extend_from_slice(&stratum_coinbase[locktime_at..]);
+    buf
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -757,6 +760,36 @@ pub fn solo_payouts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the BIP-141 witness layout: marker `0x00` + flag `0x01`
+    /// right after the 4-byte `version`, then a 1-byte witness-stack
+    /// length (`0x01`) + 1-byte item length (`0x20`) + 32 zero bytes
+    /// inserted right before the trailing 4-byte `locktime`.
+    #[test]
+    fn assemble_witness_coinbase_pins_bip141_layout() {
+        // Minimal coinbase: 4B version + 4B body + 4B locktime = 12B.
+        let mut stratum = Vec::with_capacity(12);
+        stratum.extend_from_slice(&1u32.to_le_bytes()); // version=1
+        stratum.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // body
+        stratum.extend_from_slice(&[0xEE, 0xEE, 0xEE, 0xEE]); // locktime
+        let w = assemble_witness_coinbase(&stratum);
+        // 12 stratum bytes + 2 marker/flag + 1 stack-count + 1 item-len
+        // + 32 witness bytes = 48.
+        assert_eq!(w.len(), 12 + 2 + 1 + 1 + 32);
+        // Version intact.
+        assert_eq!(&w[..4], &1u32.to_le_bytes());
+        // Marker + flag.
+        assert_eq!(w[4], 0x00);
+        assert_eq!(w[5], 0x01);
+        // Body intact.
+        assert_eq!(&w[6..10], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        // Witness stack: count=1, len=0x20, 32 zero bytes.
+        assert_eq!(w[10], 0x01);
+        assert_eq!(w[11], 0x20);
+        assert!(w[12..44].iter().all(|b| *b == 0));
+        // Locktime intact.
+        assert_eq!(&w[44..], &[0xEE, 0xEE, 0xEE, 0xEE]);
+    }
     use bitcoin::consensus::Decodable;
 
     fn template_with_height(height: u32) -> CoinbaseTemplate {

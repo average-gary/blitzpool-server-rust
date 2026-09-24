@@ -39,7 +39,7 @@
 //! caller serializes the chosen literal directly without paraphrasing.
 
 use bp_jobs_lifecycle::JobClassification;
-use bp_mining_job::{build_block_header, merkle_root_from_coinbase};
+use bp_mining_job::{assemble_witness_coinbase, build_block_header, merkle_root_from_coinbase};
 use bp_share::{calculate_difficulty, sha256d_from_parts, Difficulty, Target};
 use smallvec::SmallVec;
 
@@ -741,48 +741,6 @@ pub fn validate_submit_extended(
     }))
 }
 
-/// Convert the non-witness (stratum) coinbase bytes into the
-/// witness-form serialisation Bitcoin Core's `submitblock` expects:
-/// inserts BIP-141 marker `0x00` + flag `0x01` right after `version`,
-/// then a single witness item of 32 zero bytes (the coinbase input's
-/// mandatory reserved value) right before `locktime`.
-///
-/// Mirrors the algebra in
-/// [`bp_mining_job::MiningJob::witness_coinbase_with_extranonce`] but
-/// operates on already-assembled stratum-coinbase bytes — the SV2
-/// extended-validator path reconstructs them from
-/// `ext_job.coinbase_prefix + ext_job.extranonce_prefix +
-/// submission.extranonce + ext_job.coinbase_suffix` and has no
-/// `MiningJob` handle. Output is byte-identical to the SV1 path.
-///
-/// `pub` so the bin's JDP-block-submission
-/// sink (`bin/blitzpool/src/jdp_hooks.rs`) can reuse it: a JDP-declared
-/// job's coinbase arrives in stratum (non-witness) form via
-/// `DeclareMiningJob`, but block submission to bitcoin-core needs the
-/// witness form. Single source of truth for the BIP-141 layout.
-pub fn assemble_witness_coinbase(stratum_coinbase: &[u8]) -> Vec<u8> {
-    debug_assert!(
-        stratum_coinbase.len() >= 8,
-        "stratum coinbase smaller than version+locktime"
-    );
-    let locktime_at = stratum_coinbase.len() - 4;
-    let mut buf = Vec::with_capacity(stratum_coinbase.len() + 2 + 1 + 1 + 32);
-    // version
-    buf.extend_from_slice(&stratum_coinbase[..4]);
-    // BIP-141 marker + flag
-    buf.push(0x00);
-    buf.push(0x01);
-    // everything between version and locktime (input + outputs)
-    buf.extend_from_slice(&stratum_coinbase[4..locktime_at]);
-    // witness stack: 1 item of 32 zero bytes
-    buf.push(0x01);
-    buf.push(0x20);
-    buf.extend_from_slice(&[0u8; 32]);
-    // locktime
-    buf.extend_from_slice(&stratum_coinbase[locktime_at..]);
-    buf
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1314,89 +1272,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    // ── assemble_witness_coinbase — byte-identical to SV1's path ──────
-
-    /// Pin the BIP-141 witness layout: marker `0x00` + flag `0x01`
-    /// right after the 4-byte `version`, then a 1-byte witness-stack
-    /// length (`0x01`) + 1-byte item length (`0x20`) + 32 zero bytes
-    /// inserted right before the trailing 4-byte `locktime`.
-    #[test]
-    fn assemble_witness_coinbase_pins_bip141_layout() {
-        // Minimal coinbase: 4B version + 4B body + 4B locktime = 12B.
-        let mut stratum = Vec::with_capacity(12);
-        stratum.extend_from_slice(&1u32.to_le_bytes()); // version=1
-        stratum.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // body
-        stratum.extend_from_slice(&[0xEE, 0xEE, 0xEE, 0xEE]); // locktime
-        let w = assemble_witness_coinbase(&stratum);
-        // 12 stratum bytes + 2 marker/flag + 1 stack-count + 1 item-len
-        // + 32 witness bytes = 48.
-        assert_eq!(w.len(), 12 + 2 + 1 + 1 + 32);
-        // Version intact.
-        assert_eq!(&w[..4], &1u32.to_le_bytes());
-        // Marker + flag.
-        assert_eq!(w[4], 0x00);
-        assert_eq!(w[5], 0x01);
-        // Body intact.
-        assert_eq!(&w[6..10], &[0xAA, 0xBB, 0xCC, 0xDD]);
-        // Witness stack: count=1, len=0x20, 32 zero bytes.
-        assert_eq!(w[10], 0x01);
-        assert_eq!(w[11], 0x20);
-        assert!(w[12..44].iter().all(|b| *b == 0));
-        // Locktime intact.
-        assert_eq!(&w[44..], &[0xEE, 0xEE, 0xEE, 0xEE]);
-    }
-
-    #[test]
-    fn assemble_witness_coinbase_matches_mining_job_for_segwit_round_trip() {
-        // Build a real MiningJob (SV1's coinbase shape) + a synthetic
-        // 12-byte extranonce, then compare the witness-form output of
-        // both the MiningJob helper and our SV2-side assembler over
-        // the same stratum-coinbase bytes.
-        use bitcoin::Network;
-        use bp_mining_job::{build_mining_job, CoinbaseTemplate, PayoutEntry, EXTRANONCE_SLOT_LEN};
-
-        let payouts = [PayoutEntry {
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            sats: 5_000_000_000,
-        }];
-        let template = CoinbaseTemplate {
-            block_height: 42,
-            coinbase_value_sats: 5_000_000_000,
-            witness_commitment: [0x77; 32],
-        };
-        let job = build_mining_job(
-            Network::Regtest,
-            &payouts,
-            &template,
-            "BP",
-            EXTRANONCE_SLOT_LEN,
-            [0u8; 32],
-        )
-        .expect("ok");
-        let enonce1 = [0xAA; 4];
-        let enonce2 = [0xBB; 8];
-
-        // SV1's path: build witness coinbase from the MiningJob helpers.
-        let sv1_witness = job.witness_coinbase_with_extranonce(&enonce1, &enonce2);
-
-        // SV2's path: reconstruct the stratum coinbase the same way
-        // `validate_submit_extended` does (prefix + extranonce slot
-        // + suffix), then run the witness assembler.
-        let mut stratum = Vec::new();
-        stratum.extend_from_slice(job.coinbase_prefix());
-        stratum.extend_from_slice(&enonce1);
-        stratum.extend_from_slice(&enonce2);
-        stratum.extend_from_slice(job.coinbase_suffix());
-        let sv2_witness = assemble_witness_coinbase(&stratum);
-
-        assert_eq!(
-            sv1_witness, sv2_witness,
-            "SV1's MiningJob::witness_coinbase_with_extranonce and SV2's \
-             assemble_witness_coinbase MUST produce byte-identical output \
-             over the same stratum-coinbase input"
-        );
     }
 
     // ── ext 0x0002 Worker-ID TLV resolution in validate_submit_extended ──

@@ -54,7 +54,7 @@
 //! 4. **[`ProductionJdpBlockSink`]** — on a JDC `PushSolution`,
 //!    reconstructs the full SegWit block from (a) the declared
 //!    coinbase prefix+suffix + JDC extranonce (witness-formed via
-//!    [`bp_stratum_v2::mining::submit::assemble_witness_coinbase`]),
+//!    [`bp_mining_job::assemble_witness_coinbase`]),
 //!    (b) the JDC-supplied raw transactions from
 //!    `JdpSessionEvent::BlockSubmissionCandidate.transactions`, and
 //!    (c) the header fields — **once** — then hands that one block to
@@ -82,6 +82,7 @@ use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
 use bp_common::{AddressId, Sats, StreamKind};
+use bp_mining_job::assemble_witness_coinbase;
 use bp_stratum_v2::jdp::client::{
     parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
 };
@@ -92,7 +93,6 @@ use bp_stratum_v2::jdp_server::{
     AllocateOutcome, CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink,
     JdpServerHooks, PayoutDistributionSource, TemplateTxProvider,
 };
-use bp_stratum_v2::mining::submit::assemble_witness_coinbase;
 use bp_template_distribution::{TdpHandle, TemplateTxCache};
 use tracing::{debug, info, warn};
 
