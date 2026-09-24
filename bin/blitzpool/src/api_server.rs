@@ -123,7 +123,6 @@ fn build_app_state(
     let bitcoin_rpc_arc = Some(Arc::new(foundation.bitcoin_rpc.clone()));
     let tdp_clone = foundation.tdp.clone();
     let geoip_arc = foundation.geoip.clone();
-    let metrics_clone = foundation.metrics.clone();
 
     let state = AppState {
         pool,
@@ -138,12 +137,10 @@ fn build_app_state(
         tdp_staleness_threshold_ms: (cfg.tdp.staleness_threshold_secs as i64) * 1000,
         bitcoin_rpc: bitcoin_rpc_arc,
         geoip: geoip_arc,
-        metrics: metrics_clone,
         pool_version: env!("CARGO_PKG_VERSION"),
         email_verification_hooks: production_hooks.email_verification.clone(),
         pool_base_url: cfg.pool_base_url.clone(),
         email_enabled: cfg.smtp.is_some(),
-        push_hooks: production_hooks.push.clone(),
         start_time: chrono::Utc::now(),
         network: crate::boot::bitcoin_network(cfg.network),
         pool_identifier: cfg.pool_identifier.clone(),

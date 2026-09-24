@@ -287,6 +287,41 @@ impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
 
 // ── effective_job_difficulty ─────────────────────────────────────────
 
+/// Round a positive, finite difficulty UP to the next power of two (a power
+/// of two stays put). The one rounding both vardiff and the SV2 channel-open
+/// path apply to every difficulty the pool assigns; each caller keeps its own
+/// guards (zero, `min_difficulty`, sub-1) in front of it.
+///
+/// **Powers of two only, and always upward.** Both halves were measured on
+/// a live translating proxy, and each half fixes a different failure:
+///
+/// - *Powers of two:* a translating proxy rounds an assigned difficulty UP to
+///   a power of two when it lowers it into an SV1 `mining.set_difficulty`,
+///   so a difficulty like 2887 reached the miner as 4096 while the pool kept
+///   booking shares at 2887 — 29.5 % of a miner's work went uncredited.
+/// - *Upward:* rounding to the NEAREST rung goes down as often as up, and a
+///   downstream that requested a difficulty via `UpdateChannel` rejects a
+///   lower one as a protocol error — the translator logs "SetTarget response
+///   has target which is higher than requested target … Ignoring this
+///   pending update" and the miner simply keeps its old difficulty. Rounding
+///   down therefore does not mis-size the target, it discards the
+///   assignment. Up is always accepted.
+///
+/// The cost of rounding up is at most a factor of two in share rate, which
+/// the estimator absorbs; the cost of the other two is real work nobody is
+/// paid for.
+pub fn round_up_to_power_of_two(val: f64) -> f64 {
+    let lower = 2_f64.powf(val.log2().floor());
+    // The tolerance matters: a value that is a power of two apart from
+    // floating-point dust (0.5 arriving as 0.500000000001) must stay on its
+    // rung, not double. Only a genuine gap rounds up.
+    if val <= lower * (1.0 + 1e-9) {
+        lower
+    } else {
+        lower * 2.0
+    }
+}
+
 /// ckpool-style per-job difficulty clamp.
 ///
 /// When a vardiff ratchet flips the session difficulty up, miner firmware
@@ -1064,28 +1099,9 @@ impl<C: Clock> VarDiffEngine<C> {
         }
     }
 
-    /// Round UP to a power of two. Floors at `min_difficulty`.
-    /// Returns `None` for `val == 0`, guarding against `log2(0) = -Infinity`.
-    ///
-    /// **Powers of two only, and always upward.** Both halves were measured on
-    /// a live translating proxy, and each half fixes a different failure:
-    ///
-    /// - *Powers of two:* the ladder used to carry a `lower * 1.5` rung. The SRI
-    ///   translator rounds an assigned difficulty UP to a power of two when it
-    ///   lowers it into an SV1 `mining.set_difficulty`, so a rung like 3072
-    ///   reached the miner as 4096 while the pool kept booking shares at 3072 —
-    ///   29.5 % of a miner's work went uncredited.
-    /// - *Upward:* rounding to the NEAREST rung goes down as often as up, and a
-    ///   downstream that requested a difficulty via `UpdateChannel` rejects a
-    ///   lower one as a protocol error — the translator logs "SetTarget response
-    ///   has target which is higher than requested target … Ignoring this
-    ///   pending update" and the miner simply keeps its old difficulty. Rounding
-    ///   down therefore does not mis-size the target, it discards the
-    ///   assignment. Up is always accepted.
-    ///
-    /// The cost of rounding up is at most a factor of two in share rate, which
-    /// the estimator absorbs; the cost of the other two is real work nobody is
-    /// paid for.
+    /// Round UP to a power of two via [`round_up_to_power_of_two`]. Floors
+    /// at `min_difficulty`. Returns `None` for `val == 0`, guarding against
+    /// `log2(0) = -Infinity`.
     fn nearest_difficulty_step(&self, val: f64) -> Option<f64> {
         if val == 0.0 {
             return None;
@@ -1093,15 +1109,7 @@ impl<C: Clock> VarDiffEngine<C> {
         if val < self.min_difficulty {
             return Some(self.min_difficulty);
         }
-        let lower = 2_f64.powf(val.log2().floor());
-        // The tolerance matters: a value that is a power of two apart from
-        // floating-point dust (0.5 arriving as 0.500000000001) must stay on its
-        // rung, not double. Only a genuine gap rounds up.
-        if val <= lower * (1.0 + 1e-9) {
-            Some(lower)
-        } else {
-            Some(lower * 2.0)
-        }
+        Some(round_up_to_power_of_two(val))
     }
 }
 

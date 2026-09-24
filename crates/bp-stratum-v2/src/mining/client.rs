@@ -1212,66 +1212,16 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
 
 // ── Open-mining-channel shared helper ────────────────────────────────
 
-/// Floor a hashrate-derived worker difficulty to a whole integer.
-///
-/// `hash_rate_to_difficulty` yields fractional values (e.g. `931.31`).
-/// SV2-native miners take the 32-byte target verbatim, but SV1 rigs
-/// behind the translator receive `mining.set_difficulty(931.31)`,
-/// truncate the decimal to `931`, and then submit shares that meet
-/// integer diff `931` but not the fractional target `931.31` — which
-/// the pool rejects as difficulty-too-low. Flooring here makes the
-/// stored `session_difficulty` (used for share validation) and the
-/// target bytes on the wire agree on an integer the miner can hit.
-///
-/// Floor (not round-to-nearest) is deliberate: it never makes the
-/// target harder than the hashrate estimate, so a miner that meets the
-/// integer diff exactly always passes. Result is bounded below by
-/// `1.0` so a sub-1 computed diff can't round down to `0`.
-///
-/// This touches only the worker/share difficulty, which is a
-/// pool-internal share-accounting threshold fully decoupled from block
-/// validity (the block-candidate gate compares against the network
-/// target, not this value) — so flooring can never affect found blocks.
-/// Non-finite / non-positive inputs are returned unchanged for the
-/// caller's existing min/ceiling guards to handle.
-/// Round a difficulty we are about to ASSIGN to a downstream to a power of two.
-///
-/// Nothing in SV2 asks for this, and a miner handles a crooked target fine — the
-/// firmware filters in software against the exact value it was given. A
-/// translating proxy does not. The SRI translator rounds our target UP to a
-/// power of two when it lowers it into an SV1 `mining.set_difficulty`
-/// (`build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding`),
-/// so the miner then works against a HIGHER difficulty than the one we keep
-/// booking its shares at. Measured on a live pair: we assigned 2887, the miner
-/// was given 4096, and 29.5 % of its work was never credited. The size of the
-/// loss is just the distance to the next power of two — up to nearly half.
-///
-/// Assigning a power of two leaves such a proxy nothing to round, so both sides
-/// account for the same number.
-///
-/// **Always UP, never to the nearest rung.** Rounding to the nearest goes down
-/// as often as up, and a downstream that requested a difficulty via
-/// `UpdateChannel` rejects a lower one as a protocol error: the translator logs
-/// "SetTarget response has target which is higher than requested target …
-/// Ignoring this pending update" and the miner keeps its previous difficulty
-/// while we book against the new one. Rounding down therefore does not merely
-/// mis-size the target, it throws the assignment away — measured, and worse than
-/// the under-counting this function exists to fix. Rounding up is always
-/// accepted and costs at most a factor of two in share rate.
+/// Round a difficulty we are about to ASSIGN to a downstream to a power of two,
+/// always UP — [`bp_vardiff::round_up_to_power_of_two`] says why (a translating
+/// proxy rounds a crooked target itself and the pool then under-credits the
+/// miner). A deliberately sub-1 configured difficulty is left alone.
 fn power_of_two_difficulty(diff: Difficulty) -> Difficulty {
     let v = diff.as_f64();
     if !v.is_finite() || v < 1.0 {
-        // Leave a deliberately sub-1 configured difficulty alone.
         return diff;
     }
-    let lower = 2_f64.powf(v.log2().floor());
-    // The tolerance matters: a value that is a power of two apart from
-    // floating-point dust must stay on its rung rather than double.
-    if v <= lower * (1.0 + 1e-9) {
-        Difficulty(lower)
-    } else {
-        Difficulty(lower * 2.0)
-    }
+    Difficulty(bp_vardiff::round_up_to_power_of_two(v))
 }
 
 /// Captured context the kind-specific closure needs.

@@ -24,7 +24,6 @@ bp-blockparty-engine = { workspace = true }
 bp-template-distribution = { workspace = true }
 bp-bitcoin = { workspace = true }
 bp-geoip = { workspace = true }
-bp-metrics = { workspace = true }
 bp-config = { workspace = true }
 
 # Async runtime + HTTP server.

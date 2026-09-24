@@ -189,7 +189,6 @@ impl JdpAllocateResolver for BaseModeAllocateResolver {
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
-        _remote_addr: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome {
         let Some(miner_address) = parse_user_identifier_as_address(user_identifier) else {
@@ -296,11 +295,11 @@ async fn jdp_push_distribution_end_to_end() {
     let server_accept = server.clone();
     let accept_handle = tokio::spawn(async move {
         loop {
-            let Ok((socket, peer)) = listener.accept().await else {
+            let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
             socket.set_nodelay(true).ok();
-            server_accept.accept_connection(socket, peer.to_string());
+            server_accept.accept_connection(socket);
         }
     });
 
@@ -1104,11 +1103,11 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
     let server_accept = server.clone();
     let accept_handle = tokio::spawn(async move {
         loop {
-            let Ok((socket, peer)) = listener.accept().await else {
+            let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
             socket.set_nodelay(true).ok();
-            server_accept.accept_connection(socket, peer.to_string());
+            server_accept.accept_connection(socket);
         }
     });
 
@@ -1413,11 +1412,11 @@ async fn accept_loop(
     let addr = listener.local_addr().expect("local_addr");
     let handle = tokio::spawn(async move {
         loop {
-            let Ok((socket, peer)) = listener.accept().await else {
+            let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
             socket.set_nodelay(true).ok();
-            server.accept_connection(socket, peer.to_string());
+            server.accept_connection(socket);
         }
     });
     (addr, handle)

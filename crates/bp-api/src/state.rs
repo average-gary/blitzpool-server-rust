@@ -3,9 +3,7 @@
 //! Application state passed to every axum handler.
 //!
 //! All engine + service handles are `Option<Arc<…>>` so the binary
-//! can wire only the subsystems it boots with — early Phase-7 staging
-//! deploys can start with just `info` + `metrics` if needed and add
-//! the rest later.
+//! can wire only the subsystems it boots with.
 
 use std::sync::Arc;
 
@@ -16,7 +14,6 @@ use bp_group_mgmt_engine::{
     EmailHooks, GroupService, GroupServiceHooks, InvitationService, JoinRequestService,
 };
 use bp_group_solo_engine::engine::GroupSoloEngine;
-use bp_metrics::MetricsServiceHandle;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_template_distribution::TdpHandle;
 use chrono::{DateTime, Utc};
@@ -24,7 +21,6 @@ use redis::aio::ConnectionManager as RedisConn;
 use sqlx::PgPool;
 
 use crate::email_hooks::EmailVerificationHooks;
-use crate::push_hooks::PushHooks;
 use crate::response_cache::ResponseCache;
 
 /// Inner appstate fields. Wrapped in an `Arc` for cheap cloning into
@@ -53,7 +49,6 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     pub tdp_staleness_threshold_ms: i64,
     pub bitcoin_rpc: Option<Arc<BitcoinRpc>>,
     pub geoip: Option<Arc<GeoIpServiceHandle>>,
-    pub metrics: Option<MetricsServiceHandle>,
     /// `Cargo.toml` package version — `/api/info/version` reads this.
     pub pool_version: &'static str,
     /// Email-verification flow hooks (`/api/email/register` + `/verify`).
@@ -67,10 +62,6 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     /// Whether the email-send pipeline is enabled. When `false`,
     /// /email/register short-circuits with `email-disabled`.
     pub email_enabled: bool,
-    /// Push-notification side-effect hooks for `/api/push/register`
-    /// and `/api/push/fcm/register`. Defaults to NoopPushHooks —
-    /// bin/blitzpool wires the real FCM / Web-Push impl.
-    pub push_hooks: Arc<dyn PushHooks>,
     /// Pool start time — `/api/info` returns this as the `uptime` field
     /// (ISO-8601 timestamp, set once at startup).
     pub start_time: DateTime<Utc>,
@@ -111,12 +102,10 @@ impl<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> AppState<H, M> {
             tdp_staleness_threshold_ms: 120_000,
             bitcoin_rpc: None,
             geoip: None,
-            metrics: None,
             pool_version,
             email_verification_hooks: Arc::new(crate::email_hooks::NoopVerificationHooks),
             pool_base_url: None,
             email_enabled: false,
-            push_hooks: Arc::new(crate::push_hooks::NoopPushHooks),
             start_time: Utc::now(),
             network: bitcoin::Network::Bitcoin,
             pool_identifier: String::new(),

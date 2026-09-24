@@ -234,7 +234,7 @@ async fn jdp_accept_loop(
             res = listener.accept() => match res {
                 Ok((socket, peer)) => {
                     debug!(?peer, "jdp: accepted");
-                    server.accept_connection(socket, peer.to_string());
+                    server.accept_connection(socket);
                 }
                 Err(err) => {
                     warn!(%err, "jdp: accept failed");

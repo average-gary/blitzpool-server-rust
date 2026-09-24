@@ -632,10 +632,8 @@ pub fn handle_request_extensions(
 /// Handle `AllocateMiningJobToken`.
 ///
 /// **Caller-resolved context**: the IO layer pre-resolves
-/// [`AllocateTokenContext`] before invoking — typically by parsing
-/// the JDC's `user_identifier` as a BTC address and falling back to
-/// an IP-based lookup hook if that fails. The handler doesn't see
-/// the connection's IP. The caller also pre-encodes the pool's
+/// [`AllocateTokenContext`] before invoking by parsing the JDC's
+/// `user_identifier` as a BTC address. The caller also pre-encodes the pool's
 /// `coinbase_outputs` blob (consensus-serialised `Vec<TxOut>`) via
 /// [`crate::jdp::dynamic_outputs::encode_coinbase_outputs`].
 ///
@@ -712,8 +710,7 @@ pub fn handle_allocate_token(
 /// Helper for the IO layer: try to parse `user_identifier` as a BTC
 /// address. Returns the normalised `AddressId` when valid (any
 /// network is accepted at this layer — Mainnet/Testnet/Regtest split
-/// is the resolver's job). The caller falls back to an IP-based
-/// lookup when this returns `None`.
+/// is the resolver's job). On `None` the allocate is dropped silently.
 pub fn parse_user_identifier_as_address(user_identifier: &str) -> Option<AddressId> {
     let trimmed = user_identifier.trim();
     if trimmed.is_empty() {

@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::push_hooks::{FcmRegisterContext, UnifiedPushRegisterContext};
 use crate::state::SharedState;
 
 const UNIFIED_PUSH: &str = "unified_push";
@@ -238,14 +237,6 @@ where
     )
     .await
     .map_err(|_| push_error("registration-failed", StatusCode::BAD_REQUEST))?;
-    state
-        .push_hooks
-        .on_unified_push_registered(UnifiedPushRegisterContext {
-            address: address.as_str().to_string(),
-            endpoint: endpoint.clone(),
-            platform: platform.clone(),
-        })
-        .await;
     Ok(Json(RegisterResponse {
         success: true,
         subscription: subscription_summary(&row),
@@ -437,14 +428,6 @@ where
     )
     .await
     .map_err(|_| push_error("registration-failed", StatusCode::BAD_REQUEST))?;
-    state
-        .push_hooks
-        .validate_fcm_token(FcmRegisterContext {
-            address: address.as_str().to_string(),
-            token: token.clone(),
-            platform: platform.clone(),
-        })
-        .await;
     Ok(Json(FcmRegisterResponse {
         success: true,
         subscription_type: "fcm",

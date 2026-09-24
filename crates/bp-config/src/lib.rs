@@ -1068,12 +1068,10 @@ impl Default for AggregationConfig {
 
 /// Prometheus `/metrics` exporter configuration.
 ///
-/// Default `enabled = false`: the exporter is "off until somebody asks
-/// for a dashboard". Flip `[metrics] enabled = true` in
-/// the TOML to spawn the `:9000` HTTP listener; the actual `record_*`
-/// instrumentation across the share-accept / block-found / cron-tick
-/// hot paths is tracked as a follow-up — until then the exporter
-/// serves an empty body but the listener is reachable.
+/// Default `enabled = false`. Flip `[metrics] enabled = true` in the TOML
+/// to spawn the `:9000` HTTP listener. It serves what the pool emits: the
+/// Core→Satellite stream-consumer lag, the parked-block depths, vardiff
+/// adjustments and the lost-accepted-share counter.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {

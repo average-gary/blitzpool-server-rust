@@ -208,7 +208,6 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
-        _remote_addr: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome {
         let Some(miner_address) = parse_user_identifier_as_address(user_identifier) else {
@@ -1660,7 +1659,7 @@ mod base_allocate_tests {
     async fn a_single_payee_is_designated_at_zero_sats() {
         let ctx = granted(
             pays(&[(MINER, 312_500_000)])
-                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+                .resolve_allocate_context(MINER, false)
                 .await,
         );
         assert_eq!(ctx.miner_address.as_str(), MINER);
@@ -1688,7 +1687,7 @@ mod base_allocate_tests {
     #[tokio::test]
     async fn a_block_routed_away_from_the_miner_is_refused_on_the_base_protocol() {
         let outcome = pays(&[(OTHER, 312_500_000)])
-            .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+            .resolve_allocate_context(MINER, false)
             .await;
         assert!(
             matches!(outcome, AllocateOutcome::Refused { .. }),
@@ -1707,7 +1706,7 @@ mod base_allocate_tests {
     async fn the_same_single_payee_shape_is_served_when_it_is_the_miner() {
         let ctx = granted(
             pays(&[(MINER, 312_500_000)])
-                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+                .resolve_allocate_context(MINER, false)
                 .await,
         );
         assert_eq!(
@@ -1724,7 +1723,7 @@ mod base_allocate_tests {
     async fn a_negotiated_session_still_serves_a_routed_payout() {
         let ctx = granted(
             pays(&[(OTHER, 312_500_000)])
-                .resolve_allocate_context(MINER, "127.0.0.1:1", true)
+                .resolve_allocate_context(MINER, true)
                 .await,
         );
         assert!(ctx.coinbase_outputs.is_empty());
@@ -1739,7 +1738,7 @@ mod base_allocate_tests {
     #[tokio::test]
     async fn a_split_payout_is_refused_rather_than_silently_dropped() {
         let outcome = pays(&[(OTHER, 3_125_000), (MINER, 309_375_000)])
-            .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+            .resolve_allocate_context(MINER, false)
             .await;
         assert!(
             matches!(outcome, AllocateOutcome::Refused { .. }),
@@ -1762,15 +1761,14 @@ mod base_allocate_tests {
     /// is the failure being guarded against.
     #[tokio::test]
     async fn an_empty_payout_list_is_refused_as_an_absent_list_not_as_a_split() {
-        let AllocateOutcome::Refused { reason: absent } = pays(&[])
-            .resolve_allocate_context(MINER, "127.0.0.1:1", false)
-            .await
+        let AllocateOutcome::Refused { reason: absent } =
+            pays(&[]).resolve_allocate_context(MINER, false).await
         else {
             panic!("an empty payout list must be refused");
         };
         let AllocateOutcome::Refused { reason: split } =
             pays(&[(OTHER, 3_125_000), (MINER, 309_375_000)])
-                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+                .resolve_allocate_context(MINER, false)
                 .await
         else {
             panic!("a two-payee split must be refused");
@@ -1799,7 +1797,7 @@ mod base_allocate_tests {
     async fn a_negotiated_session_gets_no_outputs_and_is_served_on_any_split() {
         let ctx = granted(
             pays(&[(OTHER, 3_125_000), (MINER, 309_375_000)])
-                .resolve_allocate_context(MINER, "127.0.0.1:1", true)
+                .resolve_allocate_context(MINER, true)
                 .await,
         );
         assert!(
@@ -1817,7 +1815,7 @@ mod base_allocate_tests {
     #[tokio::test]
     async fn an_unparseable_identifier_is_ignored_not_refused() {
         let outcome = pays(&[(MINER, 1)])
-            .resolve_allocate_context(&"x".repeat(200), "127.0.0.1:1", false)
+            .resolve_allocate_context(&"x".repeat(200), false)
             .await;
         assert!(matches!(outcome, AllocateOutcome::Ignored));
     }
@@ -1842,9 +1840,7 @@ mod base_allocate_tests {
     #[tokio::test]
     async fn the_payout_list_is_resolved_at_the_live_template_revenue() {
         let (resolver, payouts) = resolver_with(&[(MINER, 1)], Some(TEMPLATE_REVENUE));
-        let _ = resolver
-            .resolve_allocate_context(MINER, "127.0.0.1:1", false)
-            .await;
+        let _ = resolver.resolve_allocate_context(MINER, false).await;
         assert_eq!(
             payouts.asked_at.lock().unwrap().as_slice(),
             &[TEMPLATE_REVENUE],
@@ -1869,9 +1865,7 @@ mod base_allocate_tests {
     #[tokio::test]
     async fn no_template_refuses_instead_of_resolving_against_a_guess() {
         let (resolver, payouts) = resolver_with(&[(MINER, 1)], None);
-        let outcome = resolver
-            .resolve_allocate_context(MINER, "127.0.0.1:1", false)
-            .await;
+        let outcome = resolver.resolve_allocate_context(MINER, false).await;
         assert!(
             matches!(outcome, AllocateOutcome::Refused { .. }),
             "no template must refuse, not serve a token off an invented revenue"
@@ -1889,11 +1883,7 @@ mod base_allocate_tests {
     #[tokio::test]
     async fn a_negotiated_session_is_served_before_the_first_template() {
         let (resolver, payouts) = resolver_with(&[(MINER, 1)], None);
-        let ctx = granted(
-            resolver
-                .resolve_allocate_context(MINER, "127.0.0.1:1", true)
-                .await,
-        );
+        let ctx = granted(resolver.resolve_allocate_context(MINER, true).await);
         assert!(ctx.coinbase_outputs.is_empty());
         assert!(
             payouts.asked_at.lock().unwrap().is_empty(),
@@ -1921,9 +1911,7 @@ mod base_allocate_tests {
         ] {
             let (resolver, payouts) =
                 resolver_on(&[(MINER, 312_500_000)], Some(TEMPLATE_REVENUE), stream);
-            let outcome = resolver
-                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
-                .await;
+            let outcome = resolver.resolve_allocate_context(MINER, false).await;
             assert!(
                 matches!(outcome, AllocateOutcome::Refused { .. }),
                 "{stream:?}: the mining side would refuse every job on this token"
@@ -1967,11 +1955,7 @@ mod base_allocate_tests {
             StreamKind::Pplns,
             false,
         );
-        let ctx = granted(
-            resolver
-                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
-                .await,
-        );
+        let ctx = granted(resolver.resolve_allocate_context(MINER, false).await);
         assert_eq!(
             designated_script(&ctx),
             bp_mining_job::address_to_script(BitcoinNetwork::Regtest, MINER).unwrap(),
@@ -1994,11 +1978,7 @@ mod base_allocate_tests {
             Some(TEMPLATE_REVENUE),
             StreamKind::Solo,
         );
-        let ctx = granted(
-            resolver
-                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
-                .await,
-        );
+        let ctx = granted(resolver.resolve_allocate_context(MINER, false).await);
         assert_eq!(
             designated_script(&ctx),
             bp_mining_job::address_to_script(BitcoinNetwork::Regtest, MINER).unwrap()
@@ -2023,9 +2003,7 @@ mod base_allocate_tests {
             Some(TEMPLATE_REVENUE),
             StreamKind::Solo,
         );
-        let outcome = resolver
-            .resolve_allocate_context(MINER, "127.0.0.1:1", false)
-            .await;
+        let outcome = resolver.resolve_allocate_context(MINER, false).await;
         assert!(
             matches!(outcome, AllocateOutcome::Refused { .. }),
             "the pending-party route must still be caught by the payout list"
@@ -2049,11 +2027,7 @@ mod base_allocate_tests {
             Some(TEMPLATE_REVENUE),
             StreamKind::Pplns,
         );
-        let ctx = granted(
-            resolver
-                .resolve_allocate_context(MINER, "127.0.0.1:1", true)
-                .await,
-        );
+        let ctx = granted(resolver.resolve_allocate_context(MINER, true).await);
         assert!(ctx.coinbase_outputs.is_empty());
         assert!(payouts.asked_at.lock().unwrap().is_empty());
     }

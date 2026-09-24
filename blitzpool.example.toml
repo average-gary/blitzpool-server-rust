@@ -446,9 +446,8 @@ pool_stats_interval_ms = 600000
 chart_data_interval_ms = 300000
 
 # Prometheus /metrics exporter. Default off — flip `enabled = true`
-# to bind the listener (default 0.0.0.0:9000). Recorder call-sites
-# across SV1/SV2/engines/crons are not yet wired; enabling here today
-# exposes an empty /metrics body but verifies the listener can bind.
+# to bind the listener (default 0.0.0.0:9000). Exposes stream-consumer
+# lag, parked-block depths, vardiff adjustments and lost accepted shares.
 [metrics]
 enabled = false
 # bind = "0.0.0.0:9000"

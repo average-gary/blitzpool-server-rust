@@ -85,16 +85,11 @@ use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
 
 /// Resolve `(miner_address, encoded_coinbase_outputs)` for an
 /// inbound `AllocateMiningJobToken`. Production wiring parses
-/// `user_identifier` as a BTC address (or falls back to an IP-based
-/// lookup), then computes the pool's payout outputs via
+/// `user_identifier` as a BTC address, then computes the pool's payout outputs via
 /// [`crate::hooks::PayoutResolver`] + [`crate::jdp::dynamic_outputs::encode_coinbase_outputs`].
 /// Tests use a no-op + a custom fixture.
 #[async_trait]
 pub trait JdpAllocateResolver: Send + Sync {
-    /// `remote_addr` is the connection's remote IP (string form, e.g.
-    /// `"127.0.0.1:48292"`). Caller provides it so IP-based miner
-    /// lookup is possible without leaking sockets into the handler.
-    ///
     /// `payout_distribution_negotiated` — ext 0x0003 is active on this
     /// connection. ext 0x0003/Negotiation then REQUIRES `coinbase_tx_outputs`
     /// to be empty (the distribution replaces the base
@@ -103,7 +98,6 @@ pub trait JdpAllocateResolver: Send + Sync {
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
-        remote_addr: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome;
 }
@@ -398,10 +392,9 @@ impl JdpAllocateResolver for NoOpJdpHooks {
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
-        _remote_addr: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome {
-        // Pure parse — no IP fallback. Production wiring overrides.
+        // Pure parse. Production wiring overrides.
         let Some(addr) = parse_user_identifier_as_address(user_identifier) else {
             return AllocateOutcome::Ignored;
         };
@@ -632,7 +625,7 @@ impl StratumV2JdpServer {
 
     /// Per-connection task. The TCP-accept loop calls this for
     /// each socket identified as JDP by `bp_protocol_detect`.
-    pub fn accept_connection(&self, socket: TcpStream, remote_addr: String) -> JoinHandle<()> {
+    pub fn accept_connection(&self, socket: TcpStream) -> JoinHandle<()> {
         let noise_config = self.inner.noise_config.clone();
         let hooks = self.inner.hooks.clone();
         let bridge = self.inner.bridge.clone();
@@ -646,7 +639,6 @@ impl StratumV2JdpServer {
                 hooks,
                 bridge,
                 socket,
-                remote_addr,
                 cancel,
                 dist_rx,
             )
@@ -1134,7 +1126,6 @@ async fn run_jdp_connection(
     hooks: JdpServerHooks,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     socket: TcpStream,
-    remote_addr: String,
     cancel: CancellationToken,
     mut dist_rx: tokio::sync::watch::Receiver<u64>,
 ) -> std::io::Result<()> {
@@ -1335,7 +1326,6 @@ async fn run_jdp_connection(
                     &hooks,
                     &bridge,
                     session_id,
-                    &remote_addr,
                     SystemClock.now_ms(),
                 )
                 .await;
@@ -1554,7 +1544,6 @@ async fn dispatch_jdp_inbound(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     session_id: u32,
-    remote_addr: &str,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
     match inbound {
@@ -1576,7 +1565,7 @@ async fn dispatch_jdp_inbound(
                 .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
             match hooks
                 .allocate_resolver
-                .resolve_allocate_context(&input.user_identifier, remote_addr, negotiated)
+                .resolve_allocate_context(&input.user_identifier, negotiated)
                 .await
             {
                 AllocateOutcome::Granted(ctx) => handle_allocate_token(state, &input, ctx, now_ms),
@@ -2222,11 +2211,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_op_allocate_resolver_designates_the_miners_own_output() {
         let hooks = NoOpJdpHooks;
-        let ctx = granted(
-            hooks
-                .resolve_allocate_context(ADDR, "1.2.3.4:1234", false)
-                .await,
-        );
+        let ctx = granted(hooks.resolve_allocate_context(ADDR, false).await);
         assert_eq!(ctx.miner_address.as_str(), ADDR);
         let outputs: Vec<bitcoin::TxOut> =
             bitcoin::consensus::deserialize(&ctx.coinbase_outputs).expect("outputs decode");
@@ -2250,11 +2235,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_op_allocate_resolver_empty_outputs_when_0x0003_negotiated() {
         let hooks = NoOpJdpHooks;
-        let ctx = granted(
-            hooks
-                .resolve_allocate_context(ADDR, "1.2.3.4:1234", true)
-                .await,
-        );
+        let ctx = granted(hooks.resolve_allocate_context(ADDR, true).await);
         assert_eq!(ctx.miner_address.as_str(), ADDR);
         assert!(ctx.coinbase_outputs.is_empty());
     }
@@ -2263,7 +2244,7 @@ mod tests {
     async fn no_op_allocate_resolver_rejects_garbage_user_identifier() {
         let hooks = NoOpJdpHooks;
         let outcome = hooks
-            .resolve_allocate_context(&"x".repeat(200), "1.2.3.4:1234", false)
+            .resolve_allocate_context(&"x".repeat(200), false)
             .await;
         assert!(
             matches!(outcome, AllocateOutcome::Ignored),
@@ -2287,7 +2268,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             1_000,
         )
         .await;
@@ -2405,7 +2385,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             1_000,
         )
         .await;
@@ -2447,7 +2426,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             1_000,
         )
         .await;
@@ -2478,7 +2456,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             1_000,
         )
         .await;
@@ -2521,7 +2498,6 @@ mod tests {
             hooks,
             bridge,
             1,
-            "1.2.3.4:5555",
             now_ms,
         )
         .await
@@ -2629,16 +2605,7 @@ mod tests {
         // Wrong request_id, right position count: no node call, no frame,
         // and the round-trip is still in flight afterwards — which is exactly
         // what let this repeat.
-        let out = dispatch_jdp_inbound(
-            &mut state,
-            answer(9_999),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            1_200,
-        )
-        .await;
+        let out = dispatch_jdp_inbound(&mut state, answer(9_999), &hooks, &bridge, 1, 1_200).await;
         assert!(out.outbound.is_empty(), "got {:?}", out.outbound);
         assert_eq!(
             validator.calls(),
@@ -2651,16 +2618,7 @@ mod tests {
         );
 
         // The real answer still goes through.
-        let _ = dispatch_jdp_inbound(
-            &mut state,
-            answer(11),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            1_300,
-        )
-        .await;
+        let _ = dispatch_jdp_inbound(&mut state, answer(11), &hooks, &bridge, 1, 1_300).await;
         assert_eq!(
             validator.calls(),
             2,
@@ -2737,7 +2695,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             0,
         )
         .await;
@@ -2765,16 +2722,7 @@ mod tests {
         };
 
         // No distribution published yet → the extension is not offered.
-        let outcome = dispatch_jdp_inbound(
-            &mut state,
-            request(1),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            1_000,
-        )
-        .await;
+        let outcome = dispatch_jdp_inbound(&mut state, request(1), &hooks, &bridge, 1, 1_000).await;
         match &outcome.outbound[0] {
             JdpOutboundFrame::RequestExtensionsError {
                 unsupported_extensions,
@@ -2793,16 +2741,7 @@ mod tests {
             .write()
             .unwrap()
             .publish_pool_wide(test_distribution(1));
-        let outcome = dispatch_jdp_inbound(
-            &mut state,
-            request(2),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            2_000,
-        )
-        .await;
+        let outcome = dispatch_jdp_inbound(&mut state, request(2), &hooks, &bridge, 1, 2_000).await;
         match &outcome.outbound[0] {
             JdpOutboundFrame::RequestExtensionsSuccess {
                 supported_extensions,
@@ -2969,7 +2908,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             3_000,
         )
         .await;
@@ -2988,7 +2926,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             3_000,
         )
         .await;
@@ -3006,7 +2943,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             3_000,
         )
         .await;
