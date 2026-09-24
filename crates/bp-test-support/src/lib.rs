@@ -421,10 +421,7 @@ pub mod redis_db {
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
     pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
 
-    /// `bp-session-persistence`'s `live_store_integration`. ⚠️ This is
-    /// the LAST free 32-slice of the 512-DB test container
-    /// (`15 * 32 + 31 = 511`) — the next binary that needs a base must
-    /// recreate `bp-test-redis` with `--databases` raised past 512.
+    /// `bp-session-persistence`'s `live_store_integration`.
     ///
     /// ⚠️ Index **31** of this range is lent to TWO `bp-api` test
     /// binaries — `smoke.rs` and `custom_extranonce_guard.rs` — both
@@ -433,12 +430,18 @@ pub mod redis_db {
     /// test, and don't add a write to either borrower without moving
     /// them apart first.
     pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
+
+    /// `bp-api`'s unit tests (the `lib` test binary). ⚠️ This is the LAST
+    /// 32-slice of the 544-DB test container (`16 * 32 + 31 = 543`) — the
+    /// next binary that needs a base must recreate `bp-test-redis` with
+    /// `--databases` raised past 544.
+    pub const API: u16 = 16 * RANGE;
 }
 
 /// How many logical databases this Redis actually has.
 ///
 /// Read once per process, because it decides where every test in it
-/// lands. The local test container runs `valkey-server --databases 512`;
+/// lands. The local test container runs `valkey-server --databases 544`;
 /// a stock server has 16, and **GitHub Actions service containers cannot
 /// override a container's command**, so CI's Valkey has 16 and there is
 /// no way to pass `--databases` to it as a service.

@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 
 use crate::error::ApiError;
 use crate::state::SharedState;
+use crate::time_range::format_iso_ms;
 
 const UNIFIED_PUSH: &str = "unified_push";
 const FCM: &str = "fcm";
@@ -533,13 +534,4 @@ where
 
 fn push_error(code: &'static str, status: StatusCode) -> ApiError {
     ApiError::GroupService { code, status }
-}
-
-fn format_iso_ms(ms: i64) -> String {
-    use chrono::TimeZone;
-    chrono::Utc
-        .timestamp_millis_opt(ms)
-        .single()
-        .unwrap_or_else(chrono::Utc::now)
-        .to_rfc3339()
 }

@@ -171,11 +171,7 @@ fn next_calendar_fire_local(preset: &Preset, now: DateTime<Tz>) -> DateTime<Tz> 
 }
 
 fn next_midnight(now: DateTime<Tz>) -> DateTime<Tz> {
-    let today_midnight = now
-        .timezone()
-        .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-        .single()
-        .expect("today midnight unambiguous");
+    let today_midnight = local_midnight(now);
     if today_midnight > now {
         today_midnight
     } else {
@@ -184,28 +180,31 @@ fn next_midnight(now: DateTime<Tz>) -> DateTime<Tz> {
 }
 
 fn next_day_midnight(base: DateTime<Tz>) -> DateTime<Tz> {
-    let step = base + ChronoDuration::days(1);
-    // If 00:00 local is unambiguous (the common case), use it.
-    if let Some(s) = step
-        .timezone()
-        .with_ymd_and_hms(step.year(), step.month(), step.day(), 0, 0, 0)
-        .single()
-    {
-        return s;
-    }
-    // Spring-forward edge case: 00:00 doesn't exist in the local
-    // calendar (rare TZs). Pick the next valid minute as fallback.
-    for minute in 1..=120 {
-        if let Some(s) = step
-            .timezone()
-            .with_ymd_and_hms(step.year(), step.month(), step.day(), 0, minute, 0)
-            .single()
+    local_midnight(base + ChronoDuration::days(1))
+}
+
+/// 00:00 local on `day`'s date. Where a DST jump skips midnight (Chile
+/// springs forward at 24:00), the first valid minute after it; where a
+/// fall-back repeats it, the earlier of the two.
+fn local_midnight(day: DateTime<Tz>) -> DateTime<Tz> {
+    let tz = day.timezone();
+    for minute in 0..=120 {
+        if let Some(s) = tz
+            .with_ymd_and_hms(
+                day.year(),
+                day.month(),
+                day.day(),
+                minute / 60,
+                minute % 60,
+                0,
+            )
+            .earliest()
         {
             return s;
         }
     }
     // Theoretically unreachable for IANA TZs at 00:00. Best-effort.
-    step
+    day
 }
 
 fn next_monday_midnight(now: DateTime<Tz>) -> DateTime<Tz> {
@@ -490,6 +489,27 @@ mod tests {
             next >= earliest,
             "next ({next}) should be ≥ earliest-due ({earliest})"
         );
+    }
+
+    /// Chile springs forward at 24:00, so 2026-09-06 has no 00:00 in
+    /// America/Santiago (the clock jumps to 01:00). Asked on that very day,
+    /// the next fire is the following midnight. Precondition pinned first so
+    /// the test cannot pass on a tz database where that midnight exists.
+    #[test]
+    fn next_fire_on_a_day_without_midnight_does_not_panic() {
+        use chrono_tz::America::Santiago;
+        assert!(
+            Santiago
+                .with_ymd_and_hms(2026, 9, 6, 0, 0, 0)
+                .single()
+                .is_none(),
+            "precondition: 2026-09-06 00:00 does not exist in America/Santiago"
+        );
+        let s = schedule(Preset::Daily, Santiago, None);
+        // 12:00 local on the gap day (UTC-3 after the jump).
+        let now = at_utc(2026, 9, 6, 15, 0);
+        let next = compute_next_fire(&s, None, now);
+        assert_eq!(next, at_utc(2026, 9, 7, 3, 0));
     }
 
     #[test]

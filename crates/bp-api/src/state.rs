@@ -33,6 +33,9 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     /// the resolution chain.
     pub redis: Option<RedisConn>,
     pub pplns: Option<Arc<PplnsEngine>>,
+    /// `[pplns.coinbase_autoscale]` is enabled, so the PPLNS budget in force
+    /// is the live value the autoscaler persists, not the configured floor.
+    pub pplns_budget_autoscaled: bool,
     pub group_solo: Option<Arc<GroupSoloEngine>>,
     pub group_service: Option<Arc<GroupService<H>>>,
     pub invitation_service: Option<Arc<InvitationService<H>>>,
@@ -93,6 +96,7 @@ impl<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> AppState<H, M> {
             pool,
             redis: None,
             pplns: None,
+            pplns_budget_autoscaled: false,
             group_solo: None,
             group_service: None,
             invitation_service: None,

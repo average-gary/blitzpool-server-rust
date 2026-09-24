@@ -128,6 +128,11 @@ fn build_app_state(
         pool,
         redis: Some(foundation.redis.clone()),
         pplns: pplns_arc,
+        pplns_budget_autoscaled: cfg
+            .pplns
+            .as_ref()
+            .and_then(|p| p.coinbase_autoscale.as_ref())
+            .is_some_and(|a| a.enabled),
         group_solo: group_solo_arc,
         group_service: Some(group_service),
         invitation_service: Some(invitation_service),

@@ -762,7 +762,7 @@ struct GroupSummary {
     finder_bonus_ppm: i32,
     last_round_reset_at: Option<String>,
     /// Computed next-reset wall-clock (ISO), derived from the preset +
-    /// timezone + interval by [`compute_next_reset_at`]. `None` when the
+    /// timezone + interval by [`next_reset_at`]. `None` when the
     /// group has no preset / no timezone (UI tiles then render a neutral
     /// "no schedule" state).
     next_reset_at: Option<String>,
@@ -781,16 +781,9 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
         // sliding-window LENGTH, not a wipe. Don't advertise a phantom
         // `nextResetAt` (it made the UI show a countdown to a reset that never
         // fires); the UI renders the window length instead.
-        let next_reset_at = if PayoutMode::parse_or_default(&r.payout_mode) == PayoutMode::Window {
-            None
-        } else {
-            compute_next_reset_at(
-                r.round_reset_preset.as_deref(),
-                r.round_reset_timezone.as_deref(),
-                r.round_reset_interval_days,
-                r.last_round_reset_at,
-            )
-            .map(crate::time_range::format_slot_label)
+        let next_reset_at = match PayoutMode::parse_or_default(&r.payout_mode) {
+            PayoutMode::Window => None,
+            PayoutMode::Prop => next_reset_at(&r).map(crate::time_range::format_slot_label),
         };
         Self {
             id: r.id,
@@ -814,77 +807,22 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
     }
 }
 
-/// Compute the next round-reset wall-clock as epoch milliseconds.
-/// Returns `None` when the group has no preset, no timezone, the
-/// timezone string fails to parse against the IANA database, or the
-/// custom preset is missing `interval_days`.
-fn compute_next_reset_at(
-    preset: Option<&str>,
-    timezone: Option<&str>,
-    interval_days: Option<i32>,
-    last_reset_at: Option<i64>,
-) -> Option<i64> {
-    use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc, Weekday};
-    use chrono_tz::Tz;
-
-    let preset = preset?;
-    let tz: Tz = timezone?.parse().ok()?;
-    let now_utc = Utc::now();
-    let now_local = now_utc.with_timezone(&tz);
-
-    let next_midnight = |date: NaiveDate| -> Option<i64> {
-        let naive = date.and_hms_opt(0, 0, 0)?;
-        tz.from_local_datetime(&naive)
-            .single()
-            .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
-    };
-
-    match preset {
-        "daily" => next_midnight(now_local.date_naive() + Duration::days(1)),
-        "weekly" => {
-            let mut date = now_local.date_naive() + Duration::days(1);
-            while date.weekday() != Weekday::Mon {
-                date += Duration::days(1);
-            }
-            next_midnight(date)
-        }
-        "monthly" => {
-            let (y, m) = if now_local.month() == 12 {
-                (now_local.year() + 1, 1)
-            } else {
-                (now_local.year(), now_local.month() + 1)
-            };
-            let date = NaiveDate::from_ymd_opt(y, m, 1)?;
-            next_midnight(date)
-        }
-        "custom" => {
-            let days = interval_days?;
-            if days < 1 {
-                return None;
-            }
-            let interval_ms = (days as i64) * 86_400_000;
-            // 4h DST tolerance — matches the gate inside the fireIfDue
-            // path so the displayed and actual fire times agree.
-            const DST_TOLERANCE_MS: i64 = 4 * 3_600_000;
-            let earliest_ms = match last_reset_at {
-                Some(last) => last + interval_ms - DST_TOLERANCE_MS,
-                None => now_utc.timestamp_millis(),
-            };
-            let earliest_local = Utc
-                .timestamp_millis_opt(earliest_ms)
-                .single()?
-                .with_timezone(&tz);
-            let mut date = earliest_local.date_naive();
-            if earliest_local.hour() > 0
-                || earliest_local.minute() > 0
-                || earliest_local.second() > 0
-            {
-                date += Duration::days(1);
-            }
-            next_midnight(date)
-        }
-        _ => None,
-    }
+/// The next scheduled round reset as epoch milliseconds — the instant the
+/// engine's reset cron will fire, computed by that same cron's
+/// [`compute_next_fire`](bp_group_solo_engine::reset::compute_next_fire).
+/// `None` when the group has no usable schedule (no preset, no timezone, an
+/// unknown preset or timezone, or a custom preset without an interval).
+fn next_reset_at(r: &bp_db::PplnsGroupRow) -> Option<i64> {
+    use bp_group_solo_engine::reset::{compute_next_fire, ResetSchedule};
+    let schedule = ResetSchedule::from_row_fields(
+        r.id,
+        r.round_reset_preset.as_deref(),
+        r.round_reset_timezone.as_deref(),
+        r.round_reset_interval_days
+            .and_then(|d| u32::try_from(d).ok()),
+    )
+    .ok()??;
+    Some(compute_next_fire(&schedule, r.last_round_reset_at, chrono::Utc::now()).timestamp_millis())
 }
 
 // ─── GET /api/groups/public ──────────────────────────────────────

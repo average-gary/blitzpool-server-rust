@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::response_cache::{JsonBytes, TtlKind};
-use crate::state::SharedState;
+use crate::state::{AppState, SharedState};
 
 pub(crate) fn routes<H, M>() -> Router<SharedState<H, M>>
 where
@@ -296,8 +296,8 @@ where
     M: EmailHooks + 'static,
 {
     use bp_pplns_engine::{
-        COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT, COINBASE_WITNESS_COMMITMENT_WEIGHT,
-        DUST_LIMIT_SATS,
+        max_coinbase_outputs, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
+        COINBASE_WITNESS_COMMITMENT_WEIGHT, DUST_LIMIT_SATS,
     };
     let s = state.clone();
     let bytes = state
@@ -307,35 +307,35 @@ where
             TtlKind::PplnsFees,
             async move {
                 let engine = require_pplns(&s)?;
+                let group_solo = s
+                    .group_solo
+                    .as_ref()
+                    .ok_or(ApiError::Unavailable("group-solo not wired"))?
+                    .config();
                 let cfg = engine.reader().fee_config();
                 let raw_cfg = engine.config();
-                // Pessimistic worst-case: every output is a P2TR (172 WU).
-                let usable_wu = cfg
-                    .coinbase_weight_budget
-                    .saturating_sub(COINBASE_BASE_WEIGHT + COINBASE_WITNESS_COMMITMENT_WEIGHT);
-                let max_miner_outputs = usable_wu / COINBASE_OUTPUT_WEIGHT;
-                // Adaptive count uses the same pessimistic bound until we
-                // plumb a per-address-type mixed-weight estimate through
-                // the engine; correct for current address-type populations.
+                let coinbase_weight_budget =
+                    live_pplns_budget(&s, cfg.coinbase_weight_budget).await;
+                // Exactly as many miners as the blockspace cut publishes at
+                // this budget — the shared worst-case ceiling (every output
+                // P2TR, pool output and safety margin reserved). The adaptive
+                // field has no mixed-address-type estimate behind it and
+                // reports the same ceiling.
+                let max_miner_outputs =
+                    u32::try_from(max_coinbase_outputs(coinbase_weight_budget)).unwrap_or(u32::MAX);
                 let max_miner_outputs_adaptive = max_miner_outputs;
-                // Shared group-fee lane — reuses the resolved values
-                // the Blockparty service was constructed with (same
-                // chain `[group_fees]` → `[pplns]`). When Blockparty
-                // isn't wired (e.g. PPLNS-only deployment) the fields
-                // mirror the PPLNS lane.
-                let (group_fee_percent, group_fee_address) = match s.blockparty.as_ref() {
-                    Some(bp) => (
-                        bp.pool_fee_percent(),
-                        bp.fee_address().map(|a| a.into_inner()),
-                    ),
-                    None => (cfg.fee_percent, cfg.fee_address.clone()),
-                };
                 Ok(FeesResponse {
                     fee_percent: cfg.fee_percent,
                     fee_address: cfg.fee_address,
-                    coinbase_weight_budget: cfg.coinbase_weight_budget,
-                    group_fee_percent,
-                    group_fee_address,
+                    coinbase_weight_budget,
+                    // The Group-Solo engine's own resolved lane
+                    // (`[group_fees]`, else `[pplns]`); Blockparty resolves
+                    // the same way.
+                    group_fee_percent: group_solo.fee_percent,
+                    group_fee_address: group_solo
+                        .fee_address
+                        .as_ref()
+                        .map(|a| a.as_str().to_string()),
                     dust_limit_sats: DUST_LIMIT_SATS,
                     min_payout_sats: cfg.min_payout_sats,
                     coinbase_base_weight: COINBASE_BASE_WEIGHT,
@@ -350,6 +350,37 @@ where
         )
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// The PPLNS coinbase weight budget in force. With the autoscaler on, that is
+/// the live value it persists in Redis — the process that runs it is not this
+/// one, so the engine config here only knows the floor. Falls back to the
+/// config budget when the autoscaler is off (a key left from an earlier run
+/// would be stale), the key is missing, or Redis cannot answer.
+async fn live_pplns_budget<H, M>(state: &AppState<H, M>, config_budget: u32) -> u32
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    if !state.pplns_budget_autoscaled {
+        return config_budget;
+    }
+    let Some(mut redis) = state.redis.clone() else {
+        return config_budget;
+    };
+    match bp_coinbase_snapshot::read_coinbase_budget(
+        &mut redis,
+        bp_coinbase_snapshot::PPLNS_COINBASE_BUDGET_KEY,
+    )
+    .await
+    {
+        Ok(Some(live)) => live,
+        Ok(None) => config_budget,
+        Err(err) => {
+            tracing::warn!(%err, "pplns fees: live budget unreadable; reporting the config budget");
+            config_budget
+        }
+    }
 }
 
 // ─── /api/pplns/distribution ──────────────────────────────────────
@@ -580,6 +611,63 @@ where
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    /// The fees endpoint reports the live autoscaled budget only while the
+    /// autoscaler is on. Both directions against the same stored value: with
+    /// the flag off a key left over from an earlier run must NOT leak into
+    /// the answer, with it on the key wins, and without a key the config
+    /// budget stands.
+    #[tokio::test]
+    async fn live_budget_is_read_only_while_the_autoscaler_is_on() {
+        use bp_group_mgmt_engine::{NoopEmailHooks, NoopHooks};
+        use redis::AsyncCommands;
+
+        let Some(mut redis) =
+            bp_test_support::connect_redis_in_range_or_skip(bp_test_support::redis_db::API, 0)
+                .await
+        else {
+            return;
+        };
+        const CONFIG_BUDGET: u32 = 50_000;
+        const LIVE_BUDGET: u32 = 123_456;
+        bp_coinbase_snapshot::write_coinbase_budget(
+            &mut redis,
+            bp_coinbase_snapshot::PPLNS_COINBASE_BUDGET_KEY,
+            LIVE_BUDGET,
+        )
+        .await
+        .expect("seed live budget");
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1/unused")
+            .expect("lazy pool");
+        let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
+        state.redis = Some(redis.clone());
+
+        state.pplns_budget_autoscaled = false;
+        assert_eq!(
+            live_pplns_budget(&state, CONFIG_BUDGET).await,
+            CONFIG_BUDGET,
+            "autoscaler off: a stored budget is stale and must be ignored"
+        );
+
+        state.pplns_budget_autoscaled = true;
+        assert_eq!(
+            live_pplns_budget(&state, CONFIG_BUDGET).await,
+            LIVE_BUDGET,
+            "autoscaler on: the live budget is the one in force"
+        );
+
+        let _: () = redis
+            .del(bp_coinbase_snapshot::PPLNS_COINBASE_BUDGET_KEY)
+            .await
+            .expect("del");
+        assert_eq!(
+            live_pplns_budget(&state, CONFIG_BUDGET).await,
+            CONFIG_BUDGET,
+            "autoscaler on but nothing persisted yet: the config budget stands"
+        );
+    }
 
     #[test]
     fn history_entry_has_correct_shape() {
