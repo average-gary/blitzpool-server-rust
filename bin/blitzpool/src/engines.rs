@@ -75,8 +75,7 @@ use bp_share_stats_sink::config::StatsSinkConfig;
 use bp_share_stats_sink::engine::{ShareStatsEngine, ShareStatsEngineHandle};
 use bp_share_stats_sink::hooks::{ShareStatsAcceptedSink, ShareStatsRejectedSink};
 use bp_share_stream::{
-    AcceptedShareProducer, ProducingRejectedSink, ProducingSink, StreamProducer,
-    ACCEPTED_STREAM_KEY, REJECTED_STREAM_KEY,
+    ProducingRejectedSink, ProducingSink, StreamProducer, ACCEPTED_STREAM_KEY, REJECTED_STREAM_KEY,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -748,7 +747,7 @@ fn build_producing_composite(
     core_epoch: u64,
 ) -> Arc<CompositeAcceptedShareSink> {
     let producing: Arc<dyn SharedAcceptedShareSink> = Arc::new(ProducingSink::new(
-        AcceptedShareProducer::new(redis, ACCEPTED_STREAM_KEY),
+        StreamProducer::new(redis, ACCEPTED_STREAM_KEY),
     ));
     Arc::new(CompositeAcceptedShareSink {
         sinks: ArcSwap::new(Arc::new(vec![producing])),
@@ -790,7 +789,7 @@ fn build_producing_rejected_composite(
 mod tests {
     use super::*;
     use bp_common::MiningMode;
-    use bp_share_stream::AcceptedShareConsumer;
+    use bp_share_stream::StreamConsumer;
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
     /// The settlement gate refuses to book a coinbase paying less than
@@ -1071,11 +1070,11 @@ mod tests {
         // Read it back through a consumer group — the Satellite's path.
         // ensure_group at "0" so the group sees the already-XADD'd entry,
         // then read never-delivered entries (`>`).
-        let consumer = AcceptedShareConsumer::new(conn, ACCEPTED_STREAM_KEY, "test_money", "c1");
+        let consumer = StreamConsumer::accepted(conn, ACCEPTED_STREAM_KEY, "test_money", "c1");
         consumer.ensure_group().await.expect("ensure_group");
         let entries = consumer.read_new(16, 500).await.expect("read_new");
         assert_eq!(entries.len(), 1, "exactly one share published");
-        let owned = &entries[0].share;
+        let owned = &entries[0].value;
         assert_eq!(owned.address, addr);
         assert_eq!(owned.mode, MiningMode::Pplns, "mode stamped from gate");
         assert_eq!(owned.group_id, None);

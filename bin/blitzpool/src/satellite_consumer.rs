@@ -24,31 +24,28 @@
 //!
 //! ## Delivery
 //!
-//! Each group `ensure_group`s, drains any **pending** (delivered-but-unacked)
-//! backlog left by a previous run, then loops on **new** entries. The
+//! Each group runs the shared [`StreamConsumer::run`] loop: it `ensure_group`s,
+//! drains any **pending** (delivered-but-unacked) backlog left by a previous
+//! run, then loops on **new** entries. The
 //! transport is at-least-once: a crash between sink-apply and `XACK`
 //! redelivers, and the money sinks dedup on `share_id` so the re-apply is a
 //! no-op. See [`bp_share_stream`].
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bp_share_hook::SharedAcceptedShareSink;
-use bp_share_stream::{AcceptedShareConsumer, StreamConsumerHandle, ACCEPTED_STREAM_KEY};
+use bp_share_stream::{
+    AcceptedShareFanOut, ConsumerLoopConfig, EnsureMode, StreamConsumer, StreamConsumerHandle,
+    ACCEPTED_STREAM_KEY,
+};
 use redis::aio::ConnectionManager;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
 
 use crate::engines::AcceptedSinkSet;
 
-/// Max entries pulled per `drain_*` call.
+/// Max entries pulled per read.
 const BATCH: usize = 256;
-/// How long a `drain_new` blocks waiting for at least one entry before
-/// looping back to re-check the cancel signal.
-const BLOCK_MS: usize = 1000;
-/// Back-off after a transient stream error before retrying.
-const ERROR_BACKOFF: Duration = Duration::from_millis(500);
 
 const MONEY_GROUP: &str = "money";
 const STATS_SESSION_GROUP: &str = "stats-session";
@@ -69,56 +66,37 @@ pub(crate) fn spawn(
     // `XREAD BLOCK` would otherwise head-of-line-block the other group's
     // reads (and any command queued behind it) on a shared multiplexed
     // connection.
-    let money = spawn_group(money_redis, MONEY_GROUP, sinks.money, cancel.clone());
-    let stats_session = spawn_group(stats_redis, STATS_SESSION_GROUP, sinks.aux, cancel.clone());
+    let money = spawn_group(
+        money_redis,
+        MONEY_GROUP,
+        "accepted-money",
+        sinks.money,
+        cancel.clone(),
+    );
+    let stats_session = spawn_group(
+        stats_redis,
+        STATS_SESSION_GROUP,
+        "accepted-stats-session",
+        sinks.aux,
+        cancel.clone(),
+    );
     StreamConsumerHandle::new(vec![money, stats_session], cancel, "accepted")
 }
 
 fn spawn_group(
     redis: ConnectionManager,
     group: &'static str,
+    label: &'static str,
     sinks: Vec<Arc<dyn SharedAcceptedShareSink>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    let consumer = AcceptedShareConsumer::new(redis, ACCEPTED_STREAM_KEY, group, CONSUMER);
-    tokio::spawn(async move {
-        if let Err(err) = consumer.ensure_group().await {
-            warn!(%err, group, "satellite-consumer: ensure_group failed; task not started");
-            return;
-        }
-
-        // Resume: drain the delivered-but-unacked backlog from a previous
-        // run before taking new entries. `drain_pending` re-reads from `0`
-        // each call, so loop until it reports an empty batch.
-        loop {
-            match consumer.drain_pending(&sinks, BATCH).await {
-                Ok(0) => break,
-                Ok(n) => info!(n, group, "satellite-consumer: drained pending backlog"),
-                Err(err) => {
-                    warn!(%err, group, "satellite-consumer: drain_pending failed; continuing");
-                    break;
-                }
-            }
-        }
-
-        info!(group, "satellite-consumer: live");
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                result = consumer.drain_new(&sinks, BATCH, BLOCK_MS) => {
-                    match result {
-                        Ok(_) => {}
-                        Err(err) => {
-                            warn!(%err, group, "satellite-consumer: drain_new failed; backing off");
-                            tokio::time::sleep(ERROR_BACKOFF).await;
-                        }
-                    }
-                }
-            }
-        }
-        info!(group, "satellite-consumer: stopped");
-    })
+    let consumer = StreamConsumer::accepted(redis, ACCEPTED_STREAM_KEY, group, CONSUMER);
+    tokio::spawn(consumer.run(
+        EnsureMode::FromZero,
+        ConsumerLoopConfig::new(BATCH, label),
+        cancel,
+        AcceptedShareFanOut::new(sinks),
+    ))
 }
 
 #[cfg(test)]
@@ -127,8 +105,9 @@ mod tests {
     use async_trait::async_trait;
     use bp_common::MiningMode;
     use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareOwned};
-    use bp_share_stream::AcceptedShareProducer;
+    use bp_share_stream::StreamProducer;
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
+    use std::time::Duration;
     use tokio::sync::Mutex as AsyncMutex;
 
     /// Records the `share_id` of every share it receives, in arrival order.
@@ -180,7 +159,7 @@ mod tests {
         };
 
         // Publish three shares before the consumer starts.
-        let producer = AcceptedShareProducer::new(conn.clone(), ACCEPTED_STREAM_KEY);
+        let producer = StreamProducer::new(conn.clone(), ACCEPTED_STREAM_KEY);
         for i in 0..3 {
             producer
                 .publish(&sample(&format!("1:{i}")))
@@ -218,15 +197,14 @@ mod tests {
     }
 
     /// A delivered-but-unacked backlog (a consumer that read but never
-    /// acked, e.g. crashed mid-apply) is replayed on restart via
-    /// `drain_pending`.
+    /// acked, e.g. crashed mid-apply) is replayed on restart.
     #[tokio::test]
     async fn pending_backlog_is_replayed_on_restart() {
         let Some(conn) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 8).await else {
             return;
         };
 
-        let producer = AcceptedShareProducer::new(conn.clone(), ACCEPTED_STREAM_KEY);
+        let producer = StreamProducer::new(conn.clone(), ACCEPTED_STREAM_KEY);
         for i in 0..2 {
             producer
                 .publish(&sample(&format!("1:{i}")))
@@ -237,7 +215,7 @@ mod tests {
         // Simulate a prior run that read the entries into the money group's
         // PEL but crashed before acking: ensure_group + read_new, no ack.
         let prior =
-            AcceptedShareConsumer::new(conn.clone(), ACCEPTED_STREAM_KEY, MONEY_GROUP, CONSUMER);
+            StreamConsumer::accepted(conn.clone(), ACCEPTED_STREAM_KEY, MONEY_GROUP, CONSUMER);
         prior.ensure_group().await.expect("ensure_group");
         let delivered = prior.read_new(16, 500).await.expect("read_new");
         assert_eq!(delivered.len(), 2, "two entries delivered, left unacked");

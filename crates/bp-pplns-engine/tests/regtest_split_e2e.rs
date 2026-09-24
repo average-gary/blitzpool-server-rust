@@ -35,7 +35,7 @@ use bp_pplns_engine::hooks::PplnsAcceptedShareSink;
 use bp_pplns_engine::window::NetworkDifficulty;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_share_hook::{MiningMode, SharedAcceptedShareOwned, SharedAcceptedShareSink};
-use bp_share_stream::{AcceptedShareConsumer, AcceptedShareProducer};
+use bp_share_stream::{AcceptedShareFanOut, StreamConsumer, StreamProducer};
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use sqlx::PgPool;
 
@@ -110,21 +110,19 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         mk_share("t4:1", &addr_bob, 200.0),
         mk_share("t4:2", &addr_charlie, 300.0),
     ];
-    let producer = AcceptedShareProducer::new(redis_conn.clone(), STREAM_KEY);
+    let producer = StreamProducer::new(redis_conn.clone(), STREAM_KEY);
     for s in &shares {
         producer.publish(s).await.expect("core produce");
     }
 
     let sink: Arc<dyn SharedAcceptedShareSink> =
         Arc::new(PplnsAcceptedShareSink::new(engine.clone()));
+    let fan_out = AcceptedShareFanOut::new(vec![sink.clone()]);
 
     // First Satellite run: drain + apply + ack the first two shares.
-    let c1 = AcceptedShareConsumer::new(redis_conn.clone(), STREAM_KEY, "money", "c1");
+    let c1 = StreamConsumer::accepted(redis_conn.clone(), STREAM_KEY, "money", "c1");
     c1.ensure_group().await.expect("ensure_group");
-    let n = c1
-        .drain_new(std::slice::from_ref(&sink), 2, 2000)
-        .await
-        .expect("drain_new");
+    let n = c1.drain_new(&fan_out, 2, 2000).await.expect("drain_new");
     assert_eq!(n, 2, "first run consumes Alice + Bob");
 
     // Crash simulation: deliver the third share (Charlie) and APPLY it to the
@@ -132,17 +130,14 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
     let pending = c1.read_new(10, 2000).await.expect("read_new charlie");
     assert_eq!(pending.len(), 1, "Charlie delivered to the PEL");
     for cs in &pending {
-        sink.record_accepted(cs.share.as_view()).await;
+        sink.record_accepted(cs.value.as_view()).await;
     }
     drop(c1); // the "crash" — no ack issued
 
     // ── Satellite restart: same group+consumer replays the unacked entry ──
-    let c2 = AcceptedShareConsumer::new(redis_conn.clone(), STREAM_KEY, "money", "c1");
+    let c2 = StreamConsumer::accepted(redis_conn.clone(), STREAM_KEY, "money", "c1");
     c2.ensure_group().await.expect("ensure_group after restart");
-    let replayed = c2
-        .drain_pending(std::slice::from_ref(&sink), 10)
-        .await
-        .expect("drain_pending");
+    let replayed = c2.drain_pending(&fan_out, 10).await.expect("drain_pending");
     assert_eq!(
         replayed, 1,
         "the unacked Charlie share is replayed on restart"

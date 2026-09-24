@@ -120,74 +120,11 @@ pub enum StreamError {
     MissingField { id: String },
 }
 
-/// Publishes accepted shares to a Redis stream. Cheap to clone
-/// (`ConnectionManager` is `Arc`-backed + multiplexed).
-#[derive(Clone)]
-pub struct AcceptedShareProducer {
-    conn: ConnectionManager,
-    stream_key: String,
-    maxlen: usize,
-}
-
-impl AcceptedShareProducer {
-    pub fn new(conn: ConnectionManager, stream_key: impl Into<String>) -> Self {
-        Self {
-            conn,
-            stream_key: stream_key.into(),
-            maxlen: DEFAULT_STREAM_MAXLEN,
-        }
-    }
-
-    /// Override the stream-length cap (approximate `MAXLEN ~`).
-    pub fn with_maxlen(mut self, maxlen: usize) -> Self {
-        self.maxlen = maxlen;
-        self
-    }
-
-    /// `XADD … MAXLEN ~ cap` one share with an auto-generated id (`*`).
-    /// Returns the entry id. Approximate trimming keeps the hot path cheap.
-    pub async fn publish(&self, share: &SharedAcceptedShareOwned) -> Result<String, StreamError> {
-        let json = serde_json::to_string(share)?;
-        let mut conn = self.conn.clone();
-        let id: String = conn
-            .xadd_maxlen(
-                &self.stream_key,
-                StreamMaxlen::Approx(self.maxlen),
-                "*",
-                &[(FIELD, json.as_str())],
-            )
-            .await?;
-        Ok(id)
-    }
-}
-
 /// Off-loop publish buffer. An `XADD` is sub-millisecond at realistic
 /// share rates, so this only fills if Redis publishing stalls. On overflow
 /// we drop (best-effort — the miner already got its accept) rather than
 /// block the stratum read loop. ~32 s of headroom at 250 shares/s.
 const PUBLISH_BUFFER: usize = 8192;
-
-/// Anything that can publish one owned record onto a stream. Lets the shared
-/// [`BufferedPublisher`] drain-loop back both the accepted-share producer and
-/// the generic [`StreamProducer`] without caring which it holds.
-#[async_trait]
-trait ItemPublisher<T>: Send + Sync + 'static {
-    async fn publish_item(&self, item: &T) -> Result<(), StreamError>;
-}
-
-#[async_trait]
-impl ItemPublisher<SharedAcceptedShareOwned> for AcceptedShareProducer {
-    async fn publish_item(&self, item: &SharedAcceptedShareOwned) -> Result<(), StreamError> {
-        self.publish(item).await.map(|_| ())
-    }
-}
-
-#[async_trait]
-impl<T: Serialize + Send + Sync + 'static> ItemPublisher<T> for StreamProducer<T> {
-    async fn publish_item(&self, item: &T) -> Result<(), StreamError> {
-        self.publish(item).await.map(|_| ())
-    }
-}
 
 /// Off-loop publish core shared by the producing sinks: a bounded channel + a
 /// drain task that owns the `XADD` round-trip, so the latency-sensitive stratum
@@ -200,12 +137,12 @@ struct BufferedPublisher<T> {
     what: &'static str,
 }
 
-impl<T: Send + 'static> BufferedPublisher<T> {
-    fn new<P: ItemPublisher<T>>(producer: P, what: &'static str) -> Self {
+impl<T: Serialize + Send + Sync + 'static> BufferedPublisher<T> {
+    fn new(producer: StreamProducer<T>, what: &'static str) -> Self {
         let (tx, mut rx) = mpsc::channel::<T>(PUBLISH_BUFFER);
         tokio::spawn(async move {
             while let Some(item) = rx.recv().await {
-                if let Err(e) = producer.publish_item(&item).await {
+                if let Err(e) = producer.publish(&item).await {
                     tracing::warn!(
                         error = %e,
                         what,
@@ -251,7 +188,7 @@ pub struct ProducingSink {
 }
 
 impl ProducingSink {
-    pub fn new(producer: AcceptedShareProducer) -> Self {
+    pub fn new(producer: StreamProducer<SharedAcceptedShareOwned>) -> Self {
         Self {
             inner: BufferedPublisher::new(producer, "accepted"),
         }
@@ -289,246 +226,40 @@ impl SharedRejectedShareSink for ProducingRejectedSink {
     }
 }
 
-/// One consumed entry: its stream id + the reconstructed owned share.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConsumedShare {
-    pub id: String,
-    pub share: SharedAcceptedShareOwned,
+/// The Satellite's per-entry action on the accepted-share stream: hand each
+/// consumed share to every sink, in order. The sinks are the *same*
+/// [`SharedAcceptedShareSink`] impls the engines expose in-process, so the
+/// transport adds nothing to what a share does (the equivalence seam).
+pub struct AcceptedShareFanOut {
+    sinks: Vec<Arc<dyn SharedAcceptedShareSink>>,
 }
 
-/// Reads accepted shares from a Redis stream via a consumer group. A given
-/// `(group, consumer)` pair is one logical reader; on restart the Satellite
-/// reuses the same names and reclaims its pending entries via
-/// [`Self::read_pending`].
-#[derive(Clone)]
-pub struct AcceptedShareConsumer {
-    conn: ConnectionManager,
-    stream_key: String,
-    group: String,
-    consumer: String,
-}
-
-impl AcceptedShareConsumer {
-    pub fn new(
-        conn: ConnectionManager,
-        stream_key: impl Into<String>,
-        group: impl Into<String>,
-        consumer: impl Into<String>,
-    ) -> Self {
-        Self {
-            conn,
-            stream_key: stream_key.into(),
-            group: group.into(),
-            consumer: consumer.into(),
-        }
-    }
-
-    /// Create the consumer group if absent (`MKSTREAM`, starting at id `0` so
-    /// nothing already in the stream is skipped). Idempotent: a `BUSYGROUP`
-    /// error (group already exists) is treated as success.
-    pub async fn ensure_group(&self) -> Result<(), StreamError> {
-        let mut conn = self.conn.clone();
-        let res: Result<(), RedisError> = conn
-            .xgroup_create_mkstream(&self.stream_key, &self.group, "0")
-            .await;
-        match res {
-            Ok(()) => Ok(()),
-            // Group already exists — fine.
-            Err(e) if e.code() == Some("BUSYGROUP") => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Read up to `count` never-delivered entries (`>`), blocking up to
-    /// `block_ms` for at least one. Returns `[]` on timeout.
-    pub async fn read_new(
-        &self,
-        count: usize,
-        block_ms: usize,
-    ) -> Result<Vec<ConsumedShare>, StreamError> {
-        let opts = StreamReadOptions::default()
-            .group(&self.group, &self.consumer)
-            .count(count)
-            .block(block_ms);
-        let mut conn = self.conn.clone();
-        let reply: StreamReadReply = conn
-            .xread_options(&[&self.stream_key], &[">"], &opts)
-            .await?;
-        Ok(self.partition(reply).await.0)
-    }
-
-    /// Re-read this consumer's pending (delivered-but-unacked) entries from
-    /// the start (`0`) — the resume path after a restart, so an entry whose
-    /// apply crashed before `XACK` is redelivered (and the dedup marker
-    /// makes the re-apply a no-op).
-    pub async fn read_pending(&self, count: usize) -> Result<Vec<ConsumedShare>, StreamError> {
-        Ok(self.read_pending_counted(count).await?.0)
-    }
-
-    /// Like [`Self::read_pending`] but also returns the total RAW entry count
-    /// (good + dead-lettered), so the resume loop can tell "nothing left in the
-    /// PEL" (stop) from "this batch was all poison" (keep draining).
-    async fn read_pending_counted(
-        &self,
-        count: usize,
-    ) -> Result<(Vec<ConsumedShare>, usize), StreamError> {
-        let opts = StreamReadOptions::default()
-            .group(&self.group, &self.consumer)
-            .count(count);
-        let mut conn = self.conn.clone();
-        let reply: StreamReadReply = conn
-            .xread_options(&[&self.stream_key], &["0"], &opts)
-            .await?;
-        Ok(self.partition(reply).await)
-    }
-
-    /// Drain one batch of **new** entries: read up to `count` (blocking up
-    /// to `block_ms`), dispatch each — in entry order — to every sink, then
-    /// `XACK`. Returns the number processed (`0` on timeout).
-    ///
-    /// The dispatch drives the *same* [`SharedAcceptedShareSink`] impls the
-    /// engines expose — one sink entrypoint regardless of transport (the
-    /// equivalence seam). Acking *after* dispatch is safe across a crash
-    /// because the money sinks dedup on `share_id`: a redelivered,
-    /// already-applied share is a no-op.
-    pub async fn drain_new(
-        &self,
-        sinks: &[Arc<dyn SharedAcceptedShareSink>],
-        count: usize,
-        block_ms: usize,
-    ) -> Result<usize, StreamError> {
-        let batch = self.read_new(count, block_ms).await?;
-        self.dispatch_and_ack(&batch, sinks).await?;
-        Ok(batch.len())
-    }
-
-    /// Drain this consumer's **pending** (delivered-but-unacked) entries —
-    /// the restart-resume path. Same dispatch + ack as [`Self::drain_new`].
-    ///
-    /// Returns the total RAW entry count seen (good + dead-lettered), NOT the
-    /// number of good shares. The resume loop drains until this is `0` (PEL
-    /// empty); returning `good.len()` would let an all-poison batch report `0`
-    /// and break the loop with good shares still queued behind the poison.
-    pub async fn drain_pending(
-        &self,
-        sinks: &[Arc<dyn SharedAcceptedShareSink>],
-        count: usize,
-    ) -> Result<usize, StreamError> {
-        let (batch, raw) = self.read_pending_counted(count).await?;
-        self.dispatch_and_ack(&batch, sinks).await?;
-        Ok(raw)
-    }
-
-    async fn dispatch_and_ack(
-        &self,
-        batch: &[ConsumedShare],
-        sinks: &[Arc<dyn SharedAcceptedShareSink>],
-    ) -> Result<(), StreamError> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        for cs in batch {
-            let view = cs.share.as_view();
-            for sink in sinks {
-                sink.record_accepted(view).await;
-            }
-        }
-        let ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
-        self.ack(&ids).await?;
-        Ok(())
-    }
-
-    /// `XACK` the given entry ids. Returns the number acknowledged.
-    pub async fn ack(&self, ids: &[String]) -> Result<usize, StreamError> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let mut conn = self.conn.clone();
-        let n: usize = conn.xack(&self.stream_key, &self.group, ids).await?;
-        Ok(n)
-    }
-
-    fn decode_entry(
-        entry: &redis::streams::StreamId,
-    ) -> Result<SharedAcceptedShareOwned, StreamError> {
-        let raw = entry
-            .map
-            .get(FIELD)
-            .ok_or_else(|| StreamError::MissingField {
-                id: entry.id.clone(),
-            })?;
-        let json: String = redis::from_redis_value(raw)?;
-        Ok(serde_json::from_str(&json)?)
-    }
-
-    /// Split a reply into decodable shares; an undecodable entry (missing `d`
-    /// field / malformed JSON) can never reach a sink, so it's dead-lettered
-    /// (`XACK`ed) so one poison entry can't fail its whole batch or linger
-    /// un-acked in the PEL.
-    ///
-    /// Unlike [`StreamConsumer::partition`](crate::StreamConsumer) (used for
-    /// device-status etc.), THIS is the money path: a dropped accepted share
-    /// underpays a miner and can't be recovered, so the drop is logged at
-    /// `error` + counted (`accepted_share_undecodable_dropped_total`) rather
-    /// than a quiet warning — the loss must be alertable so the operator fixes
-    /// the root cause (a non-additive share-schema skew across a rolling
-    /// Core/Satellite deploy, or a corrupt Redis write; additive changes are
-    /// absorbed by `#[serde(default)]` and never land here).
-    ///
-    /// Returns `(decodable shares, total raw entries seen)`. The raw count —
-    /// NOT `good.len()` — is what the resume loop must key on: an all-poison
-    /// batch acks its entries and returns zero good, and keying the loop on
-    /// good-count would break it there, stranding good shares queued behind
-    /// the poison until the next restart.
-    async fn partition(&self, reply: StreamReadReply) -> (Vec<ConsumedShare>, usize) {
-        let mut good = Vec::new();
-        let mut poison = Vec::new();
-        for key in reply.keys {
-            for entry in key.ids {
-                match Self::decode_entry(&entry) {
-                    Ok(share) => good.push(ConsumedShare {
-                        id: entry.id,
-                        share,
-                    }),
-                    Err(err) => {
-                        tracing::error!(
-                            id = %entry.id,
-                            %err,
-                            stream = %self.stream_key,
-                            group = %self.group,
-                            "accepted-consumer: LOST an undecodable accepted (money) share — \
-                             miner underpaid for this window; investigate share-schema skew / \
-                             corrupt write"
-                        );
-                        metrics::counter!("accepted_share_undecodable_dropped_total").increment(1);
-                        poison.push(entry.id);
-                    }
-                }
-            }
-        }
-        let raw = good.len() + poison.len();
-        if !poison.is_empty() {
-            if let Err(err) = self.ack(&poison).await {
-                tracing::warn!(
-                    %err,
-                    n = poison.len(),
-                    stream = %self.stream_key,
-                    group = %self.group,
-                    "accepted-consumer: dead-letter ack failed (entries stay pending, retried next read)"
-                );
-            }
-        }
-        (good, raw)
+impl AcceptedShareFanOut {
+    pub fn new(sinks: Vec<Arc<dyn SharedAcceptedShareSink>>) -> Self {
+        Self { sinks }
     }
 }
 
-// ── Generic typed transport ─────────────────────────────────────────
+#[async_trait]
+impl StreamEntryHandler<SharedAcceptedShareOwned> for AcceptedShareFanOut {
+    async fn handle(&self, value: SharedAcceptedShareOwned) {
+        let view = value.as_view();
+        for sink in &self.sinks {
+            sink.record_accepted(view).await;
+        }
+    }
+}
+
+// ── Typed transport ─────────────────────────────────────────────────
 //
-// A minimal reusable Redis-stream producer/consumer over any serde type —
-// the transport for low-volume Core→Satellite event streams (e.g.
-// block-found). The accepted-share path keeps its own specialised types
-// above (the consumer there fans out to `SharedAcceptedShareSink`s); this
-// generic pair just moves typed values + leaves dispatch to the caller.
+// One Redis-stream producer/consumer over any serde type. Every
+// Core→Satellite stream rides it, the accepted-share (money) stream included;
+// only what an undecodable entry costs differs, see
+// [`StreamConsumer::accepted`].
+
+/// Counter bumped for every accepted share the consumer could not decode and
+/// had to drop. Operators alert on it: each increment is a miner underpaid.
+const ACCEPTED_UNDECODABLE_COUNTER: &str = "accepted_share_undecodable_dropped_total";
 
 /// Publishes JSON-encoded `T` values onto a Redis stream. Cheap to clone.
 #[derive(Clone)]
@@ -579,17 +310,41 @@ pub struct Consumed<T> {
     pub value: T,
 }
 
-/// Reads `T` values from a Redis stream via a consumer group. Mirrors
-/// [`AcceptedShareConsumer`]'s raw read/ack surface but returns typed values
-/// and leaves dispatch to the caller (block-found has a single handler, not a
-/// sink fan-out).
+/// Reads `T` values from a Redis stream via a consumer group. A given
+/// `(group, consumer)` pair is one logical reader; on restart it reuses the
+/// same names and reclaims its pending entries via [`Self::read_pending`].
 #[derive(Clone)]
 pub struct StreamConsumer<T> {
     conn: ConnectionManager,
     stream_key: String,
     group: String,
     consumer: String,
+    /// `Some(counter)` when a dropped entry is lost money: the drop is then
+    /// logged at `error` and counted instead of a `warn`.
+    undecodable_counter: Option<&'static str>,
     _marker: PhantomData<fn() -> T>,
+}
+
+impl StreamConsumer<SharedAcceptedShareOwned> {
+    /// Consumer for the accepted-share (money) stream. Same transport as every
+    /// other stream; the one difference is that an undecodable entry is a
+    /// share that can never be credited, so its drop is logged at `error` and
+    /// counted (`accepted_share_undecodable_dropped_total`). The loss must be
+    /// alertable so the operator fixes the root cause: a non-additive
+    /// share-schema skew across a rolling Core/Satellite deploy, or a corrupt
+    /// Redis write. Additive changes are absorbed by `#[serde(default)]` and
+    /// never land here.
+    pub fn accepted(
+        conn: ConnectionManager,
+        stream_key: impl Into<String>,
+        group: impl Into<String>,
+        consumer: impl Into<String>,
+    ) -> Self {
+        Self {
+            undecodable_counter: Some(ACCEPTED_UNDECODABLE_COUNTER),
+            ..Self::new(conn, stream_key, group, consumer)
+        }
+    }
 }
 
 impl<T: DeserializeOwned> StreamConsumer<T> {
@@ -604,6 +359,7 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
             stream_key: stream_key.into(),
             group: group.into(),
             consumer: consumer.into(),
+            undecodable_counter: None,
             _marker: PhantomData,
         }
     }
@@ -712,9 +468,8 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
     /// log is correct. Genuine version-skew is prevented upstream by
     /// `#[serde(default)]` on newly-added fields.
     ///
-    /// This path carries NON-money streams (device-status, block-found,
-    /// rejected), so a drop is `warn`, not the `error` + counter the accepted-
-    /// share (money) [`AcceptedShareConsumer::partition`] uses.
+    /// A drop is a `warn`, except on the accepted-share (money) stream, where
+    /// it is an `error` + counter (see [`StreamConsumer::accepted`]).
     ///
     /// Returns `(decodable entries, total raw entries seen)` — the raw count is
     /// what the resume loop keys on so an all-poison batch doesn't halt it with
@@ -730,13 +485,27 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
                         value,
                     }),
                     Err(err) => {
-                        tracing::warn!(
-                            id = %entry.id,
-                            %err,
-                            stream = %self.stream_key,
-                            group = %self.group,
-                            "stream-consumer: dropping undecodable entry (dead-letter)"
-                        );
+                        match self.undecodable_counter {
+                            Some(counter) => {
+                                tracing::error!(
+                                    id = %entry.id,
+                                    %err,
+                                    stream = %self.stream_key,
+                                    group = %self.group,
+                                    "stream-consumer: LOST an undecodable accepted (money) share — \
+                                     miner underpaid for this window; investigate share-schema skew / \
+                                     corrupt write"
+                                );
+                                metrics::counter!(counter).increment(1);
+                            }
+                            None => tracing::warn!(
+                                id = %entry.id,
+                                %err,
+                                stream = %self.stream_key,
+                                group = %self.group,
+                                "stream-consumer: dropping undecodable entry (dead-letter)"
+                            ),
+                        }
                         poison.push(entry.id);
                     }
                 }
@@ -853,66 +622,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_trip_produce_consume_ack() {
-        let Some(conn) = connect_or_skip(12).await else {
-            return;
-        };
-        let key = "bp:test:shares:accepted";
-        let producer = AcceptedShareProducer::new(conn.clone(), key);
-        let consumer = AcceptedShareConsumer::new(conn.clone(), key, "money", "c1");
-        consumer.ensure_group().await.expect("ensure_group");
-
-        let s1 = sample("ep1:0", MiningMode::Pplns, None);
-        let s2 = sample("ep1:1", MiningMode::GroupSolo, Some("group-xyz"));
-        producer.publish(&s1).await.expect("publish s1");
-        producer.publish(&s2).await.expect("publish s2");
-
-        let got = consumer.read_new(10, 1000).await.expect("read_new");
-        assert_eq!(got.len(), 2, "both shares delivered");
-        // Reconstructed records are byte-identical, in produce order.
-        assert_eq!(got[0].share, s1);
-        assert_eq!(got[1].share, s2);
-
-        // Ack both → no longer pending.
-        let ids: Vec<String> = got.iter().map(|c| c.id.clone()).collect();
-        assert_eq!(consumer.ack(&ids).await.expect("ack"), 2);
-        let pending = consumer.read_pending(10).await.expect("read_pending");
-        assert!(pending.is_empty(), "acked entries must not remain pending");
-    }
-
-    #[tokio::test]
-    async fn unacked_entry_redelivers_via_pending() {
-        // Simulates a consumer crash: deliver (marks pending), do NOT ack,
-        // then re-read the pending entry list (the restart-resume path).
-        let Some(conn) = connect_or_skip(13).await else {
-            return;
-        };
-        let key = "bp:test:shares:accepted2";
-        let producer = AcceptedShareProducer::new(conn.clone(), key);
-        let consumer = AcceptedShareConsumer::new(conn.clone(), key, "money", "c1");
-        consumer.ensure_group().await.expect("ensure_group");
-
-        producer
-            .publish(&sample("ep1:0", MiningMode::Pplns, None))
-            .await
-            .expect("publish");
-
-        let first = consumer.read_new(10, 1000).await.expect("read_new");
-        assert_eq!(first.len(), 1);
-
-        // No ack → still pending. The resume path re-reads it.
-        let pending = consumer.read_pending(10).await.expect("read_pending");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].share.share_id, "ep1:0");
-    }
-
-    #[tokio::test]
     async fn ensure_group_is_idempotent() {
         let Some(conn) = connect_or_skip(14).await else {
             return;
         };
         let key = "bp:test:shares:accepted3";
-        let consumer = AcceptedShareConsumer::new(conn.clone(), key, "money", "c1");
+        let consumer = StreamConsumer::accepted(conn.clone(), key, "money", "c1");
         consumer.ensure_group().await.expect("first ensure_group");
         // Second call must not error on the existing group (BUSYGROUP).
         consumer.ensure_group().await.expect("second ensure_group");
@@ -933,14 +648,34 @@ mod tests {
         }
     }
 
+    fn recording_fan_out() -> (AcceptedShareFanOut, Arc<std::sync::Mutex<Vec<String>>>) {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fan_out = AcceptedShareFanOut::new(vec![Arc::new(RecordingSink {
+            ids: recorded.clone(),
+        })]);
+        (fan_out, recorded)
+    }
+
+    async fn xadd_poison(conn: &ConnectionManager, key: &str) {
+        // Raw entry whose `d` field isn't a valid share record.
+        let _: String = redis::cmd("XADD")
+            .arg(key)
+            .arg("*")
+            .arg("d")
+            .arg("{ not a share")
+            .query_async(&mut conn.clone())
+            .await
+            .expect("xadd poison");
+    }
+
     #[tokio::test]
-    async fn drain_new_dispatches_to_sinks_in_order_and_acks() {
+    async fn drain_new_fans_out_to_sinks_in_order_and_acks() {
         let Some(conn) = connect_or_skip(15).await else {
             return;
         };
         let key = "bp:test:shares:accepted4";
-        let producer = AcceptedShareProducer::new(conn.clone(), key);
-        let consumer = AcceptedShareConsumer::new(conn.clone(), key, "money", "c1");
+        let producer = StreamProducer::new(conn.clone(), key);
+        let consumer = StreamConsumer::accepted(conn.clone(), key, "money", "c1");
         consumer.ensure_group().await.expect("ensure_group");
 
         producer
@@ -952,13 +687,9 @@ mod tests {
             .await
             .expect("publish");
 
-        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sinks: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![Arc::new(RecordingSink {
-            ids: recorded.clone(),
-        })];
-
+        let (fan_out, recorded) = recording_fan_out();
         let n = consumer
-            .drain_new(&sinks, 10, 1000)
+            .drain_new(&fan_out, 10, 1000)
             .await
             .expect("drain_new");
         assert_eq!(n, 2, "both shares processed");
@@ -989,35 +720,23 @@ mod tests {
             return;
         };
         let key = "bp:test:shares:poison";
-        let producer = AcceptedShareProducer::new(conn.clone(), key);
-        let consumer = AcceptedShareConsumer::new(conn.clone(), key, "money", "c1");
+        let producer = StreamProducer::new(conn.clone(), key);
+        let consumer = StreamConsumer::accepted(conn.clone(), key, "money", "c1");
         consumer.ensure_group().await.expect("ensure_group");
 
         producer
             .publish(&sample("ep1:0", MiningMode::Pplns, None))
             .await
             .expect("publish good1");
-        // Raw entry whose `d` field isn't a valid share record.
-        let _: String = redis::cmd("XADD")
-            .arg(key)
-            .arg("*")
-            .arg("d")
-            .arg("{ not a share")
-            .query_async(&mut conn.clone())
-            .await
-            .expect("xadd poison");
+        xadd_poison(&conn, key).await;
         producer
             .publish(&sample("ep1:1", MiningMode::GroupSolo, Some("g")))
             .await
             .expect("publish good2");
 
-        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sinks: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![Arc::new(RecordingSink {
-            ids: recorded.clone(),
-        })];
-
+        let (fan_out, recorded) = recording_fan_out();
         let n = consumer
-            .drain_new(&sinks, 10, 1000)
+            .drain_new(&fan_out, 10, 1000)
             .await
             .expect("drain_new");
         assert_eq!(n, 2, "both good shares processed, poison skipped");
@@ -1038,8 +757,133 @@ mod tests {
         );
     }
 
+    /// Counts every counter increment by name. Just enough of a recorder to
+    /// see whether `partition` bumped the lost-share counter.
+    #[derive(Default)]
+    struct CountingRecorder {
+        counts: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    struct NamedCounter {
+        name: String,
+        counts: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    impl metrics::CounterFn for NamedCounter {
+        fn increment(&self, value: u64) {
+            *self
+                .counts
+                .lock()
+                .unwrap()
+                .entry(self.name.clone())
+                .or_default() += value;
+        }
+        fn absolute(&self, _value: u64) {}
+    }
+
+    impl metrics::Recorder for CountingRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::from_arc(Arc::new(NamedCounter {
+                name: key.name().to_string(),
+                counts: self.counts.clone(),
+            }))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// A dropped accepted share is lost money, so it must stay alertable: the
+    /// accepted consumer bumps `accepted_share_undecodable_dropped_total`.
+    /// Negative control on the same poison entry: a plain consumer drops it
+    /// without counting, so the assertion cannot pass on a counter that
+    /// something else bumped.
+    #[test]
+    fn an_undecodable_accepted_share_is_counted_as_lost() {
+        let recorder = CountingRecorder::default();
+        let counts = recorder.counts.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // `with_local_recorder` is per-thread; the current-thread runtime
+        // polls the consumer on this very thread.
+        let ran = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let Some(conn) = connect_or_skip(12).await else {
+                    return false;
+                };
+                let key = "bp:test:shares:lost";
+                xadd_poison(&conn, key).await;
+
+                let plain: StreamConsumer<SharedAcceptedShareOwned> =
+                    StreamConsumer::new(conn.clone(), key, "plain", "c1");
+                plain.ensure_group().await.expect("ensure plain");
+                assert!(plain
+                    .read_new(10, 500)
+                    .await
+                    .expect("read plain")
+                    .is_empty());
+                assert_eq!(
+                    counts.lock().unwrap().get(ACCEPTED_UNDECODABLE_COUNTER),
+                    None,
+                    "a plain consumer drops without counting"
+                );
+
+                let money = StreamConsumer::accepted(conn, key, "money", "c1");
+                money.ensure_group().await.expect("ensure money");
+                assert!(money
+                    .read_new(10, 500)
+                    .await
+                    .expect("read money")
+                    .is_empty());
+                true
+            })
+        });
+        if !ran {
+            return;
+        }
+        assert_eq!(
+            counts.lock().unwrap().get(ACCEPTED_UNDECODABLE_COUNTER),
+            Some(&1),
+            "the accepted consumer counts the dropped share as lost"
+        );
+    }
+
     /// Regression: the resume loop must drain good pending shares even when an
-    /// all-poison batch sits at the FRONT of the PEL. With `count == 1` the
+    /// all-poison batch sits at the FRONT of the PEL. With a batch of 1 the
     /// first pending entry (poison) is dead-lettered and yields zero good
     /// shares; the loop must key on the RAW count (keep going) not the good
     /// count (which would break here and strand the good share behind it).
@@ -1051,19 +895,12 @@ mod tests {
         let key = "bp:test:shares:strand";
         let group = "money";
         let consumer_name = "c1";
-        let producer = AcceptedShareProducer::new(conn.clone(), key);
-        let consumer = AcceptedShareConsumer::new(conn.clone(), key, group, consumer_name);
+        let producer = StreamProducer::new(conn.clone(), key);
+        let consumer = StreamConsumer::accepted(conn.clone(), key, group, consumer_name);
         consumer.ensure_group().await.expect("ensure_group");
 
         // Poison FIRST (lowest id → front of the PEL), good share behind it.
-        let _: String = redis::cmd("XADD")
-            .arg(key)
-            .arg("*")
-            .arg("d")
-            .arg("{ not a share")
-            .query_async(&mut conn.clone())
-            .await
-            .expect("xadd poison");
+        xadd_poison(&conn, key).await;
         producer
             .publish(&sample("ep1:0", MiningMode::Pplns, None))
             .await
@@ -1085,24 +922,25 @@ mod tests {
             .await
             .expect("raw deliver to PEL");
 
-        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sinks: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![Arc::new(RecordingSink {
-            ids: recorded.clone(),
-        })];
-
-        // The production resume loop, with count = 1 to force the all-poison
-        // first batch. Pre-fix: iteration 1 returns 0 good → break → good share
-        // stranded. Post-fix: raw count 1 → keep draining → good share reaches
-        // the sink.
-        loop {
-            let n = consumer
-                .drain_pending(&sinks, 1)
-                .await
-                .expect("drain_pending");
-            if n == 0 {
+        // The production loop, batch 1 to force the all-poison first batch.
+        // Keyed on the good count it would stop there and go live, and `>`
+        // never hands the pending good share out again.
+        let (fan_out, recorded) = recording_fan_out();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(consumer.clone().run(
+            EnsureMode::FromZero,
+            ConsumerLoopConfig::new(1, "test"),
+            cancel.clone(),
+            fan_out,
+        ));
+        for _ in 0..50 {
+            if !recorded.lock().unwrap().is_empty() {
                 break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        cancel.cancel();
+        task.await.expect("join");
 
         assert_eq!(
             *recorded.lock().unwrap(),
@@ -1131,20 +969,27 @@ mod tests {
             return;
         };
         let key = "bp:test:shares:accepted5";
-        let consumer = AcceptedShareConsumer::new(consumer_conn, key, "money", "c1");
+        let consumer = StreamConsumer::accepted(consumer_conn, key, "money", "c1");
         consumer.ensure_group().await.expect("ensure_group");
 
-        let sink = ProducingSink::new(AcceptedShareProducer::new(producer_conn, key));
-        let owned = sample("ep1:0", MiningMode::Pplns, None);
-        // Drive the sink with a stamped view, exactly as the composite would.
-        sink.record_accepted(owned.as_view()).await;
+        let sink = ProducingSink::new(StreamProducer::new(producer_conn, key));
+        let s1 = sample("ep1:0", MiningMode::Pplns, None);
+        let s2 = sample("ep1:1", MiningMode::GroupSolo, Some("group-xyz"));
+        // Drive the sink with stamped views, exactly as the composite would.
+        sink.record_accepted(s1.as_view()).await;
+        sink.record_accepted(s2.as_view()).await;
 
-        let got = consumer.read_new(10, 1000).await.expect("read_new");
-        assert_eq!(got.len(), 1);
-        assert_eq!(
-            got[0].share, owned,
-            "the produced record round-trips intact"
-        );
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            got.extend(consumer.read_new(10, 1000).await.expect("read_new"));
+            if got.len() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(got.len(), 2);
+        // Reconstructed records are identical, in produce order.
+        assert_eq!(got[0].value, s1, "the produced record round-trips intact");
+        assert_eq!(got[1].value, s2, "mode + group_id round-trip intact");
     }
 
     /// The rejected producing sink publishes a (group_id-stamped) rejected

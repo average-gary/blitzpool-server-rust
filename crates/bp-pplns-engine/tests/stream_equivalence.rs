@@ -26,7 +26,7 @@ use bp_pplns_engine::engine::PplnsEngine;
 use bp_pplns_engine::hooks::PplnsAcceptedShareSink;
 use bp_pplns_engine::window::NetworkDifficulty;
 use bp_share_hook::{MiningMode, SharedAcceptedShareOwned, SharedAcceptedShareSink};
-use bp_share_stream::{AcceptedShareConsumer, AcceptedShareProducer};
+use bp_share_stream::{AcceptedShareFanOut, StreamConsumer, StreamProducer};
 use bp_test_support::{connect_pg_or_skip, connect_redis_in_range_or_skip};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -125,8 +125,8 @@ async fn run_stream_path(
     sink: Arc<dyn SharedAcceptedShareSink>,
 ) {
     let key = "t1:pplns:accepted";
-    let producer = AcceptedShareProducer::new(conn.clone(), key);
-    let consumer = AcceptedShareConsumer::new(conn.clone(), key, "money", "c1");
+    let producer = StreamProducer::new(conn.clone(), key);
+    let consumer = StreamConsumer::accepted(conn.clone(), key, "money", "c1");
     consumer.ensure_group().await.expect("ensure_group");
 
     for s in shares {
@@ -138,11 +138,11 @@ async fn run_stream_path(
     }
 
     let expected = shares.len() + extra_dups.len();
-    let sinks = vec![sink];
+    let fan_out = AcceptedShareFanOut::new(vec![sink]);
     let mut drained = 0;
     while drained < expected {
         let n = consumer
-            .drain_new(&sinks, 100, 1000)
+            .drain_new(&fan_out, 100, 1000)
             .await
             .expect("drain_new");
         assert!(
