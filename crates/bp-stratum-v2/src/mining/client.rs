@@ -4023,9 +4023,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Companion to the gating test: a share whose submission-difficulty
-    /// meets the configured network-difficulty emits `ShareAccepted`
-    /// with `is_block_candidate = true`. IO-layer reads this flag to
+    /// Companion to the gating test: a share whose hash meets the job's
+    /// network target emits `ShareAccepted` with
+    /// `is_block_candidate = true`. IO-layer reads this flag to
     /// fire the `BlockSubmissionSink` (which submits block candidates
     /// for upstream processing).
     #[test]
@@ -4041,10 +4041,10 @@ pub(crate) mod tests {
         let easy = Difficulty(1.0 / 4_294_967_296.0);
         {
             let ch = s.channels.get_mut(&channel_id).unwrap();
-            // Snapshot with trivially-reachable network_difficulty so
-            // any accepted share is also a block candidate.
+            // Snapshot with a trivially-reachable target (`0xffff·2^240`)
+            // so any accepted share is also a block candidate.
             let mut snap = snapshot();
-            snap.network_difficulty = easy;
+            snap.n_bits = 0x2100_ffff;
             ch.standard_jobs
                 .record_send_for_test(7, easy, [0xDD; 32], snap, 0);
         }
@@ -4061,8 +4061,8 @@ pub(crate) mod tests {
             SessionEvent::ShareAccepted { accept, .. } => {
                 assert!(
                     accept.is_block_candidate,
-                    "submission ≥ network must flag block-candidate so \
-                     IO-layer fires BlockSubmissionSink"
+                    "a hash meeting the network target must flag block-candidate \
+                     so IO-layer fires BlockSubmissionSink"
                 );
             }
             ev => panic!("expected ShareAccepted, got {ev:?}"),

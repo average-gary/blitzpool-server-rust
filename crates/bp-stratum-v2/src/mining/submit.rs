@@ -29,7 +29,8 @@
 //! effective difficulty (for accounting), the classification
 //! (`Active` vs `StaleCreditable` — both credit, see
 //! [`bp_jobs_lifecycle::JobClassification`]), and the `is_block_candidate`
-//! flag indicating that `submission_difficulty >= network_difficulty`.
+//! flag: the hash meets the job's network target
+//! ([`bp_mining_job::meets_network_target`]).
 //! Or [`ShareValidation::Rejected`] carrying one of four SV2 wire
 //! codes: `invalid-channel-id`, `invalid-job-id`, `stale-share`,
 //! `difficulty-too-low`.
@@ -39,7 +40,9 @@
 //! caller serializes the chosen literal directly without paraphrasing.
 
 use bp_jobs_lifecycle::JobClassification;
-use bp_mining_job::{assemble_witness_coinbase, build_block_header, merkle_root_from_coinbase};
+use bp_mining_job::{
+    assemble_witness_coinbase, build_block_header, meets_network_target, merkle_root_from_coinbase,
+};
 use bp_share::{calculate_difficulty, sha256d_from_parts, Difficulty, Target};
 use smallvec::SmallVec;
 
@@ -360,7 +363,7 @@ pub struct StandardJobContext<'a> {
 /// 6. Compare against `difficulty_to_target(job_difficulty)`. Miss →
 ///    [`RejectReason::DifficultyTooLow`].
 /// 7. Otherwise build [`ShareAccept`] with `is_block_candidate =
-///    submission_difficulty >= job_ctx.network_difficulty`.
+///    meets_network_target(hash, job_ctx.n_bits)`.
 ///
 /// The dedup-cache **write** is the caller's responsibility — it
 /// happens INSIDE this function only when the share validates (so a
@@ -420,7 +423,7 @@ pub fn validate_submit_standard(
     // bad share doesn't get logged as duplicate.
     channel.submission_cache.insert_standard(dedup_key);
 
-    let is_block_candidate = pow.submission_difficulty >= job_ctx.network_difficulty;
+    let is_block_candidate = meets_network_target(&pow.submission_hash, job_ctx.n_bits);
     // Witness-form coinbase for the block-found path.
     // Built only for block-candidates; per-share allocation cost is
     // negligible on the rare candidate path.
@@ -482,7 +485,7 @@ pub struct ExtendedChannelView {
 ///
 /// **Caller's prep work**: channel lookup only (`None` → emit
 /// [`RejectReason::InvalidChannelId`] directly). Everything else —
-/// extended-job lookup, classification, network-difficulty lookup —
+/// extended-job lookup, classification, the block-found gate —
 /// happens inside.
 ///
 /// **Extranonce-size mismatch is a HARD reject** with wire-code
@@ -683,10 +686,10 @@ pub fn validate_submit_extended(
 
     submission_cache.insert_extended(dedup_key);
 
-    // Per-job pinned network difficulty (SV2 Mining/SubmitShares.Error strict)
-    // — the gate uses the template the miner hashed against, not the latest
+    // The job's own n_bits — the header the miner hashed commits to it, so
+    // the gate uses the template the miner hashed against, not the latest
     // one.
-    let is_block_candidate = pow.submission_difficulty >= ext_job.network_difficulty;
+    let is_block_candidate = meets_network_target(&pow.submission_hash, ext_job.n_bits);
     // Witness-form coinbase for the block-found path. Built only for
     // block-candidates to keep the per-share allocation off the hot
     // path (every non-candidate share goes through the validator,
@@ -1082,13 +1085,17 @@ mod tests {
         );
     }
 
-    /// `is_block_candidate` flips to true when submission ≥ network.
+    /// Target `0xffff·2^240`: met by every hash except the top 2^-16.
+    const TRIVIAL_N_BITS: u32 = 0x2100_ffff;
+
+    /// `is_block_candidate` flips to true when the hash meets the job's
+    /// network target.
     #[test]
-    fn standard_marks_block_candidate_when_submission_meets_network() {
+    fn standard_marks_block_candidate_when_the_hash_meets_the_network_target() {
         let mut ch = std_channel();
         let merkle = [0xDD; 32];
         let mut ctx = std_ctx(JobClassification::Active);
-        ctx.network_difficulty = Difficulty(0.0); // trivially meetable
+        ctx.n_bits = TRIVIAL_N_BITS;
         let out = validate_submit_standard(&mut ch, &std_submission(), easy_diff(), &merkle, &ctx);
         match out {
             ShareValidation::Accepted(a) => assert!(a.is_block_candidate),
@@ -1128,18 +1135,16 @@ mod tests {
     }
 
     /// 5b (SV2 Mining/SubmitShares.Error strict): the block-candidate gate
-    /// reads the network difficulty **pinned on the job at send-time**, not
-    /// any current/latest template. A job pinned with a trivial network
-    /// difficulty yields a block-candidate for the same easy share that the
-    /// default (1e15) job classifies as non-candidate — proving the gate is
-    /// per-job, so a block-change between send and submit can't reclassify an
-    /// in-flight share.
+    /// reads the `n_bits` **pinned on the job at send-time**, not any
+    /// current/latest template. A job pinned with a trivial target yields a
+    /// block-candidate for the same easy share that a difficulty-1 job
+    /// (`extended_accepts_easy_share`) classifies as non-candidate — proving
+    /// the gate is per-job, so a block-change between send and submit can't
+    /// reclassify an in-flight share.
     #[test]
-    fn extended_block_candidate_uses_per_job_pinned_network_difficulty() {
+    fn extended_block_candidate_uses_per_job_pinned_n_bits() {
         let mut ch = ext_channel();
-        let mut job = ext_job([0xCC; 32], 0x1d00_ffff);
-        // Trivial pinned network difficulty → any valid share is a candidate.
-        job.network_difficulty = Difficulty(1.0e-18);
+        let job = ext_job([0xCC; 32], TRIVIAL_N_BITS);
         let out = validate_ext(
             &mut ch,
             &ext_submission(),
@@ -1153,7 +1158,7 @@ mod tests {
             ShareValidation::Accepted(a) => {
                 assert!(
                     a.is_block_candidate,
-                    "trivial per-job network difficulty must yield a block candidate"
+                    "a trivial per-job target must yield a block candidate"
                 );
                 // Witness coinbase is assembled only for candidates.
                 assert!(!a.witness_coinbase.is_empty());

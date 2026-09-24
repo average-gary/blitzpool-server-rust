@@ -85,8 +85,8 @@ pub struct SharedAcceptedShare<'a> {
     pub effective_difficulty: f64,
 
     /// Difficulty the share actually **solved** (derived from the
-    /// hash). Drives best-difficulty tracking + the block-found
-    /// threshold (`>= network_difficulty`).
+    /// hash). Drives best-difficulty tracking. The block-found gate
+    /// compares the hash itself against the network target.
     pub submission_difficulty: f64,
 
     /// Miner firmware / vendor string for this session (SV1

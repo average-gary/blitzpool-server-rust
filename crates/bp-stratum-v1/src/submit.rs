@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use bp_mining_job::{build_block_header, merkle_root_from_coinbase};
+use bp_mining_job::{build_block_header, meets_network_target, merkle_root_from_coinbase};
 use bp_share::{calculate_difficulty, difficulty_to_target, Difficulty, Target};
 
 use crate::frame::{
@@ -128,9 +128,9 @@ pub struct ShareAccept {
     /// current diff when the share was issued before a vardiff ratchet.
     pub effective_difficulty: f64,
     /// Difficulty the **share actually solved for**, derived from the
-    /// hash via `bp_share::calculate_difficulty`. Drives the block-found
-    /// gate (`>= network_difficulty`) and the best-diff tracker
-    /// (`addressSettings.bestDifficulty`).
+    /// hash via `bp_share::calculate_difficulty`. Drives the best-diff
+    /// tracker (`addressSettings.bestDifficulty`); the block-found gate
+    /// compares the hash itself against the network target.
     pub submission_difficulty: f64,
     /// 80-byte block header that produced the hash. Forwarded to the
     /// external-share-submitter when enabled.
@@ -499,10 +499,11 @@ pub fn validate_submit(
         return ShareValidation::Rejected(RejectReason::LowDifficulty.into());
     }
 
-    // 7. Accepted. Block-find gate uses the (unclamped) submission diff
-    // against the network diff — a stale-creditable hit during a reorg
-    // can still find a valid alternative tip.
-    let is_block_candidate = submission_difficulty >= lookup.template.network_difficulty.as_f64();
+    // 7. Accepted. Block-find gate checks the hash itself against the
+    // template's network target, independent of the clamped share
+    // difficulty — a stale-creditable hit during a reorg can still find a
+    // valid alternative tip.
+    let is_block_candidate = meets_network_target(&hash, lookup.template.n_bits);
     // Block found marker at
     // INFO when the share also clears network diff. Always-on, no
     // debug flag — block events are too important to gate.
@@ -636,15 +637,22 @@ mod tests {
         ServerConfig::defaults_for(Network::Bitcoin)
     }
 
-    fn template_with_network_diff(network_difficulty: f64) -> ActiveSV1Template {
+    /// Difficulty 1 — out of reach for the synthetic shares below.
+    const DIFF_ONE_N_BITS: u32 = 0x1d00_ffff;
+    /// Target `0xffff·2^240`: met by every hash except the top 2^-16.
+    const TRIVIAL_N_BITS: u32 = 0x2100_ffff;
+    /// Target 1: met by no real hash.
+    const IMPOSSIBLE_N_BITS: u32 = 0x0300_0001;
+
+    fn template_with_n_bits(n_bits: u32) -> ActiveSV1Template {
         ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
-            n_bits: 0x1d00_ffff,
+            n_bits,
             header_timestamp: 0x65a1_b2c3,
             network_target: [0xFF; 32],
-            network_difficulty: bp_share::Difficulty(network_difficulty),
+            network_difficulty: bp_share::Difficulty(1.0),
             coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -687,9 +695,9 @@ mod tests {
         .unwrap()
     }
 
-    fn populated_registry(network_difficulty: f64) -> (JobRegistry, String) {
+    fn populated_registry(n_bits: u32) -> (JobRegistry, String) {
         let reg = JobRegistry::from_server_config(&server_config());
-        let active = template_with_network_diff(network_difficulty);
+        let active = template_with_n_bits(n_bits);
         let tid = reg.add_template(active.clone(), 1_000);
         let job = mining_job_from(&active);
         let jid = reg.add_job(job, tid, 1_000);
@@ -877,7 +885,7 @@ mod tests {
     /// that quietly did not hold.
     #[test]
     fn bits_outside_the_negotiated_mask_are_rejected() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session(); // negotiated 0x1fffe000
         let mut cache = SessionShareCache::new();
 
@@ -915,7 +923,7 @@ mod tests {
     /// and a miner is held to what it was actually answered with.
     #[test]
     fn a_negotiated_subset_is_what_the_miner_is_held_to() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = SessionContext {
             // What `handle_configure` stores after the miner asked for a
             // subset of the pool's mask.
@@ -974,7 +982,7 @@ mod tests {
         );
 
         let reg = JobRegistry::from_server_config(&server_config());
-        let mut active = template_with_network_diff(1.0);
+        let mut active = template_with_n_bits(DIFF_ONE_N_BITS);
         active.template.version = DIRTY_TEMPLATE;
         active.recompute_notify_header_hex();
         let tid = reg.add_template(active.clone(), 1_000);
@@ -1022,7 +1030,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_share_before_any_other_check() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         let s = submit(&jid, "deadbeef");
@@ -1041,7 +1049,7 @@ mod tests {
 
     #[test]
     fn rejects_with_job_not_found_for_unknown_id() {
-        let (reg, _jid) = populated_registry(1.0);
+        let (reg, _jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         let v = validate_submit(&submit("deadbeef", "1"), &session, &mut cache, &reg, 1_500);
@@ -1057,7 +1065,7 @@ mod tests {
 
     #[test]
     fn rejects_stale_shares_beyond_grace_window() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         // Retire at t=10_000, share arrives well beyond grace (5s default).
@@ -1075,7 +1083,7 @@ mod tests {
 
     #[test]
     fn stale_creditable_shares_are_accepted() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         // Retire at t=10_000, share within grace window (10_000 + 1s).
@@ -1091,7 +1099,7 @@ mod tests {
 
     #[test]
     fn malformed_extranonce2_hex_rejects_as_low_difficulty() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         let mut s = submit(&jid, "1");
@@ -1105,7 +1113,7 @@ mod tests {
 
     #[test]
     fn wrong_extranonce2_byte_length_rejects_as_low_difficulty() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         let mut s = submit(&jid, "1");
@@ -1119,7 +1127,7 @@ mod tests {
 
     #[test]
     fn rejects_low_difficulty_when_hash_does_not_meet_target() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = impossible_session();
         let mut cache = SessionShareCache::new();
         let v = validate_submit(&submit(&jid, "deadbeef"), &session, &mut cache, &reg, 1_500);
@@ -1136,7 +1144,7 @@ mod tests {
 
     #[test]
     fn accepts_share_that_meets_easy_target() {
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         let v = validate_submit(&submit(&jid, "deadbeef"), &session, &mut cache, &reg, 1_500);
@@ -1158,9 +1166,8 @@ mod tests {
     }
 
     #[test]
-    fn block_candidate_flagged_when_submission_diff_meets_network_diff() {
-        // network_difficulty=0 → any non-negative submission_diff is a candidate.
-        let (reg, jid) = populated_registry(0.0);
+    fn block_candidate_flagged_when_the_hash_meets_the_network_target() {
+        let (reg, jid) = populated_registry(TRIVIAL_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         let v = validate_submit(&submit(&jid, "deadbeef"), &session, &mut cache, &reg, 1_500);
@@ -1171,8 +1178,8 @@ mod tests {
     }
 
     #[test]
-    fn block_candidate_not_flagged_for_submission_below_network_diff() {
-        let (reg, jid) = populated_registry(1.0e30);
+    fn block_candidate_not_flagged_when_the_hash_misses_the_network_target() {
+        let (reg, jid) = populated_registry(IMPOSSIBLE_N_BITS);
         let session = easy_session();
         let mut cache = SessionShareCache::new();
         let v = validate_submit(&submit(&jid, "deadbeef"), &session, &mut cache, &reg, 1_500);
@@ -1191,7 +1198,7 @@ mod tests {
         // old_diff=0 (easy). For job_id=1 (< 2) the validator must
         // clamp to MIN(high, 0) = 0 → accepts. Without the clamp this
         // would be a LowDifficulty reject.
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = SessionContext {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
             session_difficulty: 1.0e30,
@@ -1216,7 +1223,7 @@ mod tests {
         // Same registry, but session says boundary=jobId 1 → job_id 1
         // is "at or after" the boundary (current diff applies). With
         // session=1e30 the share fails the target check → LowDifficulty.
-        let (reg, jid) = populated_registry(1.0);
+        let (reg, jid) = populated_registry(DIFF_ONE_N_BITS);
         let session = SessionContext {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
             session_difficulty: 1.0e30,

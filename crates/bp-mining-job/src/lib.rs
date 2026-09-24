@@ -21,5 +21,8 @@ pub use coinbase::{
     serialize_coinbase_prefix, solo_payouts, CoinbaseTemplate, MiningJob, MiningJobError,
     PayoutEntry, ResolvedPayouts, SoloFeeConfig, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
-pub use header::{build_block_header, version_meets_consensus_floor, MIN_CONSENSUS_BLOCK_VERSION};
+pub use header::{
+    build_block_header, meets_network_target, version_meets_consensus_floor,
+    MIN_CONSENSUS_BLOCK_VERSION,
+};
 pub use merkle::{coinbase_merkle_branch, merkle_root_from_coinbase};
