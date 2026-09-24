@@ -60,8 +60,8 @@ use crate::mining::submit::{RejectReason, ShareAccept};
 /// produce the `MiningJob` consumed by
 /// [`crate::mining::client::apply_template_broadcast`].
 ///
-/// Production impl runs the service-layer mode-resolver
-/// ([`bp_mining_mode::ModeResolver`]) + evaluates the per-mode distribution
+/// Production impl looks the address up in the bin's mode gate
+/// (`BlitzpoolModeGate`) + evaluates the per-mode distribution
 /// (PPLNS/Group-Solo: the SV2 ext 0x0003/Payout Computation weight formula at
 /// this reward; Blockparty / single-output solo: their own exact allocators).
 /// Tests use [`NoOpHooks`] returning a single 100%-to-self entry.

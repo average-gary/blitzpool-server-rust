@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 bp-common = { workspace = true }
-async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

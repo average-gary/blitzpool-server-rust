@@ -870,7 +870,6 @@ dependencies = [
 name = "bp-mining-mode"
 version = "2.3.5"
 dependencies = [
- "async-trait",
  "bp-common",
  "tokio",
 ]
@@ -1094,7 +1093,6 @@ dependencies = [
  "bp-jobs-lifecycle",
  "bp-metrics",
  "bp-mining-job",
- "bp-mining-mode",
  "bp-regtest-harness",
  "bp-share",
  "bp-share-hook",
