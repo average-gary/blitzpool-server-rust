@@ -99,11 +99,7 @@ impl SharedExtranonce {
     /// extranonce1, i.e. the pre-unification random behaviour.
     pub fn allocate(&self) -> PrefixGuard {
         let key = self.shared.next_key();
-        let prefix = self
-            .shared
-            .allocate(key)
-            .ok()
-            .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok());
+        let prefix = self.shared.allocate(key).ok();
         PrefixGuard {
             key,
             prefix,
@@ -305,10 +301,6 @@ impl StratumV1Server {
                 alt_translator_joins: Mutex::new(alt_joins),
             }),
         }
-    }
-
-    pub fn server_config(&self) -> &Arc<ServerConfig> {
-        &self.inner.server_config
     }
 
     pub fn job_registry(&self) -> &Arc<JobRegistry> {

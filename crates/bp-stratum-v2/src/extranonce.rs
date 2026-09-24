@@ -35,11 +35,19 @@ impl ConnectionExtranonce {
     }
 
     /// The prefix for `channel_id`; the same one again for a repeated id.
-    /// Empty when the partition is exhausted.
+    /// Empty, and logged, when the partition is exhausted.
     pub fn allocate(&self, channel_id: u32) -> Vec<u8> {
-        self.shared
-            .allocate(self.key(channel_id))
-            .unwrap_or_default()
+        match self.shared.allocate(self.key(channel_id)) {
+            Ok(prefix) => prefix.to_vec(),
+            Err(err) => {
+                tracing::warn!(
+                    channel_id,
+                    "sv2: {err}; opening the channel with an empty (non-unique) \
+                     extranonce prefix"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Return `channel_id`'s prefix. A no-op for an id holding none.

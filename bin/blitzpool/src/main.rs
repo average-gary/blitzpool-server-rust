@@ -1338,7 +1338,7 @@ fn print_stratum_error_help(err: &StratumSpawnError) {
                  non-empty when set)."
             );
         }
-        StratumSpawnError::Sv2(stratum_v2::StratumV2SpawnError::AuthorityKeyMissing) => {
+        StratumSpawnError::Sv2(stratum_v2::StratumV2SpawnError::PrivkeyMissing) => {
             eprintln!(
                 "hint: SV2 needs `[sv2] authority_privkey_hex` (32-byte \
                  secp256k1 secret key, hex-encoded). Generate one with \

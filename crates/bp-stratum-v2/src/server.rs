@@ -313,10 +313,6 @@ impl StratumV2MiningServer {
         }
     }
 
-    pub fn server_config(&self) -> &Arc<ServerConfig> {
-        &self.inner.server_config
-    }
-
     /// Snapshot of the latest assembled template. `None` until the
     /// translator pairs its first `NewTemplate` + `SetNewPrevHash`.
     pub fn current_template(&self) -> Option<Arc<ActiveTemplate>> {
@@ -637,7 +633,7 @@ async fn run_mining_connection(
                 {
                     tlv_extensions.push(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
                 }
-                let (any_message, tlvs) = match parse_message_frame_with_tlvs(
+                let (any_message, mut tlvs) = match parse_message_frame_with_tlvs(
                     header,
                     sv2_frame.payload(),
                     &tlv_extensions,
@@ -666,31 +662,13 @@ async fn run_mining_connection(
                         continue;
                     }
                 };
-                // ext 0x0002 Worker-ID TLV wiring: when the frame is a
-                // SubmitSharesExtended, re-serialise the parsed TLVs into the
-                // wire-form tail bytes and attach to the input. The validator
-                // + `resolve_share_worker_name_from_tlv` consume the wire-form
-                // bytes (ext 0x0002/TLV Format for user_identity /
-                // ext 0x0002/Extended SubmitSharesExtended Message Format).
-                // When ext 0x0002 isn't in `state.negotiated_extensions`, the
-                // validator will silently ignore any TLV
-                // (ext 0x0002/Behavior Based on Negotiation).
+                // ext 0x0002 Worker-ID TLV wiring: a SubmitSharesExtended
+                // carries its parsed TLVs into the validator, which resolves
+                // the worker name from them. When ext 0x0002 isn't in
+                // `state.negotiated_extensions`, the validator ignores any
+                // TLV (ext 0x0002/Behavior Based on Negotiation).
                 if let InboundMiningFrame::SubmitSharesExtended(ref mut submit) = inbound {
-                    if let Some(tlv_list) = &tlvs {
-                        let mut tail = Vec::new();
-                        for tlv in tlv_list {
-                            match tlv.encode() {
-                                Ok(bytes) => tail.extend_from_slice(&bytes),
-                                Err(err) => {
-                                    warn!(
-                                        ?err,
-                                        "sv2 connection {session_id_hex} tlv encode (dropped)"
-                                    );
-                                }
-                            }
-                        }
-                        submit.tail_tlvs = tail;
-                    }
+                    submit.tlvs = tlvs.take().unwrap_or_default();
                 }
                 // ext 0x0003/distribution_id TLV Field: the `distribution_id`
                 // TLV rides on the base SetCustomMiningJob frame (captured
@@ -780,11 +758,7 @@ async fn run_mining_connection(
                         // there.)
                         let address = addr.clone();
                         let worker = state.worker_name.clone();
-                        let user_agent = if state.vendor.is_empty() {
-                            "jd-client/sv2".to_string()
-                        } else {
-                            format!("{}/sv2", state.vendor)
-                        };
+                        let user_agent = session_user_agent(&state.vendor);
                         hooks
                             .session_persistence
                             .register_session(
@@ -1097,15 +1071,29 @@ async fn run_mining_connection(
     Ok(())
 }
 
+/// `"{vendor}/sv2"`: the user agent a connection's SetupConnection `vendor`
+/// is recorded under (`bitaxe/sv2`, `NerdQAxe++/sv2`); `None` for an empty
+/// vendor.
+fn vendor_user_agent(vendor: &str) -> Option<String> {
+    (!vendor.is_empty()).then(|| format!("{vendor}/sv2"))
+}
+
+/// [`vendor_user_agent`], with an empty vendor recorded as the
+/// `jd-client/sv2` placeholder the downstream report later refines.
+fn session_user_agent(vendor: &str) -> String {
+    vendor_user_agent(vendor).unwrap_or_else(|| "jd-client/sv2".to_string())
+}
+
 // ── Dispatch + Outbound write helpers ───────────────────────────────
 
-/// Compare-swap-emit shared by channel-open and the live broadcast path: if
-/// `channel` is Extended and not already on `prefix`, swap it and return the
+/// Compare-swap-emit for the live broadcast path
+/// ([`custom_extranonce_broadcast_frames`]): if `channel` is Extended and not
+/// already on `prefix`, swap it and return the
 /// [`OutboundFrame::SetExtranoncePrefix`] announcing the change (the caller
 /// writes it before the channel's next job, per
 /// SV2 Mining/SetExtranoncePrefix). Returns `None` when there is nothing to
-/// change. One copy keeps the two callers in lockstep on the equality guard
-/// and that ordering contract.
+/// change. Channel-open does not come through here: it puts the prefix in the
+/// OpenSuccess instead ([`maybe_apply_custom_extranonce`]).
 fn swap_channel_prefix(
     channel: &mut crate::mining::channel::ChannelState,
     channel_id: u32,
@@ -1124,16 +1112,16 @@ fn swap_channel_prefix(
 }
 
 /// Swap the pool-allocated extranonce prefix for the customer's chosen one on a
-/// freshly-opened Extended channel, returning the
-/// [`OutboundFrame::SetExtranoncePrefix`] that announces it — or `None` when no
-/// override applies (the case for every connection but the paying customer's).
+/// freshly-opened Extended channel, returning that prefix for the OpenSuccess
+/// the caller has not written yet — or `None` when no override applies (the
+/// case for every connection but the paying customer's).
 ///
 /// Solo-gated: the override is only safe without collision handling when the
 /// session hashes its own payout coinbase, i.e. the Solo stream. On any other
 /// stream the prefix is the sole work-partitioner across miners sharing one
 /// coinbase, so a customer-picked value could overlap another miner's search.
 ///
-/// The caller writes the returned frame BEFORE the channel's first job: per
+/// The caller sends the returned prefix BEFORE the channel's first job: per
 /// SV2 Mining/SetExtranoncePrefix a new prefix takes effect from the next job,
 /// and that first job is built (via the per-job prefix pin on
 /// [`crate::mining::jobs::ExtendedJob`]) with the value set here — so the miner
@@ -1225,11 +1213,10 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
 /// path for other miners; the jobs they receive are byte-for-byte unchanged.
 ///
 /// For a connection that DOES carry an override, look up its current value and,
-/// for every Extended channel whose prefix differs, swap it and emit a
-/// `SetExtranoncePrefix`. The caller writes these BEFORE the template's jobs, so
+/// if the primary channel is Extended and on another prefix, swap it and emit a
+/// `SetExtranoncePrefix`. The caller writes it BEFORE the template's jobs, so
 /// the miner switches prefix and the job it then gets (via the per-job pin on
-/// [`crate::mining::jobs::ExtendedJob`]) is built with the new value — the same
-/// race-free ordering as channel-open. In-flight shares for the previous job
+/// [`crate::mining::jobs::ExtendedJob`]) is built with the new value. In-flight shares for the previous job
 /// stay valid: each job pins the prefix it went out under, so a block-change job
 /// keeps the old prefix and only the next template after a change switches.
 ///
@@ -1644,11 +1631,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 // pending row for the /api/info histogram (`bitaxe/sv2`,
                 // etc.); it reaches client_entity.userAgent when the row is
                 // born.
-                let user_agent_owned = if state.vendor.is_empty() {
-                    "jd-client/sv2".to_string()
-                } else {
-                    format!("{}/sv2", state.vendor)
-                };
+                let user_agent_owned = session_user_agent(&state.vendor);
                 hooks
                     .device_status_sink
                     .on_device_event(
@@ -1663,11 +1646,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             SessionEvent::ChannelClosed { .. } => {
                 if !address_str.is_empty() {
                     // Same vendor-derived UA the online/register path uses.
-                    let user_agent = if state.vendor.is_empty() {
-                        "jd-client/sv2".to_string()
-                    } else {
-                        format!("{}/sv2", state.vendor)
-                    };
+                    let user_agent = session_user_agent(&state.vendor);
                     hooks
                         .device_status_sink
                         .on_device_event(
@@ -1735,11 +1714,7 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 }
                 // Same vendor-derived UA the register / device-status
                 // path uses (empty vendor ⇒ no UA).
-                let user_agent = if state.vendor.is_empty() {
-                    None
-                } else {
-                    Some(format!("{}/sv2", state.vendor))
-                };
+                let user_agent = vendor_user_agent(&state.vendor);
                 hooks
                     .accepted_sink
                     .record_accepted(crate::shared_adapter::shared_accepted(
@@ -1809,12 +1784,14 @@ mod tests {
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
     fn noise_cfg() -> NoiseConfig {
-        NoiseConfig::parse_strings(
-            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72",
-            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n",
-            crate::noise::DEFAULT_CERT_VALIDITY,
+        NoiseConfig::new(
+            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+                .parse()
+                .unwrap(),
+            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+                .parse()
+                .unwrap(),
         )
-        .unwrap()
     }
 
     fn server_cfg() -> ServerConfig {
@@ -2608,6 +2585,18 @@ mod tests {
         assert!(!job.coinbase_suffix().is_empty());
     }
 
+    // ── User agent ────────────────────────────────────────────────
+
+    /// The session row and the device events record an empty vendor as the
+    /// `jd-client/sv2` placeholder; the accepted-share path records none.
+    #[test]
+    fn user_agent_from_vendor() {
+        assert_eq!(vendor_user_agent("bitaxe").as_deref(), Some("bitaxe/sv2"));
+        assert_eq!(vendor_user_agent(""), None);
+        assert_eq!(session_user_agent("bitaxe"), "bitaxe/sv2");
+        assert_eq!(session_user_agent(""), "jd-client/sv2");
+    }
+
     // ── ServerConfig defaults ─────────────────────────────────────
 
     #[test]
@@ -2918,19 +2907,21 @@ mod tests {
         // weight-1 pool output.
         let entry = crate::bridge::PayoutDistributionEntry {
             distribution_id: 5,
-            pool_payout: WeightedOutput {
-                script_pubkey: vec![0x51],
-                weight: 1,
+            built: crate::bridge::BuiltPayoutDistribution {
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 9,
+                }],
+                dust_limits: vec![1],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([0x5A; 32]),
+                bookable: true,
             },
-            payouts: vec![WeightedOutput {
-                script_pubkey: vec![0x00, 0x14, 0xAA],
-                weight: 9,
-            }],
-            dust_limits: vec![1],
-            additional_outputs: vec![],
-            reference_reward_sats: 312_500_000,
-            payouts_fingerprint: Some([0x5A; 32]),
-            bookable: true,
             accounting: crate::bridge::DistributionAccounting::PoolWide,
             jdp_session_id: None,
             published_at_ms: 0,
@@ -2939,10 +2930,10 @@ mod tests {
         // published weights.
         let conformant = bitcoin::consensus::serialize(
             &compute_payout_vector(
-                &entry.pool_payout,
-                &entry.payouts,
-                &entry.dust_limits,
-                &entry.additional_outputs,
+                &entry.built.pool_payout,
+                &entry.built.payouts,
+                &entry.built.dust_limits,
+                &entry.built.additional_outputs,
                 312_500_000,
             )
             .unwrap(),
@@ -3242,19 +3233,21 @@ mod tests {
 
         let tailored = |id: u64, published_at_ms: u64| crate::bridge::PayoutDistributionEntry {
             distribution_id: id,
-            pool_payout: WeightedOutput {
-                script_pubkey: vec![0x51],
-                weight: 1,
+            built: crate::bridge::BuiltPayoutDistribution {
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 9,
+                }],
+                dust_limits: vec![1],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([0x5A; 32]),
+                bookable: true,
             },
-            payouts: vec![WeightedOutput {
-                script_pubkey: vec![0x00, 0x14, 0xAA],
-                weight: 9,
-            }],
-            dust_limits: vec![1],
-            additional_outputs: vec![],
-            reference_reward_sats: 312_500_000,
-            payouts_fingerprint: Some([0x5A; 32]),
-            bookable: true,
             accounting: crate::bridge::DistributionAccounting::GroupSolo(owner.clone()),
             jdp_session_id: Some(OLD_SESSION),
             published_at_ms,
@@ -3262,10 +3255,10 @@ mod tests {
         let declared_against = tailored(5, 1_000);
         let conformant = bitcoin::consensus::serialize(
             &compute_payout_vector(
-                &declared_against.pool_payout,
-                &declared_against.payouts,
-                &declared_against.dust_limits,
-                &declared_against.additional_outputs,
+                &declared_against.built.pool_payout,
+                &declared_against.built.payouts,
+                &declared_against.built.dust_limits,
+                &declared_against.built.additional_outputs,
                 312_500_000,
             )
             .unwrap(),

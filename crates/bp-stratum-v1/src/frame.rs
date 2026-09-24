@@ -565,10 +565,9 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             // every share-path write targets a non-empty name — the touch
             // UPDATE then matches 0 rows, `updatedAt` freezes, and
             // `kill_dead_clients` sweeps an actively-hashing session.
-            let (address, worker) = match raw_username.split_once('.') {
-                Some((a, w)) if !w.is_empty() => (a.to_string(), w.to_string()),
-                Some((a, _)) => (a.to_string(), "worker".to_string()),
-                None => (raw_username.clone(), "worker".to_string()),
+            let (address, worker) = match bp_common::split_user_identity(&raw_username) {
+                (a, Some(w)) if !w.is_empty() => (a.to_string(), w.to_string()),
+                (a, _) => (a.to_string(), "worker".to_string()),
             };
             let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
             Ok(SV1Request::Authorize(AuthorizeRequest {

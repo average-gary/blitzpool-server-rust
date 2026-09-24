@@ -2637,7 +2637,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
         use bp_stratum_v2::jdp::payout_distribution::WeightedOutput;
         use bp_stratum_v2::jdp_server::{JdpServerHooks, StratumV2JdpServer};
-        use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+        use bp_stratum_v2::noise::NoiseConfig;
 
         let bridge = Arc::new(std::sync::RwLock::new(JdpDeclaredJobRegistry::new()));
         bridge
@@ -2645,29 +2645,33 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
             .unwrap()
             .publish_pool_wide(PayoutDistributionEntry {
                 distribution_id: 7,
-                pool_payout: WeightedOutput {
-                    script_pubkey: vec![0x51],
-                    weight: 1,
+                built: bp_stratum_v2::bridge::BuiltPayoutDistribution {
+                    pool_payout: WeightedOutput {
+                        script_pubkey: vec![0x51],
+                        weight: 1,
+                    },
+                    payouts: vec![WeightedOutput {
+                        script_pubkey: vec![0x00, 0x14, 0xAA],
+                        weight: 100,
+                    }],
+                    dust_limits: vec![546],
+                    additional_outputs: vec![],
+                    reference_reward_sats: 312_500_000,
+                    payouts_fingerprint: Some([0x11; 32]),
+                    bookable: true,
                 },
-                payouts: vec![WeightedOutput {
-                    script_pubkey: vec![0x00, 0x14, 0xAA],
-                    weight: 100,
-                }],
-                dust_limits: vec![546],
-                additional_outputs: vec![],
-                reference_reward_sats: 312_500_000,
-                payouts_fingerprint: Some([0x11; 32]),
-                bookable: true,
                 accounting: bp_stratum_v2::bridge::DistributionAccounting::PoolWide,
                 jdp_session_id: None,
                 published_at_ms: 1_001,
             });
-        let noise = NoiseConfig::parse_strings(
-            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72",
-            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n",
-            DEFAULT_CERT_VALIDITY,
-        )
-        .expect("noise config");
+        let noise = NoiseConfig::new(
+            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+                .parse()
+                .unwrap(),
+            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+                .parse()
+                .unwrap(),
+        );
         let server = StratumV2JdpServer::spawn(
             noise,
             JdpServerHooks::no_op(),

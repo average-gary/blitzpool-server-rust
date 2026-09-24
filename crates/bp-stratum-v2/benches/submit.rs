@@ -121,7 +121,7 @@ fn ext_submission(nonce: u32) -> SubmitSharesExtendedInput {
         version: 0x2000_0000,
         ntime: 0x6500_0001,
         extranonce: ExtranonceBytes::from_slice(&[0x11; 8]),
-        tail_tlvs: Vec::new(),
+        tlvs: Vec::new(),
     }
 }
 

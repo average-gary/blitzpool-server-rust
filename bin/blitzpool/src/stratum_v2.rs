@@ -45,7 +45,7 @@ use bp_stratum_v2::hooks::{
     BlockSubmissionSink as Sv2BlockSink, MiningServerHooks, PayoutResolver,
 };
 use bp_stratum_v2::mining::client::PortConfig as Sv2PortConfig;
-use bp_stratum_v2::noise::{NoiseConfig, NoiseConfigError, DEFAULT_CERT_VALIDITY};
+use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::server::{ServerConfig as Sv2ServerConfig, StratumV2MiningServer};
 use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use thiserror::Error;
@@ -74,16 +74,14 @@ pub(crate) struct Sv2PortServer {
 
 #[derive(Debug, Error)]
 pub(crate) enum StratumV2SpawnError {
-    #[error("sv2 noise config invalid: {0}")]
-    Noise(#[from] NoiseConfigError),
     #[error("sv2 authority private key hex must be exactly 64 hex chars (32 bytes): got {0}")]
-    AuthorityPrivkeyHexLen(usize),
+    PrivkeyHexLen(usize),
     #[error("sv2 authority private key hex didn't decode: {0}")]
-    AuthorityPrivkeyHex(String),
+    PrivkeyHex(String),
     #[error("sv2 authority private key bytes didn't parse: {0}")]
-    AuthorityPrivkey(String),
+    InvalidPrivkey(String),
     #[error("sv2 needs [sv2].authority_privkey_hex (32-byte hex) — none configured")]
-    AuthorityKeyMissing,
+    PrivkeyMissing,
 }
 
 /// Construct the shared [`JdpDeclaredJobRegistry`] used by every SV2
@@ -97,34 +95,28 @@ pub(crate) fn build_bridge() -> Arc<RwLock<JdpDeclaredJobRegistry>> {
 
 /// Build the pool-wide [`NoiseConfig`] from `[sv2]`. Decodes
 /// `authority_privkey_hex` (raw 32-byte secp256k1 secret in hex),
-/// derives the matching x-only public key, and stamps the default
-/// 12-hour cert validity.
+/// and derives the matching x-only public key.
 pub(crate) fn build_noise_config(cfg: &AppConfig) -> Result<NoiseConfig, StratumV2SpawnError> {
     let hex_str = cfg
         .sv2
         .authority_privkey_hex
         .as_deref()
-        .ok_or(StratumV2SpawnError::AuthorityKeyMissing)?;
+        .ok_or(StratumV2SpawnError::PrivkeyMissing)?;
     if hex_str.len() != 64 {
-        return Err(StratumV2SpawnError::AuthorityPrivkeyHexLen(hex_str.len()));
+        return Err(StratumV2SpawnError::PrivkeyHexLen(hex_str.len()));
     }
-    let raw_bytes: Vec<u8> = (0..hex_str.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex_str[i..i + 2], 16)
-                .map_err(|e| StratumV2SpawnError::AuthorityPrivkeyHex(e.to_string()))
-        })
-        .collect::<Result<_, _>>()?;
+    let raw_bytes = hex::decode(hex_str)
+        .map_err(|e| StratumV2SpawnError::PrivkeyHex(e.to_string()))?;
     // Round-trip via base58check — stratum-apps's `FromStr` parses
     // that form, which avoids depending on a specific `secp256k1`
     // version (stratum-apps pins 0.28; the workspace uses 0.29).
     let b58 = bs58::encode(&raw_bytes).with_check().into_string();
     let authority_prv: Secp256k1SecretKey =
         b58.parse().map_err(|e: stratum_apps::key_utils::Error| {
-            StratumV2SpawnError::AuthorityPrivkey(format!("{e:?}"))
+            StratumV2SpawnError::InvalidPrivkey(format!("{e:?}"))
         })?;
     let authority_pub: Secp256k1PublicKey = authority_prv.into();
-    NoiseConfig::new(authority_pub, authority_prv, DEFAULT_CERT_VALIDITY).map_err(Into::into)
+    Ok(NoiseConfig::new(authority_pub, authority_prv))
 }
 
 /// Build the SV2 [`ServerConfig`](Sv2ServerConfig) from the network +
@@ -400,7 +392,6 @@ mod tests {
     fn build_noise_config_decodes_hex_secret() {
         let cfg = min_cfg_with_sv2(Some(TEST_PRIVKEY_HEX.to_string()));
         let noise = build_noise_config(&cfg).expect("must parse");
-        assert_eq!(noise.cert_validity(), DEFAULT_CERT_VALIDITY);
         // Public key derived from secret must be non-zero.
         assert_ne!((*noise.authority_pub()).into_bytes(), [0u8; 32]);
     }
@@ -410,7 +401,7 @@ mod tests {
         let cfg = min_cfg_with_sv2(None);
         assert!(matches!(
             build_noise_config(&cfg),
-            Err(StratumV2SpawnError::AuthorityKeyMissing)
+            Err(StratumV2SpawnError::PrivkeyMissing)
         ));
     }
 
@@ -419,7 +410,7 @@ mod tests {
         let cfg = min_cfg_with_sv2(Some("aa".to_string()));
         assert!(matches!(
             build_noise_config(&cfg),
-            Err(StratumV2SpawnError::AuthorityPrivkeyHexLen(2))
+            Err(StratumV2SpawnError::PrivkeyHexLen(2))
         ));
     }
 
@@ -428,7 +419,18 @@ mod tests {
         let cfg = min_cfg_with_sv2(Some("g".repeat(64)));
         assert!(matches!(
             build_noise_config(&cfg),
-            Err(StratumV2SpawnError::AuthorityPrivkeyHex(_))
+            Err(StratumV2SpawnError::PrivkeyHex(_))
+        ));
+    }
+
+    /// 64 bytes that are not 64 ASCII characters: a multi-byte character
+    /// straddling a two-character hex pair is a decode error, not a panic.
+    #[test]
+    fn build_noise_config_rejects_non_ascii() {
+        let cfg = min_cfg_with_sv2(Some(format!("€{}", "a".repeat(61))));
+        assert!(matches!(
+            build_noise_config(&cfg),
+            Err(StratumV2SpawnError::PrivkeyHex(_))
         ));
     }
 

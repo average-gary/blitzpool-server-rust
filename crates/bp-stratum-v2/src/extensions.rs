@@ -7,7 +7,7 @@
 //!   shape; the wire codec is `stratum-core`'s.
 //! - **0x0002 Worker-Specific Hashrate Tracking** — Worker-ID TLV
 //!   piggy-backed on `SubmitSharesExtended` (extension_type stays
-//!   0x0000). See [`encode_worker_id_tlv`], [`parse_worker_id_tlv`],
+//!   0x0000). See [`parse_worker_id_tlv`],
 //!   [`resolve_share_worker_name_from_tlv`].
 //! - **0x0003 Non-Custodial Payouts** (push model) —
 //!   [`SetPayoutDistribution`] (JDS→JDC) + the `distribution_id` TLV
@@ -54,17 +54,6 @@ pub const SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS: u16 = 0x0003;
 pub enum ExtensionsParseError {
     #[error("buffer truncated: needed {needed} more bytes at offset {offset}")]
     Truncated { offset: usize, needed: usize },
-    #[error("invalid UTF-8 in string field at offset {offset}")]
-    InvalidUtf8 { offset: usize },
-}
-
-/// Encode-side errors for the Worker-ID TLV.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum WorkerIdEncodeError {
-    #[error("user_identity must not be empty")]
-    Empty,
-    #[error("user_identity {got} bytes exceeds spec max {max}")]
-    TooLong { got: usize, max: usize },
 }
 
 // ── Minimal LE/BE codec helpers (private) ──────────────────────────
@@ -294,133 +283,49 @@ pub fn encode_distribution_id_tlv(distribution_id: u64) -> Vec<u8> {
 
 // ── 0x0002 Worker-ID TLV ───────────────────────────────────────────
 
-/// Encode a Worker-ID TLV, ready to be appended to `SubmitSharesExtended`.
+/// The `user_identity` of the first ext 0x0002 Worker-ID TLV among a
+/// frame's parsed TLVs (ext 0x0002/TLV Format for user_identity), or `None`
+/// when there is none.
 ///
-/// Wire shape (TLV header fields are U16/U8 per
-/// SV2 Overview/Stratum V2 TLV Encoding Model, so the U16s are
-/// **little-endian** like every SV2 integer; value is UTF-8):
-/// `[Type: ext_type U16-LE | field_type U8] [Length U16-LE] [UTF-8 bytes]`.
-///
-/// `"Worker_001"` therefore encodes as
-/// `02 00 01 0A 00 57 6F 72 6B 65 72 5F 30 30 31`.
-pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEncodeError> {
-    let value = user_identity.as_bytes();
-    if value.is_empty() {
-        return Err(WorkerIdEncodeError::Empty);
+/// TLVs of other extensions are skipped (SV2 Overview/Stratum V2 TLV
+/// Encoding Model: receivers MUST ignore unexpected TLVs). A Worker-ID TLV
+/// that is empty, longer than [`SV2_USER_IDENTITY_MAX_BYTES`] or not UTF-8
+/// also yields `None`: the share itself is structurally valid, so it falls
+/// back to the channel's worker rather than being rejected.
+pub fn parse_worker_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Option<&str> {
+    let tlv = tlvs.iter().find(|tlv| {
+        tlv.r#type.extension_type == SV2_EXTENSION_TYPE_WORKER_ID
+            && tlv.r#type.field_type == SV2_FIELD_TYPE_USER_IDENTITY
+    })?;
+    if tlv.value.is_empty() || tlv.value.len() > SV2_USER_IDENTITY_MAX_BYTES {
+        return None;
     }
-    if value.len() > SV2_USER_IDENTITY_MAX_BYTES {
-        return Err(WorkerIdEncodeError::TooLong {
-            got: value.len(),
-            max: SV2_USER_IDENTITY_MAX_BYTES,
-        });
-    }
-    let mut buf = Vec::with_capacity(5 + value.len());
-    buf.extend_from_slice(&SV2_EXTENSION_TYPE_WORKER_ID.to_le_bytes());
-    buf.push(SV2_FIELD_TYPE_USER_IDENTITY);
-    buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
-    buf.extend_from_slice(value);
-    Ok(buf)
+    std::str::from_utf8(&tlv.value).ok()
 }
 
-/// Parse a Worker-ID TLV from a tail buffer (bytes appended after the
-/// base `SubmitSharesExtended` serialisation). Returns the
-/// `user_identity` string, or `None` if no 0x0002 TLV is present.
+/// The worker name a `SubmitSharesExtended` share is attributed to by its
+/// ext 0x0002 Worker-ID TLV, or `None` to keep the channel's own worker.
 ///
-/// Unknown TLVs are skipped per SV2 Overview/Stratum V2 TLV Encoding Model
-/// (receivers MUST ignore unexpected TLVs). Little-endian header per the SV2
-/// U16 convention.
-///
-/// Returns `None` on malformed TLV (truncated header / value, length
-/// cap exceeded). Callers SHOULD treat a malformed TLV the same as
-/// missing — fall back to the channel-default identity rather than
-/// rejecting the share, since the share itself is structurally valid.
-pub fn parse_worker_id_tlv(tail: &[u8]) -> Option<String> {
-    let mut o = 0;
-    while o + 5 <= tail.len() {
-        let ext_type = u16::from_le_bytes([tail[o], tail[o + 1]]);
-        let field_type = tail[o + 2];
-        let length = u16::from_le_bytes([tail[o + 3], tail[o + 4]]) as usize;
-        let value_start = o + 5;
-        let value_end = value_start.checked_add(length)?;
-        if value_end > tail.len() {
-            return None;
-        }
-        if ext_type == SV2_EXTENSION_TYPE_WORKER_ID && field_type == SV2_FIELD_TYPE_USER_IDENTITY {
-            if length == 0 || length > SV2_USER_IDENTITY_MAX_BYTES {
-                return None;
-            }
-            return std::str::from_utf8(&tail[value_start..value_end])
-                .ok()
-                .map(String::from);
-        }
-        o = value_end;
+/// - ext 0x0002 not negotiated: `None`; any TLV is ignored
+///   (ext 0x0002/Behavior Based on Negotiation).
+/// - TLV missing or malformed: `None`.
+/// - `"worker"` (no dot): that worker.
+/// - `"<prefix>.<worker>"`: the worker part, split at the first dot like
+///   every `address.worker` identity; a trailing dot (empty worker) is
+///   `None`. The prefix is not checked: it names the worker only, and the
+///   share stays booked to the address its channel was opened under.
+pub fn resolve_share_worker_name_from_tlv(
+    tlvs: &[stratum_core::parsers_sv2::Tlv],
+    ext_0x0002_negotiated: bool,
+) -> Option<String> {
+    if !ext_0x0002_negotiated {
+        return None;
     }
-    None
-}
-
-/// Inputs for [`resolve_share_worker_name_from_tlv`].
-pub struct ResolveWorkerNameInput<'a> {
-    pub tail: &'a [u8],
-    /// Channel-locked address, lowercase normalised (bech32 form). May
-    /// be `None` for connections that haven't completed
-    /// `OpenStandardMiningChannel` (in which case any TLV is treated
-    /// as bare worker-name).
-    pub channel_address: Option<&'a str>,
-    /// Channel-default worker name to fall back to.
-    pub channel_worker: &'a str,
-    /// Whether ext 0x0002 was negotiated for this connection.
-    pub ext_0x0002_negotiated: bool,
-}
-
-/// Decide which worker name to attribute a share to, given a possibly-
-/// present ext 0x0002 Worker-ID TLV on `SubmitSharesExtended`.
-///
-/// Semantics:
-/// - If ext 0x0002 isn't negotiated → channel default. The TLV (if
-///   any) is silently ignored per SV2 Overview/Stratum V2 TLV Encoding Model.
-/// - If the TLV is missing or malformed → channel default.
-/// - If the TLV's `user_identity` is bare (`"workerName"`) → that's
-///   the worker; channel address is implicit.
-/// - If `user_identity` is `"<address>.<worker>"` → use the worker
-///   part ONLY when the address matches the channel-locked one.
-///   Otherwise fall back to channel default. (Cross-account
-///   attribution is a security boundary — a multiplexing proxy must
-///   stay within the address it opened the channel under.)
-pub fn resolve_share_worker_name_from_tlv(opts: &ResolveWorkerNameInput<'_>) -> String {
-    if !opts.ext_0x0002_negotiated {
-        return opts.channel_worker.to_string();
-    }
-    if opts.tail.is_empty() {
-        return opts.channel_worker.to_string();
-    }
-    let user_identity = match parse_worker_id_tlv(opts.tail) {
-        Some(s) => s,
-        None => return opts.channel_worker.to_string(),
+    let worker = match bp_common::split_user_identity(parse_worker_id_tlv(tlvs)?) {
+        (bare, None) => bare,
+        (_prefix, Some(worker)) => worker,
     };
-    match user_identity.find('.') {
-        None => {
-            if user_identity.is_empty() {
-                opts.channel_worker.to_string()
-            } else {
-                user_identity
-            }
-        }
-        Some(dot) => {
-            let tlv_address = user_identity[..dot].to_lowercase();
-            let tlv_worker = &user_identity[dot + 1..];
-            if let Some(channel_addr) = opts.channel_address {
-                if tlv_address != channel_addr.to_lowercase() {
-                    // Cross-account attribution — silently drop.
-                    return opts.channel_worker.to_string();
-                }
-            }
-            if tlv_worker.is_empty() {
-                opts.channel_worker.to_string()
-            } else {
-                tlv_worker.to_string()
-            }
-        }
-    }
+    (!worker.is_empty()).then(|| worker.to_string())
 }
 
 #[cfg(test)]
@@ -535,33 +440,28 @@ mod tests {
 
     // ── 0x0002 Worker-ID TLV ───────────────────────────────────────
 
-    /// `wire layout: "Worker_001" with little-endian TLV header`
+    use stratum_core::parsers_sv2::Tlv;
+
+    fn worker_tlv(user_identity: &str) -> Tlv {
+        Tlv::new(
+            SV2_EXTENSION_TYPE_WORKER_ID,
+            SV2_FIELD_TYPE_USER_IDENTITY,
+            user_identity.as_bytes().to_vec(),
+        )
+    }
+
+    /// `wire layout: "Worker_001" decodes with a little-endian TLV header`
     #[test]
     fn worker_id_tlv_wire_layout_is_little_endian() {
-        let tlv = encode_worker_id_tlv("Worker_001").unwrap();
         // SV2 Overview/Stratum V2 TLV Encoding Model types the header as
         // U16|U8 + U16 — U16 is LE in SV2.
         // (ext 0x0002/Extended SubmitSharesExtended Message Format example
         // shows `00 02 …`, contradicting the base data-type convention; the
         // example is wrong.)
-        assert_eq!(hex::encode(&tlv), "0200010a00576f726b65725f303031");
-    }
-
-    /// `wire-compatible with the reference TLV codec (parsers_sv2)`
-    #[test]
-    fn worker_id_tlv_matches_reference_codec() {
-        use stratum_core::parsers_sv2::Tlv;
-        let reference = Tlv::new(
-            SV2_EXTENSION_TYPE_WORKER_ID,
-            SV2_FIELD_TYPE_USER_IDENTITY,
-            b"Worker_001".to_vec(),
-        )
-        .encode()
-        .expect("reference encode");
-        assert_eq!(encode_worker_id_tlv("Worker_001").unwrap(), reference);
-        // And the reverse: reference-encoded bytes parse on our side.
+        let wire = hex::decode("0200010a00576f726b65725f303031").unwrap();
+        let parsed = Tlv::decode(&wire).expect("reference decode");
         assert_eq!(
-            parse_worker_id_tlv(&reference).as_deref(),
+            parse_worker_id_tlv(std::slice::from_ref(&parsed)),
             Some("Worker_001")
         );
     }
@@ -569,43 +469,36 @@ mod tests {
     /// `round-trips arbitrary UTF-8`
     #[test]
     fn worker_id_tlv_roundtrips_utf8() {
-        let tlv = encode_worker_id_tlv("rig.€42").unwrap();
-        assert_eq!(parse_worker_id_tlv(&tlv).as_deref(), Some("rig.€42"));
-    }
-
-    /// `rejects empty user_identity at encode`
-    #[test]
-    fn worker_id_tlv_rejects_empty() {
-        assert_eq!(encode_worker_id_tlv(""), Err(WorkerIdEncodeError::Empty));
-    }
-
-    /// `rejects > 32 byte user_identity at encode
-    /// (ext 0x0002/TLV Format for user_identity)`
-    #[test]
-    fn worker_id_tlv_rejects_too_long() {
-        let too_long = "x".repeat(33);
         assert_eq!(
-            encode_worker_id_tlv(&too_long),
-            Err(WorkerIdEncodeError::TooLong { got: 33, max: 32 })
+            parse_worker_id_tlv(&[worker_tlv("rig.€42")]),
+            Some("rig.€42")
         );
     }
 
-    /// `parser returns null on > 32 byte declared length (malformed)`
+    /// `rejects an empty or > 32 byte user_identity
+    /// (ext 0x0002/TLV Format for user_identity) and invalid UTF-8`
     #[test]
-    fn worker_id_tlv_parser_rejects_oversized_length() {
-        // Forge a TLV header claiming length=33 (0x21 LE).
-        let mut buf = vec![0x02, 0x00, 0x01, 0x21, 0x00];
-        buf.extend(std::iter::repeat_n(0x41u8, 33));
-        assert_eq!(parse_worker_id_tlv(&buf), None);
+    fn worker_id_tlv_parser_rejects_malformed_values() {
+        assert_eq!(parse_worker_id_tlv(&[worker_tlv("")]), None);
+        assert_eq!(parse_worker_id_tlv(&[worker_tlv(&"A".repeat(33))]), None);
+        assert_eq!(
+            parse_worker_id_tlv(&[worker_tlv(&"A".repeat(32))]),
+            Some("A".repeat(32).as_str())
+        );
+        let not_utf8 = Tlv::new(
+            SV2_EXTENSION_TYPE_WORKER_ID,
+            SV2_FIELD_TYPE_USER_IDENTITY,
+            vec![0xFF, 0xFE],
+        );
+        assert_eq!(parse_worker_id_tlv(&[not_utf8]), None);
     }
 
-    /// `returns null when no 0x0002 TLV is present`
+    /// `returns None when no 0x0002 TLV is present`
     #[test]
     fn worker_id_tlv_returns_none_when_absent() {
         assert_eq!(parse_worker_id_tlv(&[]), None);
-        // An unrelated TLV (extType=0x0099 LE).
         assert_eq!(
-            parse_worker_id_tlv(&[0x99, 0x00, 0x01, 0x01, 0x00, 0x42]),
+            parse_worker_id_tlv(&[Tlv::new(0x0099, 0x01, vec![0x42])]),
             None
         );
     }
@@ -613,85 +506,69 @@ mod tests {
     /// `skips unknown leading TLVs and finds the 0x0002 one`
     #[test]
     fn worker_id_tlv_skips_unknown_leading_tlvs() {
-        // Unknown TLV first (ext=0x0099 LE, field=0x01, len=4, value=0x00000000), then 0x0002.
-        let unknown = [0x99, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let ours = encode_worker_id_tlv("rig42").unwrap();
-        let mut buf = unknown.to_vec();
-        buf.extend_from_slice(&ours);
-        assert_eq!(parse_worker_id_tlv(&buf).as_deref(), Some("rig42"));
+        let unknown = Tlv::new(0x0099, 0x01, vec![0; 4]);
+        assert_eq!(
+            parse_worker_id_tlv(&[unknown, worker_tlv("rig42")]),
+            Some("rig42")
+        );
     }
 
     // ── resolve_share_worker_name_from_tlv ─────────────────────────
 
-    fn resolve(tail: &[u8], negotiated: bool) -> String {
-        resolve_share_worker_name_from_tlv(&ResolveWorkerNameInput {
-            tail,
-            channel_address: Some("addr1"),
-            channel_worker: "default",
-            ext_0x0002_negotiated: negotiated,
-        })
+    fn resolve(user_identity: &str, negotiated: bool) -> Option<String> {
+        resolve_share_worker_name_from_tlv(&[worker_tlv(user_identity)], negotiated)
     }
 
-    /// `returns channel default when ext 0x0002 not negotiated (TLV ignored)`
+    /// `keeps the channel worker when ext 0x0002 is not negotiated (TLV ignored)`
     #[test]
     fn resolve_returns_default_when_not_negotiated() {
-        let tail = encode_worker_id_tlv("hacker.evil").unwrap();
-        assert_eq!(resolve(&tail, false), "default");
+        assert_eq!(resolve("hacker.evil", false), None);
     }
 
-    /// `returns channel default when no TLV present`
+    /// `keeps the channel worker when no TLV is present`
     #[test]
     fn resolve_returns_default_when_no_tlv() {
-        assert_eq!(resolve(&[], true), "default");
+        assert_eq!(resolve_share_worker_name_from_tlv(&[], true), None);
     }
 
     /// `accepts bare worker name (no address prefix)`
     #[test]
     fn resolve_accepts_bare_worker() {
-        let tail = encode_worker_id_tlv("rig42").unwrap();
-        assert_eq!(resolve(&tail, true), "rig42");
+        assert_eq!(resolve("rig42", true).as_deref(), Some("rig42"));
     }
 
-    /// `accepts "<channelAddress>.<worker>" form and returns just the worker`
+    /// `accepts "<address>.<worker>" form and returns just the worker`
     #[test]
     fn resolve_accepts_address_worker_form() {
-        let tail = encode_worker_id_tlv("addr1.rig42").unwrap();
-        assert_eq!(resolve(&tail, true), "rig42");
+        assert_eq!(resolve("addr1.rig42", true).as_deref(), Some("rig42"));
     }
 
-    /// `SECURITY: drops cross-account TLV (address mismatch) → channel default`
+    /// The prefix before the dot is not compared with anything: a TLV naming
+    /// another address still only renames the worker. The share's address
+    /// is the channel's, which the TLV cannot reach.
     #[test]
-    fn resolve_drops_cross_account_tlv() {
-        let tail = encode_worker_id_tlv("addr2.victim").unwrap();
-        assert_eq!(resolve(&tail, true), "default");
+    fn resolve_strips_any_address_prefix() {
+        assert_eq!(resolve("addr2.victim", true).as_deref(), Some("victim"));
     }
 
-    /// `SECURITY: address-match check is case-insensitive (bech32 lowercase)`
-    #[test]
-    fn resolve_address_match_is_case_insensitive() {
-        let tail = encode_worker_id_tlv("ADDR1.rig").unwrap();
-        assert_eq!(resolve(&tail, true), "rig");
-    }
-
-    /// `handles trailing-dot edge case ("addr.") → channel default (empty worker)`
+    /// `handles trailing-dot edge case ("addr.") → channel worker (empty worker)`
     #[test]
     fn resolve_handles_trailing_dot() {
-        let tail = encode_worker_id_tlv("addr1.").unwrap();
-        assert_eq!(resolve(&tail, true), "default");
+        assert_eq!(resolve("addr1.", true), None);
     }
 
     /// `preserves nested dots in worker name ("addr.a.b" → "a.b")`
     #[test]
     fn resolve_preserves_nested_dots() {
-        let tail = encode_worker_id_tlv("addr1.farm.rig5").unwrap();
-        assert_eq!(resolve(&tail, true), "farm.rig5");
+        assert_eq!(
+            resolve("addr1.farm.rig5", true).as_deref(),
+            Some("farm.rig5")
+        );
     }
 
-    /// `malformed TLV (truncated) → channel default, share remains accountable`
+    /// `malformed TLV (oversized) → channel worker, share remains accountable`
     #[test]
-    fn resolve_malformed_truncated_tlv() {
-        // Truncated 0x0002 TLV: claims length=10 (LE) but only 5 bytes follow.
-        let malformed = [0x02, 0x00, 0x01, 0x0a, 0x00, 0x41, 0x42, 0x43, 0x44, 0x45];
-        assert_eq!(resolve(&malformed, true), "default");
+    fn resolve_malformed_tlv_keeps_channel_worker() {
+        assert_eq!(resolve(&"x".repeat(33), true), None);
     }
 }

@@ -32,7 +32,7 @@ use bp_share::Difficulty;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::hooks::MiningServerHooks;
 use bp_stratum_v2::mining::client::PortConfig;
-use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use stratum_apps::key_utils::Secp256k1PublicKey;
@@ -84,8 +84,7 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         .expect("mine 1 to force TDP emit");
     let server_config = ServerConfig::defaults_for(Network::Regtest);
     let noise_config =
-        NoiseConfig::parse_strings(SRI_TEST_PUB, SRI_TEST_PRV, DEFAULT_CERT_VALIDITY)
-            .expect("noise config");
+        NoiseConfig::new(SRI_TEST_PUB.parse().unwrap(), SRI_TEST_PRV.parse().unwrap());
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
     let server = StratumV2MiningServer::spawn(
         server_config,

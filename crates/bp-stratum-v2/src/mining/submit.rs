@@ -273,18 +273,17 @@ pub struct SubmitSharesExtendedInput {
     pub version: u32,
     pub ntime: u32,
     pub extranonce: ExtranonceBytes,
-    /// Trailing TLV bytes from the frame's tail (after the
-    /// `SubmitSharesExtended` base payload). Carries ext 0x0002
-    /// `[ext_type 0x0002 BE][field_type 0x01][len BE16][user_identity]`
-    /// when the miner has negotiated 0x0002 (Worker-Specific Hashrate
-    /// Tracking). Empty when no TLVs are present.
+    /// The TLVs the frame carried after the `SubmitSharesExtended` base
+    /// payload, as the frame parser decoded them. Carries the ext 0x0002
+    /// Worker-ID TLV when the miner uses Worker-Specific Hashrate Tracking;
+    /// empty when there are none.
     ///
     /// Resolved into [`ShareAccept::effective_worker_name`] by
     /// [`validate_submit_extended`] via
     /// [`crate::extensions::resolve_share_worker_name_from_tlv`] —
     /// ext 0x0002/Behavior Based on Negotiation: scan-for-known-TLV semantics,
     /// TLV-order-irrelevant.
-    pub tail_tlvs: Vec<u8>,
+    pub tlvs: Vec<stratum_core::parsers_sv2::Tlv>,
 }
 
 // ── Standard-channel job context ─────────────────────────────────────
@@ -696,33 +695,13 @@ pub fn validate_submit_extended(
         Vec::new()
     };
     // ext 0x0002 Worker-ID TLV resolution
-    // (ext 0x0002/Behavior Based on Negotiation). The validator operates at
-    // the channel layer and doesn't know the session-level `address` or
-    // `channel_worker` — those are session-state. We pass empty channel
-    // defaults so the resolver either returns a non-empty TLV-derived worker
-    // name (TLV present
-    // + valid + spec-compliant) or the empty channel default. The
-    // empty string is collapsed to `None` so consumers can rely on
-    // `Some(_) ⇒ TLV was present and the caller should override
-    // attribution`.
-    //
-    // The IO layer applies the cross-account-attribution security
-    // check (TLV-address must match the channel's session address)
-    // before applying `effective_worker_name` to share-stats, because
-    // it has the session context.
-    let resolved = crate::extensions::resolve_share_worker_name_from_tlv(
-        &crate::extensions::ResolveWorkerNameInput {
-            tail: &submission.tail_tlvs,
-            channel_address: None,
-            channel_worker: "",
-            ext_0x0002_negotiated,
-        },
+    // (ext 0x0002/Behavior Based on Negotiation). `Some(_)` means the TLV
+    // names a worker and the caller attributes the share to it instead of
+    // the channel's worker.
+    let effective_worker_name = crate::extensions::resolve_share_worker_name_from_tlv(
+        &submission.tlvs,
+        ext_0x0002_negotiated,
     );
-    let effective_worker_name = if resolved.is_empty() {
-        None
-    } else {
-        Some(resolved)
-    };
 
     ShareValidation::Accepted(Box::new(ShareAccept {
         classification,
@@ -818,7 +797,7 @@ mod tests {
             version: 0x2000_0000,
             ntime: 0x6500_0001,
             extranonce: SmallVec::from_slice(&[0x11; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         }
     }
 
@@ -1272,18 +1251,12 @@ mod tests {
 
     // ── ext 0x0002 Worker-ID TLV resolution in validate_submit_extended ──
 
-    fn worker_id_tlv_bytes(user_identity: &str) -> Vec<u8> {
-        // Hand-built wire-form TLV: [ext_type 0x0002 LE][field_type 0x01]
-        // [length LE16][value bytes]. Mirrors ext 0x0002/TLV Format for user_identity with the
-        // SV2 U16 little-endian convention
-        // (SV2 Overview/Stratum V2 TLV Encoding Model).
-        let value = user_identity.as_bytes();
-        let mut tlv = Vec::with_capacity(5 + value.len());
-        tlv.extend_from_slice(&0x0002u16.to_le_bytes());
-        tlv.push(0x01);
-        tlv.extend_from_slice(&(value.len() as u16).to_le_bytes());
-        tlv.extend_from_slice(value);
-        tlv
+    fn worker_id_tlvs(user_identity: &str) -> Vec<stratum_core::parsers_sv2::Tlv> {
+        vec![stratum_core::parsers_sv2::Tlv::new(
+            crate::extensions::SV2_EXTENSION_TYPE_WORKER_ID,
+            crate::extensions::SV2_FIELD_TYPE_USER_IDENTITY,
+            user_identity.as_bytes().to_vec(),
+        )]
     }
 
     /// ext 0x0002 negotiated + valid TLV → `ShareAccept.effective_worker_name`
@@ -1293,7 +1266,7 @@ mod tests {
         let mut ch = ext_channel();
         let job = ext_job([0xCC; 32], 0x1d00_ffff);
         let mut sub = ext_submission();
-        sub.tail_tlvs = worker_id_tlv_bytes("Worker_001");
+        sub.tlvs = worker_id_tlvs("Worker_001");
 
         let out = validate_ext(
             &mut ch,
@@ -1325,7 +1298,7 @@ mod tests {
         let mut ch = ext_channel();
         let job = ext_job([0xCC; 32], 0x1d00_ffff);
         let mut sub = ext_submission();
-        sub.tail_tlvs = worker_id_tlv_bytes("Worker_001");
+        sub.tlvs = worker_id_tlvs("Worker_001");
 
         let out = validate_ext(
             &mut ch,
@@ -1353,7 +1326,7 @@ mod tests {
     fn ext_0x0002_negotiated_no_tlv_falls_back_to_channel_default() {
         let mut ch = ext_channel();
         let job = ext_job([0xCC; 32], 0x1d00_ffff);
-        let sub = ext_submission(); // tail_tlvs is empty.
+        let sub = ext_submission(); // tlvs is empty.
 
         let out = validate_ext(
             &mut ch,

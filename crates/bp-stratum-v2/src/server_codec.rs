@@ -249,7 +249,7 @@ fn decode_submit_shares_extended(
         // layer extracts the TLV-tail via `parse_message_frame_with_tlvs`
         // and attaches it post-decode (`server.rs` sets this field
         // before passing to `handle_submit_shares_extended`).
-        tail_tlvs: Vec::new(),
+        tlvs: Vec::new(),
     })
 }
 

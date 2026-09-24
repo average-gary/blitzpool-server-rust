@@ -361,7 +361,7 @@ async fn run_block_submit_case(
         version: header_version,
         ntime: prev_hash.header_timestamp,
         extranonce: miner_extranonce,
-        tail_tlvs: Vec::new(),
+        tlvs: Vec::new(),
     };
     let job_target = channel.target_for(job_difficulty);
     let view = ExtendedChannelView {

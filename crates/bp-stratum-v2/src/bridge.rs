@@ -571,6 +571,29 @@ pub fn accounting_fits_mode(
     }
 }
 
+/// A freshly-built payout distribution, ready to publish as
+/// `SetPayoutDistribution` (ext 0x0003/SetPayoutDistribution) and to register
+/// in the bridge for ext 0x0003/Output Verification validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltPayoutDistribution {
+    /// The pool output (`weight_P` in the amount field).
+    pub pool_payout: WeightedOutput,
+    /// Miner payout slots in ext 0x0003/Payout Computation coinbase order.
+    pub payouts: Vec<WeightedOutput>,
+    /// Parallel to `payouts` (ext 0x0003/SetPayoutDistribution).
+    pub dust_limits: Vec<u32>,
+    /// Consensus-serialized 0-value TxOuts the pool appends.
+    pub additional_outputs: Vec<Vec<u8>>,
+    /// Revenue the weight boosts were projected against.
+    pub reference_reward_sats: u64,
+    /// Settlement-snapshot identity. `None` = the owning mode books
+    /// without a snapshot (Solo).
+    pub payouts_fingerprint: Option<[u8; 32]>,
+    /// Whether a found block on this distribution may be booked
+    /// (`false` when the snapshot write failed).
+    pub bookable: bool,
+}
+
 /// One published `SetPayoutDistribution` (ext 0x0003/SetPayoutDistribution),
 /// tracked pool-wide so both the JDP declare path and the mining-side
 /// `SetCustomMiningJob` path can resolve a `distribution_id` TLV to the
@@ -581,25 +604,8 @@ pub struct PayoutDistributionEntry {
     /// ext 0x0003/SetPayoutDistribution: strictly increasing, universal across
     /// all connections.
     pub distribution_id: u64,
-    /// The pool output (`weight_P` in the amount field).
-    pub pool_payout: WeightedOutput,
-    /// Miner payout slots in ext 0x0003/Payout Computation coinbase order.
-    pub payouts: Vec<WeightedOutput>,
-    /// Parallel to `payouts` (ext 0x0003/SetPayoutDistribution).
-    pub dust_limits: Vec<u32>,
-    /// Consensus-serialized 0-value TxOuts the pool appends.
-    pub additional_outputs: Vec<Vec<u8>>,
-    /// Revenue the distribution's weight boosts were projected against —
-    /// carried to the block-found path, which uses it as the fallback
-    /// reward when the block's own coinbase value is unavailable.
-    pub reference_reward_sats: u64,
-    /// Settlement-snapshot identity (weights fingerprint). `None` when
-    /// the owning mode books without a snapshot (Solo).
-    pub payouts_fingerprint: Option<[u8; 32]>,
-    /// Whether a booking may be stamped on jobs built from this
-    /// distribution (`false` e.g. when the snapshot write failed — the
-    /// job is still served, but a found block is reported-not-booked).
-    pub bookable: bool,
+    /// The payout plan itself, as the pool built it.
+    pub built: BuiltPayoutDistribution,
     /// Which accounting this distribution belongs to — see
     /// [`DistributionAccounting`].
     pub accounting: DistributionAccounting,
@@ -1431,19 +1437,21 @@ mod tests {
     ) -> PayoutDistributionEntry {
         PayoutDistributionEntry {
             distribution_id: id,
-            pool_payout: WeightedOutput {
-                script_pubkey: vec![0x51],
-                weight: 1,
+            built: crate::bridge::BuiltPayoutDistribution {
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 100,
+                }],
+                dust_limits: vec![546],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([id as u8; 32]),
+                bookable: true,
             },
-            payouts: vec![WeightedOutput {
-                script_pubkey: vec![0x00, 0x14, 0xAA],
-                weight: 100,
-            }],
-            dust_limits: vec![546],
-            additional_outputs: vec![],
-            reference_reward_sats: 312_500_000,
-            payouts_fingerprint: Some([id as u8; 32]),
-            bookable: true,
             accounting,
             jdp_session_id: session,
             published_at_ms: 1_000 + id,

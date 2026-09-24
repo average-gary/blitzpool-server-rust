@@ -24,8 +24,8 @@
 //! There is no shared mutable state to rotate centrally — every
 //! [`accept_pool_noise`] call generates a fresh Responder with a fresh
 //! 12h cert. The "rotation" is therefore inherent in the per-connection
-//! generation; this module exposes the convention as a named constant
-//! and the explicit IO-layer config knob.
+//! generation; this module exposes the convention as a named constant.
+//! It is not configurable.
 //!
 //! ## What this module wraps vs. what stays in `stratum-apps`
 //!
@@ -33,8 +33,7 @@
 //!   handshake state machine, framing, encoder/decoder, the
 //!   `Responder::from_authority_kp` builder, the `NoiseTcpStream`
 //!   read/write split.
-//! - **In this module**: pool-side config (parsed authority keys,
-//!   `cert_validity` Duration), the convenience builder, the
+//! - **In this module**: pool-side config (parsed authority keys), the
 //!   re-exports (so consumers `use crate::noise::{NoiseConfig,
 //!   NoiseTcpStream, ...}` without the deep `stratum_apps::network_helpers::*`
 //!   path), and the [`DEFAULT_CERT_VALIDITY`] constant.
@@ -83,109 +82,24 @@ pub type NoiseError = NoiseHelpersError;
 /// requiring manual revocation tooling.
 pub const DEFAULT_CERT_VALIDITY: Duration = Duration::from_secs(12 * 3600);
 
-/// Minimum sane cert validity. Lower than this means certs expire
-/// before a typical mining session's first share — guards against
-/// config typos like `cert_validity = 60` (mistaking seconds for
-/// minutes).
-pub const MIN_CERT_VALIDITY: Duration = Duration::from_secs(60);
-
-/// Maximum sane cert validity. Higher than this defeats the
-/// natural-retirement-via-daily-rotation property. 7 days is the
-/// upper bound — anything longer needs explicit acknowledgement at
-/// the call site.
-pub const MAX_CERT_VALIDITY: Duration = Duration::from_secs(7 * 24 * 3600);
-
 // ── NoiseConfig ─────────────────────────────────────────────────────
 
-/// Pool-side Noise-handshake configuration. Holds the parsed
-/// authority key-pair + the per-connection cert validity. Clone-able
-/// so the same config can be shared between the mining-server and
-/// JDP-server accept loops without an `Arc`.
+/// Pool-side Noise-handshake configuration: the parsed authority key-pair.
+/// Every connection's cert is issued for [`DEFAULT_CERT_VALIDITY`].
+/// Clone-able so the same config can be shared between the mining-server
+/// and JDP-server accept loops without an `Arc`.
 #[derive(Clone, Debug)]
 pub struct NoiseConfig {
     authority_pub: Secp256k1PublicKey,
     authority_prv: Secp256k1SecretKey,
-    cert_validity: Duration,
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum NoiseConfigError {
-    /// `cert_validity` was outside `[MIN_CERT_VALIDITY,
-    /// MAX_CERT_VALIDITY]`. The caller's config has a likely typo or
-    /// an unsafe long-lived cert.
-    #[error("cert_validity {got_secs}s outside the sane range [{min_secs}s, {max_secs}s]")]
-    OutOfRange {
-        got_secs: u64,
-        min_secs: u64,
-        max_secs: u64,
-    },
-    /// Authority public key didn't parse from its base58-encoded
-    /// string form. The wrapped message is from
-    /// [`Secp256k1PublicKey`]'s [`std::str::FromStr`] impl.
-    #[error("authority public key parse error: {0}")]
-    InvalidPublicKey(String),
-    /// Authority private key didn't parse from its base58-encoded
-    /// string form.
-    #[error("authority private key parse error: {0}")]
-    InvalidPrivateKey(String),
 }
 
 impl NoiseConfig {
-    /// Construct from already-parsed key types with an explicit
-    /// validity. Use [`Self::parse_strings`] when loading from a
-    /// config file's textual values.
-    pub fn new(
-        authority_pub: Secp256k1PublicKey,
-        authority_prv: Secp256k1SecretKey,
-        cert_validity: Duration,
-    ) -> Result<Self, NoiseConfigError> {
-        if cert_validity < MIN_CERT_VALIDITY || cert_validity > MAX_CERT_VALIDITY {
-            return Err(NoiseConfigError::OutOfRange {
-                got_secs: cert_validity.as_secs(),
-                min_secs: MIN_CERT_VALIDITY.as_secs(),
-                max_secs: MAX_CERT_VALIDITY.as_secs(),
-            });
-        }
-        Ok(Self {
-            authority_pub,
-            authority_prv,
-            cert_validity,
-        })
-    }
-
-    /// Convenience constructor with [`DEFAULT_CERT_VALIDITY`] (12 h).
-    pub fn with_default_cert_validity(
-        authority_pub: Secp256k1PublicKey,
-        authority_prv: Secp256k1SecretKey,
-    ) -> Self {
+    pub fn new(authority_pub: Secp256k1PublicKey, authority_prv: Secp256k1SecretKey) -> Self {
         Self {
             authority_pub,
             authority_prv,
-            cert_validity: DEFAULT_CERT_VALIDITY,
         }
-    }
-
-    /// Parse keys from their base58-encoded string form, using the
-    /// `FromStr` impls in [`stratum_apps::key_utils`]. Same
-    /// validity-range guard as [`Self::new`].
-    pub fn parse_strings(
-        authority_pub_str: &str,
-        authority_prv_str: &str,
-        cert_validity: Duration,
-    ) -> Result<Self, NoiseConfigError> {
-        let authority_pub: Secp256k1PublicKey =
-            authority_pub_str
-                .parse()
-                .map_err(|e: stratum_apps::key_utils::Error| {
-                    NoiseConfigError::InvalidPublicKey(format!("{e:?}"))
-                })?;
-        let authority_prv: Secp256k1SecretKey =
-            authority_prv_str
-                .parse()
-                .map_err(|e: stratum_apps::key_utils::Error| {
-                    NoiseConfigError::InvalidPrivateKey(format!("{e:?}"))
-                })?;
-        Self::new(authority_pub, authority_prv, cert_validity)
     }
 
     pub fn authority_pub(&self) -> &Secp256k1PublicKey {
@@ -195,10 +109,6 @@ impl NoiseConfig {
     pub fn authority_prv(&self) -> &Secp256k1SecretKey {
         &self.authority_prv
     }
-
-    pub fn cert_validity(&self) -> Duration {
-        self.cert_validity
-    }
 }
 
 // ── accept_pool_noise ───────────────────────────────────────────────
@@ -207,8 +117,8 @@ impl NoiseConfig {
 ///
 /// Thin wrapper over
 /// [`stratum_apps::network_helpers::accept_noise_connection`] that
-/// passes the pool's authority key-pair + cert validity from
-/// [`NoiseConfig`]. The handshake timeout is `stratum_apps`-internal
+/// passes the pool's authority key-pair from [`NoiseConfig`] and
+/// [`DEFAULT_CERT_VALIDITY`]. The handshake timeout is `stratum_apps`-internal
 /// (10 s, fixed at the time of pinning); see
 /// [`stratum_apps::network_helpers::noise_stream::NoiseTcpStream::accept`]
 /// for the override path.
@@ -225,7 +135,7 @@ pub async fn accept_pool_noise(
         stream,
         config.authority_pub,
         config.authority_prv,
-        config.cert_validity.as_secs(),
+        DEFAULT_CERT_VALIDITY.as_secs(),
     )
     .await
 }
@@ -246,77 +156,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_strings_roundtrips_sri_test_keys() {
-        let cfg =
-            NoiseConfig::parse_strings(TEST_PUB, TEST_PRV, DEFAULT_CERT_VALIDITY).expect("valid");
-        assert_eq!(cfg.cert_validity(), DEFAULT_CERT_VALIDITY);
-        // Round-trip: emit via Debug then re-parse (FromStr is
-        // base58-stable). Use `into_bytes()` to confirm the key parsed
-        // into a non-zero value.
-        assert_ne!((*cfg.authority_pub()).into_bytes(), [0u8; 32]);
-        assert_ne!((*cfg.authority_prv()).into_bytes(), [0u8; 32]);
-    }
-
-    #[test]
-    fn parse_strings_rejects_bogus_public_key() {
-        let err = NoiseConfig::parse_strings("not-a-real-key", TEST_PRV, DEFAULT_CERT_VALIDITY)
-            .unwrap_err();
-        assert!(matches!(err, NoiseConfigError::InvalidPublicKey(_)));
-    }
-
-    #[test]
-    fn parse_strings_rejects_bogus_private_key() {
-        let err = NoiseConfig::parse_strings(TEST_PUB, "not-a-real-key", DEFAULT_CERT_VALIDITY)
-            .unwrap_err();
-        assert!(matches!(err, NoiseConfigError::InvalidPrivateKey(_)));
-    }
-
-    #[test]
-    fn new_rejects_cert_validity_below_minimum() {
+    fn new_holds_the_sri_test_keys() {
         let pub_k: Secp256k1PublicKey = TEST_PUB.parse().unwrap();
         let prv_k: Secp256k1SecretKey = TEST_PRV.parse().unwrap();
-        let err = NoiseConfig::new(pub_k, prv_k, Duration::from_secs(30)).unwrap_err();
-        assert_eq!(
-            err,
-            NoiseConfigError::OutOfRange {
-                got_secs: 30,
-                min_secs: 60,
-                max_secs: 7 * 24 * 3600,
-            }
-        );
-    }
-
-    #[test]
-    fn new_rejects_cert_validity_above_maximum() {
-        let pub_k: Secp256k1PublicKey = TEST_PUB.parse().unwrap();
-        let prv_k: Secp256k1SecretKey = TEST_PRV.parse().unwrap();
-        let err = NoiseConfig::new(pub_k, prv_k, Duration::from_secs(8 * 24 * 3600)).unwrap_err();
-        assert!(matches!(err, NoiseConfigError::OutOfRange { .. }));
-    }
-
-    #[test]
-    fn new_accepts_boundary_values() {
-        let pub_k: Secp256k1PublicKey = TEST_PUB.parse().unwrap();
-        let prv_k: Secp256k1SecretKey = TEST_PRV.parse().unwrap();
-        assert!(NoiseConfig::new(pub_k, prv_k, MIN_CERT_VALIDITY).is_ok());
-        assert!(NoiseConfig::new(pub_k, prv_k, MAX_CERT_VALIDITY).is_ok());
-    }
-
-    #[test]
-    fn with_default_cert_validity_skips_range_check() {
-        let pub_k: Secp256k1PublicKey = TEST_PUB.parse().unwrap();
-        let prv_k: Secp256k1SecretKey = TEST_PRV.parse().unwrap();
-        let cfg = NoiseConfig::with_default_cert_validity(pub_k, prv_k);
-        assert_eq!(cfg.cert_validity(), DEFAULT_CERT_VALIDITY);
-    }
-
-    /// `Clone` allows shareing the same config between mining +
-    /// JDP server accept loops without an Arc indirection.
-    #[test]
-    fn noise_config_is_cloneable() {
-        let cfg = NoiseConfig::parse_strings(TEST_PUB, TEST_PRV, DEFAULT_CERT_VALIDITY).unwrap();
-        let cfg2 = cfg.clone();
-        assert_eq!(cfg.cert_validity(), cfg2.cert_validity());
+        let cfg = NoiseConfig::new(pub_k, prv_k);
+        assert_eq!(cfg.authority_pub().into_bytes(), pub_k.into_bytes());
+        assert_eq!(cfg.authority_prv().into_bytes(), prv_k.into_bytes());
+        assert_ne!(pub_k.into_bytes(), [0u8; 32]);
     }
 
     /// `accept_pool_noise` is async + needs a real TCP-stream peer

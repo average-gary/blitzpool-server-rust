@@ -25,7 +25,7 @@ use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::extranonce::SharedExtranonceAllocator;
 use bp_stratum_v2::hooks::MiningServerHooks;
 use bp_stratum_v2::mining::client::{PortConfig, FLAG_REQUIRES_VERSION_ROLLING};
-use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use bp_template_distribution::TemplateUpdate;
 use stratum_apps::key_utils::Secp256k1PublicKey;
@@ -127,8 +127,7 @@ fn spawn_server(
 ) -> (StratumV2MiningServer, broadcast::Sender<TemplateUpdate>) {
     let (updates_tx, updates_rx) = broadcast::channel::<TemplateUpdate>(8);
     let noise_config =
-        NoiseConfig::parse_strings(SRI_TEST_PUB, SRI_TEST_PRV, DEFAULT_CERT_VALIDITY)
-            .expect("noise config");
+        NoiseConfig::new(SRI_TEST_PUB.parse().unwrap(), SRI_TEST_PRV.parse().unwrap());
     let server = StratumV2MiningServer::spawn(
         ServerConfig::defaults_for(Network::Regtest),
         noise_config,

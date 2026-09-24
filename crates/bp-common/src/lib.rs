@@ -203,6 +203,17 @@ pub fn normalize_btc_address(address: &str) -> String {
     }
 }
 
+/// Split a stratum `address.worker` identity at its FIRST dot; the worker
+/// keeps any further dots. The worker is `None` when there is no dot and
+/// `Some("")` for a trailing dot. Which default an absent or empty worker
+/// gets is the caller's business, and so is validating the address part.
+pub fn split_user_identity(identity: &str) -> (&str, Option<&str>) {
+    match identity.split_once('.') {
+        Some((address, worker)) => (address, Some(worker)),
+        None => (identity, None),
+    }
+}
+
 fn validate_address_shape(s: &str) -> Result<(), InvalidAddressError> {
     if s.is_empty() {
         return Err(InvalidAddressError::Empty);
@@ -548,6 +559,27 @@ mod tests {
     fn empty_input_returns_empty() {
         assert_eq!(normalize_btc_address(""), "");
         assert_eq!(normalize_btc_address("   "), "");
+    }
+
+    // ── split_user_identity ──────────────────────────────────────────
+
+    /// The cases the SV1 authorize, the SV2 channel open, the JDP allocate
+    /// and the ext 0x0002 Worker-ID resolution rely on.
+    #[test]
+    fn split_user_identity_splits_at_the_first_dot() {
+        assert_eq!(split_user_identity("addr.rig1"), ("addr", Some("rig1")));
+        // The worker keeps every further dot.
+        assert_eq!(
+            split_user_identity("addr.farm.rig5"),
+            ("addr", Some("farm.rig5"))
+        );
+        // No dot: no worker, and the whole string is the first part.
+        assert_eq!(split_user_identity("addr"), ("addr", None));
+        // Trailing dot: an empty worker, distinct from no dot at all.
+        assert_eq!(split_user_identity("addr."), ("addr", Some("")));
+        // Leading dot: an empty address part.
+        assert_eq!(split_user_identity(".rig"), ("", Some("rig")));
+        assert_eq!(split_user_identity(""), ("", None));
     }
 
     #[test]

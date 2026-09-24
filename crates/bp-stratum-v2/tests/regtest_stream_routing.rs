@@ -49,7 +49,7 @@ use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::hooks::{BlockSubmissionSink, MiningServerHooks, PayoutResolver};
 use bp_stratum_v2::mining::client::{PortConfig, FLAG_REQUIRES_VERSION_ROLLING};
 use bp_stratum_v2::mining::submit::ShareAccept;
-use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use bp_test_support::poll_for_height;
@@ -363,8 +363,7 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
         ..MiningServerHooks::no_op()
     };
     let noise_config =
-        NoiseConfig::parse_strings(SRI_TEST_PUB, SRI_TEST_PRV, DEFAULT_CERT_VALIDITY)
-            .expect("noise config");
+        NoiseConfig::new(SRI_TEST_PUB.parse().unwrap(), SRI_TEST_PRV.parse().unwrap());
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
     let server = StratumV2MiningServer::spawn(
         ServerConfig::defaults_for(Network::Regtest),

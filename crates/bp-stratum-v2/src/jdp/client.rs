@@ -50,6 +50,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bitcoin::hex::DisplayHex;
 use bp_common::normalize_btc_address;
 use bp_common::AddressId;
 
@@ -723,10 +724,7 @@ pub fn parse_user_identifier_as_address(user_identifier: &str) -> Option<Address
     // coinbase-output encode time, collapsing the pool payout to an empty
     // output set (`coinbase_tx_outputs = 0x00`). Same split as the
     // mining channel-open parse (`address.worker_name`, first dot).
-    let address_part = match trimmed.find('.') {
-        Some(idx) => &trimmed[..idx],
-        None => trimmed,
-    };
+    let (address_part, _worker) = bp_common::split_user_identity(trimmed);
     if address_part.is_empty() {
         return None;
     }
@@ -933,17 +931,6 @@ pub fn handle_provide_missing_transactions_success(
     accept_declaration(state, &pending.input, merged, pending.miner_address, ctx)
 }
 
-/// Lowercase hex of a 32-byte hash for log lines. Hand-rolled like
-/// `Token::to_hex` — the `hex` crate is a dev-only dependency here.
-fn hash_hex(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(64);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
 // ── Internal: accept_declaration ────────────────────────────────────
 
 fn accept_declaration(
@@ -1078,10 +1065,10 @@ fn accept_declaration(
         }
         match validate_coinbase_outputs_against_distribution(
             &declared_coinbase.tx.output,
-            &entry.pool_payout,
-            &entry.payouts,
-            &entry.dust_limits,
-            &entry.additional_outputs,
+            &entry.built.pool_payout,
+            &entry.built.payouts,
+            &entry.built.dust_limits,
+            &entry.built.additional_outputs,
         ) {
             Ok(_declared_revenue) => {
                 // The coinbase pays this distribution — record it as the
@@ -1090,11 +1077,11 @@ fn accept_declaration(
                 declared_distribution_id = Some(entry.distribution_id);
                 // Vouch for booking only when the distribution's
                 // settlement snapshot actually landed.
-                if entry.bookable {
+                if entry.built.bookable {
                     declared_booking = Some(PayoutBooking {
                         distribution_id: entry.distribution_id,
-                        payouts_fingerprint: entry.payouts_fingerprint.unwrap_or([0u8; 32]),
-                        reference_reward_sats: entry.reference_reward_sats,
+                        payouts_fingerprint: entry.built.payouts_fingerprint.unwrap_or([0u8; 32]),
+                        reference_reward_sats: entry.built.reference_reward_sats,
                     });
                 } else {
                     tracing::warn!(
@@ -1234,7 +1221,7 @@ pub fn handle_push_solution(
     // (`ExtendedJob::jdp_claims_the_block`).
     if !state.full_template_mode {
         tracing::info!(
-            prev_hash = %hash_hex(&input.header.prev_hash),
+            prev_hash = %input.header.prev_hash.as_hex(),
             "jdp: PushSolution from a Coinbase-only session — no declaration to reassemble the \
              block from; the JDC propagates it and the mining side records it"
         );
@@ -1247,7 +1234,7 @@ pub fn handle_push_solution(
         Some(j) => j,
         None => {
             tracing::warn!(
-                prev_hash = %hash_hex(&input.header.prev_hash),
+                prev_hash = %input.header.prev_hash.as_hex(),
                 "jdp: PushSolution dropped — no matching declared job (reconnect gap or stale solution)"
             );
             return JdpHandlerOutcome::default();
@@ -1285,7 +1272,7 @@ pub fn handle_push_solution(
         // ext 0x0003/Implementation Notes settle. See `CandidateBacking`.
         (None, Some(distribution_id)) => {
             tracing::error!(
-                prev_hash = %hash_hex(&input.header.prev_hash),
+                prev_hash = %input.header.prev_hash.as_hex(),
                 distribution_id,
                 "jdp: BLOCK FOUND on a validated distribution that was never bookable — \
                  its coinbase pays miners on-chain but this block gets NO ledger entry, \
@@ -1308,7 +1295,7 @@ pub fn handle_push_solution(
             Some(raw) => transactions.push(raw.clone()),
             None => {
                 tracing::warn!(
-                    prev_hash = %hash_hex(&input.header.prev_hash),
+                    prev_hash = %input.header.prev_hash.as_hex(),
                     position = i,
                     "jdp: PushSolution dropped — declared job is missing raw tx data"
                 );
@@ -1496,19 +1483,21 @@ mod tests {
     fn distribution_entry(id: u64) -> crate::bridge::PayoutDistributionEntry {
         crate::bridge::PayoutDistributionEntry {
             distribution_id: id,
-            pool_payout: WeightedOutput {
-                script_pubkey: vec![0x51],
-                weight: 1,
+            built: crate::bridge::BuiltPayoutDistribution {
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 9,
+                }],
+                dust_limits: vec![1],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([id as u8; 32]),
+                bookable: true,
             },
-            payouts: vec![WeightedOutput {
-                script_pubkey: vec![0x00, 0x14, 0xAA],
-                weight: 9,
-            }],
-            dust_limits: vec![1],
-            additional_outputs: vec![],
-            reference_reward_sats: 312_500_000,
-            payouts_fingerprint: Some([id as u8; 32]),
-            bookable: true,
             accounting: crate::bridge::DistributionAccounting::PoolWide,
             jdp_session_id: None,
             published_at_ms: 1_000,
@@ -1564,10 +1553,10 @@ mod tests {
     /// ext 0x0003/Output Verification positional validation by construction.
     fn matching_suffix(entry: &crate::bridge::PayoutDistributionEntry, t: u64) -> Vec<u8> {
         let outputs = compute_payout_vector(
-            &entry.pool_payout,
-            &entry.payouts,
-            &entry.dust_limits,
-            &entry.additional_outputs,
+            &entry.built.pool_payout,
+            &entry.built.payouts,
+            &entry.built.dust_limits,
+            &entry.built.additional_outputs,
             t,
         )
         .unwrap();
@@ -2196,10 +2185,10 @@ mod tests {
         let conformant = {
             let e = tailored(7);
             let outputs = compute_payout_vector(
-                &e.pool_payout,
-                &e.payouts,
-                &e.dust_limits,
-                &e.additional_outputs,
+                &e.built.pool_payout,
+                &e.built.payouts,
+                &e.built.dust_limits,
+                &e.built.additional_outputs,
                 312_500_000,
             )
             .unwrap();
@@ -2262,10 +2251,10 @@ mod tests {
 
         // Reject: swap the pool/payout positions, Σ preserved.
         let mut swapped = compute_payout_vector(
-            &entry.pool_payout,
-            &entry.payouts,
-            &entry.dust_limits,
-            &entry.additional_outputs,
+            &entry.built.pool_payout,
+            &entry.built.payouts,
+            &entry.built.dust_limits,
+            &entry.built.additional_outputs,
             5_000_000_000,
         )
         .unwrap();
@@ -2442,7 +2431,7 @@ mod tests {
         let token = complete_setup_and_allocate(&mut s);
         negotiate_0x0003(&mut s);
         let mut entry = distribution_entry(7);
-        entry.bookable = false;
+        entry.built.bookable = false;
         let mut input = declare(3, token, vec![]);
         input.distribution_id = Some(7);
         input.coinbase_tx_suffix = matching_suffix(&entry, 5_000_000_000);

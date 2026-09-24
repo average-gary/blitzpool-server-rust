@@ -121,7 +121,6 @@ pub struct DeclaredJob {
 /// by the JDP connection task — no internal locking.
 #[derive(Debug)]
 pub struct DeclaredJobStore {
-    capacity: usize,
     jobs: HashMap<Token, DeclaredJob>,
     /// Insertion order, oldest at the front. `pop_front()` gives the
     /// next eviction candidate.
@@ -136,14 +135,9 @@ impl Default for DeclaredJobStore {
 
 impl DeclaredJobStore {
     pub fn new() -> Self {
-        Self::with_capacity(MAX_DECLARED_JOBS)
-    }
-
-    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            capacity,
-            jobs: HashMap::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
+            jobs: HashMap::with_capacity(MAX_DECLARED_JOBS),
+            order: VecDeque::with_capacity(MAX_DECLARED_JOBS),
         }
     }
 
@@ -155,35 +149,26 @@ impl DeclaredJobStore {
         self.jobs.is_empty()
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Insert a declared job. If the store is at capacity, the
-    /// oldest entry is evicted and returned. Returns `None` when
-    /// the insert didn't push anything out.
+    /// Insert a declared job. If the store holds [`MAX_DECLARED_JOBS`]
+    /// already, the oldest entry is evicted.
     ///
     /// Inserting a job with a `new_token` that's already in the
     /// store replaces the existing entry (its FIFO position is
     /// preserved). This is defensive — JDS-generated tokens are
     /// random 16-byte values so collisions are astronomically
     /// unlikely; the replace path keeps the API total.
-    pub fn insert(&mut self, job: DeclaredJob) -> Option<DeclaredJob> {
+    pub fn insert(&mut self, job: DeclaredJob) {
         let token = job.new_token;
-        if let Some(existing) = self.jobs.insert(token, job) {
+        if self.jobs.insert(token, job).is_some() {
             // Replace: don't touch insertion order, don't evict.
-            return Some(existing);
+            return;
         }
         self.order.push_back(token);
-        if self.jobs.len() > self.capacity {
-            // Evict oldest.
+        if self.jobs.len() > MAX_DECLARED_JOBS {
             if let Some(oldest_token) = self.order.pop_front() {
-                if let Some(evicted) = self.jobs.remove(&oldest_token) {
-                    return Some(evicted);
-                }
+                self.jobs.remove(&oldest_token);
             }
         }
-        None
     }
 
     /// Look up a job by `new_token`.
@@ -270,14 +255,13 @@ mod tests {
         let s = DeclaredJobStore::new();
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
-        assert_eq!(s.capacity(), MAX_DECLARED_JOBS);
     }
 
     #[test]
     fn insert_then_get_returns_same_job() {
         let mut s = DeclaredJobStore::new();
         let j = job(0x01, 1_000, None);
-        assert!(s.insert(j.clone()).is_none(), "no eviction under cap");
+        s.insert(j.clone());
         let stored = s.get(&tok(0x01)).expect("must be found");
         assert_eq!(stored, &j);
     }
@@ -297,43 +281,31 @@ mod tests {
         s.insert(job(0x02, 2_000, None));
         s.insert(job(0x03, 3_000, None));
         assert_eq!(s.len(), 3);
-        let evicted = s.insert(job(0x04, 4_000, None));
+        s.insert(job(0x04, 4_000, None));
         assert_eq!(s.len(), 3);
-        let evicted = evicted.expect("4th insert evicts");
-        assert_eq!(evicted.new_token, tok(0x01), "oldest is evicted");
-        // 0x01 is gone, 0x02/0x03/0x04 remain.
-        assert!(s.get(&tok(0x01)).is_none());
+        // The oldest, 0x01, is gone; 0x02/0x03/0x04 remain.
+        assert!(s.get(&tok(0x01)).is_none(), "oldest is evicted");
         assert!(s.get(&tok(0x02)).is_some());
         assert!(s.get(&tok(0x03)).is_some());
         assert!(s.get(&tok(0x04)).is_some());
     }
 
-    #[test]
-    fn custom_capacity_honoured() {
-        let mut s = DeclaredJobStore::with_capacity(2);
-        s.insert(job(0x01, 1_000, None));
-        s.insert(job(0x02, 2_000, None));
-        let evicted = s.insert(job(0x03, 3_000, None));
-        assert_eq!(s.len(), 2);
-        assert_eq!(evicted.unwrap().new_token, tok(0x01));
-    }
-
     /// Replacing an existing token (same `new_token`) does NOT
     /// rotate the FIFO and does NOT evict — the new entry takes
-    /// over the old slot, returns the old value, insertion order
-    /// is preserved.
+    /// over the old slot, insertion order is preserved.
     #[test]
     fn replace_existing_token_preserves_fifo_position() {
-        let mut s = DeclaredJobStore::with_capacity(2);
+        let mut s = DeclaredJobStore::new();
         s.insert(job(0x01, 1_000, None));
         s.insert(job(0x02, 2_000, None));
-        let replaced = s.insert(job(0x01, 9_999, None));
-        assert!(replaced.is_some(), "replace returns old value");
-        assert_eq!(replaced.unwrap().declared_at_ms, 1_000);
-        assert_eq!(s.len(), 2);
+        s.insert(job(0x03, 3_000, None));
+        s.insert(job(0x01, 9_999, None));
+        assert_eq!(s.len(), 3, "a replace does not evict");
+        assert_eq!(s.get(&tok(0x01)).unwrap().declared_at_ms, 9_999);
         // Next insert evicts 0x01 (still at the front), not 0x02.
-        let evicted = s.insert(job(0x03, 3_000, None));
-        assert_eq!(evicted.unwrap().new_token, tok(0x01));
+        s.insert(job(0x04, 4_000, None));
+        assert!(s.get(&tok(0x01)).is_none());
+        assert!(s.get(&tok(0x02)).is_some());
     }
 
     // ── match_for_solution ─────────────────────────────────────────

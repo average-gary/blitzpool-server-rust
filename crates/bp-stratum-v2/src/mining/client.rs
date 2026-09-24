@@ -1096,20 +1096,14 @@ fn assign_channel_to_group<C: Clock>(
     if state.requires_standard_jobs || state.is_tdp_client || state.work_selection {
         return 0;
     }
-    let gid = match state.groups.group_for_size(full_extranonce_size) {
-        Some(gid) => gid,
-        None => {
-            let gid = state.next_channel_id;
-            state.next_channel_id = state.next_channel_id.saturating_add(1);
-            state.groups.create(gid, full_extranonce_size);
-            gid
-        }
-    };
-    // Matches by construction (looked up / created for `full_extranonce_size`).
-    let _ = state
+    let next_channel_id = &mut state.next_channel_id;
+    state
         .groups
-        .add_channel(gid, channel_id, full_extranonce_size);
-    gid
+        .join_group_for_size(channel_id, full_extranonce_size, || {
+            let gid = *next_channel_id;
+            *next_channel_id = next_channel_id.saturating_add(1);
+            gid
+        })
 }
 
 // ── Handler: OpenExtendedMiningChannel ──────────────────────────────
@@ -1252,10 +1246,7 @@ fn resolve_open_context<C: Clock>(
     // Parse `user_identity` → (address, worker). Format is
     // `address.worker_name` (single dot split). Multiple dots: worker_name
     // keeps the rest (split only on first dot).
-    let (address_part, worker_part) = match user_identity.find('.') {
-        Some(idx) => (&user_identity[..idx], &user_identity[idx + 1..]),
-        None => (user_identity, ""),
-    };
+    let (address_part, worker_part) = bp_common::split_user_identity(user_identity);
     if address_part.is_empty() {
         return Err(err(ERR_UNKNOWN_USER));
     }
@@ -1278,10 +1269,9 @@ fn resolve_open_context<C: Clock>(
         }
     }
 
-    let worker = if worker_part.is_empty() {
-        "default".to_string()
-    } else {
-        worker_part.to_string()
+    let worker = match worker_part {
+        Some(w) if !w.is_empty() => w.to_string(),
+        _ => "default".to_string(),
     };
 
     // Initial difficulty. A positive `nominal_hash_rate` is the miner
@@ -3099,10 +3089,10 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 };
             if crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
                 &declared,
-                &entry.pool_payout,
-                &entry.payouts,
-                &entry.dust_limits,
-                &entry.additional_outputs,
+                &entry.built.pool_payout,
+                &entry.built.payouts,
+                &entry.built.dust_limits,
+                &entry.built.additional_outputs,
             )
             .is_err()
             {
@@ -3111,7 +3101,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // Only now, past ext 0x0003/Output Verification — a fingerprint
             // stamped before the recompute would name a distribution this
             // coinbase was never proven to pay.
-            entry.payouts_fingerprint
+            entry.built.payouts_fingerprint
         }
     };
 
@@ -4165,7 +4155,7 @@ pub(crate) mod tests {
             version: 0,
             ntime: 0,
             extranonce: ExtranonceBytes::from_slice(&[0; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         };
         let out = handle_submit_shares_extended(&mut s, &sub, 0);
         match &out.outbound[0] {
@@ -4218,7 +4208,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             ntime: 0x6500_0001,
             extranonce: ExtranonceBytes::from_slice(&[0x11; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         };
         let out = handle_submit_shares_extended(&mut s, &sub, 0);
         assert!(matches!(
@@ -4295,7 +4285,7 @@ pub(crate) mod tests {
                 version: 0x2000_0000,
                 ntime: 0x6500_0001,
                 extranonce: ExtranonceBytes::from_slice(&[0x11; 8]),
-                tail_tlvs: Vec::new(),
+                tlvs: Vec::new(),
             };
             let out = handle_submit_shares_extended(&mut s, &sub, 0);
             match out.events.first() {
@@ -5844,7 +5834,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             ntime: 0x6500_0001,
             extranonce: ExtranonceBytes::from_slice(&[0x11u8; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         };
         let member_ch = s.channels.get_mut(&member).unwrap();
         let res = validate_ext(
@@ -5979,7 +5969,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             ntime: 0x6500_0001,
             extranonce: ExtranonceBytes::from_slice(&[0x11u8; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         };
         let res = validate_ext(
             s.channels.get_mut(&ch1).unwrap(),
@@ -7156,19 +7146,21 @@ pub(crate) mod tests {
     ) -> crate::bridge::PayoutDistributionEntry {
         crate::bridge::PayoutDistributionEntry {
             distribution_id: 9,
-            pool_payout: WeightedOutput {
-                script_pubkey: vec![0x51],
-                weight: 1,
+            built: crate::bridge::BuiltPayoutDistribution {
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 9,
+                }],
+                dust_limits: vec![1],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([0x5A; 32]),
+                bookable: true,
             },
-            payouts: vec![WeightedOutput {
-                script_pubkey: vec![0x00, 0x14, 0xAA],
-                weight: 9,
-            }],
-            dust_limits: vec![1],
-            additional_outputs: vec![],
-            reference_reward_sats: 312_500_000,
-            payouts_fingerprint: Some([0x5A; 32]),
-            bookable: true,
             accounting,
             jdp_session_id: None,
             published_at_ms: 1_000,
@@ -7179,10 +7171,10 @@ pub(crate) mod tests {
     /// `entry` at revenue `t`.
     fn conformant_outputs(entry: &crate::bridge::PayoutDistributionEntry, t: u64) -> Vec<u8> {
         let outputs = compute_payout_vector(
-            &entry.pool_payout,
-            &entry.payouts,
-            &entry.dust_limits,
-            &entry.additional_outputs,
+            &entry.built.pool_payout,
+            &entry.built.payouts,
+            &entry.built.dust_limits,
+            &entry.built.additional_outputs,
             t,
         )
         .unwrap();
@@ -7247,7 +7239,10 @@ pub(crate) mod tests {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
-        let fingerprint = entry.payouts_fingerprint.expect("fixture must carry one");
+        let fingerprint = entry
+            .built
+            .payouts_fingerprint
+            .expect("fixture must carry one");
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -8701,10 +8696,10 @@ pub(crate) mod tests {
             assert!(
                 crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
                     &outputs,
-                    &entry.pool_payout,
-                    &entry.payouts,
-                    &entry.dust_limits,
-                    &entry.additional_outputs,
+                    &entry.built.pool_payout,
+                    &entry.built.payouts,
+                    &entry.built.dust_limits,
+                    &entry.built.additional_outputs,
                 )
                 .is_ok(),
                 "the {label} coinbase must be ext 0x0003/Output Verification-conformant, or this test \

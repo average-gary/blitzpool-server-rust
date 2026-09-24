@@ -644,7 +644,7 @@ impl ProductionDistributionSource {
         d: &bp_pplns::WeightDistribution,
         fingerprint: Option<[u8; 32]>,
         bookable: bool,
-    ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
+    ) -> Option<bp_stratum_v2::bridge::BuiltPayoutDistribution> {
         let pool_script = self.script_of(d.fee_address.as_str())?;
         let mut payouts = Vec::new();
         let mut dust_limits = Vec::new();
@@ -659,7 +659,7 @@ impl ProductionDistributionSource {
             });
             dust_limits.push(entry.dust_limit);
         }
-        Some(bp_stratum_v2::jdp_server::BuiltPayoutDistribution {
+        Some(bp_stratum_v2::bridge::BuiltPayoutDistribution {
             pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
                 script_pubkey: pool_script,
                 weight: d.weight_p,
@@ -683,7 +683,7 @@ impl ProductionDistributionSource {
         pool_weight: u64,
         entries: &[(String, u64)],
         reference_reward_sats: u64,
-    ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
+    ) -> Option<bp_stratum_v2::bridge::BuiltPayoutDistribution> {
         let pool_script = self.script_of(pool_addr)?;
         let mut payouts = Vec::new();
         let mut dust_limits = Vec::new();
@@ -697,7 +697,7 @@ impl ProductionDistributionSource {
             });
             dust_limits.push(bp_pplns::DUST_LIMIT_SATS as u32);
         }
-        Some(bp_stratum_v2::jdp_server::BuiltPayoutDistribution {
+        Some(bp_stratum_v2::bridge::BuiltPayoutDistribution {
             pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
                 script_pubkey: pool_script,
                 weight: pool_weight.max(1),
@@ -715,7 +715,7 @@ impl ProductionDistributionSource {
 
 #[async_trait]
 impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistributionSource {
-    async fn build_pool_wide(&self) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
+    async fn build_pool_wide(&self) -> Option<bp_stratum_v2::bridge::BuiltPayoutDistribution> {
         let t_ref = self.chain.reference_revenue()?;
         let pplns = self.resolver.pplns.as_ref()?;
         let result = match pplns.build_distribution(t_ref).await {
