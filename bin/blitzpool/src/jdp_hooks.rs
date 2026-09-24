@@ -76,7 +76,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use bitcoin::block::{Block, Header, Version as BlockVersion};
 use bitcoin::blockdata::transaction::Transaction;
-use bitcoin::consensus::{encode::serialize_hex, Decodable};
+use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
@@ -96,7 +96,7 @@ use bp_stratum_v2::mining::submit::assemble_witness_coinbase;
 use bp_template_distribution::{TdpHandle, TemplateTxCache};
 use tracing::{debug, info, warn};
 
-use crate::block_sink::FoundBlockRecord;
+use crate::block_sink::{decode_whole_tx, FoundBlockRecord};
 use crate::payout_resolver::ProductionPayoutResolver;
 
 /// Build the production `JdpServerHooks` aggregate. The four hooks
@@ -723,28 +723,6 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
     async fn record_unbookable(&self, record: FoundBlockRecord) -> bool {
         self.record_declared_block_without_booking(record).await
     }
-}
-
-/// Decode a transaction and require that it consumed EVERY byte.
-///
-/// `Transaction::consensus_decode` reads from a slice and stops when it has a
-/// complete transaction. On a malformed input that happens to start with a
-/// valid one it therefore SUCCEEDS, silently, on a prefix — which is how a
-/// double-wrapped coinbase turned into a 21-byte transaction with no inputs
-/// instead of an error. Anything reassembled into a block has to be the whole
-/// thing, so a remainder is a failure.
-fn decode_whole_tx(bytes: &[u8]) -> Option<Transaction> {
-    let mut cursor = bytes;
-    let tx = Transaction::consensus_decode(&mut cursor).ok()?;
-    if !cursor.is_empty() {
-        warn!(
-            total = bytes.len(),
-            consumed = bytes.len() - cursor.len(),
-            "JDP block: transaction decoded from a PREFIX only — treating as malformed"
-        );
-        return None;
-    }
-    Some(tx)
 }
 
 /// Reassemble the block a `PushSolution` describes: the JDC's coinbase plus

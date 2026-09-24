@@ -1508,22 +1508,48 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
 }
 
 /// Decode the submitted witness coinbase into its per-address payment
-/// record. `None` (with a warn) if the bytes don't parse — settlement
-/// then has no actuals and the block is reported-not-booked rather
-/// than booked from a guess.
+/// record. `None` (with a warn) if the bytes are not exactly one
+/// transaction — settlement then has no actuals and the block is
+/// reported-not-booked rather than booked from a guess.
+///
+/// Strict through [`decode_whole_tx`], as the JDP path always was: a
+/// coinbase decoded from a prefix would book the prefix's outputs.
 fn decode_actual_coinbase(
     witness_coinbase: &[u8],
     network: bitcoin::Network,
 ) -> Option<ActualCoinbase> {
-    match <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(
-        &mut &witness_coinbase[..],
-    ) {
-        Ok(tx) => Some(ActualCoinbase::from_coinbase(&tx, network)),
-        Err(err) => {
-            warn!(%err, "block-found: submitted coinbase failed to decode — no actuals for settlement");
-            None
-        }
+    let Some(tx) = decode_whole_tx(witness_coinbase) else {
+        warn!(
+            len = witness_coinbase.len(),
+            "block-found: submitted coinbase is not exactly one transaction — no actuals for \
+             settlement"
+        );
+        return None;
+    };
+    Some(ActualCoinbase::from_coinbase(&tx, network))
+}
+
+/// Decode a transaction and require that it consumed EVERY byte.
+///
+/// `Transaction::consensus_decode` reads from a slice and stops when it has a
+/// complete transaction. On a malformed input that happens to start with a
+/// valid one it therefore SUCCEEDS, silently, on a prefix — which is how a
+/// double-wrapped coinbase turned into a 21-byte transaction with no inputs
+/// instead of an error. Anything reassembled into a block, or booked from,
+/// has to be the whole thing, so a remainder is a failure.
+pub(crate) fn decode_whole_tx(bytes: &[u8]) -> Option<bitcoin::Transaction> {
+    let mut cursor = bytes;
+    let tx = <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(&mut cursor)
+        .ok()?;
+    if !cursor.is_empty() {
+        warn!(
+            total = bytes.len(),
+            consumed = bytes.len() - cursor.len(),
+            "transaction decoded from a PREFIX only — treating as malformed"
+        );
+        return None;
     }
+    Some(tx)
 }
 
 /// Compute the standard Bitcoin block hash display form (big-endian
@@ -1633,6 +1659,45 @@ mod tests {
              mining it would pay the pre-settlement balances a second time"
         );
         server.shutdown().await;
+    }
+
+    /// The SV1/SV2 block path books from `decode_actual_coinbase`, so it must
+    /// be as strict as the JDP path: bytes that decode from a PREFIX would
+    /// book the prefix's outputs. Both directions in one test — the real
+    /// witness coinbase still decodes, so strictness cannot cost a block.
+    #[test]
+    fn a_coinbase_with_trailing_bytes_books_nothing() {
+        let miner = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let job = build_mining_job(
+            Network::Regtest,
+            &[PayoutEntry {
+                address: miner.to_string(),
+                sats: 5_000_000_000,
+            }],
+            &CoinbaseTemplate {
+                block_height: 42,
+                coinbase_value_sats: 5_000_000_000,
+                witness_commitment: [0x77; 32],
+            },
+            "BP",
+            EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
+        )
+        .expect("build job");
+        let mut witness = job.witness_coinbase_with_extranonce(&[0xAA; 4], &[0xBB; 8]);
+
+        let actual = decode_actual_coinbase(&witness, Network::Regtest)
+            .expect("the coinbase a job really builds must decode");
+        assert_eq!(
+            actual.total_value_sats, 5_000_000_000,
+            "precondition: the clean bytes carry the whole payout"
+        );
+
+        witness.extend_from_slice(&[0xAB; 8]);
+        assert!(
+            decode_actual_coinbase(&witness, Network::Regtest).is_none(),
+            "trailing bytes mean this is not the coinbase the block paid"
+        );
     }
 
     /// No JDP server (the common deployment): settling is a no-op, not a
