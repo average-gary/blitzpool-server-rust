@@ -7,10 +7,7 @@ use std::str::FromStr;
 use bitcoin::{Address, AddressType};
 use bp_common::Sats;
 
-/// Bitcoin Core's default dust policy value for P2PKH at
-/// `dustRelayFee = 3000 sat/kvB`. Outputs below this can't be relayed as
-/// standard transactions.
-pub const DUST_LIMIT_SATS: u64 = 546;
+pub use bp_common::DUST_LIMIT_SATS;
 
 /// Pool's default minimum on-chain payout. Outputs below stay as pending
 /// credit in the signed ledger until they accumulate past the threshold.

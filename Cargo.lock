@@ -517,6 +517,7 @@ dependencies = [
  "bitcoin_core_sv2",
  "bp-api",
  "bp-bitcoin",
+ "bp-blockparty",
  "bp-blockparty-engine",
  "bp-client-live",
  "bp-coinbase-snapshot",
@@ -527,7 +528,6 @@ dependencies = [
  "bp-geoip",
  "bp-group-mgmt-engine",
  "bp-group-solo-engine",
- "bp-jobs-lifecycle",
  "bp-metrics",
  "bp-mining-job",
  "bp-mining-mode",
@@ -650,7 +650,6 @@ name = "bp-blockparty"
 version = "2.3.5"
 dependencies = [
  "bp-common",
- "bp-pplns",
  "serde",
 ]
 

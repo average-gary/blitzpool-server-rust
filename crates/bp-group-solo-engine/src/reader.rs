@@ -77,11 +77,14 @@ impl ReaderView<'_> {
             Some(g) => crate::engine::group_mode_from_row(&g),
             None => (PayoutMode::Prop, 0),
         };
-        if mode != PayoutMode::Window {
-            return Ok(WindowTimeline {
-                window_ms: 0,
-                buckets: Vec::new(),
-            });
+        match mode {
+            PayoutMode::Window => {}
+            PayoutMode::Prop => {
+                return Ok(WindowTimeline {
+                    window_ms: 0,
+                    buckets: Vec::new(),
+                });
+            }
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let buckets = self

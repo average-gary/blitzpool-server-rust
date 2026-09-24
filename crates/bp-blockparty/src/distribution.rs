@@ -15,9 +15,17 @@
 //! Inputs are trusted: the service layer enforces `Σ percentBp == 10000`.
 //! A mis-summed input under/over-pays; the residual lands in pool-fee.
 
-use bp_common::{AddressId, Sats};
-use bp_pplns::{CoinbaseDistributionEntry, DUST_LIMIT_SATS};
+use bp_common::{AddressId, Sats, DUST_LIMIT_SATS};
 use serde::{Deserialize, Serialize};
+
+/// One coinbase output of a party's split: address + on-chain sats +
+/// percent of the block reward.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CoinbaseDistributionEntry {
+    pub address: AddressId,
+    pub percent: f64,
+    pub sats: Sats,
+}
 
 /// One member's split contribution to a block. Persisted as-is into
 /// the `blockparty_block_history.splits` JSONB column.

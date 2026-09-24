@@ -206,6 +206,15 @@ pub enum ConfigError {
     ZeroUnsignedField { field: &'static str },
 }
 
+/// Epoch-ms before which an owner counts as gone after `abandoned_days`
+/// without a share. The one place that turns `[pplns]
+/// abandoned_balance_days` into a boundary: the dust sweep's abandoned
+/// credits, the window trim's age rule and the ledger summary's abandoned
+/// buckets all read it through here.
+pub(crate) fn abandoned_cutoff_ms(now_ms: i64, abandoned_days: u32) -> i64 {
+    now_ms - (abandoned_days as i64) * 86_400_000
+}
+
 #[cfg(test)]
 mod tests {
     use bp_pplns::{COINBASE_BASE_WEIGHT, DUST_LIMIT_SATS};

@@ -419,10 +419,10 @@ impl PplnsEngine {
     /// the design.
     ///
     /// Idempotent on redelivery without a guard of its own:
-    /// `pplns_payout_history` is UNIQUE on `(blockHeight, address)` and
-    /// the balance upsert only runs when history rows were actually
-    /// inserted, so a second delivery writes nothing and reports
-    /// `history_inserted == 0`.
+    /// [`crate::ledger::apply_distribution`] checks the height's existing
+    /// payout history first. A redelivery whose value rows match what is
+    /// booked writes nothing and reports `history_inserted == 0`; one whose
+    /// rows differ is an error, never a second booking.
     pub async fn on_block_found(
         &self,
         block_height: i32,
@@ -638,11 +638,7 @@ impl PplnsEngine {
                 audit_rows.push(AuditRow {
                     address: addr_id.clone(),
                     paid_sats: Sats(paid as i64),
-                    percent: if t > 0 {
-                        (paid as f64 / t as f64 * 100.0) as f32
-                    } else {
-                        0.0
-                    },
+                    percent: actual.percent_of_total(paid),
                     row_type: PayoutRowType::Coinbase,
                 });
             } else if delta != 0 {
@@ -687,11 +683,7 @@ impl PplnsEngine {
                 audit_rows.push(AuditRow {
                     address: addr_id.clone(),
                     paid_sats: Sats(*paid as i64),
-                    percent: if t > 0 {
-                        (*paid as f64 / t as f64 * 100.0) as f32
-                    } else {
-                        0.0
-                    },
+                    percent: actual.percent_of_total(*paid),
                     row_type: PayoutRowType::Coinbase,
                 });
                 emitted.insert(addr_str.clone());

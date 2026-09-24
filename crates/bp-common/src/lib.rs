@@ -23,6 +23,12 @@ use serde::{Deserialize, Serialize};
 /// live hashrate sampler and the API charts all use.
 pub const HASHES_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
 
+/// Bitcoin Core's default dust policy value for P2PKH at
+/// `dustRelayFee = 3000 sat/kvB`. Outputs below this can't be relayed as
+/// standard transactions. Every payout mode floors its coinbase outputs
+/// here.
+pub const DUST_LIMIT_SATS: u64 = 546;
+
 pub mod display;
 pub use display::{short_address, short_address_with_tail};
 pub mod extranonce;

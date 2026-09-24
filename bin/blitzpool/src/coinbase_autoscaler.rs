@@ -68,19 +68,19 @@ fn params_from_config(cfg: &CoinbaseAutoscaleConfig, floor: u32) -> AutoscalePar
 }
 
 /// Apply `new_budget`, coupling the trimmer budget to bitcoin-core's
-/// reservation in the race-safe order, then persist. Returns `true` if the
-/// change fully took effect (so the caller can resync the control core's
-/// belief on partial failure).
+/// reservation in the race-safe order, then persist. Returns nothing: an
+/// aborted raise leaves `live` unchanged, and both callers read what took
+/// effect back from `live`.
 async fn apply_budget(
     new_budget: u32,
     live: &LiveBudget,
     engine: &PplnsEngine,
     tdp: &TdpHandle,
     redis: &mut ConnectionManager,
-) -> bool {
+) {
     let current = live.get();
     if new_budget == current {
-        return true;
+        return;
     }
     let c = crate::boot::tdp_constraint_for_budget(new_budget);
 
@@ -131,7 +131,6 @@ async fn apply_budget(
             new_budget, "autoscale: coinbase weight budget changed"
         );
     }
-    applied
 }
 
 /// Boot reconcile: adopt the persisted budget (if any), clamped to

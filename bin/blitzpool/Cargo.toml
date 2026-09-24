@@ -38,6 +38,7 @@ bp-pplns-engine = { workspace = true }
 # Durable coinbase-budget persistence (autoscaler).
 bp-coinbase-snapshot = { workspace = true }
 bp-group-solo-engine = { workspace = true }
+bp-blockparty = { workspace = true }
 bp-blockparty-engine = { workspace = true }
 bp-share-stats-sink = { workspace = true }
 bp-session-persistence = { workspace = true }
@@ -56,8 +57,7 @@ sqlx = { workspace = true }
 chrono = { workspace = true }
 
 # BlockSubmissionSink wiring (`block_sink.rs`) — Stratum-server
-# protocol crate + the MiningJob coinbase-assembly helper + the
-# JobClassification enum used in the per-test ShareAccept builder.
+# protocol crate + the MiningJob coinbase-assembly helper.
 bp-stratum-v1 = { workspace = true }
 bp-stratum-v2 = { workspace = true }
 jd_server_sv2 = { workspace = true }
@@ -65,7 +65,6 @@ stratum-core = { workspace = true }
 bitcoin_core_sv2 = { workspace = true }
 bp-share = { workspace = true }
 bp-mining-job = { workspace = true }
-bp-jobs-lifecycle = { workspace = true }
 # `bitcoin::Network` for the test fixture.
 bitcoin = { workspace = true }
 

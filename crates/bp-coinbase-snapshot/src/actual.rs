@@ -59,6 +59,17 @@ impl ActualCoinbase {
             total_value_sats,
         }
     }
+
+    /// `sats` as a percentage of the block's actual revenue, for the
+    /// `percent` column of a payout-history row. Display only: nothing
+    /// books from it. `0.0` for a zero-value coinbase.
+    pub fn percent_of_total(&self, sats: u64) -> f32 {
+        if self.total_value_sats > 0 {
+            (sats as f64 / self.total_value_sats as f64 * 100.0) as f32
+        } else {
+            0.0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -107,6 +118,27 @@ mod tests {
         assert_eq!(actual.total_value_sats, 1000);
         assert_eq!(actual.paid_by_address.len(), 1);
         assert_eq!(actual.paid_by_address[MINER], 600);
+    }
+
+    #[test]
+    fn percent_of_total_is_share_of_actual_revenue() {
+        let actual = ActualCoinbase {
+            paid_by_address: HashMap::new(),
+            pool_paid_sats: 0,
+            total_value_sats: 3_125_004_321,
+        };
+        for paid in [0u64, 1, 546, 1_000_000, 1_562_502_160, 3_125_004_321] {
+            assert_eq!(
+                actual.percent_of_total(paid),
+                (paid as f64 / 3_125_004_321f64 * 100.0) as f32
+            );
+        }
+        let empty = ActualCoinbase {
+            paid_by_address: HashMap::new(),
+            pool_paid_sats: 0,
+            total_value_sats: 0,
+        };
+        assert_eq!(empty.percent_of_total(600), 0.0);
     }
 
     /// `fee address doubling as miner: the two outputs stay separate`

@@ -18,8 +18,8 @@
 //! 1. Consult [`BlitzpoolModeGate::lookup_mode`] for the address.
 //! 2. **Solo** → [`solo_payouts`] (single 100%-to-miner OR split
 //!    with `dev_fee_address`/`dev_fee_percent` when configured).
-//! 3. **Pplns** → [`PplnsEngine::build_distribution`] →
-//!    `Vec<CoinbaseDistributionEntry>` → `Vec<PayoutEntry>`.
+//! 3. **Pplns** → [`PplnsEngine::build_distribution`] → the weight
+//!    distribution's payouts as `Vec<PayoutEntry>`.
 //! 4. **GroupSolo** → [`GroupSoloEngine::build_distribution`] (need
 //!    the group_id from the gate's `MiningModeResult.group_id` field
 //!    plus the miner's own `AddressId` as the finder).
@@ -46,13 +46,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bp_blockparty::CoinbaseDistributionEntry;
 use bp_blockparty_engine::BlockpartyApi;
 use bp_common::{AddressId, MiningMode, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 /// Re-exported so the wiring keeps one import path for the solo split.
 pub(crate) use bp_mining_job::SoloFeeConfig;
 use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
-use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_stratum_v2::bridge::DistributionAccounting;
 use bp_stratum_v2::jdp_server::TailoredDistribution;
@@ -418,14 +418,7 @@ impl ProductionPayoutResolver {
         let svc = self.blockparty.as_ref()?;
         let addr = AddressId::new(miner_address.to_string()).ok()?;
         let route = svc.pending_party_fee_route(&addr).await?;
-        // Single output at `route.percent` (100% for the pending-fee route) →
-        // exact sats. The coinbase builder's remainder guard tops up any
-        // sub-1-sat floor loss on this sole output.
-        let sats = ((route.percent as f64 / 100.0) * reward_sats as f64).floor() as u64;
-        Some(vec![PayoutEntry {
-            address: route.fee_address.into_inner(),
-            sats,
-        }])
+        Some(pending_fee_route_payouts(route, reward_sats))
     }
 
     async fn blockparty_payouts(
@@ -900,6 +893,18 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
+/// The pending-fee route's coinbase: one output, the whole reward to the
+/// pool-fee address.
+fn pending_fee_route_payouts(
+    route: bp_blockparty_engine::PendingPartyFeeRoute,
+    reward_sats: u64,
+) -> Vec<PayoutEntry> {
+    vec![PayoutEntry {
+        address: route.fee_address.into_inner(),
+        sats: reward_sats,
+    }]
+}
+
 /// Translate the engine's `CoinbaseDistributionEntry` shape into the
 /// `bp_mining_job::PayoutEntry` shape consumed by `build_mining_job_from_tdp`.
 /// Carries the EXACT per-output sats the distributor computed (largest-remainder
@@ -1159,6 +1164,34 @@ mod tests {
         assert_eq!(r.len(), 1, "no zero-value dev output");
         assert_eq!(r[0].address, "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
+    }
+
+    /// The route used to carry a `percent` that was always 100 and ran the
+    /// reward through `floor(100 / 100 · reward)` in f64. Paying the reward
+    /// directly must give the same satoshis for every reward that occurs —
+    /// every subsidy era plus fees, up to the whole money supply, where f64
+    /// is still exact.
+    #[test]
+    fn pending_fee_route_pays_what_the_percent_formula_paid() {
+        let fee = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let mut rewards = vec![0u64, 1, 546, 2_100_000_000_000_000];
+        for era in 0..34u32 {
+            let subsidy = 5_000_000_000u64 >> era;
+            rewards.extend([subsidy, subsidy + 1, subsidy + 12_345_678]);
+        }
+        for reward in rewards {
+            let route = bp_blockparty_engine::PendingPartyFeeRoute {
+                fee_address: AddressId::new(fee.to_string()).unwrap(),
+            };
+            let paid = pending_fee_route_payouts(route, reward);
+            assert_eq!(paid.len(), 1);
+            assert_eq!(paid[0].address, fee);
+            assert_eq!(
+                paid[0].sats,
+                PayoutEntry::from_percent(fee, 100.0, reward).sats,
+                "reward {reward}"
+            );
+        }
     }
 
     #[test]

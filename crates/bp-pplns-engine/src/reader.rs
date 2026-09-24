@@ -236,7 +236,7 @@ impl ReaderView<'_> {
     pub async fn ledger_summary(&self) -> Result<LedgerSummary, EngineError> {
         let cfg = self.engine.config();
         let now_ms = Utc::now().timestamp_millis();
-        let cutoff_ms = now_ms - (cfg.abandoned_balance_days as i64) * 86_400_000;
+        let cutoff_ms = crate::config::abandoned_cutoff_ms(now_ms, cfg.abandoned_balance_days);
 
         // One PG round-trip — credit/debit sums, row counts, abandoned
         // buckets and lifetime payout are all computed in SQL. The

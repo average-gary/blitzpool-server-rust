@@ -101,14 +101,12 @@ pub struct MarkMemberConfirmedResult {
     pub member_token: Option<String>,
 }
 
-/// Result of [`BlockpartyService::pending_party_fee_route`]. Wraps the
-/// concrete pool-fee output the Solo-fallback path must emit when the
-/// admin's address belongs to an unconfirmed party.
+/// Result of [`BlockpartyService::pending_party_fee_route`]. Names the
+/// pool-fee address the Solo-fallback path must pay the WHOLE block reward
+/// to when the admin's address belongs to an unconfirmed party.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPartyFeeRoute {
     pub fee_address: AddressId,
-    /// Always 100. Encoded as a field so the type doesn't lie.
-    pub percent: u8,
 }
 
 // ─── Service struct ────────────────────────────────────────────────
@@ -230,10 +228,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
     ) -> Option<PendingPartyFeeRoute> {
         let _gid = self.cache.pending_fee_route_admin(address).await?;
         let fee_address = self.config.fee_address.clone()?;
-        Some(PendingPartyFeeRoute {
-            fee_address,
-            percent: 100,
-        })
+        Some(PendingPartyFeeRoute { fee_address })
     }
 
     /// Member-side lookup. Returns the party's group id if `address`

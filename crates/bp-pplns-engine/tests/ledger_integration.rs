@@ -16,8 +16,8 @@
 
 use bp_common::{AddressId, Sats};
 use bp_pplns_engine::ledger::{
-    apply_distribution, coinbase_row, pending_row, touch_buffer::flush_once,
-    touch_buffer::TouchBuffer, ApplyDistributionResult, AuditRow, BalanceWrite, PayoutRowType,
+    apply_distribution, pending_row, touch_buffer::flush_once, touch_buffer::TouchBuffer,
+    ApplyDistributionResult, AuditRow, BalanceWrite, PayoutRowType,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
@@ -294,10 +294,10 @@ async fn apply_distribution_mixed_row_types() {
     cleanup(&pool, prefix, &[block_height]).await;
 }
 
-// ── Test 4 — coinbase_row constructor matches manual build ─────────
+// ── Test 4 — a coinbase row's fields survive the round trip ────────
 
 #[tokio::test]
-async fn coinbase_row_constructor_roundtrips_via_apply_distribution() {
+async fn coinbase_audit_row_roundtrips_via_apply_distribution() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -307,12 +307,12 @@ async fn coinbase_row_constructor_roundtrips_via_apply_distribution() {
     cleanup(&pool, prefix, &[block_height]).await;
 
     let addr = AddressId::new(format!("{prefix}miner")).unwrap();
-    let entry = bp_pplns::CoinbaseDistributionEntry {
+    let row = AuditRow {
         address: addr.clone(),
+        paid_sats: Sats(83_333),
         percent: 33.33,
-        sats: Sats(83_333),
+        row_type: PayoutRowType::Coinbase,
     };
-    let row = coinbase_row(&entry);
 
     let result = apply_in_tx(
         &pool,

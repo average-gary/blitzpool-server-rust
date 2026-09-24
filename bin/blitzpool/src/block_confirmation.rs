@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::pending_blocks::{
-    count_pending_at, load_pending_blocks, put_pending_at, remove_pending_at, remove_pending_block,
+    count_pending_at, load_pending_blocks, park_unbookable_block, remove_pending_block,
     PendingBlock, SettlementMode, PENDING_KEY, UNBOOKABLE_KEY,
 };
 
@@ -172,27 +172,25 @@ async fn classify_block(bitcoin_rpc: &BitcoinRpc, block_hash: &str, depth: i64) 
     }
 }
 
-/// Load every parked entry under `key`, prune unparsable ones, discard
+/// Load every entry in the pending store, prune unparsable ones, discard
 /// orphaned/gone ones, and return the CONFIRMED entries ready to apply (left in
 /// the store — the caller removes each after a successful apply, so a failed
 /// apply is retried next tick). The engine-agnostic half of the pass.
 async fn collect_confirmed(
     bitcoin_rpc: &BitcoinRpc,
     conn: &mut ConnectionManager,
-    key: &str,
     depth: i64,
-    label: &str,
 ) -> Vec<PendingBlock> {
-    let (pending, unparsable) = match load_pending_blocks(conn, key).await {
+    let (pending, unparsable) = match load_pending_blocks(conn).await {
         Ok(v) => v,
         Err(err) => {
-            warn!(%err, label, "block-confirmation: load pending failed; retry next tick");
+            warn!(%err, "block-confirmation: load pending failed; retry next tick");
             return Vec::new();
         }
     };
     for hash in unparsable {
-        warn!(label, block_hash = %hash, "block-confirmation: pruning unparsable pending entry");
-        let _ = remove_pending_at(conn, key, &hash).await;
+        warn!(block_hash = %hash, "block-confirmation: pruning unparsable pending entry");
+        let _ = remove_pending_block(conn, &hash).await;
     }
 
     let mut confirmed = Vec::new();
@@ -201,17 +199,15 @@ async fn collect_confirmed(
             BlockStatus::Confirmed => confirmed.push(pb),
             BlockStatus::Orphaned => {
                 warn!(
-                    label,
                     block_hash = %pb.block_hash,
                     height = pb.block_height,
                     "block-confirmation: block orphaned / not on active chain — discarding frozen \
                      distribution (no on-chain payment occurred)"
                 );
-                let _ = remove_pending_at(conn, key, &pb.block_hash).await;
+                let _ = remove_pending_block(conn, &pb.block_hash).await;
             }
             BlockStatus::Maturing => {}
             BlockStatus::Unknown => warn!(
-                label,
                 block_hash = %pb.block_hash,
                 "block-confirmation: getblockheader failed; will retry next tick"
             ),
@@ -270,7 +266,7 @@ async fn reconcile(
 ) {
     let depth = i64::from(confirmation_depth);
     let mut conn = redis.clone();
-    let confirmed = collect_confirmed(bitcoin_rpc, &mut conn, PENDING_KEY, depth, "pool").await;
+    let confirmed = collect_confirmed(bitcoin_rpc, &mut conn, depth).await;
 
     for pb in confirmed {
         // Settlement is `claim − paid` against the block's OWN coinbase,
@@ -319,7 +315,7 @@ async fn reconcile(
             Err(err) if err.is_terminal() => {
                 // Park, don't destroy: the frozen blob is the only record
                 // of what this block paid every miner.
-                let parked = put_pending_at(&mut conn, UNBOOKABLE_KEY, &pb).await.is_ok();
+                let parked = park_unbookable_block(&mut conn, &pb).await.is_ok();
                 error!(
                     %err,
                     block_hash = %pb.block_hash,
@@ -829,17 +825,15 @@ mod declared_block_booking_regtest {
         }
 
         fn sink(&self) -> TdpBlockSubmissionSink {
-            TdpBlockSubmissionSink::new(self.tdp.clone())
-                .with_network(Network::Regtest)
-                .with_fanout(
-                    self.gate.clone(),
-                    Some(self.pplns.clone()),
-                    self.group_solo.clone(),
-                    None,
-                    self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
-                )
-                .with_pool(self.pg.clone())
-                .with_redis(self.redis.clone())
+            TdpBlockSubmissionSink::new(
+                self.tdp.clone(),
+                self.gate.clone(),
+                self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
+                self.pg.clone(),
+            )
+            .with_network(Network::Regtest)
+            .with_fanout(Some(self.pplns.clone()), self.group_solo.clone(), None)
+            .with_redis(self.redis.clone())
         }
 
         /// Book through the JDP door. `actual = None` models a block whose
@@ -1483,17 +1477,15 @@ mod declared_block_booking_regtest {
         }
 
         fn sink(&self) -> TdpBlockSubmissionSink {
-            TdpBlockSubmissionSink::new(self.tdp.clone())
-                .with_network(Network::Regtest)
-                .with_fanout(
-                    self.gate.clone(),
-                    Some(self.pplns.clone()),
-                    self.group_solo.clone(),
-                    None,
-                    self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
-                )
-                .with_pool(self.pg.clone())
-                .with_redis(self.redis.clone())
+            TdpBlockSubmissionSink::new(
+                self.tdp.clone(),
+                self.gate.clone(),
+                self.node.bitcoin_rpc().expect("regtest BitcoinRpc"),
+                self.pg.clone(),
+            )
+            .with_network(Network::Regtest)
+            .with_fanout(Some(self.pplns.clone()), self.group_solo.clone(), None)
+            .with_redis(self.redis.clone())
         }
 
         async fn book(

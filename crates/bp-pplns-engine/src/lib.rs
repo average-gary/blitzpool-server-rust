@@ -27,9 +27,8 @@
 //! - [`ledger`] — Postgres-backed signed credit/debit ledger.
 //!   Balance bulk-upsert + history bulk-insert in one TX, lastAcceptedShareAt
 //!   60s flush buffer.
-//! - [`distribution`] — `build_distribution` wrapper around
-//!   `bp_pplns::build_coinbase_distribution` with snapshot-readback +
-//!   recompute-fallback.
+//! - [`distribution`] — `build_distribution` wrapper around the shared
+//!   weight build + snapshot write, `bp_coinbase_snapshot::build_and_snapshot`.
 //! - [`sweep`] — daily 03:00 UTC `tokio`-loop that pair-cancels
 //!   abandoned credits ↔ debits. Group-solo dust-absorption lives in
 //!   the future `bp-group-solo-engine` crate.

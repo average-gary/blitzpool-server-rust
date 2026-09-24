@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use bp_common::AddressId;
 use bp_db::PplnsGroupJoinRequestRow;
 use bp_group_mgmt::token::TokenHash;
 use sqlx::PgPool;
@@ -383,8 +382,3 @@ fn is_unique_violation(err: &bp_db::DbError) -> bool {
         _ => false,
     }
 }
-
-/// AddressId fwd-ref to keep clippy happy about the unused import — not
-/// strictly needed but mirrors the style other modules use.
-#[allow(dead_code)]
-fn _force_address_id_use(_: AddressId) {}

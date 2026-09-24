@@ -200,10 +200,9 @@ pub(crate) async fn spawn(
         accepted_sink,
         rejected_sink,
         session_persistence_hook,
-        // Blockparty wiring lands in a follow-up patch — needs the
-        // AddressEmailService handle for invitation flow and a
-        // dedicated config block. None disables the feature without
-        // touching any other code path.
+        // Filled in by main.rs once `blockparty_service::spawn` has run —
+        // it needs the GroupService, which is built after the engines.
+        // Stays `None` when the Blockparty feature is not configured.
         blockparty: None,
     })
 }
@@ -496,7 +495,10 @@ impl BlitzpoolModeGate {
         }
     }
 
-    fn lookup(&self, address: &str) -> MiningModeResult {
+    /// The mode for `address`, Solo when the gate has never been told. The
+    /// full `MiningModeResult` (mode + optional group_id), for the share
+    /// producer, the payout resolver and block-found.
+    pub(crate) fn lookup_mode(&self, address: &str) -> MiningModeResult {
         self.lookup_known(address)
             .unwrap_or_else(MiningModeResult::solo)
     }
@@ -508,7 +510,7 @@ impl BlitzpoolModeGate {
     /// deregister), and for Solo vs PPLNS there is no persistent record to
     /// fall back on: the port the miner connects to IS the declaration. So an
     /// address the gate does not know is genuinely undecided, and
-    /// [`Self::lookup`]'s Solo default is a guess.
+    /// [`Self::lookup_mode`]'s Solo default is a guess.
     ///
     /// Callers that only need to route a live connection can keep guessing —
     /// by then a session exists, so the guess never fires. A caller that acts
@@ -526,15 +528,7 @@ impl BlitzpoolModeGate {
     /// payout rows, so a Solo block without them is normal. Every other mode
     /// books, and a missing row there is a real miss.
     pub(crate) fn keeps_a_payout_ledger(&self, address: &str) -> bool {
-        !matches!(self.lookup(address).mode, MiningMode::Solo)
-    }
-
-    /// Public alias of [`Self::lookup`] for the
-    /// [`crate::payout_resolver::ProductionPayoutResolver`] — needs
-    /// full `MiningModeResult` (mode + optional group_id), not just
-    /// the slice the trait surfaces expose.
-    pub(crate) fn lookup_mode(&self, address: &str) -> MiningModeResult {
-        self.lookup(address)
+        !matches!(self.lookup_mode(address).mode, MiningMode::Solo)
     }
 
     /// Resolve an address to its **Group-Solo** `group_id` — `None` for any
@@ -542,11 +536,11 @@ impl BlitzpoolModeGate {
     /// a Group-Solo group). The single source of the Group-Solo group filter
     /// the rejected composite stamps from.
     pub(crate) fn group_for_address(&self, address: &str) -> Option<Uuid> {
-        let r = self.lookup(address);
-        if r.mode != MiningMode::GroupSolo {
-            return None;
+        let r = self.lookup_mode(address);
+        match r.mode {
+            MiningMode::GroupSolo => r.group_id.and_then(|s| Uuid::parse_str(&s).ok()),
+            MiningMode::Solo | MiningMode::Pplns | MiningMode::Blockparty => None,
         }
-        r.group_id.and_then(|s| Uuid::parse_str(&s).ok())
     }
 
     /// Snapshot the connected addresses currently gated `Solo` or `GroupSolo`

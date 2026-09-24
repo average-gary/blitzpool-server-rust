@@ -1,29 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared distribution record types.
+//! Distribution telemetry.
 //!
 //! The satoshi allocation itself lives in [`crate::weights`]: the pool's
 //! payout model is the SV2 ext 0x0003 §4 weight formula
 //! (`floor(weight·T/W)` with dust pruning and the pool output absorbing
 //! the remainder), evaluated by the pool's own coinbase build, by every
 //! job-declaration client at its own template revenue, and by the
-//! declared-coinbase validator alike. The former 5-phase sats-exact
-//! allocator was replaced by that model; what remains here are the
-//! record shapes other crates still speak.
-
-use bp_common::{AddressId, Sats};
-
-/// One coinbase output: address + on-chain sats + percent of block reward.
-///
-/// Carried by the schema-1 snapshots still readable from before the
-/// weight model, by the Blockparty allocator (its own integer-exact
-/// split), and by the group history rows.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct CoinbaseDistributionEntry {
-    pub address: AddressId,
-    pub percent: f64,
-    pub sats: Sats,
-}
+//! declared-coinbase validator alike.
 
 /// Per-distribution weight-budget pressure, consumed by the coinbase-budget
 /// autoscaler. Utilization = `desired_weight / effective_budget`: at ≥ 1.0 the
