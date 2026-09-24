@@ -10,20 +10,13 @@ pub struct DispatcherConfig {
     /// IANA timezone for device-status timestamps. Default
     /// `Europe/Zurich` — falls back to `UTC` on parse failure.
     pub timezone: Tz,
-    /// If `false`, `notify_best_diff` is a no-op. Controlled by
-    /// `[notifications.ntfy] diff_notifications` (which disables ntfy
-    /// best-diff spam). We extend the toggle to the whole dispatcher
-    /// because the engine never knows in advance which adapters would
-    /// handle a given event.
-    pub best_diff_enabled: bool,
 }
 
 impl DispatcherConfig {
-    /// Default — `Europe/Zurich` TZ, best-diff enabled.
+    /// Default — `Europe/Zurich` TZ.
     pub fn default_zurich() -> Self {
         Self {
             timezone: chrono_tz::Europe::Zurich,
-            best_diff_enabled: true,
         }
     }
 }

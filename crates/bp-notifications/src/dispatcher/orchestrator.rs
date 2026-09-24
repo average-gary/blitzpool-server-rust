@@ -132,9 +132,6 @@ impl NotificationDispatcher {
     /// responsible for deciding this actually IS a new best (engines
     /// keep that state — dispatcher just sends).
     pub async fn notify_best_diff(&self, address: &AddressId, difficulty: f64) {
-        if !self.config.best_diff_enabled {
-            return;
-        }
         let (telegram_subs, ntfy_sub, push_subs) = self.load_subs(address).await;
         let formatted = format_number_suffix(difficulty);
 

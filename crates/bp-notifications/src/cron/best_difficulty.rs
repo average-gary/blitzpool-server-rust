@@ -3,8 +3,10 @@
 //! Best-difficulty cron — runs every 60 s (offset by `:43` so it
 //! doesn't align with slot-boundary jobs).
 //!
-//! Each tick: look up which addresses have at least one push
-//! subscription, read their persisted `address_settings.bestDifficulty`
+//! Each tick: look up which addresses have a live subscription on any
+//! transport (Telegram, ntfy or push — whether each one wants best-diff is
+//! the dispatcher's per-subscription check), read their persisted
+//! `address_settings.bestDifficulty`
 //! and their `best_difficulty_tracker_entity` row in two bulk reads.
 //! The tracker row is the dedup baseline:
 //!
@@ -25,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bp_common::AddressId;
 use bp_db::{
-    find_address_settings, find_addresses_with_push_subscription,
+    find_address_settings, find_best_difficulty_scan_addresses,
     find_best_difficulty_trackers_for_addresses, upsert_best_difficulty_trackers,
 };
 use sqlx::PgPool;
@@ -128,7 +130,7 @@ pub fn spawn_best_difficulty_cron(
 }
 
 async fn run_once(pool: &PgPool, dispatcher: &NotificationDispatcher) -> Result<(), String> {
-    let addresses = find_addresses_with_push_subscription(pool)
+    let addresses = find_best_difficulty_scan_addresses(pool)
         .await
         .map_err(|e| format!("addresses read: {e}"))?;
     if addresses.is_empty() {

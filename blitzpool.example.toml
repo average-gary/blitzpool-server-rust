@@ -386,13 +386,11 @@ submit_latency = false
 
 # [notifications.telegram]
 # bot_token = "REPLACE-ME"
-# diff_notifications = true
 
 # [notifications.ntfy]
 # server_url = "https://ntfy.example.com"
 # # access_token = "REPLACE-ME"
 # # topic_prefix = "blitzpool-"
-# diff_notifications = false
 
 # [notifications.web_push]
 # vapid_public_key = "REPLACE-ME"

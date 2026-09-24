@@ -991,8 +991,6 @@ impl Default for DeviceStatusConfig {
 #[serde(deny_unknown_fields)]
 pub struct TelegramConfig {
     pub bot_token: String,
-    #[serde(default)]
-    pub diff_notifications: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1003,8 +1001,6 @@ pub struct NtfyConfig {
     pub access_token: Option<String>,
     #[serde(default)]
     pub topic_prefix: Option<String>,
-    #[serde(default)]
-    pub diff_notifications: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
