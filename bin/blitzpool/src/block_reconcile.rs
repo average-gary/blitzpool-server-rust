@@ -302,10 +302,13 @@ pub(crate) async fn run_once(
 /// one block sat there, then replaced by a reorg, would otherwise never be
 /// looked at again — and the replacement is the block that actually pays.
 fn scan_start(checked_through: Option<u64>, tip: u64, lookback: u64) -> u64 {
-    match checked_through {
+    let start = match checked_through {
         Some(h) => h.saturating_add(1).min(tip.saturating_sub(REORG_OVERLAP)),
         None => tip.saturating_sub(lookback),
-    }
+    };
+    // Never genesis: its coinbase cannot pay the pool and bitcoin-core will
+    // not return it.
+    start.max(1)
 }
 
 /// How far this pass may claim to have checked.
@@ -508,10 +511,12 @@ mod tests {
         assert_eq!(scan_start(Some(50), 120, DEFAULT_LOOKBACK), 51);
         // First pass after a restart: the lookback window.
         assert_eq!(scan_start(None, 500, DEFAULT_LOOKBACK), 356);
-        // A chain shorter than the window starts at genesis rather than
-        // underflowing.
-        assert_eq!(scan_start(Some(3), 3, DEFAULT_LOOKBACK), 0);
-        assert_eq!(scan_start(None, 10, DEFAULT_LOOKBACK), 0);
+        // A chain shorter than the window starts at height 1 rather than
+        // underflowing, and not at genesis: its coinbase can never have paid
+        // the pool, and bitcoin-core refuses to return it, so reading it only
+        // produced a "could not check block" warning on every fresh start.
+        assert_eq!(scan_start(Some(3), 3, DEFAULT_LOOKBACK), 1);
+        assert_eq!(scan_start(None, 10, DEFAULT_LOOKBACK), 1);
     }
 
     #[test]

@@ -460,7 +460,7 @@ pub(crate) fn validate_submit(
         tracing::info!(
             worker = %submit.worker,
             job_id = %submit.job_id,
-            height = lookup.template.template_id,
+            template_id = lookup.template.template_id,
             n_bits = format_args!("{:#010x}", lookup.template.n_bits),
             "🎉🎉🎉 !!! BLOCK FOUND !!! (SV1) — submission_diff={:.2}",
             submission_difficulty
