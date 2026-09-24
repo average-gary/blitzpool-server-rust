@@ -2,9 +2,9 @@
 
 //! `BlockSubmissionSink` implementations.
 //!
-//! When a Stratum share's submission difficulty meets / exceeds the
-//! network difficulty derived from the template's `n_bits`, the
-//! per-protocol server fires the block-submission hook. The Rust port
+//! When a Stratum share's hash meets the network target the template's
+//! `n_bits` encodes, the per-protocol server fires the block-submission
+//! hook. The Rust port
 //! routes those through [`TdpBlockSubmissionSink`] which assembles the
 //! witness-form coinbase from the share's owned `MiningJob` snapshot
 //! plus the parsed extranonces, then calls
@@ -1782,8 +1782,6 @@ mod tests {
                     prev_hash: [0u8; 32],
                     n_bits: 0x1d00ffff,
                     header_timestamp: 0x12345678,
-                    network_target: [0xff; 32],
-                    network_difficulty: bp_share::Difficulty(1.0),
                     coinbase_prefix: vec![],
                     coinbase_tx_version: 2,
                     coinbase_tx_input_sequence: 0xffff_ffff,

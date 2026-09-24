@@ -301,11 +301,8 @@ pub struct StandardJobContext<'a> {
     /// 32-byte previous-block hash from the template.
     pub prev_hash: [u8; 32],
     /// `n_bits` (`block.bits`) from the template — encodes the network
-    /// target.
+    /// target the block-found gate checks.
     pub n_bits: u32,
-    /// Network difficulty derived from `n_bits`. Cached on the template
-    /// so we don't recompute per-share.
-    pub network_difficulty: Difficulty,
     /// Job classification from the central registry (`JobNotFound` /
     /// `Active` / `StaleCreditable` / `StaleRejected`). `None` for
     /// genuinely missing jobs.
@@ -498,11 +495,10 @@ pub struct ExtendedChannelView {
 /// `job_difficulty` is the per-job target the share validates against
 /// (SV2 Mining/SubmitShares.Error). Caller resolves it from
 /// `channel.standard_jobs.job_id_to_difficulty` if present, else falls back to
-/// `channel.session_difficulty`. The **network** difficulty for the
-/// block-found gate is read from `ext_job.network_difficulty` (pinned at
-/// send-time, SV2 Mining/SubmitShares.Error strict) — NOT the current
-/// template, so a block-change between job-send and submit can't reclassify
-/// the share.
+/// `channel.session_difficulty`. The **network** target for the
+/// block-found gate is read from `ext_job.n_bits` (pinned at send-time, SV2
+/// Mining/SubmitShares.Error strict) — NOT the current template, so a
+/// block-change between job-send and submit can't reclassify the share.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_submit_extended(
     submission_cache: &mut SubmissionCache,
@@ -781,10 +777,6 @@ mod tests {
             // the validator now reconstructs the coinbase from the JOB's prefix.
             extranonce_prefix: vec![0u8; 4],
             difficulty: Difficulty(1.0 / 4_294_967_296.0),
-            // Unreasonably hard pinned network difficulty → not a block
-            // candidate. Tests that exercise the candidate gate set this
-            // field explicitly on the returned job.
-            network_difficulty: Difficulty(1e15),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
             jdp_claims_the_block: false,
@@ -799,7 +791,6 @@ mod tests {
             template_version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
-            network_difficulty: Difficulty(1e15), // unreasonably hard → not a block
             classification: class,
             template_id: None,
             coinbase_stratum: &[],

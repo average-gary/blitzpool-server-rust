@@ -59,7 +59,7 @@
 //! Both Standard and Extended share validation use the template the miner
 //! actually hashed against, pinned on the job record at send-time — the
 //! `StandardJobEntry`'s `template_snapshot` and the `ExtendedJob`'s
-//! `network_difficulty` respectively. Neither consults the current template,
+//! `n_bits` respectively. Neither consults the current template,
 //! so a block-change between job-send and share-submit can't reclassify an
 //! in-flight share's block-candidacy.
 //!
@@ -1299,7 +1299,7 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
 /// - **SubmitSharesStandard / SubmitSharesExtended**: both validate against
 ///   the **per-job template snapshot** pinned on the job record at send-time
 ///   (SV2 Mining/SubmitShares.Error strict) — the `StandardJobEntry`'s
-///   `template_snapshot` and the `ExtendedJob`'s `network_difficulty`
+///   `template_snapshot` and the `ExtendedJob`'s `n_bits`
 ///   respectively. Neither consults the current template, so a block-change
 ///   between job-send and share-submit can't reclassify an in-flight share's
 ///   block-candidacy.
@@ -1349,7 +1349,7 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
         }
         InboundMiningFrame::SubmitSharesExtended(input) => {
             // SV2 Mining/SubmitShares.Error strict: the per-job
-            // `network_difficulty` is pinned on the ExtendedJob at send-time.
+            // `n_bits` is pinned on the ExtendedJob at send-time.
             // Handler reads it from the job record — no IO-layer
             // current-template lookup needed.
             handle_submit_shares_extended(state, &input, now_ms)
@@ -2488,8 +2488,6 @@ mod tests {
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
             header_timestamp: 0x6500_0001,
-            network_target: [0xFF; 32],
-            network_difficulty: Difficulty(1.0),
             coinbase_prefix: vec![0x03, 0xC8, 0x00, 0x00],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,

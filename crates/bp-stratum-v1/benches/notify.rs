@@ -84,8 +84,6 @@ fn make_template(merkle_depth: usize) -> ActiveSV1Template {
         prev_hash: [0x11; 32],
         n_bits: 0x1d00_ffff,
         header_timestamp: 0x6500_0001,
-        network_target: [0xFF; 32],
-        network_difficulty: bp_share::Difficulty(1.0),
         coinbase_prefix: vec![0xAA; 64],
         coinbase_tx_version: 2,
         coinbase_tx_input_sequence: 0xffff_ffff,

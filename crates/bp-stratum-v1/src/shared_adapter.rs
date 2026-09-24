@@ -213,8 +213,6 @@ mod tests {
                     prev_hash: [0u8; 32],
                     n_bits: 0x1d00_ffff,
                     header_timestamp: 0,
-                    network_target: [0xff; 32],
-                    network_difficulty: bp_share::Difficulty(1.0),
                     coinbase_prefix: vec![],
                     coinbase_tx_version: 2,
                     coinbase_tx_input_sequence: 0xffff_ffff,

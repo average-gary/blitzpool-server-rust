@@ -237,7 +237,7 @@ pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 ///
 /// It has to be REJECTED rather than merely served, because the pool derives
 /// the job's block-candidate threshold from it
-/// (`network_difficulty_from_n_bits`). Taken on trust, a JDC declaring a
+/// (`bp_mining_job::meets_network_target`). Taken on trust, a JDC declaring a
 /// trivial `n_bits` makes every ordinary share look like a found block — and
 /// since the mining side now records a block found on a custom job, that is a
 /// phantom `blocks_entity` row and a "block found" notification per share.
@@ -1477,7 +1477,6 @@ pub fn handle_submit_shares_standard<C: Clock>(
         template_version: entry.template_snapshot.version as i32,
         prev_hash: entry.template_snapshot.prev_hash,
         n_bits: entry.template_snapshot.n_bits,
-        network_difficulty: entry.template_snapshot.network_difficulty,
         classification,
         payouts_fingerprint: entry.payouts_fingerprint,
         template_id: entry.template_id,
@@ -1541,9 +1540,8 @@ pub use crate::mining::jobs::StandardTemplateSnapshot;
 /// Handle `SubmitSharesExtended`. Resolves the channel, extended-job
 /// and per-job difficulty (per-job if available, otherwise channel
 /// session difficulty) and delegates to
-/// [`validate_submit_extended`]. The `network_difficulty` argument and
-/// the `now_ms` clock-read are caller-provided so the handler stays
-/// pure.
+/// [`validate_submit_extended`]. The `now_ms` clock-read is
+/// caller-provided so the handler stays pure.
 pub fn handle_submit_shares_extended<C: Clock>(
     state: &mut MiningSessionState<C>,
     submission: &SubmitSharesExtendedInput,
@@ -2250,7 +2248,6 @@ pub fn apply_template_broadcast<C: Clock>(
                     version: template.version,
                     prev_hash: template.prev_hash,
                     n_bits: template.n_bits,
-                    network_difficulty: template.network_difficulty,
                     coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
                 };
                 channel.standard_jobs.record_send(
@@ -2346,7 +2343,6 @@ pub fn apply_template_broadcast<C: Clock>(
                     min_ntime: template.header_timestamp,
                     extranonce_prefix: channel.extranonce_prefix.clone(),
                     difficulty: channel.session_difficulty,
-                    network_difficulty: template.network_difficulty,
                     coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
                     template_id: Some(template.template_id),
                     jdp_claims_the_block: false,
@@ -2412,7 +2408,6 @@ pub fn apply_template_broadcast<C: Clock>(
             min_ntime: template.header_timestamp,
             extranonce_prefix: Vec::new(),
             difficulty: Difficulty(0.0),
-            network_difficulty: template.network_difficulty,
             coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
             template_id: Some(template.template_id),
             jdp_claims_the_block: false,
@@ -2738,7 +2733,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // The job's `n_bits` must be the one the pool is working on. This is NOT
     // a per-regime rule and must not move into one of the blocks below: the
     // pool derives this job's block-candidate threshold from the number
-    // (`network_difficulty_from_n_bits`, further down), so on trust a JDC
+    // (`meets_network_target` at submit time), so on trust a JDC
     // declaring a trivial `n_bits` turns every ordinary share into a "block
     // found" — a phantom `blocks_entity` row and a notification per share,
     // now that the mining side records blocks found on custom jobs.
@@ -3222,11 +3217,6 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             min_ntime: input.min_ntime,
             extranonce_prefix: channel.extranonce_prefix.clone(),
             difficulty: channel.session_difficulty,
-            // Custom (JDC-declared) job: derive the block-found gate's network
-            // difficulty from the declared job's own n_bits (no pool template).
-            network_difficulty: bp_template_distribution::network_difficulty_from_n_bits(
-                input.n_bits,
-            ),
             // No pool template → no reward to thread; the JDC builds and
             // propagates the block itself.
             coinbase_tx_value_remaining: 0,
@@ -3885,7 +3875,6 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
-            network_difficulty: Difficulty(1e15),
             coinbase_tx_value_remaining: 5_000_000_000,
         }
     }
@@ -3998,7 +3987,7 @@ pub(crate) mod tests {
         let easy = Difficulty(1.0 / 4_294_967_296.0);
         {
             let ch = s.channels.get_mut(&channel_id).unwrap();
-            // Default snapshot() pins network_difficulty=1e15 → unreachable.
+            // Default snapshot() pins n_bits = difficulty 1 → unreachable.
             ch.standard_jobs
                 .record_send_for_test(7, easy, [0xDD; 32], snapshot(), 0);
         }
@@ -4261,7 +4250,6 @@ pub(crate) mod tests {
             n_bits: 0x1d00_ffff,
             min_ntime: 0,
             difficulty: easy,
-            network_difficulty: Difficulty(1e15),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
             jdp_claims_the_block: false,
@@ -4334,7 +4322,6 @@ pub(crate) mod tests {
                 n_bits: 0x1d00_ffff,
                 min_ntime: 0,
                 difficulty: Difficulty(1.0 / 4_294_967_296.0),
-                network_difficulty: Difficulty(1e15),
                 coinbase_tx_value_remaining: 5_000_000_000,
                 template_id: None,
                 created_at: 0,
@@ -4923,8 +4910,6 @@ pub(crate) mod tests {
             prev_hash: prev,
             n_bits: 0x1d00_ffff,
             header_timestamp: 0x6500_0001,
-            network_target: [0xFF; 32],
-            network_difficulty: Difficulty(1.0),
             coinbase_prefix: vec![0x03, 0xC8, 0x00, 0x00],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -6246,7 +6231,6 @@ pub(crate) mod tests {
                     n_bits: 0,
                     min_ntime: 0,
                     difficulty: Difficulty(1.0),
-                    network_difficulty: Difficulty(1e15),
                     coinbase_tx_value_remaining: 5_000_000_000,
                     template_id: None,
                     jdp_claims_the_block: false,
@@ -6904,7 +6888,7 @@ pub(crate) mod tests {
     /// threshold from it.
     ///
     /// Taken on trust, a JDC declaring a trivial `n_bits` makes every
-    /// ordinary share clear `network_difficulty` and arrive at the block
+    /// ordinary share meet the network target and arrive at the block
     /// sink as a find. Since the mining side now records a block found on a
     /// custom job, that is a phantom `blocks_entity` row plus a "block found"
     /// notification for every share the JDC submits.

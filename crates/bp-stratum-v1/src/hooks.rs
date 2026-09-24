@@ -76,8 +76,8 @@ pub trait PayoutResolver: Send + Sync {
 
 // ── Block submission ─────────────────────────────────────────────────
 
-/// Fires when an accepted share's `submission_difficulty` meets the
-/// network difficulty. Production wiring forwards to
+/// Fires when an accepted share's hash meets the network target
+/// (`bp_mining_job::meets_network_target`). Production wiring forwards to
 /// `bp_template_distribution::TdpHandle::submit_solution(template_id,
 /// version, header_timestamp, header_nonce, witness_coinbase)`.
 ///

@@ -399,7 +399,6 @@ mod tests {
             n_bits: 0x1d00_ffff,
             min_ntime: 0,
             difficulty: bp_share::Difficulty(1024.0),
-            network_difficulty: bp_share::Difficulty(1e9),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: Some(1),
             jdp_claims_the_block: false,

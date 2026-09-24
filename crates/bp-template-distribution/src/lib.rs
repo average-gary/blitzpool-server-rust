@@ -55,10 +55,7 @@ mod message;
 mod tx_cache;
 mod worker;
 
-pub use assembler::{
-    network_difficulty_from_n_bits, ActiveFromTemplate, ActiveTemplate, TemplateAssembler,
-    TemplateChange,
-};
+pub use assembler::{ActiveFromTemplate, ActiveTemplate, TemplateAssembler, TemplateChange};
 pub use config::{
     TdpCoinbaseConstraints, TdpConfig, DEFAULT_BROADCAST_CAPACITY, DEFAULT_FEE_THRESHOLD,
     DEFAULT_MIN_INTERVAL_SECS, DEFAULT_RECONNECT_BACKOFF_SECS, DEFAULT_SUBMIT_CAPACITY,

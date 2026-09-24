@@ -73,8 +73,8 @@ static GLOBAL: Counting = Counting;
 // a ~64-byte prefix and ~100-byte suffix, and a merkle path whose depth
 // matches a real block (~3–4k txs → ~12 levels). The job difficulty is
 // set trivially easy so the share is Accepted (the hot path), and the
-// pinned network difficulty is set unreachably hard so it is NOT a
-// block-candidate (no witness-coinbase assembly).
+// job's n_bits is difficulty 1, out of reach for the synthetic share, so
+// it is NOT a block-candidate (no witness-coinbase assembly).
 
 const MERKLE_DEPTH_MAINNET: usize = 12;
 const MERKLE_DEPTH_SHALLOW: usize = 1;
@@ -100,7 +100,6 @@ fn ext_job(merkle_depth: usize) -> ExtendedJob {
         // Trivially easy → target ≈ MAX → any hash meets it → Accepted.
         difficulty: Difficulty(1.0 / 4_294_967_296.0),
         // Unreachably hard → never a block candidate (no witness assembly).
-        network_difficulty: Difficulty(1e15),
         coinbase_tx_value_remaining: 5_000_000_000,
         template_id: Some(1),
         jdp_claims_the_block: false,

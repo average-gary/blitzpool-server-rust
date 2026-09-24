@@ -71,6 +71,10 @@ pub struct ExtendedJob {
     pub merkle_path: Vec<[u8; 32]>,
     pub version: u32,
     pub prev_hash: [u8; 32],
+    /// Pinned at send-time (SV2 Mining/SubmitShares.Error). The block-found
+    /// gate reads the network target from THIS, not the current template's —
+    /// a block change between job-send and share-submit must not
+    /// retroactively reclassify an in-flight share's block-candidacy.
     pub n_bits: u32,
     pub min_ntime: u32,
     /// The channel's extranonce prefix **as of send-time**. Extended jobs
@@ -84,8 +88,8 @@ pub struct ExtendedJob {
     /// keeps using the old one. Validating those in-flight shares against
     /// the channel's new prefix would diverge the reconstructed coinbase
     /// and reject every one of them as diff-too-low. Same send-time-pinning
-    /// rationale as [`Self::difficulty`] and [`Self::network_difficulty`],
-    /// applied to the one input those two don't cover.
+    /// rationale as [`Self::difficulty`] and [`Self::n_bits`], applied to
+    /// the one input those two don't cover.
     pub extranonce_prefix: Vec<u8>,
     /// Per-job session difficulty stored at send-time.
     /// SV2 Mining/SubmitShares.Error requires share validation against the
@@ -96,14 +100,6 @@ pub struct ExtendedJob {
     /// the Extended submit-handler read directly from the job record instead
     /// of cross-referencing the Standard-side map.
     pub difficulty: Difficulty,
-    /// Per-job **network** difficulty pinned at send-time
-    /// (SV2 Mining/SubmitShares.Error). The block-found gate compares the
-    /// share's solved difficulty against THIS, not the current template's — a
-    /// block-change between job-send and share-submit must not retroactively
-    /// reclassify an in-flight share's block-candidacy. Mirrors the Standard
-    /// side, which pins it on
-    /// [`StandardTemplateSnapshot::network_difficulty`].
-    pub network_difficulty: Difficulty,
     /// Block-reward portion the coinbase claims (= the template's
     /// `coinbase_tx_value_remaining` at send-time). Threaded onto
     /// [`crate::mining::submit::ShareAccept`] so the block-found fan-out can
@@ -217,7 +213,6 @@ pub struct StandardTemplateSnapshot {
     pub version: u32,
     pub prev_hash: [u8; 32],
     pub n_bits: u32,
-    pub network_difficulty: Difficulty,
     /// Block-reward portion the coinbase claims (= the template's
     /// `coinbase_tx_value_remaining` at send-time). Threaded onto
     /// [`crate::mining::submit::ShareAccept`] so the block-found fan-out can
@@ -337,8 +332,8 @@ impl StandardJobMaps {
 
     /// Record a fresh `NewMiningJob` send. `now_ms` stamps
     /// `created_at_ms` for the aging algorithm. `template_snapshot`
-    /// freezes the template context (version / prev_hash / n_bits /
-    /// network_difficulty) at send-time so submit-validation can
+    /// freezes the template context (version / prev_hash / n_bits) at
+    /// send-time so submit-validation can
     /// reconstruct the exact 80-byte header the miner hashed against
     /// — SV2 Mining/SubmitShares.Error strict-conform.
     ///
@@ -486,7 +481,6 @@ mod tests {
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
-            network_difficulty: Difficulty(1.0),
             coinbase_tx_value_remaining: 5_000_000_000,
         }
     }
@@ -503,7 +497,6 @@ mod tests {
             n_bits: 0x1d00_ffff,
             min_ntime: 0,
             difficulty: Difficulty(1.0),
-            network_difficulty: Difficulty(1.0),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
             jdp_claims_the_block: false,
@@ -646,14 +639,12 @@ mod tests {
             version: 0x2000_0000,
             prev_hash: [0xAA; 32],
             n_bits: 0x1d00_ffff,
-            network_difficulty: Difficulty(100.0),
             coinbase_tx_value_remaining: 5_000_000_000,
         };
         let snap_new = StandardTemplateSnapshot {
             version: 0x2000_0001,
             prev_hash: [0xBB; 32],
             n_bits: 0x1d01_ffff,
-            network_difficulty: Difficulty(200.0),
             coinbase_tx_value_remaining: 4_900_000_000,
         };
         maps.record_send_for_test(1, Difficulty(1.0), [0x11; 32], snap_old, 1_000);
@@ -669,6 +660,10 @@ mod tests {
         assert_eq!(
             e1_after.template_snapshot.prev_hash, [0xAA; 32],
             "retired entry must keep its send-time snapshot"
+        );
+        assert_eq!(
+            e1_after.template_snapshot.n_bits, 0x1d00_ffff,
+            "the block-found gate reads the send-time n_bits, not the new tip's"
         );
         assert_eq!(e1_after.retired_at_ms, Some(3_000));
     }

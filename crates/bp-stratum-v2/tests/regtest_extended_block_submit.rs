@@ -282,8 +282,6 @@ async fn run_block_submit_case(
         n_bits: prev_hash.n_bits,
         min_ntime: prev_hash.header_timestamp,
         difficulty: job_difficulty,
-        // Trivial pinned network difficulty → every share is a block candidate.
-        network_difficulty: Difficulty(1.0e-18),
         coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
         template_id: Some(template.template_id),
         jdp_claims_the_block: false,

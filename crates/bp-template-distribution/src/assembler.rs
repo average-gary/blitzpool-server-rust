@@ -24,8 +24,6 @@
 
 use std::collections::HashMap;
 
-use bp_share::Difficulty;
-
 use crate::message::{NewTemplate, SetNewPrevHash, TemplateSnapshot, TemplateUpdate};
 
 /// Why the active template changed.
@@ -43,8 +41,9 @@ pub enum TemplateChange {
     Refresh,
 }
 
-/// A `NewTemplate` joined with its activating `SetNewPrevHash`, plus the
-/// network difficulty derived from `n_bits`. One per active block height.
+/// A `NewTemplate` joined with its activating `SetNewPrevHash`. One per
+/// active block height. The block-found gate reads the network target from
+/// `n_bits` (`bp_mining_job::meets_network_target`).
 ///
 /// `prev_hash` stays in Bitcoin internal LE order, as bitcoin-core delivers
 /// it and as SV2's `SetNewPrevHash` carries it; SV1 word-swaps it for
@@ -56,11 +55,6 @@ pub struct ActiveTemplate {
     pub prev_hash: [u8; 32],
     pub n_bits: u32,
     pub header_timestamp: u32,
-    pub network_target: [u8; 32],
-    /// Network difficulty derived from `n_bits` (compact-target decoder).
-    /// Used as the block-found pre-filter (`submission_difficulty >=
-    /// network_difficulty`). bitcoind is the authoritative validator.
-    pub network_difficulty: Difficulty,
     pub coinbase_prefix: Vec<u8>,
     pub coinbase_tx_version: u32,
     pub coinbase_tx_input_sequence: u32,
@@ -88,8 +82,6 @@ impl ActiveFromTemplate for ActiveTemplate {
             prev_hash: prev.prev_hash,
             n_bits: prev.n_bits,
             header_timestamp: prev.header_timestamp,
-            network_target: prev.target,
-            network_difficulty: network_difficulty_from_n_bits(prev.n_bits),
             coinbase_prefix: template.coinbase_prefix,
             coinbase_tx_version: template.coinbase_tx_version,
             coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
@@ -101,9 +93,9 @@ impl ActiveFromTemplate for ActiveTemplate {
         }
     }
 
-    /// Only the coinbase / merkle fields move. `prev_hash`, `n_bits`,
-    /// `header_timestamp`, `network_target` and `network_difficulty` are
-    /// left untouched — only a fresh `SetNewPrevHash` may change them.
+    /// Only the coinbase / merkle fields move. `prev_hash`, `n_bits` and
+    /// `header_timestamp` are left untouched — only a fresh `SetNewPrevHash`
+    /// may change them.
     fn refresh(&mut self, t: &NewTemplate) {
         self.template_id = t.template_id;
         self.version = t.version;
@@ -221,17 +213,6 @@ impl<A: ActiveFromTemplate> TemplateAssembler<A> {
     }
 }
 
-/// Approximate network difficulty from compact `n_bits`. f64 arithmetic
-/// with the max-target floor at `2^208 * 65535`; loses precision for very
-/// low / very high difficulties, which is fine for a pre-filter.
-pub fn network_difficulty_from_n_bits(n_bits: u32) -> Difficulty {
-    let mantissa = (n_bits & 0x007f_ffff) as f64;
-    let exponent = ((n_bits >> 24) & 0xff) as i32;
-    let target = mantissa * 256_f64.powi(exponent - 3);
-    let max_target = 2_f64.powi(208) * 65535_f64;
-    Difficulty(max_target / target)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,8 +296,6 @@ mod tests {
         assert_eq!(active.prev_hash, [0xAB; 32]);
         assert_eq!(active.n_bits, 0x1d00_ffff);
         assert_eq!(active.header_timestamp, 0x6500_0001);
-        assert_eq!(active.network_target, [0xFF; 32]);
-        assert!((active.network_difficulty.as_f64() - 1.0).abs() < 1.0e-9);
         assert_eq!(a.future_count(), 0, "future cache cleared on activation");
     }
 
@@ -399,7 +378,6 @@ mod tests {
         assert_eq!(active.prev_hash, before.prev_hash);
         assert_eq!(active.n_bits, before.n_bits);
         assert_eq!(active.header_timestamp, before.header_timestamp);
-        assert_eq!(active.network_difficulty, before.network_difficulty);
     }
 
     /// Non-future NewTemplate with NO active template yet is stashed.
@@ -502,24 +480,5 @@ mod tests {
                 last_update_at: None,
             })
             .is_none());
-    }
-
-    // ── network_difficulty_from_n_bits ──────────────────────────────
-
-    /// Genesis nBits 0x1d00ffff → exactly difficulty 1: mantissa 0xffff,
-    /// exponent 0x1d, target = 0xffff * 2^208 = max_target.
-    #[test]
-    fn network_difficulty_genesis_is_one() {
-        let d = network_difficulty_from_n_bits(0x1d00_ffff);
-        assert!((d.as_f64() - 1.0).abs() < 1.0e-12, "got difficulty {d}");
-    }
-
-    /// 0x1b0404cb is an older real-world bits with diff ~16307.
-    #[test]
-    fn network_difficulty_higher_n_bits_scales_inversely() {
-        let d = network_difficulty_from_n_bits(0x1b0404cb).as_f64();
-        assert!(d > 1000.0 && d < 1.0e9, "got difficulty {d}");
-        let hard = network_difficulty_from_n_bits(0x1700_ffff).as_f64(); // mainnet-ish
-        assert!(hard > d);
     }
 }

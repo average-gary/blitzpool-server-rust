@@ -505,16 +505,16 @@ pub fn validate_submit(
     // valid alternative tip.
     let is_block_candidate = meets_network_target(&hash, lookup.template.n_bits);
     // Block found marker at
-    // INFO when the share also clears network diff. Always-on, no
+    // INFO when the share also meets the network target. Always-on, no
     // debug flag — block events are too important to gate.
     if is_block_candidate {
         tracing::info!(
             worker = %submit.worker,
             job_id = %submit.job_id,
             height = lookup.template.template_id,
-            "🎉🎉🎉 !!! BLOCK FOUND !!! (SV1) — submission_diff={:.2}, network_diff={:.2}",
-            submission_difficulty,
-            lookup.template.network_difficulty.as_f64()
+            n_bits = format_args!("{:#010x}", lookup.template.n_bits),
+            "🎉🎉🎉 !!! BLOCK FOUND !!! (SV1) — submission_diff={:.2}",
+            submission_difficulty
         );
     } else if session.share_logs {
         // Per-share accept trace, gated by `stratum_share_logs`.
@@ -651,8 +651,6 @@ mod tests {
             prev_hash: [0xAB; 32],
             n_bits,
             header_timestamp: 0x65a1_b2c3,
-            network_target: [0xFF; 32],
-            network_difficulty: bp_share::Difficulty(1.0),
             coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
