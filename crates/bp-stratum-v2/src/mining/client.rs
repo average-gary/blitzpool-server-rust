@@ -3182,18 +3182,13 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // + the full extranonce slot (pool prefix + miner-rollable).
     let full_extranonce_size = channel.full_extranonce_size();
     let script_sig_len = input.coinbase_prefix.len() + full_extranonce_size;
-    let script_sig_len_varint = encode_varint(script_sig_len as u64);
 
     // Assemble the non-witness coinbase prefix.
-    let mut coinbase_tx_prefix =
-        Vec::with_capacity(4 + 1 + 36 + script_sig_len_varint.len() + input.coinbase_prefix.len());
-    coinbase_tx_prefix.extend_from_slice(&input.coinbase_tx_version.to_le_bytes());
-    coinbase_tx_prefix.push(0x01); // input_count varint = 1
-                                   // null outpoint: 32 zero bytes (hash) + 0xFFFFFFFF (index, LE).
-    coinbase_tx_prefix.extend_from_slice(&[0u8; 32]);
-    coinbase_tx_prefix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    coinbase_tx_prefix.extend_from_slice(&script_sig_len_varint);
-    coinbase_tx_prefix.extend_from_slice(&input.coinbase_prefix);
+    let coinbase_tx_prefix = bp_mining_job::serialize_coinbase_prefix(
+        input.coinbase_tx_version,
+        &input.coinbase_prefix,
+        script_sig_len,
+    );
 
     // Assemble the non-witness coinbase suffix.
     let mut coinbase_tx_suffix = Vec::with_capacity(4 + input.coinbase_tx_outputs.len() + 4);
@@ -3280,30 +3275,6 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         request_id: input.request_id,
         job_id,
     })
-}
-
-/// Encode a `u64` as a Bitcoin varint (1 / 3 / 5 / 9 bytes). Pure
-/// helper — kept private to this module since the only consumer is
-/// [`handle_set_custom_mining_job`]'s scriptSig length encoding.
-fn encode_varint(n: u64) -> Vec<u8> {
-    if n < 0xFD {
-        vec![n as u8]
-    } else if n <= 0xFFFF {
-        let mut buf = Vec::with_capacity(3);
-        buf.push(0xFD);
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
-        buf
-    } else if n <= 0xFFFF_FFFF {
-        let mut buf = Vec::with_capacity(5);
-        buf.push(0xFE);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-        buf
-    } else {
-        let mut buf = Vec::with_capacity(9);
-        buf.push(0xFF);
-        buf.extend_from_slice(&n.to_le_bytes());
-        buf
-    }
 }
 
 #[cfg(test)]
@@ -6447,13 +6418,7 @@ pub(crate) mod tests {
         outputs_blob: &[u8],
     ) -> (Vec<u8>, Vec<u8>) {
         let script_sig_len = script_sig_prefix.len() + FIXTURE_DECLARED_SLOT;
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(&2u32.to_le_bytes()); // coinbase_tx_version
-        prefix.push(0x01); // input count
-        prefix.extend_from_slice(&[0u8; 32]); // null outpoint hash
-        prefix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // outpoint index
-        prefix.extend_from_slice(&encode_varint(script_sig_len as u64));
-        prefix.extend_from_slice(script_sig_prefix);
+        let prefix = bp_mining_job::serialize_coinbase_prefix(2, script_sig_prefix, script_sig_len);
 
         let mut suffix = Vec::new();
         suffix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nSequence

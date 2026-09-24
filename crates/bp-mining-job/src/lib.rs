@@ -17,9 +17,9 @@ pub use address::{address_to_script, AddressError};
 pub use bip54::{check_coinbase as check_coinbase_bip54, decode_bip34_height, Bip54Violation};
 pub use cache::{MiningJobCache, MiningJobCacheStats};
 pub use coinbase::{
-    assemble_witness_coinbase, build_mining_job, build_mining_job_from_tdp, solo_payouts,
-    CoinbaseTemplate, MiningJob, MiningJobError, PayoutEntry, ResolvedPayouts, SoloFeeConfig,
-    TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+    assemble_witness_coinbase, build_mining_job, build_mining_job_from_tdp,
+    serialize_coinbase_prefix, solo_payouts, CoinbaseTemplate, MiningJob, MiningJobError,
+    PayoutEntry, ResolvedPayouts, SoloFeeConfig, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
 pub use header::{build_block_header, version_meets_consensus_floor, MIN_CONSENSUS_BLOCK_VERSION};
 pub use merkle::{coinbase_merkle_branch, merkle_root_from_coinbase};

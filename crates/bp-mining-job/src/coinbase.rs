@@ -311,7 +311,11 @@ pub fn build_mining_job(
     // materialized (spliced per-share), so there is no full-coinbase buffer to
     // build and slice. Version 2 is the RPC-path coinbase version.
     let locktime = template.block_height.saturating_sub(1);
-    let coinbase_prefix = serialize_coinbase_prefix(2, &script_sig, extranonce_slot_size);
+    let coinbase_prefix = serialize_coinbase_prefix(
+        2,
+        &script_sig[..script_sig.len() - extranonce_slot_size],
+        script_sig.len(),
+    );
     let coinbase_suffix = serialize_coinbase_suffix(
         COINBASE_NONFINAL_SEQUENCE,
         outputs.len() as u64,
@@ -468,8 +472,8 @@ pub(crate) fn assemble_tdp_job(
     // per-share), so there is no full-coinbase buffer to build and slice.
     let coinbase_prefix = serialize_coinbase_prefix(
         template.coinbase_tx_version,
-        &script_sig,
-        extranonce_slot_size,
+        &script_sig[..script_sig.len() - extranonce_slot_size],
+        script_sig.len(),
     );
     let coinbase_suffix = serialize_coinbase_suffix(
         template.coinbase_tx_input_sequence,
@@ -500,17 +504,23 @@ fn build_tdp_scriptsig(tdp_prefix: &[u8], identifier: &[u8], slot_len: usize) ->
 
 /// Serialize the coinbase **prefix**: everything up to (but not including) the
 /// extranonce slot — version, input count, null prev-outpoint, the scriptsig
-/// length varint, and the scriptsig bytes *before* the slot.
+/// length varint, and `scriptsig_head`, the scriptsig bytes *before* the slot.
 ///
-/// The scriptsig length varint encodes the **full** scriptsig length (the real
-/// coinbase carries the extranonce inside the scriptsig); only the trailing
-/// `slot_len` scriptsig bytes are omitted here — the per-share hot path splices
-/// the extranonce into exactly that gap. Building the prefix directly (rather
-/// than serializing the whole coinbase and slicing) avoids one full-buffer
-/// allocation + copy per job and never materializes the discarded slot bytes.
-fn serialize_coinbase_prefix(version: u32, scriptsig: &[u8], slot_len: usize) -> Vec<u8> {
-    let head = scriptsig.len() - slot_len;
-    let mut buf = Vec::with_capacity(4 + 1 + 32 + 4 + 9 + head);
+/// `scriptsig_len` is the **full** scriptsig length (the real coinbase carries
+/// the extranonce inside the scriptsig); the per-share hot path splices the
+/// extranonce into the gap after the head. Building the prefix directly
+/// (rather than serializing the whole coinbase and slicing) avoids one
+/// full-buffer allocation + copy per job and never materializes the slot.
+///
+/// The one implementation of this layout: the pool's own jobs build it here,
+/// and so does SV2's `SetCustomMiningJob`, whose head comes from the JDC.
+pub fn serialize_coinbase_prefix(
+    version: u32,
+    scriptsig_head: &[u8],
+    scriptsig_len: usize,
+) -> Vec<u8> {
+    debug_assert!(scriptsig_head.len() <= scriptsig_len);
+    let mut buf = Vec::with_capacity(4 + 1 + 32 + 4 + 9 + scriptsig_head.len());
     // version (LE u32 — consensus-equivalent to i32 for positive values)
     buf.extend_from_slice(&version.to_le_bytes());
     // input count = 1
@@ -519,8 +529,8 @@ fn serialize_coinbase_prefix(version: u32, scriptsig: &[u8], slot_len: usize) ->
     buf.extend_from_slice(&[0u8; 32]);
     buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
     // scriptsig length (FULL length, incl. the slot) + scriptsig up to the slot
-    encode_varint(&mut buf, scriptsig.len() as u64);
-    buf.extend_from_slice(&scriptsig[..head]);
+    encode_varint(&mut buf, scriptsig_len as u64);
+    buf.extend_from_slice(scriptsig_head);
     buf
 }
 
