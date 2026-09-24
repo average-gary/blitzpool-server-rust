@@ -66,4 +66,4 @@ pub use message::{
     apply_to_snapshot, NewTemplate, RequestTransactionDataError, RequestTransactionDataSuccess,
     SetNewPrevHash, TdpRequest, TemplateSnapshot, TemplateUpdate,
 };
-pub use tx_cache::{TemplateTxCache, DEFAULT_TEMPLATE_FIFO};
+pub use tx_cache::TemplateTxCache;

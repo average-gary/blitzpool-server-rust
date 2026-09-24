@@ -23,7 +23,10 @@ use bp_mining_job::{
     address_to_script, MiningJobCache, ResolvedPayouts, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
 
-use crate::config::{PortConfig, ServerConfig};
+use crate::config::{
+    PortConfig, ServerConfig, CPUMINER_FALLBACK_DIFFICULTY, CPUMINER_HIGH_DIFF_THRESHOLD,
+    EXTRANONCE2_SIZE, VERSION_ROLLING_MASK,
+};
 use crate::frame::{
     parse_request, write_authorize_response, write_configure_response, write_error,
     write_extranonce_subscribe_response, write_set_difficulty, write_submit_success,
@@ -49,7 +52,7 @@ use bp_vardiff::{Clock, VarDiffEngine};
 /// Outbound frames produced by handlers are returned as `Vec<u8>` for
 /// the caller to flush; inbound bytes are parsed and dispatched
 /// upstream.
-pub struct SessionState<C: Clock> {
+pub(crate) struct SessionState<C: Clock> {
     /// BIP-310 `last_mask`: which version bits this session may change.
     ///
     /// Starts at the pool's advertised mask, and every `mining.configure`
@@ -76,12 +79,10 @@ pub struct SessionState<C: Clock> {
     // Identity
     pub session_id_hex: String,
     pub extranonce1: [u8; 4],
-    pub session_start_ms: u64,
     pub network: Network,
 
     // Handshake messages — populated as they arrive
     pub subscription: Option<SubscribeRequest>,
-    pub configuration: Option<ConfigureRequest>,
     pub authorization: Option<AuthorizeRequest>,
     pub suggested_difficulty: Option<SuggestDifficultyRequest>,
 
@@ -94,7 +95,6 @@ pub struct SessionState<C: Clock> {
     pub session_difficulty: f64,
     pub old_session_difficulty: f64,
     pub diff_change_job_id: Option<u64>,
-    pub pending_session_difficulty: Option<f64>,
 
     // VarDiff + dedup
     pub vardiff: VarDiffEngine<C>,
@@ -103,15 +103,6 @@ pub struct SessionState<C: Clock> {
 
     // Live caches mirrored back from vardiff
     pub hash_rate: f64,
-
-    // Per-job dev-fee bookkeeping.
-    pub no_fee: bool,
-
-    /// Set once the client sends `mining.extranonce.subscribe`. Gates whether
-    /// the server may push `mining.set_extranonce` to this session — a client
-    /// that never opted in must not be sent extranonce updates, or it would
-    /// keep mining on its original extranonce-1 and every share would mismatch.
-    pub extranonce_subscribed: bool,
 
     /// Which TDP template stream this connection mines on. Resolved once from
     /// the authorized address (`StreamKind::for_mode`) and then fixed for the
@@ -128,8 +119,7 @@ pub struct SessionState<C: Clock> {
 }
 
 impl<C: Clock> SessionState<C> {
-    /// Construct a fresh session. `clock` drives the vardiff engine + the
-    /// `session_start_ms` timestamp. `session_id_hex` is the 8-hex
+    /// Construct a fresh session. `clock` drives the vardiff engine. `session_id_hex` is the 8-hex
     /// session identity (used for the UI / DB / device notifications) —
     /// pass a freshly-generated one via [`random_session_id_hex`] or a
     /// fixed value for deterministic tests.
@@ -139,13 +129,12 @@ impl<C: Clock> SessionState<C> {
     /// collision-free prefix from `server::SharedExtranonce` right after
     /// construction (the two used to be the same value — they are now
     /// decoupled so two sessions can never mine identical coinbases).
-    pub fn new(
+    pub(crate) fn new(
         clock: C,
         server_config: &ServerConfig,
         port_config: &PortConfig,
         session_id_hex: String,
     ) -> Self {
-        let session_start_ms = clock.now_ms();
         let extranonce1 = parse_session_id(&session_id_hex);
         let initial = port_config.effective_initial_difficulty();
 
@@ -160,14 +149,12 @@ impl<C: Clock> SessionState<C> {
         .with_initial_difficulty(initial);
 
         Self {
-            version_rolling_mask: server_config.version_rolling_mask,
+            version_rolling_mask: VERSION_ROLLING_MASK,
             session_id_hex,
             extranonce1,
-            session_start_ms,
             network: server_config.network,
 
             subscription: None,
-            configuration: None,
             authorization: None,
             suggested_difficulty: None,
 
@@ -178,24 +165,14 @@ impl<C: Clock> SessionState<C> {
             session_difficulty: initial,
             old_session_difficulty: initial,
             diff_change_job_id: None,
-            pending_session_difficulty: Some(initial),
 
             vardiff,
             last_difficulty_check_ms: 0,
             share_cache: SessionShareCache::new(),
             hash_rate: 0.0,
-            no_fee: false,
-            extranonce_subscribed: false,
             stream: bp_common::StreamKind::Pplns,
             share_logs: server_config.share_logs,
         }
-    }
-
-    /// True after `mining.authorize` has been accepted and the worker
-    /// address recorded. PPLNS / group-solo path eligibility depends on
-    /// this.
-    pub fn is_authorized(&self) -> bool {
-        self.authorization.is_some()
     }
 }
 
@@ -214,7 +191,7 @@ fn parse_session_id(hex_id: &str) -> [u8; 4] {
 /// pathological cases (e.g. closed FDs in a hardened seccomp sandbox),
 /// and even then a fixed session id is preferable to crashing the
 /// connection.
-pub fn random_session_id_hex() -> String {
+pub(crate) fn random_session_id_hex() -> String {
     let mut bytes = [0u8; 4];
     getrandom::getrandom(&mut bytes).unwrap_or_default();
     let n = u32::from_be_bytes(bytes);
@@ -228,7 +205,7 @@ pub fn random_session_id_hex() -> String {
 /// (DB writes, share-stats fan-out, disconnect) without re-deriving
 /// state.
 #[derive(Debug)]
-pub enum SessionEvent {
+pub(crate) enum SessionEvent {
     /// Subscribe completed (sessionId pinned, extranonce assigned). The
     /// server can log the user-agent etc. Carried for diagnostic logging
     /// only — no hooks fire on this.
@@ -236,9 +213,9 @@ pub enum SessionEvent {
     /// Authorize completed for `address` (already normalized). The
     /// server registers the client under this address for fan-out.
     Authorized { address: String, worker: String },
-    /// VarDiff ratcheted. Caller wires `bp-stats` per-mode hashrate
-    /// flush + `client_difficulty_statistics` persist.
-    DifficultyChanged { old: f64, new: f64 },
+    /// The session difficulty moved. The server counts it as a retarget
+    /// metric.
+    DifficultyChanged,
     /// Accepted share — caller updates share-totals, runs PPLNS /
     /// group-solo `recordShare` (if applicable), invokes the block-found
     /// path when `is_block_candidate`.
@@ -255,7 +232,7 @@ pub enum SessionEvent {
 
 /// Result of an inbound-request handler.
 #[derive(Debug, Default)]
-pub struct HandlerOutcome {
+pub(crate) struct HandlerOutcome {
     /// Bytes to write to the socket, in order. Each entry is a fully
     /// line-terminated JSON-RPC frame.
     pub outbound_frames: Vec<Vec<u8>>,
@@ -289,7 +266,7 @@ impl HandlerOutcome {
 ///
 /// The pure handlers are also exposed individually so tests can drive
 /// the state machine without re-encoding to JSON each time.
-pub fn dispatch<C: Clock>(
+pub(crate) fn dispatch<C: Clock>(
     state: &mut SessionState<C>,
     server_config: &ServerConfig,
     port_config: &PortConfig,
@@ -311,16 +288,10 @@ pub fn dispatch<C: Clock>(
         }
     };
     match request {
-        SV1Request::Subscribe(req) => handle_subscribe(
-            state,
-            server_config,
-            port_config,
-            registry,
-            current_template,
-            req,
-            now_ms,
-        ),
-        SV1Request::Configure(req) => handle_configure(state, server_config, req),
+        SV1Request::Subscribe(req) => {
+            handle_subscribe(state, port_config, registry, current_template, req, now_ms)
+        }
+        SV1Request::Configure(req) => handle_configure(state, req),
         SV1Request::Authorize(req) => handle_authorize(
             state,
             server_config,
@@ -334,30 +305,23 @@ pub fn dispatch<C: Clock>(
             handle_suggest_difficulty(state, port_config, registry, req, now_ms)
         }
         SV1Request::Submit(req) => handle_submit(state, registry, req, now_ms),
-        SV1Request::ExtranonceSubscribe(id) => handle_extranonce_subscribe(state, id),
+        SV1Request::ExtranonceSubscribe(id) => handle_extranonce_subscribe(id),
         SV1Request::Other { .. } => HandlerOutcome::default(),
     }
 }
 
 /// `mining.extranonce.subscribe` — opt-in to the dynamic-extranonce extension.
-/// Records the opt-in on the session and acks with `{"result":true}`. The flag
-/// gates any later `mining.set_extranonce` push (a session that never
-/// subscribed must not be sent extranonce updates). We do NOT rotate the
-/// extranonce here — extranonce-1 stays the pool-assigned prefix from
-/// subscribe time until something explicitly changes it.
-pub fn handle_extranonce_subscribe<C: Clock>(
-    state: &mut SessionState<C>,
-    id: RpcId,
-) -> HandlerOutcome {
-    state.extranonce_subscribed = true;
+/// Acks with `{"result":true}` and nothing else: the pool never pushes
+/// `mining.set_extranonce`, so extranonce-1 stays the pool-assigned prefix
+/// from subscribe time for the whole connection.
+pub(crate) fn handle_extranonce_subscribe(id: RpcId) -> HandlerOutcome {
     HandlerOutcome::with_frame(write_extranonce_subscribe_response(&id))
 }
 
 // ── Subscribe ────────────────────────────────────────────────────────
 
-pub fn handle_subscribe<C: Clock>(
+pub(crate) fn handle_subscribe<C: Clock>(
     state: &mut SessionState<C>,
-    server_config: &ServerConfig,
     port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
     current_template: Option<&ActiveSV1Template>,
@@ -383,7 +347,7 @@ pub fn handle_subscribe<C: Clock>(
         &subscription_id,
         &state.session_id_hex,
         &extranonce1_hex,
-        server_config.extranonce2_size,
+        EXTRANONCE2_SIZE,
     ));
     out.push_event(SessionEvent::Subscribed);
 
@@ -394,7 +358,6 @@ pub fn handle_subscribe<C: Clock>(
     if !state.stratum_initialized && !already_subscribed {
         flush_init(
             state,
-            server_config,
             port_config,
             registry,
             current_template,
@@ -409,7 +372,6 @@ pub fn handle_subscribe<C: Clock>(
 /// drive it directly without the full subscribe round-trip.
 fn flush_init<C: Clock>(
     state: &mut SessionState<C>,
-    server_config: &ServerConfig,
     _port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
     current_template: Option<&ActiveSV1Template>,
@@ -422,20 +384,14 @@ fn flush_init<C: Clock>(
     // cpuminer AND whose initial difficulty is below the high-diff
     // threshold gets pinned to 0.1.
     if let Some(sub) = &state.subscription {
-        if sub.user_agent == "cpuminer"
-            && state.initial_difficulty < server_config.cpuminer_high_diff_threshold
-        {
-            let new_diff = server_config.cpuminer_fallback_difficulty;
+        if sub.user_agent == "cpuminer" && state.initial_difficulty < CPUMINER_HIGH_DIFF_THRESHOLD {
+            let new_diff = CPUMINER_FALLBACK_DIFFICULTY;
             // Snapshot the boundary for the ckpool race-clamp.
             state.old_session_difficulty = state.session_difficulty;
             state.diff_change_job_id = Some(registry.peek_next_job_id());
             state.session_difficulty = new_diff;
-            state.pending_session_difficulty = Some(new_diff);
             state.vardiff.note_difficulty_assigned(new_diff);
-            out.push_event(SessionEvent::DifficultyChanged {
-                old: state.old_session_difficulty,
-                new: new_diff,
-            });
+            out.push_event(SessionEvent::DifficultyChanged);
         }
     }
 
@@ -458,9 +414,8 @@ fn flush_init<C: Clock>(
 
 // ── Configure ────────────────────────────────────────────────────────
 
-pub fn handle_configure<C: Clock>(
+pub(crate) fn handle_configure<C: Clock>(
     state: &mut SessionState<C>,
-    server_config: &ServerConfig,
     request: ConfigureRequest,
 ) -> HandlerOutcome {
     // BIP-310: "The server responds to the configuration message by sending
@@ -498,20 +453,19 @@ pub fn handle_configure<C: Clock>(
             u32::MAX
         }
     };
-    let negotiated = server_config.version_rolling_mask & requested;
+    let negotiated = VERSION_ROLLING_MASK & requested;
 
     // BIP-310's `last_mask` for the rest of the session. Assigned, not
     // narrowed against the previous value: a repeated `mining.configure` is
     // a fresh negotiation and its answer is what the miner will act on, so
     // the stored mask has to be the one we just sent.
     state.version_rolling_mask = negotiated;
-    state.configuration = Some(request.clone());
     HandlerOutcome::with_frame(write_configure_response(&request.id, negotiated))
 }
 
 // ── Authorize ────────────────────────────────────────────────────────
 
-pub fn handle_authorize<C: Clock>(
+pub(crate) fn handle_authorize<C: Clock>(
     state: &mut SessionState<C>,
     _server_config: &ServerConfig,
     _port_config: &PortConfig,
@@ -568,7 +522,7 @@ pub fn handle_authorize<C: Clock>(
 
 // ── Suggest difficulty ───────────────────────────────────────────────
 
-pub fn handle_suggest_difficulty<C: Clock>(
+pub(crate) fn handle_suggest_difficulty<C: Clock>(
     state: &mut SessionState<C>,
     port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
@@ -603,13 +557,9 @@ pub fn handle_suggest_difficulty<C: Clock>(
     if new_diff != state.session_difficulty {
         state.old_session_difficulty = state.session_difficulty;
         state.diff_change_job_id = Some(registry.peek_next_job_id());
-        out.push_event(SessionEvent::DifficultyChanged {
-            old: state.session_difficulty,
-            new: new_diff,
-        });
+        out.push_event(SessionEvent::DifficultyChanged);
     }
     state.session_difficulty = new_diff;
-    state.pending_session_difficulty = Some(new_diff);
     state.vardiff.note_difficulty_assigned(new_diff);
     state.used_suggested_difficulty = true;
     out.push_frame(write_set_difficulty(new_diff));
@@ -618,7 +568,7 @@ pub fn handle_suggest_difficulty<C: Clock>(
 
 // ── Submit ───────────────────────────────────────────────────────────
 
-pub fn handle_submit<C: Clock>(
+pub(crate) fn handle_submit<C: Clock>(
     state: &mut SessionState<C>,
     registry: &Arc<JobRegistry>,
     request: SubmitRequest,
@@ -736,7 +686,7 @@ pub fn handle_submit<C: Clock>(
 ///     clean_jobs=true on diff change … the right cover for in-flight
 ///     stale-diff shares is the CK-style clamp, not a queue flush."
 #[allow(clippy::too_many_arguments)]
-pub fn apply_vardiff_check<C: Clock>(
+pub(crate) fn apply_vardiff_check<C: Clock>(
     state: &mut SessionState<C>,
     server_config: &ServerConfig,
     port_config: &PortConfig,
@@ -775,16 +725,11 @@ pub fn apply_vardiff_check<C: Clock>(
 
     // Snapshot the boundary BEFORE the ratchet. Any job
     // whose id is < the upcoming next-id was issued under the old diff.
-    let previous = state.session_difficulty;
     state.old_session_difficulty = state.session_difficulty;
     state.diff_change_job_id = Some(registry.peek_next_job_id());
     state.session_difficulty = target;
-    state.pending_session_difficulty = Some(target);
     state.vardiff.note_difficulty_assigned(target);
-    out.push_event(SessionEvent::DifficultyChanged {
-        old: previous,
-        new: target,
-    });
+    out.push_event(SessionEvent::DifficultyChanged);
 
     out.push_frame(write_set_difficulty(target));
 
@@ -819,7 +764,7 @@ pub fn apply_vardiff_check<C: Clock>(
 ///   - allocates a new jobId in the registry,
 ///   - clears the dedup cache on `clean_jobs=true`.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_new_template<C: Clock>(
+pub(crate) fn apply_new_template<C: Clock>(
     state: &mut SessionState<C>,
     server_config: &ServerConfig,
     port_config: &PortConfig,
@@ -866,7 +811,7 @@ pub fn apply_new_template<C: Clock>(
 /// [`crate::hooks::PayoutResolver`] hook and threads them down here.
 #[allow(clippy::too_many_arguments)]
 fn build_and_register_notify<C: Clock>(
-    state: &mut SessionState<C>,
+    state: &SessionState<C>,
     server_config: &ServerConfig,
     _port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
@@ -879,12 +824,6 @@ fn build_and_register_notify<C: Clock>(
     if payouts.entries.is_empty() {
         return None;
     }
-
-    state.no_fee = payouts.entries.len() == 1
-        && state
-            .authorization
-            .as_ref()
-            .is_some_and(|a| payouts.entries[0].address == a.address);
 
     let tdp_template = TdpCoinbaseTemplate {
         coinbase_prefix: &template.coinbase_prefix,
@@ -907,6 +846,13 @@ fn build_and_register_notify<C: Clock>(
             EXTRANONCE_SLOT_LEN,
             payouts.payouts_fingerprint,
         )
+        .inspect_err(|err| {
+            tracing::warn!(
+                ?err,
+                session_id = %state.session_id_hex,
+                "skipping mining.notify: mining-job build failed"
+            );
+        })
         .ok()?;
 
     // `template.clone()` is an Arc refcount bump — the registry shares
@@ -919,18 +865,6 @@ fn build_and_register_notify<C: Clock>(
         &job_id_hex,
         clean_jobs,
     ))
-}
-
-// ── Destroy ──────────────────────────────────────────────────────────
-
-/// Implements pure-state cleanup on disconnect — clears the
-/// vardiff cache and the dedup set, signals a Disconnect for the hooks
-/// layer to drive unregister/delete/notification. Idempotent.
-pub fn apply_destroy<C: Clock>(state: &mut SessionState<C>) -> HandlerOutcome {
-    state.share_cache.clear();
-    let mut out = HandlerOutcome::default();
-    out.push_event(SessionEvent::Disconnect);
-    out
 }
 
 #[cfg(test)]
@@ -1002,12 +936,12 @@ mod tests {
     #[test]
     fn no_notify_is_built_when_the_resolver_serves_no_job() {
         let port = solo_port(1.0);
-        let mut state = fresh_state(TestClock::new(0), &port);
+        let state = fresh_state(TestClock::new(0), &port);
         let template = mineable_template();
         let cache = MiningJobCache::new();
 
         let out = build_and_register_notify(
-            &mut state,
+            &state,
             &server_config(),
             &port,
             &empty_registry(),
@@ -1025,7 +959,7 @@ mod tests {
         // Control: the same call with a real list DOES produce one, so the
         // assertion above cannot pass for an unrelated reason.
         let out = build_and_register_notify(
-            &mut state,
+            &state,
             &server_config(),
             &port,
             &empty_registry(),
@@ -1124,38 +1058,6 @@ mod tests {
         }])
     }
 
-    // ── 3 destroy spec cases ────────────────────────────────────────
-
-    #[test]
-    fn destroy_before_subscribe_emits_disconnect_only() {
-        let port = solo_port(1024.0);
-        let mut state = fresh_state(TestClock::new(0), &port);
-        let out = apply_destroy(&mut state);
-        assert!(out.outbound_frames.is_empty());
-        assert!(matches!(out.events.as_slice(), [SessionEvent::Disconnect]));
-    }
-
-    #[test]
-    fn destroy_with_subscription_only_still_just_disconnect() {
-        let port = solo_port(1024.0);
-        let mut state = fresh_state(TestClock::new(0), &port);
-        state.subscription = Some(subscribe_req(Some("cgminer/4.11.1")));
-        let out = apply_destroy(&mut state);
-        assert!(matches!(out.events.as_slice(), [SessionEvent::Disconnect]));
-    }
-
-    #[test]
-    fn destroy_with_authorization_emits_disconnect() {
-        let port = solo_port(1024.0);
-        let mut state = fresh_state(TestClock::new(0), &port);
-        state.subscription = Some(subscribe_req(Some("cgminer")));
-        state.authorization = Some(authorize_req(REGTEST_ADDR));
-        let out = apply_destroy(&mut state);
-        // The hooks layer in Task #9 will translate Disconnect into an
-        // unregisterClient + DB delete; the pure layer just signals.
-        assert!(matches!(out.events.as_slice(), [SessionEvent::Disconnect]));
-    }
-
     // ── 2 cpuminer-fallback spec cases ──────────────────────────────
 
     #[test]
@@ -1166,7 +1068,7 @@ mod tests {
         state.subscription = Some(subscribe_req(Some("cpuminer/2.5")));
         let reg = empty_registry();
         let mut out = HandlerOutcome::default();
-        flush_init(&mut state, &server_config(), &port, &reg, None, 0, &mut out);
+        flush_init(&mut state, &port, &reg, None, 0, &mut out);
 
         // First out-frame is set_difficulty (no suggested-diff seen).
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
@@ -1183,7 +1085,7 @@ mod tests {
         state.subscription = Some(subscribe_req(Some("cpuminer/2.5")));
         let reg = empty_registry();
         let mut out = HandlerOutcome::default();
-        flush_init(&mut state, &server_config(), &port, &reg, None, 0, &mut out);
+        flush_init(&mut state, &port, &reg, None, 0, &mut out);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"params\":[1000000]"));
         assert_eq!(state.session_difficulty, 1_000_000.0);
@@ -1221,7 +1123,6 @@ mod tests {
         let reg = empty_registry();
         let out = handle_subscribe(
             &mut state,
-            &server_config(),
             &port,
             &reg,
             None,
@@ -1251,7 +1152,6 @@ mod tests {
         let reg = empty_registry();
         let out = handle_subscribe(
             &mut state,
-            &server_config(),
             &port,
             &reg,
             None,
@@ -1286,7 +1186,6 @@ mod tests {
         let template = template_for_regtest();
         let out = handle_subscribe(
             &mut state,
-            &server_config(),
             &port,
             &reg,
             Some(&template),
@@ -1311,7 +1210,6 @@ mod tests {
         let mut state = fresh_state(TestClock::new(0), &port);
         let out = handle_configure(
             &mut state,
-            &server_config(),
             ConfigureRequest {
                 id: RpcId::from(7),
                 params,
@@ -1366,8 +1264,7 @@ mod tests {
                 {"version-rolling.mask": bad}
             ]));
             assert_eq!(
-                stored,
-                server_config().version_rolling_mask,
+                stored, VERSION_ROLLING_MASK,
                 "unreadable mask {bad} must not narrow the session"
             );
             assert!(
@@ -1393,10 +1290,7 @@ mod tests {
     fn a_fresh_session_starts_at_the_advertised_mask() {
         let port = solo_port(16384.0);
         let state = fresh_state(TestClock::new(0), &port);
-        assert_eq!(
-            state.version_rolling_mask,
-            server_config().version_rolling_mask
-        );
+        assert_eq!(state.version_rolling_mask, VERSION_ROLLING_MASK);
         assert_ne!(state.version_rolling_mask, 0);
     }
 
@@ -1479,13 +1373,8 @@ mod tests {
     // ── Extranonce subscribe ──────────────────────────────────────────
 
     #[test]
-    fn extranonce_subscribe_acks_and_sets_optin_flag() {
-        let port = solo_port(16384.0);
-        let mut state = fresh_state(TestClock::new(0), &port);
-        assert!(!state.extranonce_subscribed);
-        let out = handle_extranonce_subscribe(&mut state, RpcId::from(7));
-        // Opt-in recorded so a later mining.set_extranonce push is permitted.
-        assert!(state.extranonce_subscribed);
+    fn extranonce_subscribe_acks() {
+        let out = handle_extranonce_subscribe(RpcId::from(7));
         // Acked with {"result":true} carrying the request id.
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert_eq!(s, "{\"id\":7,\"error\":null,\"result\":true}\n");
@@ -1780,7 +1669,7 @@ mod tests {
         assert!(out
             .events
             .iter()
-            .any(|e| matches!(e, SessionEvent::DifficultyChanged { .. })));
+            .any(|e| matches!(e, SessionEvent::DifficultyChanged)));
     }
 
     #[test]

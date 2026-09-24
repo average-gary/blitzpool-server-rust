@@ -11,7 +11,7 @@
 
 use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
 
-use crate::{RejectReason, ShareAccept};
+use crate::submit::{RejectReason, ShareAccept};
 
 /// The shared view of an accepted SV1 share.
 pub(crate) fn shared_accepted<'a>(

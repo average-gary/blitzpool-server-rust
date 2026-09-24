@@ -30,7 +30,6 @@ members = [
     "crates/bp-notifications",
     "crates/bp-stratum-v1",
     "crates/bp-stratum-v2",
-    "crates/bp-protocol-detect",
     "crates/bp-api",
     "crates/bp-metrics",
     "crates/bp-geoip",
@@ -260,7 +259,6 @@ bp-mining-mode = { path = "crates/bp-mining-mode" }
 bp-notifications = { path = "crates/bp-notifications" }
 bp-stratum-v1 = { path = "crates/bp-stratum-v1" }
 bp-stratum-v2 = { path = "crates/bp-stratum-v2" }
-bp-protocol-detect = { path = "crates/bp-protocol-detect" }
 bp-api = { path = "crates/bp-api" }
 bp-metrics = { path = "crates/bp-metrics" }
 bp-geoip = { path = "crates/bp-geoip" }

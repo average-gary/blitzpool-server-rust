@@ -24,8 +24,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use bitcoin::hex::DisplayHex;
 use bp_mining_job::{build_block_header, meets_network_target, merkle_root_from_coinbase};
-use bp_share::{calculate_difficulty, difficulty_to_target, Difficulty, Target};
+use bp_share::{calculate_difficulty, Difficulty, TargetMemo};
 
 use crate::frame::{
     SubmitRequest, ERR_DUPLICATE_SHARE, ERR_JOB_NOT_FOUND, ERR_LOW_DIFFICULTY_SHARE,
@@ -37,33 +38,6 @@ use crate::notify::ActiveSV1Template;
 use bp_mining_job::MiningJob;
 use bp_vardiff::effective_job_difficulty;
 
-// ── Log helpers ──────────────────────────────────────────────────────
-
-/// Zero-allocation, lazily-rendered hex view of a byte slice, for use as a
-/// `tracing` field value.
-///
-/// [`Display::fmt`](std::fmt::Display::fmt) writes the hex digits straight
-/// into the subscriber's formatter, so:
-///
-/// - **nothing is built unless the log line is actually emitted** — a
-///   `tracing` field is only formatted once the callsite is enabled; and
-/// - even when it *is* emitted there is no intermediate `String` and no
-///   per-byte `format!` allocation.
-///
-/// This replaces the `hash[..8].iter().map(|b| format!("{b:02x}")).collect()`
-/// pattern that used to sit *outside* the reject-path `warn!`, where it
-/// allocated on every rejected share regardless of the active log level.
-pub(crate) struct HexDisplay<'a>(pub(crate) &'a [u8]);
-
-impl std::fmt::Display for HexDisplay<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
-    }
-}
-
 // ── Reject classification ────────────────────────────────────────────
 
 /// One of the four wire-visible reject reasons.
@@ -73,7 +47,7 @@ impl std::fmt::Display for HexDisplay<'_> {
 /// tracked under a distinct internal counter so operators can tell the
 /// two failure modes apart in the rejection breakdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RejectReason {
+pub(crate) enum RejectReason {
     DuplicateShare,
     JobNotFound,
     Stale,
@@ -90,7 +64,7 @@ pub enum RejectReason {
 
 impl RejectReason {
     /// JSON-RPC `error[0]` numeric code on the wire.
-    pub fn wire_code(self) -> i64 {
+    pub(crate) fn wire_code(self) -> i64 {
         match self {
             RejectReason::DuplicateShare => ERR_DUPLICATE_SHARE,
             RejectReason::JobNotFound | RejectReason::Stale => ERR_JOB_NOT_FOUND,
@@ -101,7 +75,7 @@ impl RejectReason {
 
     /// JSON-RPC `error[1]` human-readable message — standard wire format.
     /// Some monitoring tooling parses these; do not paraphrase.
-    pub fn wire_message(self) -> &'static str {
+    pub(crate) fn wire_message(self) -> &'static str {
         match self {
             RejectReason::DuplicateShare => REJECT_DUPLICATE,
             RejectReason::JobNotFound => REJECT_JOB_NOT_FOUND,
@@ -162,7 +136,7 @@ pub struct ShareAccept {
 /// Rejected-share details. Bundles the reason with its on-the-wire form
 /// so the caller writes the error frame without re-deriving them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShareReject {
+pub(crate) struct ShareReject {
     pub reason: RejectReason,
     pub wire_code: i64,
     pub wire_message: &'static str,
@@ -180,7 +154,7 @@ impl From<RejectReason> for ShareReject {
 
 /// Outcome of [`validate_submit`].
 #[derive(Clone, Debug)]
-pub enum ShareValidation {
+pub(crate) enum ShareValidation {
     Accepted(Box<ShareAccept>),
     Rejected(ShareReject),
 }
@@ -191,7 +165,7 @@ pub enum ShareValidation {
 /// the client task; passed by reference into [`validate_submit`] so the
 /// validator stays pure.
 #[derive(Clone, Copy, Debug)]
-pub struct SessionContext<'a> {
+pub(crate) struct SessionContext<'a> {
     /// 4-byte extranonce1 — pinned at subscribe time, never changes for
     /// the life of the session (ckpool-style fixed enonce1).
     pub extranonce1: &'a [u8; 4],
@@ -230,16 +204,12 @@ pub struct SessionContext<'a> {
 /// ~10× cheaper, and we don't expose the dedup key on the wire so the
 /// choice has no observable side-effects.
 #[derive(Default)]
-pub struct SessionShareCache {
+pub(crate) struct SessionShareCache {
     seen: HashSet<DedupKey>,
-    /// Memo for `difficulty_to_target` on the per-share accept check.
-    /// The effective difficulty takes at most two values per session
-    /// (current vs ckpool-clamped), changing only on a vardiff ratchet,
-    /// so a single `(effective_diff bits → target)` slot serves nearly
-    /// every share and a miss just recomputes. Keyed on the exact f64
-    /// bit pattern, so the cached target is bit-identical to recomputing
-    /// — purely an allocation/BigUint-divide saving, no behaviour change.
-    target_memo: Option<(u64, Target)>,
+    /// Target memo for the per-share accept check. The effective
+    /// difficulty takes at most two values per session (current vs
+    /// ckpool-clamped), changing only on a vardiff ratchet.
+    target_memo: TargetMemo,
 }
 
 /// Parsed-integer dedup key — zero heap allocations per share (mirrors
@@ -273,7 +243,7 @@ impl DedupKey {
 }
 
 impl SessionShareCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -282,7 +252,7 @@ impl SessionShareCache {
     /// versionMask, extranonce2)` tuple has been seen before in this
     /// session. A malformed submit (unparseable fields) can't form a key
     /// and returns `false` — it is rejected at the parse step regardless.
-    pub fn record(&mut self, submit: &SubmitRequest) -> bool {
+    pub(crate) fn record(&mut self, submit: &SubmitRequest) -> bool {
         match DedupKey::from_submit(submit) {
             Some(key) => !self.seen.insert(key),
             None => false,
@@ -293,33 +263,12 @@ impl SessionShareCache {
     /// goes out — old shares can no longer collide with anything we'd
     /// accept now anyway, and the set otherwise grows unbounded across a
     /// long-lived session.
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.seen.clear();
     }
 
-    /// Target for `effective_diff`, memoized. Returns the cached target
-    /// when the difficulty matches the last computed one (the common
-    /// case — diff only moves on a vardiff ratchet), otherwise computes
-    /// it via `difficulty_to_target` and caches the result. The key is
-    /// the exact f64 bit pattern, so the returned target is identical to
-    /// an uncached `difficulty_to_target(Difficulty(effective_diff))`.
-    pub(crate) fn target_for(&mut self, effective_diff: f64) -> Target {
-        let key = effective_diff.to_bits();
-        if let Some((cached_key, cached_target)) = self.target_memo {
-            if cached_key == key {
-                return cached_target;
-            }
-        }
-        let target = difficulty_to_target(Difficulty(effective_diff));
-        self.target_memo = Some((key, target));
-        target
-    }
-
-    pub fn len(&self) -> usize {
-        self.seen.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
 }
@@ -338,9 +287,9 @@ impl SessionShareCache {
 ///      same end-state).
 ///   5. Assemble header → hash → submission difficulty.
 ///   6. Apply [`effective_job_difficulty`] clamp; compare hash against
-///      `target_for(effective_diff)`.
+///      the session's memoized target for `effective_diff`.
 ///   7. `meets_target` ⇒ `Accepted`; else `LowDifficulty`.
-pub fn validate_submit(
+pub(crate) fn validate_submit(
     submit: &SubmitRequest,
     session: &SessionContext<'_>,
     dedup: &mut SessionShareCache,
@@ -461,7 +410,7 @@ pub fn validate_submit(
         session.old_session_difficulty,
         session.diff_change_job_id,
     );
-    let effective_target = dedup.target_for(effective_diff);
+    let effective_target = dedup.target_memo.target_for(Difficulty(effective_diff));
 
     // Per-share diff trace, gated by the `stratum_share_logs` config
     // flag (still DEBUG, so it also needs `RUST_LOG=...,bp_stratum_v1=debug`).
@@ -482,16 +431,16 @@ pub fn validate_submit(
         // Plus hash_prefix_be for cross-checking against the miner's
         // own debug trace when validator vs miner disagree on the hash.
         //
-        // Both hex fields go through [`HexDisplay`] *inside* the macro, so
-        // they cost nothing unless the line is actually emitted. This path
-        // runs on every rejected share, so an eager hex build here is paid
-        // even when the log level discards it.
+        // Both hex fields are lazy `as_hex()` views rendered *inside* the
+        // macro, so they cost nothing unless the line is actually emitted.
+        // This path runs on every rejected share, so an eager hex build here
+        // is paid even when the log level discards it.
         tracing::warn!(
             worker = %submit.worker,
             job_id = %submit.job_id,
             nonce = format_args!("0x{:08x}", nonce),
-            extranonce2 = %HexDisplay(&extranonce2),
-            hash_prefix_be = %HexDisplay(&hash[..8]),
+            extranonce2 = %extranonce2.as_hex(),
+            hash_prefix_be = %hash[..8].as_hex(),
             "❌ Share rejected: difficulty-too-low (submitted={:.2} < effective={:.2})",
             submission_difficulty,
             effective_diff
@@ -561,65 +510,18 @@ fn parse_submit_fields(submit: &SubmitRequest) -> Option<(u32, u32, u32, [u8; 8]
 
 #[cfg(test)]
 mod tests {
-    // ── HexDisplay (reject-path log helper) ──────────────────────────
-    //
-    // The point of `HexDisplay` is not just correct hex: it is that the
-    // reject path builds NOTHING unless the log line is emitted. The old
-    // code ran `hash[..8].iter().map(|b| format!(...)).collect()` OUTSIDE
-    // the `warn!`, so every rejected share paid ~9 allocations even when
-    // the level discarded the line.
-
-    /// Renders lowercase hex, matching the previous `format!("{b:02x}")`
-    /// output byte-for-byte (the field is cross-checked against miner
-    /// debug traces, so the encoding must not drift).
+    /// The reject-path log renders `hash_prefix_be` / `extranonce2` with
+    /// `as_hex()`. The field is cross-checked against miner debug traces,
+    /// so it must stay byte-identical to the `format!("{b:02x}")` encoding
+    /// it replaced: lowercase, leading-zero nibbles kept.
     #[test]
-    fn hex_display_renders_lowercase_hex() {
-        use super::HexDisplay;
-        assert_eq!(
-            HexDisplay(&[0xde, 0xad, 0xbe, 0xef]).to_string(),
-            "deadbeef"
-        );
-        // Leading-zero nibbles must be preserved (0x0a -> "0a", not "a").
-        assert_eq!(HexDisplay(&[0x00, 0x0a, 0xff]).to_string(), "000aff");
-        assert_eq!(HexDisplay(&[]).to_string(), "");
-    }
-
-    /// Byte-for-byte parity with the exact expression the reject path used
-    /// to run eagerly — guards against an encoding change slipping in with
-    /// the laziness change.
-    #[test]
-    fn hex_display_matches_the_previous_eager_expression() {
-        use super::HexDisplay;
+    fn reject_log_hex_matches_the_per_byte_format() {
+        use bitcoin::hex::DisplayHex;
         let hash: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(37));
         let old: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(HexDisplay(&hash[..8]).to_string(), old);
-    }
-
-    /// THE regression guard: `HexDisplay` must not do any work until it is
-    /// actually formatted. A counter in `Display::fmt` proves construction
-    /// is free — so putting it in a `tracing` field costs nothing when the
-    /// callsite is disabled.
-    #[test]
-    fn hex_display_does_no_work_until_formatted() {
-        use std::cell::Cell;
-        thread_local! {
-            static FMT_CALLS: Cell<usize> = const { Cell::new(0) };
-        }
-        struct Counted<'a>(&'a [u8]);
-        impl std::fmt::Display for Counted<'_> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                FMT_CALLS.with(|c| c.set(c.get() + 1));
-                write!(f, "{}", super::HexDisplay(self.0))
-            }
-        }
-        let bytes = [0xAAu8; 8];
-        // Construct and hold it — exactly what a tracing field does when
-        // the callsite is disabled: the value is never formatted.
-        let held = Counted(&bytes);
-        assert_eq!(FMT_CALLS.with(|c| c.get()), 0, "construction must be free");
-        // Only formatting does the work.
-        let _ = held.to_string();
-        assert_eq!(FMT_CALLS.with(|c| c.get()), 1);
+        assert_eq!(hash[..8].as_hex().to_string(), old);
+        let en2 = [0x00u8, 0x0a, 0xff, 0xde, 0xad, 0xbe, 0xef, 0x01];
+        assert_eq!(en2.as_hex().to_string(), "000affdeadbeef01");
     }
 
     use super::*;
@@ -724,7 +626,7 @@ mod tests {
             share_logs: false,
             // A session that ran `mining.configure` normally — what the
             // tests below assume unless they say otherwise.
-            version_rolling_mask: crate::config::DEFAULT_VERSION_ROLLING_MASK,
+            version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
         }
     }
 
@@ -738,7 +640,7 @@ mod tests {
             share_logs: false,
             // A session that ran `mining.configure` normally — what the
             // tests below assume unless they say otherwise.
-            version_rolling_mask: crate::config::DEFAULT_VERSION_ROLLING_MASK,
+            version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
         }
     }
 
@@ -779,29 +681,6 @@ mod tests {
     }
 
     #[test]
-    fn target_memo_matches_uncached_and_recomputes_on_change() {
-        let mut cache = SessionShareCache::new();
-        // Across a spread of difficulties (integer, fractional, extreme)
-        // the memoized target must be bit-identical to the uncached path.
-        for d in [1.0, 1024.0, 65535.0, 0.5, 1e9, 1234.5678] {
-            let direct = difficulty_to_target(Difficulty(d));
-            assert_eq!(cache.target_for(d), direct, "diff {d}: memo != uncached");
-            // Immediate repeat is served from the slot — still equal.
-            assert_eq!(cache.target_for(d), direct, "diff {d}: repeat mismatch");
-        }
-        // Switching difficulty must recompute (no stale slot), and
-        // switching back must still yield the correct target.
-        let a = cache.target_for(1024.0);
-        let b = cache.target_for(2048.0);
-        assert_ne!(a, b, "distinct difficulties must map to distinct targets");
-        assert_eq!(
-            cache.target_for(1024.0),
-            difficulty_to_target(Difficulty(1024.0)),
-            "re-selecting a prior difficulty must recompute correctly"
-        );
-    }
-
-    #[test]
     fn dedup_treats_any_field_change_as_a_new_share() {
         let mut cache = SessionShareCache::new();
         cache.record(&submit("1", "deadbeef"));
@@ -835,7 +714,7 @@ mod tests {
     fn dedup_clear_resets_the_set() {
         let mut cache = SessionShareCache::new();
         cache.record(&submit("1", "deadbeef"));
-        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.seen.len(), 1);
         cache.clear();
         assert!(cache.is_empty());
         assert!(!cache.record(&submit("1", "deadbeef")));
@@ -974,7 +853,7 @@ mod tests {
         // `testdummy` is STARTED. Bit 28 is inside the advertised mask.
         const DIRTY_TEMPLATE: u32 = 0x3000_0000;
         assert_ne!(
-            DIRTY_TEMPLATE & crate::config::DEFAULT_VERSION_ROLLING_MASK,
+            DIRTY_TEMPLATE & crate::config::VERSION_ROLLING_MASK,
             0,
             "precondition: the template sets a bit the miner is allowed to roll"
         );
@@ -1005,7 +884,7 @@ mod tests {
             DIRTY_TEMPLATE,
             "the pool must hash the version it published; BIP-310's masked OR \
              would give 0x{:08x} here",
-            DIRTY_TEMPLATE & !crate::config::DEFAULT_VERSION_ROLLING_MASK
+            DIRTY_TEMPLATE & !crate::config::VERSION_ROLLING_MASK
         );
 
         // Negative control: a miner that DOES roll still moves the version,
@@ -1201,7 +1080,7 @@ mod tests {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
             session_difficulty: 1.0e30,
             old_session_difficulty: 0.0,
-            version_rolling_mask: crate::config::DEFAULT_VERSION_ROLLING_MASK,
+            version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
             diff_change_job_id: Some(2),
             share_logs: false,
         };
@@ -1226,7 +1105,7 @@ mod tests {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
             session_difficulty: 1.0e30,
             old_session_difficulty: 0.0,
-            version_rolling_mask: crate::config::DEFAULT_VERSION_ROLLING_MASK,
+            version_rolling_mask: crate::config::VERSION_ROLLING_MASK,
             diff_change_job_id: Some(1),
             share_logs: false,
         };

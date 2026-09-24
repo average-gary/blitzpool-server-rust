@@ -534,7 +534,6 @@ dependencies = [
  "bp-notifications",
  "bp-pplns",
  "bp-pplns-engine",
- "bp-protocol-detect",
  "bp-regtest-harness",
  "bp-session-persistence",
  "bp-share",
@@ -950,10 +949,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bp-protocol-detect"
-version = "2.3.5"
-
-[[package]]
 name = "bp-regtest-harness"
 version = "2.3.5"
 dependencies = [
@@ -1147,6 +1142,9 @@ dependencies = [
 [[package]]
 name = "bp-vardiff"
 version = "2.3.5"
+dependencies = [
+ "bp-common",
+]
 
 [[package]]
 name = "brotli"

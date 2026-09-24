@@ -7,7 +7,7 @@
 //! optionally pplns + pplns-high-diff). The TCP-accept loop lives in
 //! `stratum.rs` because it's now protocol-detect-multiplexed (SV1 +
 //! SV2 share the same listening port and dispatch via
-//! [`bp_protocol_detect::detect`]). Each server has its own
+//! the first-byte router in `stratum.rs`). Each server has its own
 //! [`ServerHooks`] clone wired to:
 //!
 //! - **block_sink**: [`TdpBlockSubmissionSink`] (shared across all
@@ -183,7 +183,7 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
     sc.pool_identifier = cfg.pool_identifier.clone();
     // Solo dev-fee is applied by `ProductionPayoutResolver` (reads
     // `cfg.solo` directly); `ServerConfig` carries no fee fields.
-    sc.job_retention_ms = cfg.stratum.job_retention_ms;
+    sc.lifecycle.retention_ms = cfg.stratum.job_retention_ms;
     sc.difficulty_check_interval_ms = cfg.stratum.difficulty_check_interval_ms;
     sc.vardiff_silence_easing = cfg.stratum.vardiff_silence_easing_enabled;
     sc.protocol_debug = cfg.debug.stratum_wire_logs;
@@ -624,7 +624,7 @@ mod tests {
         cfg.pool_identifier = "MyPool".into();
         let sc = build_server_config(&cfg);
         assert_eq!(sc.pool_identifier, "MyPool");
-        assert_eq!(sc.job_retention_ms, 600_000);
+        assert_eq!(sc.lifecycle.retention_ms, 600_000);
         assert_eq!(sc.network, bitcoin::Network::Regtest);
     }
 

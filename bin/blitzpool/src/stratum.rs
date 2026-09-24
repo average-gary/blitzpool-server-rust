@@ -4,7 +4,7 @@
 //!
 //! Owns one TCP listener per configured port (solo + solo-high-diff +
 //! optionally pplns + pplns-high-diff). For each connection: peek the
-//! first byte, classify via [`bp_protocol_detect::detect`], dispatch
+//! first byte, classify via [`detect`], dispatch
 //! to either the SV1 server's `accept_connection` (existing SV1
 //! handshake) or the SV2 server's `accept_connection` (Noise XK
 //! handshake). HTTP requests on a stratum port get closed with a
@@ -38,7 +38,6 @@ use std::sync::{Arc, RwLock};
 
 use bp_config::AppConfig;
 use bp_notifications::dispatcher::NotificationDispatcher;
-use bp_protocol_detect::{detect, Detected};
 use bp_stratum_v1::{PortConfig as Sv1PortConfig, StratumV1Server};
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::server::StratumV2MiningServer;
@@ -385,6 +384,41 @@ async fn dispatch_connection(
     }
 }
 
+/// What the first byte of an accepted connection says it speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Detected {
+    /// SV1 JSON-RPC: `'{'`, or one of the pre-JSON whitespace bytes
+    /// `' '` / `'\n'` / `'\r'` some SV1 implementations lead with.
+    Sv1,
+    /// SV2 binary protocol (Noise handshake). Every byte the other
+    /// variants don't claim lands here.
+    Sv2,
+    /// HTTP request: `'G'` (GET) or `'P'` (POST/PUT/PATCH). Not served on
+    /// a stratum port — [`dispatch_connection`] logs a warning and closes.
+    Http,
+    /// TLS ClientHello (`0x16`). Closed right away, so a TLS probe never
+    /// reaches the SV2 handshake machinery.
+    Tls,
+}
+
+/// Classify a connection by its first byte.
+///
+/// Pre-JSON whitespace (`' '`, `'\n'`, `'\r'`) counts as SV1: the SV1
+/// spec opens with `{`, but some implementations lead with whitespace.
+/// The byte is only peeked, so the SV1 parser still sees it and trims it.
+fn detect(first_byte: u8) -> Detected {
+    match first_byte {
+        // HTTP — GET (0x47) or POST/PUT/PATCH (0x50).
+        b'G' | b'P' => Detected::Http,
+        // SV1 — '{' (0x7B) or leading whitespace before the JSON body.
+        b'{' | b' ' | b'\n' | b'\r' => Detected::Sv1,
+        // TLS ClientHello — not a stratum protocol.
+        0x16 => Detected::Tls,
+        // Anything else: assume SV2 binary (Noise handshake).
+        _ => Detected::Sv2,
+    }
+}
+
 /// Peek the first byte from `socket` without consuming it. Returns
 /// `Ok(None)` when the peer closed the connection before sending
 /// anything; `Err(_)` for any I/O error.
@@ -446,23 +480,39 @@ impl PortTemplates {
 mod tests {
     use super::*;
 
-    // Detection routing is exercised end-to-end against the actual
-    // `bp_protocol_detect::detect` table; the pure-classification
-    // logic itself is tested inside that crate. Here we just confirm
-    // the mapping we rely on in `dispatch_connection` hasn't shifted.
+    // ── first-byte detection ─────────────────────────────────────────
 
     #[test]
-    fn detect_table_pins_expected_mappings() {
-        assert_eq!(detect(b'{'), Detected::Sv1);
-        assert_eq!(detect(b' '), Detected::Sv1);
-        assert_eq!(detect(b'\n'), Detected::Sv1);
-        assert_eq!(detect(b'\r'), Detected::Sv1);
+    fn http_method_initials_route_to_http() {
+        // GET (0x47); POST / PUT / PATCH all start with 0x50.
         assert_eq!(detect(b'G'), Detected::Http);
         assert_eq!(detect(b'P'), Detected::Http);
+    }
+
+    #[test]
+    fn open_brace_and_leading_whitespace_are_sv1() {
+        // Some non-strict SV1 implementations lead with whitespace.
+        for b in [b'{', b' ', b'\n', b'\r'] {
+            assert_eq!(detect(b), Detected::Sv1, "byte 0x{b:02x}");
+        }
+    }
+
+    #[test]
+    fn tls_client_hello_is_its_own_variant() {
+        // TLS ClientHello typically starts 0x16 0x03 0x01 (handshake, TLS 1.0).
         assert_eq!(detect(0x16), Detected::Tls);
-        // SV2's Noise handshake first byte is typically 0x00..0x40 but
-        // any non-classified byte falls into SV2.
-        assert_eq!(detect(0x00), Detected::Sv2);
-        assert_eq!(detect(0xFF), Detected::Sv2);
+    }
+
+    #[test]
+    fn unclaimed_bytes_fall_through_to_sv2() {
+        // A Noise XK first message starts with the ephemeral public key, so
+        // the leading byte is whatever the curve produced.
+        for b in [0x00, 0x01, 0x42, 0x80, 0xab, 0xfe, 0xff] {
+            assert_eq!(detect(b), Detected::Sv2, "byte 0x{b:02x}");
+        }
+        // Letters other than the HTTP method initials are not HTTP.
+        for b in [b'A', b'B', b'H', b'O', b'T', b'X', b'Z'] {
+            assert_eq!(detect(b), Detected::Sv2, "letter '{}'", b as char);
+        }
     }
 }

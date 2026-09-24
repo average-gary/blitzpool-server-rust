@@ -17,12 +17,13 @@
 //! ## Design
 //!
 //! - One [`TemplateTxCache`] per pool process. Cheap to clone (Arc).
-//! - Internally a FIFO of the last `N` template_ids (default 3). Old
-//!   entries fall out as new ones arrive — covers
-//!   `prev_hash`/template-rolling without unbounded memory growth.
-//! - Per template_id: a `HashMap<wtxid → raw_witness_tx_bytes>`. The
-//!   wtxid is `sha256d(raw_witness_serialised_bytes)` — matches the
-//!   key shape `partition_against_template` looks up.
+//! - Holds the tx set of the **latest** `RequestTransactionDataSuccess`
+//!   only; each response replaces the previous one. A JDC that declared
+//!   against an older template simply finds fewer of its wtxids here and
+//!   sends the rest via `ProvideMissingTransactions`.
+//! - The set is a `HashMap<wtxid → raw_witness_tx_bytes>`. The wtxid is
+//!   `sha256d(raw_witness_serialised_bytes)` — matches the key shape
+//!   `partition_against_template` looks up.
 //! - A background task subscribes to [`crate::TdpHandle::subscribe`]
 //!   and, on each `NewTemplate`, fires
 //!   [`crate::TdpHandle::request_transaction_data`] for that
@@ -40,7 +41,7 @@
 //! the same race fixed for SV1/SV2 regtests
 //! (`memory/feedback-tdp-initial-template-drain.md`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bp_share::sha256d;
@@ -50,72 +51,16 @@ use tracing::{debug, warn};
 use crate::handle::TdpHandle;
 use crate::message::{NewTemplate, RequestTransactionDataSuccess, TemplateUpdate};
 
-/// Default FIFO depth — enough headroom for one stale + one current +
-/// one in-flight template, which covers the common case of bitcoin-core
-/// emitting a `NewTemplate` while a JDC is mid-roundtrip on the previous.
-pub const DEFAULT_TEMPLATE_FIFO: usize = 3;
+/// `wtxid → raw_witness_tx` of one template.
+type WtxidMap = HashMap<[u8; 32], Vec<u8>>;
 
 #[derive(Clone)]
 pub struct TemplateTxCache {
-    inner: Arc<Mutex<TxCacheInner>>,
+    /// The newest template's map; `None` until the first response arrives.
+    latest: Arc<Mutex<Option<WtxidMap>>>,
 }
 
-struct TxCacheInner {
-    /// Newest template at the back; oldest at the front.
-    entries: VecDeque<TemplateEntry>,
-    capacity: usize,
-}
-
-struct TemplateEntry {
-    template_id: u64,
-    txs: HashMap<[u8; 32], Vec<u8>>,
-}
-
-impl TxCacheInner {
-    fn new(capacity: usize) -> Self {
-        Self {
-            entries: VecDeque::with_capacity(capacity.max(1)),
-            capacity: capacity.max(1),
-        }
-    }
-
-    fn record(&mut self, template_id: u64, raw_txs: Vec<Vec<u8>>) {
-        // Replace in place if the same template_id is already cached.
-        // bitcoin-core can re-issue `RequestTransactionDataSuccess`
-        // (e.g. the JDC's request races with a NewTemplate broadcast)
-        // and we want the second response to overwrite, not duplicate.
-        if let Some(slot) = self
-            .entries
-            .iter_mut()
-            .find(|e| e.template_id == template_id)
-        {
-            slot.txs = build_wtxid_map(raw_txs);
-            return;
-        }
-        self.entries.push_back(TemplateEntry {
-            template_id,
-            txs: build_wtxid_map(raw_txs),
-        });
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
-        }
-    }
-
-    fn current(&self) -> Option<HashMap<[u8; 32], Vec<u8>>> {
-        self.entries.back().map(|e| e.txs.clone())
-    }
-
-    fn get_by_wtxid(&self, wtxid: &[u8; 32]) -> Option<Vec<u8>> {
-        for entry in self.entries.iter().rev() {
-            if let Some(b) = entry.txs.get(wtxid) {
-                return Some(b.clone());
-            }
-        }
-        None
-    }
-}
-
-fn build_wtxid_map(raw_txs: Vec<Vec<u8>>) -> HashMap<[u8; 32], Vec<u8>> {
+fn build_wtxid_map(raw_txs: Vec<Vec<u8>>) -> WtxidMap {
     let mut out = HashMap::with_capacity(raw_txs.len());
     for raw in raw_txs {
         out.insert(sha256d(&raw), raw);
@@ -124,52 +69,41 @@ fn build_wtxid_map(raw_txs: Vec<Vec<u8>>) -> HashMap<[u8; 32], Vec<u8>> {
 }
 
 impl TemplateTxCache {
-    /// Spawn the cache against a live [`TdpHandle`]. Uses
-    /// [`DEFAULT_TEMPLATE_FIFO`] as the FIFO depth. Must be called
+    /// Spawn the cache against a live [`TdpHandle`]. Must be called
     /// inside a tokio runtime — the cache spawns a background task on
     /// the current runtime.
     pub fn spawn(tdp: &TdpHandle) -> Self {
-        Self::spawn_with_capacity(tdp, DEFAULT_TEMPLATE_FIFO)
-    }
-
-    /// Spawn with an explicit FIFO depth. `capacity` is clamped to at
-    /// least 1.
-    pub fn spawn_with_capacity(tdp: &TdpHandle, capacity: usize) -> Self {
         // Subscribe SYNCHRONOUSLY before tokio::spawn so the loop's
         // receiver registers before the worker has a chance to emit a
         // dropped NewTemplate.
         let rx = tdp.subscribe();
-        let inner = Arc::new(Mutex::new(TxCacheInner::new(capacity)));
-        let tdp_clone = tdp.clone();
-        let inner_clone = Arc::clone(&inner);
-        tokio::spawn(run_cache_loop(rx, tdp_clone, inner_clone));
-        Self { inner }
+        let cache = Self {
+            latest: Arc::new(Mutex::new(None)),
+        };
+        tokio::spawn(run_cache_loop(rx, tdp.clone(), cache.clone()));
+        cache
     }
 
-    /// Snapshot of the **newest** cached template's `wtxid → raw_tx`
-    /// map. Cloned out of the lock — callers can mutate freely.
+    /// Snapshot of the newest cached template's `wtxid → raw_tx` map.
+    /// Cloned out of the lock — callers can mutate freely.
     /// Returns `None` if no template has been cached yet (initial
     /// boot window).
-    pub fn current_template_txs(&self) -> Option<HashMap<[u8; 32], Vec<u8>>> {
-        self.inner.lock().ok()?.current()
+    pub fn current_template_txs(&self) -> Option<WtxidMap> {
+        self.latest.lock().ok()?.clone()
     }
 
-    /// Search all cached templates (newest first) for the given wtxid.
-    pub fn get_tx_by_wtxid(&self, wtxid: &[u8; 32]) -> Option<Vec<u8>> {
-        self.inner.lock().ok()?.get_by_wtxid(wtxid)
-    }
-
-    #[cfg(test)]
-    fn empty(capacity: usize) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(TxCacheInner::new(capacity))),
+    /// Replace the cached set with `raw_txs`.
+    fn record(&self, raw_txs: Vec<Vec<u8>>) {
+        let map = build_wtxid_map(raw_txs);
+        if let Ok(mut g) = self.latest.lock() {
+            *g = Some(map);
         }
     }
 
     #[cfg(test)]
-    fn record_response(&self, template_id: u64, raw_txs: Vec<Vec<u8>>) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.record(template_id, raw_txs);
+    fn empty() -> Self {
+        Self {
+            latest: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -177,7 +111,7 @@ impl TemplateTxCache {
 async fn run_cache_loop(
     mut rx: broadcast::Receiver<TemplateUpdate>,
     tdp: TdpHandle,
-    inner: Arc<Mutex<TxCacheInner>>,
+    cache: TemplateTxCache,
 ) {
     loop {
         match rx.recv().await {
@@ -195,15 +129,13 @@ async fn run_cache_loop(
                 ..
             })) => {
                 let tx_count = transaction_list.len();
-                if let Ok(mut g) = inner.lock() {
-                    g.record(template_id, transaction_list);
-                }
+                cache.record(transaction_list);
                 debug!(template_id, tx_count, "tx_cache: stored template-tx set");
             }
             Ok(_) => {
                 // SetNewPrevHash + RequestTransactionDataError — cache
-                // doesn't react. Templates remain valid until they age
-                // out of the FIFO.
+                // doesn't react. The held set stays until the next
+                // response replaces it.
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 warn!(skipped, "tx_cache: broadcast lagged; some updates missed");
@@ -224,20 +156,19 @@ mod tests {
 
     #[test]
     fn empty_cache_returns_none() {
-        let cache = TemplateTxCache::empty(3);
+        let cache = TemplateTxCache::empty();
         assert!(cache.current_template_txs().is_none());
-        assert!(cache.get_tx_by_wtxid(&[0u8; 32]).is_none());
     }
 
     #[test]
     fn record_indexes_by_wtxid_and_returns_current() {
-        let cache = TemplateTxCache::empty(3);
+        let cache = TemplateTxCache::empty();
         let tx_a = raw_tx(0xaa);
         let tx_b = raw_tx(0xbb);
         let wtxid_a = sha256d(&tx_a);
         let wtxid_b = sha256d(&tx_b);
 
-        cache.record_response(1, vec![tx_a.clone(), tx_b.clone()]);
+        cache.record(vec![tx_a.clone(), tx_b.clone()]);
 
         let current = cache.current_template_txs().expect("populated");
         assert_eq!(current.len(), 2);
@@ -246,69 +177,19 @@ mod tests {
     }
 
     #[test]
-    fn fifo_evicts_oldest_template_beyond_capacity() {
-        let cache = TemplateTxCache::empty(3);
-        let tx_id1 = raw_tx(1);
-        let tx_id2 = raw_tx(2);
-        let tx_id3 = raw_tx(3);
-        let tx_id4 = raw_tx(4);
-        let wtxid_id1 = sha256d(&tx_id1);
-        let wtxid_id4 = sha256d(&tx_id4);
+    fn a_newer_response_replaces_the_held_set() {
+        let cache = TemplateTxCache::empty();
+        let old = raw_tx(1);
+        let new_a = raw_tx(2);
+        let new_b = raw_tx(3);
 
-        cache.record_response(1, vec![tx_id1.clone()]);
-        cache.record_response(2, vec![tx_id2]);
-        cache.record_response(3, vec![tx_id3]);
-        // Cache full at capacity=3; recording id=4 evicts id=1.
-        cache.record_response(4, vec![tx_id4.clone()]);
+        cache.record(vec![old.clone()]);
+        cache.record(vec![new_a.clone(), new_b]);
 
-        // current() = newest template (id=4) only.
-        let current = cache.current_template_txs().expect("populated");
-        assert_eq!(current.len(), 1);
-        assert!(current.contains_key(&wtxid_id4));
-
-        // Oldest template's wtxid no longer reachable; newest still is.
-        assert!(cache.get_tx_by_wtxid(&wtxid_id1).is_none());
-        assert_eq!(cache.get_tx_by_wtxid(&wtxid_id4), Some(tx_id4));
-    }
-
-    #[test]
-    fn get_by_wtxid_searches_all_cached_templates() {
-        let cache = TemplateTxCache::empty(3);
-        let stale = raw_tx(0xee);
-        let current = raw_tx(0xcc);
-        let wtxid_stale = sha256d(&stale);
-        let wtxid_current = sha256d(&current);
-
-        cache.record_response(10, vec![stale.clone()]);
-        cache.record_response(11, vec![current.clone()]);
-
-        // newest first via current() — gives template 11 only.
-        let top = cache.current_template_txs().unwrap();
-        assert!(top.contains_key(&wtxid_current));
-        assert!(!top.contains_key(&wtxid_stale));
-
-        // But get_tx_by_wtxid spans the full FIFO.
-        assert_eq!(cache.get_tx_by_wtxid(&wtxid_stale), Some(stale));
-        assert_eq!(cache.get_tx_by_wtxid(&wtxid_current), Some(current));
-    }
-
-    #[test]
-    fn record_replaces_in_place_for_same_template_id() {
-        let cache = TemplateTxCache::empty(3);
-        let v1 = raw_tx(1);
-        let v2_a = raw_tx(2);
-        let v2_b = raw_tx(3);
-        let wtxid_v1 = sha256d(&v1);
-        let wtxid_v2_a = sha256d(&v2_a);
-
-        cache.record_response(7, vec![v1.clone()]);
-        // Same template_id, fresh tx-set — must replace, not extend.
-        cache.record_response(7, vec![v2_a.clone(), v2_b.clone()]);
-
+        // Only the newest set is visible; the older one's wtxid is gone.
         let current = cache.current_template_txs().unwrap();
         assert_eq!(current.len(), 2);
-        assert!(current.contains_key(&wtxid_v2_a));
-        // First payload's wtxid evicted by the replace.
-        assert!(!current.contains_key(&wtxid_v1));
+        assert!(current.contains_key(&sha256d(&new_a)));
+        assert!(!current.contains_key(&sha256d(&old)));
     }
 }

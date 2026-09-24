@@ -6,7 +6,7 @@
 //! Both engines carried near-identical copies of:
 //!
 //! - [`snapshot`] — the Redis-hash format + write/read/delete that bridges template-build-time coinbase distribution to block-found ledger application.
-//! - [`parse_entry`] — the share-zset entry parser.
+//! - [`share_map_from_redis_hash`] — the Redis share aggregate → validated distribution input.
 //! - [`ledger`] — the row-type discriminator + apply-distribution result / error types.
 //!
 //! Consolidating them here keeps the wire format (stable across
@@ -70,77 +70,9 @@ pub fn share_map_from_redis_hash(
     out
 }
 
-/// Parse a share-zset entry string `<address>:<difficulty>:<timestamp>`
-/// into `(address, difficulty)`. Returns `None` if the format doesn't
-/// match.
-///
-/// The timestamp slot is kept in the wire format for diagnostic-tool
-/// compatibility but the engines never read it back —
-/// trim / round ordering is by zset score (the INCR counter), not
-/// timestamp. A 2-segment entry is malformed (the trailing segment is a
-/// shape guard). Negative / non-finite difficulties are rejected.
-pub fn parse_entry(entry: &str) -> Option<(&str, f64)> {
-    let mut parts = entry.splitn(3, ':');
-    let addr = parts.next()?;
-    let diff_str = parts.next()?;
-    // We don't care about the timestamp slot but its existence is a
-    // shape guard — a 2-segment entry is malformed.
-    parts.next()?;
-    if addr.is_empty() {
-        return None;
-    }
-    let diff: f64 = diff_str.parse().ok()?;
-    if !diff.is_finite() || diff < 0.0 {
-        return None;
-    }
-    Some((addr, diff))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_entry_well_formed() {
-        let (addr, diff) = parse_entry("bc1qfoo:1234.5:1700000000000").unwrap();
-        assert_eq!(addr, "bc1qfoo");
-        assert!((diff - 1234.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn parse_entry_two_segments_rejects() {
-        assert!(parse_entry("bc1qfoo:1234.5").is_none());
-    }
-
-    #[test]
-    fn parse_entry_empty_addr_rejects() {
-        assert!(parse_entry(":1234:5678").is_none());
-    }
-
-    #[test]
-    fn parse_entry_non_numeric_diff_rejects() {
-        assert!(parse_entry("bc1qfoo:notnumber:5678").is_none());
-    }
-
-    #[test]
-    fn parse_entry_negative_diff_rejects() {
-        assert!(parse_entry("bc1qfoo:-1.0:5678").is_none());
-    }
-
-    #[test]
-    fn parse_entry_nan_diff_rejects() {
-        assert!(parse_entry("bc1qfoo:nan:5678").is_none());
-    }
-
-    #[test]
-    fn parse_entry_address_with_colon_in_metadata_only_takes_first_three() {
-        // Defensive: address slots shouldn't contain `:` (bech32 / base58
-        // never include one) but splitn(3) means a 4th colon in the
-        // timestamp slot wouldn't break parsing.
-        let (addr, diff) = parse_entry("bc1qfoo:1.0:1700:0").unwrap();
-        assert_eq!(addr, "bc1qfoo");
-        assert!((diff - 1.0).abs() < 1e-9);
-    }
 
     #[test]
     fn share_map_skips_invalid_addresses() {

@@ -150,7 +150,7 @@ struct Cli {
     /// SV1+SV2 Stratum listeners (solo + solo-high-diff + optionally
     /// pplns + pplns-high-diff). Exits cleanly once all listeners
     /// are up. Each port multiplexes SV1 + SV2 via
-    /// [`bp_protocol_detect`]; JDP runs on its own `[sv2].jdp_port`
+    /// first-byte detection in `stratum.rs`; JDP runs on its own `[sv2].jdp_port`
     /// and is verified together with the stratum stack.
     #[arg(long)]
     check_stratum: bool,

@@ -32,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bp_share::{difficulty_to_target, Difficulty, Target};
+use bp_share::{Difficulty, Target, TargetMemo};
 
 use super::jobs::{ExtendedJob, StandardJobMaps};
 use super::submit::ExtranonceBytes;
@@ -132,14 +132,9 @@ pub struct ChannelState {
     /// `false` until the first share is processed.
     pub first_share_logged: bool,
 
-    /// Memo for `difficulty_to_target` on the per-share accept check.
-    /// Per-job difficulty changes only on a vardiff ratchet, so within a
-    /// channel nearly every share validates at the same difficulty — a
-    /// single `(difficulty bits → target)` slot serves them all and a
-    /// miss just recomputes. Keyed on the exact f64 bit pattern, so the
-    /// cached target is bit-identical to recomputing: purely a
-    /// per-share BigUint-divide saving, no behaviour change.
-    target_memo: Option<(u64, Target)>,
+    /// Target memo for the per-share accept check. Per-job difficulty
+    /// changes only on a vardiff ratchet.
+    target_memo: TargetMemo,
 }
 
 impl ChannelState {
@@ -169,7 +164,7 @@ impl ChannelState {
             submission_cache: SubmissionCache::Standard(HashSet::new()),
             last_sent_job_signature: None,
             first_share_logged: false,
-            target_memo: None,
+            target_memo: TargetMemo::default(),
         }
     }
 
@@ -200,7 +195,7 @@ impl ChannelState {
             submission_cache: SubmissionCache::Extended(HashSet::new()),
             last_sent_job_signature: None,
             first_share_logged: false,
-            target_memo: None,
+            target_memo: TargetMemo::default(),
         }
     }
 
@@ -212,23 +207,10 @@ impl ChannelState {
         self.accepted_share_difficulty_sum += share_difficulty.as_f64();
     }
 
-    /// Target for `job_difficulty`, memoized per channel. Returns the
-    /// cached target when the difficulty matches the last computed one
-    /// (the common case — per-job difficulty only moves on a vardiff
-    /// ratchet), otherwise computes it via `difficulty_to_target` and
-    /// caches the result. Keyed on the exact f64 bit pattern, so the
-    /// returned target is identical to an uncached
-    /// `difficulty_to_target(job_difficulty)`.
+    /// Target for `job_difficulty`, memoized per channel (see
+    /// [`TargetMemo`]).
     pub fn target_for(&mut self, job_difficulty: Difficulty) -> Target {
-        let key = job_difficulty.as_f64().to_bits();
-        if let Some((cached_key, cached_target)) = self.target_memo {
-            if cached_key == key {
-                return cached_target;
-            }
-        }
-        let target = difficulty_to_target(job_difficulty);
-        self.target_memo = Some((key, target));
-        target
+        self.target_memo.target_for(job_difficulty)
     }
 
     /// Reset the submission-dedup cache. Called on `SetNewPrevHash`
@@ -353,38 +335,6 @@ mod tests {
     }
 
     // ── Construction ───────────────────────────────────────────────
-
-    /// The per-channel target memo returns bit-identical results to an
-    /// uncached `difficulty_to_target` and recomputes on a difficulty
-    /// change — so it's a pure performance shim, no behaviour change.
-    #[test]
-    fn target_memo_matches_uncached_and_recomputes_on_change() {
-        let mut ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1024.0), max_target());
-        for d in [1.0, 1024.0, 65535.0, 0.5, 1e9, 1234.5678] {
-            let direct = difficulty_to_target(Difficulty(d));
-            assert_eq!(
-                ch.target_for(Difficulty(d)),
-                direct,
-                "diff {d}: memo != uncached"
-            );
-            // Immediate repeat is served from the slot — still equal.
-            assert_eq!(
-                ch.target_for(Difficulty(d)),
-                direct,
-                "diff {d}: repeat mismatch"
-            );
-        }
-        // Switching difficulty recomputes (no stale slot); switching back
-        // still yields the correct target.
-        let a = ch.target_for(Difficulty(1024.0));
-        let b = ch.target_for(Difficulty(2048.0));
-        assert_ne!(a, b, "distinct difficulties must map to distinct targets");
-        assert_eq!(
-            ch.target_for(Difficulty(1024.0)),
-            difficulty_to_target(Difficulty(1024.0)),
-            "re-selecting a prior difficulty must recompute correctly"
-        );
-    }
 
     /// Fresh Standard channel: zero extranonce_size, empty maps.
     #[test]

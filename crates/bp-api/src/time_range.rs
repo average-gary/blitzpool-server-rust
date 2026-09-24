@@ -160,9 +160,6 @@ pub fn format_iso_ms_opt(ms: Option<i64>) -> Option<String> {
 
 // ─── shared constants ──────────────────────────────────────────────
 
-/// 2^32 — converts share-difficulty sums to H/s.
-pub const DIFFICULTY_1: f64 = 4_294_967_296.0;
-
 /// 10-minute slot duration in seconds; divisor in hashrate conversion.
 pub const SLOT_SECONDS: f64 = 600.0;
 

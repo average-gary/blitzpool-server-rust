@@ -940,7 +940,8 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-use crate::time_range::{DIFFICULTY_1, SLOT_SECONDS};
+use crate::time_range::SLOT_SECONDS;
+use bp_common::HASHES_PER_DIFFICULTY_1;
 
 async fn chart<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -967,7 +968,7 @@ where
                 .filter(|r| r.time < cutoff)
                 .map(|r| ChartPoint {
                     label: crate::time_range::format_slot_label(r.time),
-                    data: (r.accepted as f64 * DIFFICULTY_1 / SLOT_SECONDS).round(),
+                    data: (r.accepted as f64 * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
                 })
                 .collect())
         })
@@ -1398,7 +1399,7 @@ where
 //   - 10-min slots
 //   - hide both the in-progress and just-ended slot (via the same
 //     visibility-cutoff helper the writer uses)
-//   - hashrate = ROUND(diff * DIFFICULTY_1 / 600)
+//   - hashrate = ROUND(diff * HASHES_PER_DIFFICULTY_1 / 600)
 
 async fn chart_mode<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -1430,7 +1431,7 @@ where
                 label: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(r.time)
                     .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
                     .unwrap_or_default(),
-                data: ((r.diff as f64) * DIFFICULTY_1 / SLOT_SECONDS).round(),
+                data: ((r.diff as f64) * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
             })
             .collect(),
     ))

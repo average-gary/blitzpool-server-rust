@@ -105,8 +105,8 @@ pub(crate) fn build_noise_config(cfg: &AppConfig) -> Result<NoiseConfig, Stratum
     if hex_str.len() != 64 {
         return Err(StratumV2SpawnError::PrivkeyHexLen(hex_str.len()));
     }
-    let raw_bytes = hex::decode(hex_str)
-        .map_err(|e| StratumV2SpawnError::PrivkeyHex(e.to_string()))?;
+    let raw_bytes =
+        hex::decode(hex_str).map_err(|e| StratumV2SpawnError::PrivkeyHex(e.to_string()))?;
     // Round-trip via base58check — stratum-apps's `FromStr` parses
     // that form, which avoids depending on a specific `secp256k1`
     // version (stratum-apps pins 0.28; the workspace uses 0.29).

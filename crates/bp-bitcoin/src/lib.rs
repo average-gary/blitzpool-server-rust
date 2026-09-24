@@ -45,5 +45,5 @@ pub use config::{BitcoinRpcConfig, RpcAuth};
 pub use error::{RpcError, RpcErrorDetail};
 pub use types::{
     BlockHeaderInfo, BlockTxids, DecodedTransaction, LocalAddress, MiningInfo, NetworkInfo,
-    NetworkInfoNetwork, PeerInfo, ScriptPubKey, TransactionOutput,
+    NetworkInfoNetwork, ScriptPubKey, TransactionOutput,
 };

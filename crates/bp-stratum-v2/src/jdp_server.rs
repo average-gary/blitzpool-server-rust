@@ -599,8 +599,8 @@ impl StratumV2JdpServer {
         });
     }
 
-    /// Per-connection task. The TCP-accept loop calls this for
-    /// each socket identified as JDP by `bp_protocol_detect`.
+    /// Per-connection task. The accept loop on the dedicated JDP port
+    /// calls this for every accepted socket.
     pub fn accept_connection(&self, socket: TcpStream) -> JoinHandle<()> {
         let noise_config = self.inner.noise_config.clone();
         let hooks = self.inner.hooks.clone();

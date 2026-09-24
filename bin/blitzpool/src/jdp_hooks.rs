@@ -479,10 +479,10 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
 /// map; the JDC then fills in every tx via the standard
 /// `ProvideMissingTransactions` round-trip.
 ///
-/// A cache-miss with the cache present means either the cache hasn't
-/// been warmed yet (first few seconds of pool boot) or the JDC
-/// declared against a template older than the FIFO — either way the
-/// JDC handles it by sending the full tx-set via
+/// The cache holds only the newest template's tx set. A JDC that
+/// declared against an older template, or any declaration before the
+/// cache is warm (first seconds of pool boot), finds some or all of its
+/// wtxids missing here; the JDC then sends exactly those via
 /// `ProvideMissingTransactions`.
 pub(crate) struct TdpTemplateTxProvider {
     cache: Option<Arc<TemplateTxCache>>,

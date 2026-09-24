@@ -18,6 +18,11 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// Expected hashes per unit of difficulty-1 work (`2^32`). `Σdifficulty ×
+/// this / seconds` is a hashrate in H/s — the one conversion vardiff, the
+/// live hashrate sampler and the API charts all use.
+pub const HASHES_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
+
 pub mod display;
 pub use display::{short_address, short_address_with_tail};
 pub mod extranonce;
@@ -45,8 +50,6 @@ pub struct Sats(pub i64);
 
 impl Sats {
     pub const ZERO: Sats = Sats(0);
-    /// One whole bitcoin in sats.
-    pub const ONE_BTC: Sats = Sats(100_000_000);
 
     /// Returns the raw signed integer value.
     pub fn to_i64(self) -> i64 {
@@ -68,10 +71,6 @@ impl Sats {
 
     pub fn checked_sub(self, rhs: Sats) -> Option<Sats> {
         self.0.checked_sub(rhs.0).map(Sats)
-    }
-
-    pub fn is_negative(self) -> bool {
-        self.0 < 0
     }
 
     pub fn is_zero(self) -> bool {
@@ -646,11 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn sats_one_btc_constant() {
-        assert_eq!(Sats::ONE_BTC.to_i64(), 100_000_000);
-    }
-
-    #[test]
     fn sats_arithmetic() {
         assert_eq!(Sats(100) + Sats(50), Sats(150));
         assert_eq!(Sats(100) - Sats(50), Sats(50));
@@ -677,8 +671,6 @@ mod tests {
 
     #[test]
     fn sats_predicates() {
-        assert!(Sats(-5).is_negative());
-        assert!(!Sats(5).is_negative());
         assert!(Sats::ZERO.is_zero());
         assert!(!Sats(1).is_zero());
         assert_eq!(Sats(-5).abs(), Sats(5));

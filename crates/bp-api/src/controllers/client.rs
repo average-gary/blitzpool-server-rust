@@ -69,7 +69,8 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-use crate::time_range::{DIFFICULTY_1, SLOT_SECONDS};
+use crate::time_range::SLOT_SECONDS;
+use bp_common::HASHES_PER_DIFFICULTY_1;
 
 async fn chart<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -103,7 +104,8 @@ where
                 .iter()
                 .map(|&b| ChartPoint {
                     label: crate::time_range::format_slot_label(b),
-                    data: (buckets.get(&b).copied().unwrap_or(0.0) * DIFFICULTY_1 / SLOT_SECONDS)
+                    data: (buckets.get(&b).copied().unwrap_or(0.0) * HASHES_PER_DIFFICULTY_1
+                        / SLOT_SECONDS)
                         .round(),
                 })
                 .collect())
@@ -578,7 +580,7 @@ where
                 entry.rejected_stale_diff1 += r.rejected_stale_diff1 as f64;
             }
             for e in grouped.values_mut() {
-                e.data = e.accepted * DIFFICULTY_1 / SLOT_SECONDS;
+                e.data = e.accepted * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS;
             }
             let chart_data: Vec<WorkerChartEntry> = grouped.into_values().collect();
             Ok(WorkerResponse {
@@ -657,7 +659,7 @@ where
                     .into_iter()
                     .map(|(t, shares)| ChartPoint {
                         label: crate::time_range::format_slot_label(t),
-                        data: shares * DIFFICULTY_1 / SLOT_SECONDS,
+                        data: shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS,
                     })
                     .collect();
 

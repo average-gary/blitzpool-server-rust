@@ -25,15 +25,3 @@ pub enum RpcAuth {
     /// Static credentials from `bitcoin.conf` (`rpcuser` / `rpcpassword`).
     UserPassword { user: String, password: String },
 }
-
-impl BitcoinRpcConfig {
-    /// Convenience constructor for a regtest cookie setup on the default
-    /// regtest port.
-    pub fn regtest_cookie(cookie_path: impl Into<PathBuf>) -> Self {
-        Self {
-            url: "http://127.0.0.1:18443".to_string(),
-            auth: RpcAuth::Cookie(cookie_path.into()),
-            timeout: None,
-        }
-    }
-}

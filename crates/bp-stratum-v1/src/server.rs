@@ -147,7 +147,7 @@ impl Drop for PrefixGuard {
 /// template by reference; the production tracer/observability layer may
 /// also tee these for metrics.
 #[derive(Clone, Debug)]
-pub struct TemplateBroadcast {
+pub(crate) struct TemplateBroadcast {
     /// `Arc` so the tokio broadcast channel hands each of the N connected
     /// sessions a refcount bump rather than a full deep copy of the
     /// template (merkle path + hex branches + coinbase buffers) on every
@@ -324,8 +324,8 @@ impl StratumV1Server {
     /// the connection runs until the socket closes, the cancel token
     /// fires, or the session signals `Disconnect`.
     ///
-    /// The TCP-accept loop calls this for each socket the
-    /// `bp_protocol_detect` router has identified as SV1.
+    /// The TCP-accept loop in `bin/blitzpool` calls this for each socket
+    /// its first-byte detection has classified as SV1.
     pub fn accept_connection(&self, socket: TcpStream, port_config: PortConfig) -> JoinHandle<()> {
         let server_config = self.inner.server_config.clone();
         let registry = self.inner.registry.clone();
@@ -1039,27 +1039,16 @@ async fn resolve_payouts_for_state<C: bp_vardiff::Clock>(
 /// Translate a [`SessionEvent`] into the relevant hook calls. Returns
 /// `false` on `Disconnect`.
 ///
-/// Pulled out as a pub(crate) free function so unit tests can drive it
-/// against a fake `SessionState` + recording hooks without ever
-/// touching a `TcpStream`.
-pub(crate) async fn process_event(
-    event: SessionEvent,
-    state: &SessionState<SystemClock>,
-    hooks: &ServerHooks,
-) -> bool {
-    process_event_generic(event, state, hooks).await
-}
-
-/// Generic variant — exposed only to the test module so the recording
-/// hooks can drive it with a `SessionState<Arc<TestClock>>`.
-pub(crate) async fn process_event_generic<C: bp_vardiff::Clock>(
+/// Generic over the clock and free of any socket, so unit tests drive it
+/// with a `SessionState<Arc<TestClock>>` + recording hooks.
+pub(crate) async fn process_event<C: bp_vardiff::Clock>(
     event: SessionEvent,
     state: &SessionState<C>,
     hooks: &ServerHooks,
 ) -> bool {
     match event {
         SessionEvent::Subscribed => true,
-        SessionEvent::DifficultyChanged { .. } => {
+        SessionEvent::DifficultyChanged => {
             // Retarget counter. Without it the vardiff controller is
             // invisible in production: nothing else on either protocol
             // reports that a difficulty moved, so there is no way to tell a
@@ -1544,7 +1533,7 @@ mod tests {
         let state = fresh_state(&port);
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let keep = process_event_generic(
+        let keep = process_event(
             SessionEvent::Authorized {
                 address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
                 worker: "w".into(),
@@ -1582,7 +1571,7 @@ mod tests {
         });
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let keep = process_event_generic(
+        let keep = process_event(
             SessionEvent::ShareAccepted(dummy_share_accept(false)),
             &state,
             &hooks,
@@ -1609,7 +1598,7 @@ mod tests {
         });
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let _ = process_event_generic(
+        let _ = process_event(
             SessionEvent::ShareAccepted(dummy_share_accept(true)),
             &state,
             &hooks,
@@ -1635,7 +1624,7 @@ mod tests {
         });
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let _ = process_event_generic(
+        let _ = process_event(
             SessionEvent::ShareRejected {
                 reason: crate::submit::RejectReason::LowDifficulty,
                 difficulty: 4096.0,
@@ -1655,7 +1644,7 @@ mod tests {
         let state = fresh_state(&port);
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let keep = process_event_generic(SessionEvent::Disconnect, &state, &hooks).await;
+        let keep = process_event(SessionEvent::Disconnect, &state, &hooks).await;
         assert!(!keep);
     }
 

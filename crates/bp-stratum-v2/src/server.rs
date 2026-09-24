@@ -342,8 +342,8 @@ impl StratumV2MiningServer {
     }
 
     /// Spawn a per-connection task. The TCP-accept loop in
-    /// `bin/blitzpool` calls this for each socket
-    /// `bp_protocol_detect` identifies as SV2 mining.
+    /// `bin/blitzpool` calls this for each socket its first-byte
+    /// detection classifies as SV2 mining.
     ///
     /// The first thing the task does is hand the `socket` to
     /// [`crate::noise::accept_pool_noise`] for the Noise-XK handshake.

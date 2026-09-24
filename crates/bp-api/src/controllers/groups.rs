@@ -1969,7 +1969,8 @@ fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError
 
 use crate::time_range::{chart_slot_boundaries, ChartPoint, Range, SlotCounts, SlotDataResponse};
 
-use crate::time_range::{DIFFICULTY_1, SLOT_SECONDS};
+use crate::time_range::SLOT_SECONDS;
+use bp_common::HASHES_PER_DIFFICULTY_1;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2025,7 +2026,7 @@ where
                 .into_iter()
                 .map(|(t, shares)| ChartPoint {
                     label: crate::time_range::format_slot_label(t),
-                    data: (shares * DIFFICULTY_1 / SLOT_SECONDS).round(),
+                    data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
                 })
                 .collect())
         })

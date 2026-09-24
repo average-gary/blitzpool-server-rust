@@ -53,17 +53,7 @@ use bp_mining_job::MiningJob;
 use crate::config::ServerConfig;
 use crate::notify::ActiveSV1Template;
 
-pub use bp_jobs_lifecycle::JobClassification;
-
-/// Build a [`LifecycleConfig`] from the SV1 [`ServerConfig`] field
-/// names. Free helper so the `JobRegistry` constructors stay simple.
-pub fn lifecycle_from_server_config(cfg: &ServerConfig) -> LifecycleConfig {
-    LifecycleConfig {
-        grace_ms: cfg.stale_grace_ms,
-        retention_ms: cfg.job_retention_ms,
-        min_retained: cfg.min_retained_jobs,
-    }
-}
+pub(crate) use bp_jobs_lifecycle::JobClassification;
 
 /// Snapshot returned by [`JobRegistry::classify`] when a job is found.
 /// Holds `Arc` handles to the shared [`MiningJob`] and
@@ -137,7 +127,7 @@ impl JobRegistry {
     }
 
     pub fn from_server_config(cfg: &ServerConfig) -> Self {
-        Self::new(lifecycle_from_server_config(cfg))
+        Self::new(cfg.lifecycle)
     }
 
     pub fn config(&self) -> LifecycleConfig {

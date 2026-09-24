@@ -58,7 +58,7 @@ use crate::submit::ShareAccept;
 /// `reward_sats` is the block-reward portion available to the
 /// coinbase (= TDP template's `coinbase_tx_value_remaining`).
 ///
-/// The default impl on [`NoOpHooks`] returns a single 100%-to-miner
+/// The default impl on `NoOpHooks` returns a single 100%-to-miner
 /// entry — matches the pre-7.4d behaviour where every mode emitted
 /// solo-output coinbase regardless of port (share crediting was
 /// correct via the accept-hook fan-out, only the on-chain payout
@@ -143,7 +143,7 @@ impl ServerHooks {
 
 /// Stub impl of the SV1-specific hook traits. Useful as a placeholder
 /// without full production wiring + for unit-testing the dispatch layer.
-pub struct NoOpHooks;
+pub(crate) struct NoOpHooks;
 
 #[async_trait]
 impl BlockSubmissionSink for NoOpHooks {

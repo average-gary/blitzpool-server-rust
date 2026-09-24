@@ -2,7 +2,8 @@
 
 //! Per-session VarDiff engine + ckpool-style race-window clamp.
 //!
-//! Pure-math leaf crate, std-only. Shared between `bp-stratum-v1` (which
+//! Pure-math crate; its only dependency is `bp-common`, for
+//! [`HASHES_PER_DIFFICULTY_1`]. Shared between `bp-stratum-v1` (which
 //! sends the result as `mining.set_difficulty` JSON) and `bp-stratum-v2`
 //! (which sends the result as a binary `SetTarget` frame on Standard /
 //! Extended channels). The vardiff math is wire-format-agnostic — only
@@ -103,6 +104,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bp_common::HASHES_PER_DIFFICULTY_1;
+
 // ── Constants ────────────────────────────────────────────────────────
 
 /// Maximum number of submissions kept in the retarget sample cache.
@@ -115,10 +118,6 @@ pub const VARDIFF_CACHE_WINDOW_MS: u64 = 300_000;
 /// Default vardiff floor when the caller passes a non-finite / non-positive
 /// `min_difficulty`.
 pub const VARDIFF_DEFAULT_MIN_DIFFICULTY: f64 = 0.00001;
-
-/// Difficulty-1 hash count (`2^32`). Used to convert accepted-share
-/// difficulty into hashrate (`sum * DIFFICULTY_1 / seconds`).
-pub const VARDIFF_DIFFICULTY_1: f64 = 4_294_967_296.0;
 
 /// Hashrate-slot length. 10-minute slots labeled by their end timestamp;
 /// the engine only cares about transitions, so the constant is inlined
@@ -213,7 +212,6 @@ pub const VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR: f64 = 256.0;
 ///   receives a `now_ms`, and its one production caller passes a share's own
 ///   `ts_ms` — the stamp that travelled with the data. A clock there would
 ///   make that crate a time source for the first time.
-/// - This crate is a zero-dependency std-only leaf; `bp-common` carries four.
 ///
 /// What was NOT the argument, because measuring did not support it:
 /// injectability. It is a call-site choice, not a crate-location one — 54 uses
@@ -871,7 +869,7 @@ impl<C: Clock> VarDiffEngine<C> {
                     return None;
                 }
                 let elapsed_s = elapsed_ms as f64 / 1000.0;
-                self.lifetime_difficulty_sum * VARDIFF_DIFFICULTY_1 / elapsed_s
+                self.lifetime_difficulty_sum * HASHES_PER_DIFFICULTY_1 / elapsed_s
             } else if self.silence_easing {
                 // No accepted share, ever. The classic estimators are blind
                 // here — their only sensor is a share — so an over-assigned
@@ -909,7 +907,7 @@ impl<C: Clock> VarDiffEngine<C> {
             // throttle that legitimate convergence to several intervals of
             // flooding. The cap guards the windowed path, where eased-
             // recovery overshoot and burst-inflated windows actually live.
-            let target = rate * self.target_submission_per_second / VARDIFF_DIFFICULTY_1;
+            let target = rate * self.target_submission_per_second / HASHES_PER_DIFFICULTY_1;
             if !target.is_finite() {
                 return None;
             }
@@ -1128,7 +1126,7 @@ fn slot_hashrate(work: f64, span_ms: u64) -> f64 {
     if span_ms == 0 {
         return 0.0;
     }
-    work * VARDIFF_DIFFICULTY_1 / (span_ms as f64 / 1000.0)
+    work * HASHES_PER_DIFFICULTY_1 / (span_ms as f64 / 1000.0)
 }
 
 /// Silence-easing descent floor: never let `value` fall more than
@@ -1577,7 +1575,7 @@ mod tests {
         e.update_hash_rate(2048.0, true);
         // shares = 3072, prev = 0, elapsed = 1s.
         // hashrate = 3072 * 2^32 / 1 ≈ 1.32e13.
-        let expected = 3072.0 * VARDIFF_DIFFICULTY_1 / 1.0;
+        let expected = 3072.0 * HASHES_PER_DIFFICULTY_1 / 1.0;
         assert!(
             (e.hash_rate() - expected).abs() < 1.0,
             "expected ≈ {}, got {}",
