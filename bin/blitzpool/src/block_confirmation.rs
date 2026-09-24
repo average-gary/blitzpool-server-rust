@@ -37,7 +37,7 @@ use tracing::{error, info, warn};
 
 use crate::pending_blocks::{
     count_pending_at, load_pending_blocks, put_pending_at, remove_pending_at, remove_pending_block,
-    PendingBlock, PENDING_KEY, UNBOOKABLE_KEY,
+    PendingBlock, SettlementMode, PENDING_KEY, UNBOOKABLE_KEY,
 };
 
 /// Fallback re-check cadence when the TDP stream is quiet. New blocks normally
@@ -288,49 +288,19 @@ async fn reconcile(
             continue;
         };
 
-        let applied = match (&pb.group, pplns, group_solo) {
-            (Some(group), _, Some(engine)) => {
-                let (Ok(group_uuid), Ok(finder)) = (
-                    uuid::Uuid::parse_str(&group.group_id),
-                    AddressId::new(group.finder.clone()),
-                ) else {
-                    error!(
-                        block_hash = %pb.block_hash,
-                        group_id = %group.group_id,
-                        "block-confirmation: parked Group-Solo block has an unusable group id \
-                         or finder — discarding"
-                    );
-                    let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
-                    continue;
-                };
-                engine
-                    .on_block_found(
-                        group_uuid,
-                        pb.block_height,
-                        &actual,
-                        &finder,
-                        pb.weight_snapshot.clone(),
-                        pb.payouts_fingerprint,
-                    )
-                    .await
-                    .map_err(SettleError::GroupSolo)
-            }
-            (None, Some(engine), _) => engine
-                .on_block_found(
-                    pb.block_height,
-                    &actual,
-                    pb.weight_snapshot.clone(),
-                    pb.payouts_fingerprint,
-                )
-                .await
-                .map_err(SettleError::Pplns),
-            // The engine this block belongs to is not wired on this
-            // process. Leave it parked — another process may own it.
-            _ => continue,
-        };
+        let applied = settle_block(
+            pplns,
+            group_solo,
+            pb.mode(),
+            pb.block_height,
+            &actual,
+            pb.weight_snapshot.clone(),
+            pb.payouts_fingerprint,
+        )
+        .await;
 
         match applied {
-            Ok(outcome) => {
+            Ok(history_inserted) => {
                 if let Some(signal) = settle {
                     signal.settle().await;
                 }
@@ -338,12 +308,24 @@ async fn reconcile(
                     block_hash = %pb.block_hash,
                     height = pb.block_height,
                     group = pb.group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
-                    history_inserted = outcome.history_inserted,
+                    history_inserted,
                     "block-confirmation: confirmed → payout history applied"
                 );
                 let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
             }
-            Err(err) if err.is_terminal() => {
+            // The engine this block belongs to is not wired on this
+            // process. Leave it parked — another process may own it.
+            Err(SettleFailure::NoEngine) => continue,
+            Err(SettleFailure::UnusableGroup) => {
+                error!(
+                    block_hash = %pb.block_hash,
+                    group_id = pb.group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
+                    "block-confirmation: parked Group-Solo block has an unusable group id \
+                     or finder — discarding"
+                );
+                let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+            }
+            Err(SettleFailure::Engine(err)) if err.is_terminal() => {
                 // Park, don't destroy: the frozen blob is the only record
                 // of what this block paid every miner.
                 let parked = put_pending_at(&mut conn, UNBOOKABLE_KEY, &pb).await.is_ok();
@@ -361,7 +343,7 @@ async fn reconcile(
                     let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
                 }
             }
-            Err(err) => warn!(
+            Err(SettleFailure::Engine(err)) => warn!(
                 %err,
                 block_hash = %pb.block_hash,
                 "block-confirmation: apply failed; will retry next tick"
@@ -374,9 +356,64 @@ async fn reconcile(
     report_parked_depths(&mut conn, last_unbookable).await;
 }
 
+/// Book one block into its mode's engine — the one settlement both the
+/// watcher and the immediate apply ([`crate::block_sink`]) run, so they
+/// cannot drift apart. Returns the engine's `history_inserted`. What to do
+/// with a failure (retry, park, give up) is the caller's call: only the
+/// watcher has a parked entry to leave in place.
+pub(crate) async fn settle_block(
+    pplns: Option<&PplnsEngine>,
+    group_solo: Option<&GroupSoloEngine>,
+    mode: SettlementMode<'_>,
+    height: i32,
+    actual: &bp_coinbase_snapshot::ActualCoinbase,
+    weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+    payouts_fingerprint: Option<[u8; 32]>,
+) -> Result<u64, SettleFailure> {
+    match mode {
+        SettlementMode::GroupSolo(group) => {
+            let engine = group_solo.ok_or(SettleFailure::NoEngine)?;
+            let (Ok(group_uuid), Ok(finder)) = (
+                uuid::Uuid::parse_str(&group.group_id),
+                AddressId::new(group.finder.clone()),
+            ) else {
+                return Err(SettleFailure::UnusableGroup);
+            };
+            engine
+                .on_block_found(
+                    group_uuid,
+                    height,
+                    actual,
+                    &finder,
+                    weight_snapshot,
+                    payouts_fingerprint,
+                )
+                .await
+                .map(|o| o.history_inserted)
+                .map_err(|e| SettleFailure::Engine(SettleError::GroupSolo(e)))
+        }
+        SettlementMode::Pplns => pplns
+            .ok_or(SettleFailure::NoEngine)?
+            .on_block_found(height, actual, weight_snapshot, payouts_fingerprint)
+            .await
+            .map(|o| o.history_inserted)
+            .map_err(|e| SettleFailure::Engine(SettleError::Pplns(e))),
+    }
+}
+
+/// Why [`settle_block`] booked nothing.
+#[derive(Debug)]
+pub(crate) enum SettleFailure {
+    /// This process has no engine for the block's mode.
+    NoEngine,
+    /// A Group-Solo block whose group id or finder does not parse.
+    UnusableGroup,
+    Engine(SettleError),
+}
+
 /// The two engines' errors, so one loop can treat them alike.
 #[derive(Debug, thiserror::Error)]
-enum SettleError {
+pub(crate) enum SettleError {
     #[error(transparent)]
     Pplns(bp_pplns_engine::engine::EngineError),
     #[error(transparent)]
@@ -384,7 +421,7 @@ enum SettleError {
 }
 
 impl SettleError {
-    fn is_terminal(&self) -> bool {
+    pub(crate) fn is_terminal(&self) -> bool {
         match self {
             SettleError::Pplns(e) => e.is_terminal(),
             SettleError::GroupSolo(e) => e.is_terminal(),

@@ -66,9 +66,40 @@ pub(crate) struct PendingBlock {
     /// The weights fingerprint the winning job carried.
     #[serde(default)]
     pub payouts_fingerprint: Option<[u8; 32]>,
-    /// `Some` → Group-Solo, `None` → PPLNS.
+    /// `Some` → Group-Solo, `None` → PPLNS. Branch on
+    /// [`PendingBlock::mode`], not on this field.
     #[serde(default)]
     pub group: Option<PendingGroup>,
+}
+
+/// Which engine settles a block. The stored shape stays `group: Option`:
+/// parked blocks carry no TTL, so a format change would have the watcher
+/// prune every block parked before the deploy as unparsable.
+pub(crate) enum SettlementMode<'a> {
+    Pplns,
+    GroupSolo(&'a PendingGroup),
+}
+
+impl<'a> SettlementMode<'a> {
+    pub(crate) fn of(group: Option<&'a PendingGroup>) -> Self {
+        match group {
+            Some(g) => Self::GroupSolo(g),
+            None => Self::Pplns,
+        }
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Pplns => "pplns",
+            Self::GroupSolo(_) => "group-solo",
+        }
+    }
+}
+
+impl PendingBlock {
+    pub(crate) fn mode(&self) -> SettlementMode<'_> {
+        SettlementMode::of(self.group.as_ref())
+    }
 }
 
 /// Persist a pending block under `key`, field = block hash (idempotent —

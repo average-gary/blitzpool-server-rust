@@ -777,6 +777,7 @@ async fn main() -> ExitCode {
             engines.blockparty.clone(),
             None,
             Some(handles.redis.clone()),
+            Some(settle_signal.clone()),
         );
         let bf_redis = handles
             .dedicated_redis(&cfg.redis, "block-found-ledger")
@@ -799,8 +800,14 @@ async fn main() -> ExitCode {
                 let bf_notify_redis = handles
                     .dedicated_redis(&cfg.redis, "block-found-notify")
                     .await;
-                let applier =
-                    crate::block_sink::BlockFoundApplier::new(None, None, None, Some(d), None);
+                let applier = crate::block_sink::BlockFoundApplier::new(
+                    None,
+                    None,
+                    None,
+                    Some(d),
+                    None,
+                    None,
+                );
                 Some(crate::block_found_consumer::spawn(
                     bf_notify_redis,
                     applier,

@@ -58,9 +58,10 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
+use crate::block_confirmation::{settle_block, SettleFailure};
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
-use crate::pending_blocks::{put_pending_block, PendingBlock, PendingGroup};
+use crate::pending_blocks::{put_pending_block, PendingBlock, PendingGroup, SettlementMode};
 
 /// Accounting inputs for a found block, bundled so the block-found fan-out
 /// (per-mode engine ledger + notifications) runs from one value.
@@ -815,12 +816,17 @@ impl BlockFoundApplier {
     /// Build an applier from the back-office engines + dispatcher + Redis —
     /// the Satellite's block-found stream consumer uses this to run the same
     /// apply the front runs in-process on a publish-failure fallback.
+    ///
+    /// `settle` is an argument, not a builder step: the payout satellite's
+    /// applier was built without it, so a block it booked on the immediate
+    /// path never invalidated the published distributions.
     pub(crate) fn new(
         pplns: Option<PplnsEngine>,
         group_solo: Option<GroupSoloEngine>,
         blockparty: Option<Arc<dyn bp_blockparty_engine::BlockpartyApi>>,
         dispatcher: Option<Arc<NotificationDispatcher>>,
         redis: Option<ConnectionManager>,
+        settle: Option<crate::settlement::SettlementSignal>,
     ) -> Self {
         Self {
             pplns,
@@ -828,7 +834,7 @@ impl BlockFoundApplier {
             blockparty,
             dispatcher,
             redis,
-            settle: None,
+            settle,
         }
     }
 
@@ -872,11 +878,7 @@ impl BlockFoundApplier {
         payouts_fingerprint: Option<[u8; 32]>,
         group: Option<PendingGroup>,
     ) {
-        let mode = if group.is_some() {
-            "group-solo"
-        } else {
-            "pplns"
-        };
+        let mode = SettlementMode::of(group.as_ref()).label();
         // Settlement is `claim − paid` against the block's OWN coinbase,
         // so its payments are not optional: without them there is
         // nothing to settle against.
@@ -956,59 +958,43 @@ impl BlockFoundApplier {
         payouts_fingerprint: Option<[u8; 32]>,
         group: Option<PendingGroup>,
     ) {
-        let applied = match (&group, self.pplns.as_ref(), self.group_solo.as_ref()) {
-            (Some(g), _, Some(engine)) => {
-                let (Ok(group_uuid), Ok(finder)) = (
-                    uuid::Uuid::parse_str(&g.group_id),
-                    AddressId::new(g.finder.clone()),
-                ) else {
-                    warn!(
-                        address = address_str,
-                        group_id = %g.group_id,
-                        height,
-                        "block-found: Group-Solo group id or finder unusable — NOT booked"
-                    );
-                    return;
-                };
-                engine
-                    .on_block_found(
-                        group_uuid,
-                        height,
-                        actual,
-                        &finder,
-                        weight_snapshot,
-                        payouts_fingerprint,
-                    )
-                    .await
-                    .map(|o| (o.history_inserted, "group-solo"))
-                    .map_err(|e| e.to_string())
-            }
-            (None, Some(engine), _) => engine
-                .on_block_found(height, actual, weight_snapshot, payouts_fingerprint)
-                .await
-                .map(|o| (o.history_inserted, "pplns"))
-                .map_err(|e| e.to_string()),
-            _ => {
-                warn!(
-                    address = address_str,
-                    height, "block-found: no engine wired for this block — NOT booked"
-                );
-                return;
-            }
-        };
+        let mode = SettlementMode::of(group.as_ref());
+        let label = mode.label();
+        let applied = settle_block(
+            self.pplns.as_ref(),
+            self.group_solo.as_ref(),
+            mode,
+            height,
+            actual,
+            weight_snapshot,
+            payouts_fingerprint,
+        )
+        .await;
         match applied {
-            Ok((history_inserted, mode)) => {
+            Ok(history_inserted) => {
                 self.settle_distributions().await;
                 info!(
                     address = address_str,
                     height,
                     reward_sats = reward,
-                    mode,
+                    mode = label,
                     history_inserted,
                     "block-found: payout history applied (immediate)"
                 );
             }
-            Err(err) => warn!(
+            Err(SettleFailure::NoEngine) => warn!(
+                address = address_str,
+                height,
+                mode = label,
+                "block-found: no engine wired for this block — NOT booked"
+            ),
+            Err(SettleFailure::UnusableGroup) => warn!(
+                address = address_str,
+                group_id = group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
+                height,
+                "block-found: Group-Solo group id or finder unusable — NOT booked"
+            ),
+            Err(SettleFailure::Engine(err)) => warn!(
                 %err, address = address_str, height,
                 "block-found: immediate apply failed"
             ),
