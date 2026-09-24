@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bp_common::{AddressId, Sats, StreamKind};
+use bp_common::{AddressId, StreamKind};
 use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
 use bp_stratum_v2::extensions::{
     encode_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
@@ -59,7 +59,7 @@ use bp_stratum_v2::jdp::client::{
     FLAG_DECLARE_TX_DATA,
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
-    encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
+    designated_output_blob, CandidateBacking, PayoutBooking,
 };
 use bp_stratum_v2::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
 use bp_stratum_v2::jdp_server::{
@@ -197,14 +197,11 @@ impl JdpAllocateResolver for BaseModeAllocateResolver {
         let coinbase_outputs = if payout_distribution_negotiated {
             Vec::new()
         } else {
-            match encode_coinbase_outputs(
+            match bp_mining_job::address_to_script(
                 bitcoin::Network::Regtest,
-                &[DynamicOutput {
-                    address: miner_address.clone(),
-                    sats: Sats(0),
-                }],
+                miner_address.as_str(),
             ) {
-                Ok(bytes) => bytes,
+                Ok(script) => designated_output_blob(&script),
                 Err(_) => {
                     return AllocateOutcome::Refused {
                         reason: "fixture address does not encode",

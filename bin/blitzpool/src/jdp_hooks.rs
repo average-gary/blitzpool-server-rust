@@ -22,7 +22,7 @@
 //!    - **base protocol** → the single
 //!      SV2 JDP/AllocateMiningJobToken.Success designated payout output
 //!      at 0 sats, paying the miner itself, consensus-serialised through
-//!      [`bp_stratum_v2::jdp::dynamic_outputs::encode_coinbase_outputs`].
+//!      [`bp_stratum_v2::jdp::dynamic_outputs::designated_output_blob`].
 //!      Only a Solo miner gets one, and two independent checks say so:
 //!      the miner's stream must be Solo (which is what the mining side
 //!      will serve a base custom job on), and its payout list must fit
@@ -81,14 +81,12 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
-use bp_common::{AddressId, Sats, StreamKind};
+use bp_common::{AddressId, StreamKind};
 use bp_mining_job::assemble_witness_coinbase;
 use bp_stratum_v2::jdp::client::{
     parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
 };
-use bp_stratum_v2::jdp::dynamic_outputs::{
-    encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
-};
+use bp_stratum_v2::jdp::dynamic_outputs::{designated_output_blob, CandidateBacking};
 use bp_stratum_v2::jdp_server::{
     AllocateOutcome, CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink,
     JdpServerHooks, PayoutDistributionSource, TemplateTxProvider,
@@ -107,8 +105,8 @@ use crate::payout_resolver::ProductionPayoutResolver;
 /// block-submission sink: `true` → real RPC resubmit (full anti-orphan
 /// redundancy); `false` → the JDC is the sole propagator via its own
 /// TDP connection and the pool only reports the block. Source:
-/// `[sv2].jdp_orphan_submitblock` in the TOML. `ledger_booker` switches
-/// the other half, independently.
+/// `[sv2].jdp_orphan_submitblock` in the TOML. `ledger_booker` is the other
+/// half: it books a proven block against the distribution its coinbase paid.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_jdp_hooks(
     tdp: TdpHandle,
@@ -117,7 +115,7 @@ pub(crate) fn build_jdp_hooks(
     template_tx_cache: Option<Arc<TemplateTxCache>>,
     network: BitcoinNetwork,
     orphan_submitblock_enabled: bool,
-    ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
+    ledger_booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
     distribution_source: Arc<dyn PayoutDistributionSource>,
     settle: crate::settlement::SettlementSignal,
     job_validator: Option<Arc<dyn DeclaredJobValidator>>,
@@ -136,14 +134,11 @@ pub(crate) fn build_jdp_hooks(
         );
         None
     };
-    if ledger_booker.is_none() {
-        info!("jdp: ledger fan-out not wired — a JDC-found block will be reported but not booked");
-    }
     // One sink for both halves. The block was found whether or not the pool
-    // resubmits it, so booking hangs off its own switch, not the resubmit one.
+    // resubmits it, so booking does not hang off the resubmit switch.
     let block_sink: Arc<dyn JdpBlockSubmissionSink> = Arc::new(ProductionJdpBlockSink {
         propagator,
-        booker: ledger_booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
+        booker: ledger_booker,
         chain: Arc::new(tdp.clone()),
         booked: StdMutex::new(VecDeque::new()),
         network,
@@ -452,22 +447,18 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         };
         // 0 sats per SV2 JDP/AllocateMiningJobToken.Success — the amount is
         // the JDC's to fill in.
-        let outputs = [DynamicOutput {
-            address: designated,
-            sats: Sats(0),
-        }];
-        match encode_coinbase_outputs(self.network, &outputs) {
-            Ok(bytes) => AllocateOutcome::Granted(AllocateTokenContext {
+        match bp_mining_job::address_to_script(self.network, designated.as_str()) {
+            Ok(script) => AllocateOutcome::Granted(AllocateTokenContext {
                 miner_address,
-                coinbase_outputs: bytes,
+                coinbase_outputs: designated_output_blob(&script),
             }),
             Err(err) => {
-                // Refuse the allocate outright. An unencodable output set
-                // must not degrade into a bogus 1-byte blob the JDC would
-                // size its coinbase reservation from.
+                // Refuse the allocate outright. An address that does not
+                // encode on this network must not degrade into a bogus blob
+                // the JDC would size its coinbase reservation from.
                 warn!(
                     %err,
-                    user_identifier, "JDP allocate: encode_coinbase_outputs failed; refusing"
+                    user_identifier, "JDP allocate: payout address does not encode; refusing"
                 );
                 AllocateOutcome::Refused {
                     reason: "payout address does not encode on this network",
@@ -818,17 +809,16 @@ fn assemble_declared_block(
 /// it.
 ///
 /// One sink rather than a chain of them, because both halves want the same
-/// reassembled block and reassembly is the only expensive step. Each half has
-/// its own switch and neither answers to the other's: the resubmit is
-/// `[sv2].jdp_orphan_submitblock`, the booking is whether a ledger fan-out was
-/// wired. The block was found either way.
+/// reassembled block and reassembly is the only expensive step. The resubmit
+/// is switchable (`[sv2].jdp_orphan_submitblock`); the booking is not — a
+/// proven block is always booked. The block was found either way.
 pub(crate) struct ProductionJdpBlockSink {
     /// `Some` → the pool resubmits the block to its own node as anti-orphan
     /// redundancy. `None` → the JDC is the sole propagator.
     propagator: Option<Arc<dyn BlockPropagator>>,
-    /// `Some` → a proven block is booked against the distribution its coinbase
-    /// paid. `None` → no ledger fan-out on this deployment; report only.
-    booker: Option<Arc<dyn DeclaredBlockBooker>>,
+    /// Books a proven block against the distribution its coinbase paid, or
+    /// records it without a ledger entry when that cannot be computed.
+    booker: Arc<dyn DeclaredBlockBooker>,
     /// The pool's own chain view. Booking is checked against this, never
     /// against anything the JD-client sent.
     chain: Arc<dyn ChainView>,
@@ -943,7 +933,6 @@ impl ProductionJdpBlockSink {
     /// the pool's published distributions at will.
     async fn settle_and_book(
         &self,
-        to_book: Option<(PayoutBooking, &dyn DeclaredBlockBooker)>,
         backing: CandidateBacking,
         miner_address: &AddressId,
         declaration: DeclarationRef,
@@ -999,20 +988,14 @@ impl ProductionJdpBlockSink {
         if backing.settles_here() {
             self.settle.settle().await;
         }
-        let Some((booking, booker)) = to_book else {
-            // Nothing to book. For an `UnbookableDistribution` the block is
-            // still the pool's, and without a row it appears in no API and no
-            // UI — the operator would have to find it in a log line. Record
-            // it, ledger untouched.
-            //
-            // A base-protocol declaration gets nothing here on purpose: the
-            // mining side already records that one off its own share
-            // (`ExtendedJob::jdp_claims_the_block`), and a second record would
-            // be a duplicate row on an insert with no `ON CONFLICT`.
-            if let (CandidateBacking::UnbookableDistribution { distribution_id }, Some(recorder)) =
-                (backing, self.booker.as_ref())
-            {
-                let recorded = recorder
+        let booking = match backing {
+            CandidateBacking::Bookable(booking) => booking,
+            // Nothing to book, but the block is still the pool's, and without
+            // a row it appears in no API and no UI — the operator would have
+            // to find it in a log line. Record it, ledger untouched.
+            CandidateBacking::UnbookableDistribution { distribution_id } => {
+                let recorded = self
+                    .booker
                     .record_unbookable(FoundBlockRecord {
                         miner_address: miner_address.as_str().to_string(),
                         session_id: declaration_session_id(declaration.jdp_session_id),
@@ -1033,8 +1016,13 @@ impl ProductionJdpBlockSink {
                      The miners were paid by the coinbase; the pool's ledger is short one \
                      reconciliation."
                 );
+                return;
             }
-            return;
+            // Gets nothing here on purpose: the mining side already records
+            // this one off its own share (`ExtendedJob::jdp_claims_the_block`),
+            // and a second record would be a duplicate row on an insert with
+            // no `ON CONFLICT`.
+            CandidateBacking::BaseProtocol => return,
         };
         // The block's own coinbase is the settlement ground truth —
         // `claim − paid` is booked from what it ACTUALLY pays. The
@@ -1049,7 +1037,8 @@ impl ProductionJdpBlockSink {
             .as_ref()
             .map(|a| a.total_value_sats)
             .unwrap_or(booking.reference_reward_sats);
-        let booked = booker
+        let booked = self
+            .booker
             .book(
                 FoundBlockRecord {
                     miner_address: miner_address.as_str().to_string(),
@@ -1100,25 +1089,21 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
         );
         log_booking_status(&miner_address, backing);
 
-        let to_book = match backing {
-            CandidateBacking::Bookable(booking) => {
-                self.booker.as_ref().map(|booker| (booking, booker))
-            }
+        let bookable = match backing {
+            CandidateBacking::Bookable(_) => true,
             CandidateBacking::UnbookableDistribution { .. } | CandidateBacking::BaseProtocol => {
-                None
+                false
             }
         };
-        // Nothing downstream wants the block, so don't pay to build it: a
-        // deployment with the resubmit off and no ledger wired is the JDC
-        // propagating alone, and reassembly would be work for a log line.
+        // Nothing downstream wants the block, so don't pay to build it: with
+        // the resubmit off, a candidate that is neither bookable nor paid a
+        // published distribution is the JDC propagating alone, and reassembly
+        // would be work for a log line.
         //
         // The ext 0x0003/Implementation Notes settle counts as "wants it": it
         // needs the assembled block to check the solution is real before
         // invalidating anything.
-        if self.propagator.is_none()
-            && to_book.is_none()
-            && !backing.paid_a_published_distribution()
-        {
+        if self.propagator.is_none() && !bookable && !backing.paid_a_published_distribution() {
             return;
         }
         let Some(block) = assemble_declared_block(&coinbase_raw, &transactions, solution) else {
@@ -1134,7 +1119,7 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
         // to book — a reading in which every found block is on the wrong tip.
         // Needed for the settle as well as the booking: both act only on a
         // block the chain can vouch for.
-        let needs_evidence = to_book.is_some() || backing.paid_a_published_distribution();
+        let needs_evidence = bookable || backing.paid_a_published_distribution();
         let demands_on_arrival = needs_evidence.then(|| self.chain.demands()).flatten();
 
         // Propagation first, and nothing that only the ledger needs before it.
@@ -1145,7 +1130,6 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
         }
         if needs_evidence {
             self.settle_and_book(
-                to_book.map(|(booking, booker)| (booking, booker.as_ref())),
                 backing,
                 &miner_address,
                 declaration,
@@ -2102,6 +2086,7 @@ mod jdp_validation_socket_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bp_stratum_v2::jdp::dynamic_outputs::PayoutBooking;
 
     /// The JDC's bytes are untrusted input; garbage must not panic or produce
     /// a block, it must decline so the caller reports instead of booking.
@@ -2297,7 +2282,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     /// the production code left it green.
     #[tokio::test]
     async fn a_repeated_block_is_booked_only_once() {
-        let sink = sink_with_halves(None, Some(Arc::new(RecordingBooker::default())), None);
+        let sink = sink_with_halves(None, Arc::new(RecordingBooker::default()), None);
         assert!(!sink.already_booked(&[1u8; 32]), "first sighting");
         sink.remember_booked([1u8; 32]);
         assert!(sink.already_booked(&[1u8; 32]), "the same block again");
@@ -2454,7 +2439,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn the_booking_path_records_the_jdp_session_id() {
         let booker = Arc::new(RecordingBooker::default());
         let (sink, _bridge, _server) =
-            sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
+            sink_and_published_distribution(booker.clone(), Some(met_by_the_fixture()));
 
         push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
 
@@ -2566,13 +2551,13 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     /// independently switchable in production, so both are here.
     fn sink_with_halves(
         propagator: Option<Arc<RecordingPropagator>>,
-        booker: Option<Arc<RecordingBooker>>,
+        booker: Arc<RecordingBooker>,
         chain: Option<ChainDemands>,
     ) -> ProductionJdpBlockSink {
         ProductionJdpBlockSink {
             network: BitcoinNetwork::Regtest,
             propagator: propagator.map(|p| p as Arc<dyn BlockPropagator>),
-            booker: booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
+            booker,
             settle: crate::settlement::SettlementSignal::local_only(),
             chain: Arc::new(FixedChain(chain)),
             booked: StdMutex::new(VecDeque::new()),
@@ -2590,7 +2575,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let propagator = Arc::new(RecordingPropagator::default());
         let booker = Arc::new(RecordingBooker::default());
         (
-            sink_with_halves(Some(propagator.clone()), Some(booker.clone()), chain),
+            sink_with_halves(Some(propagator.clone()), booker.clone(), chain),
             propagator,
             booker,
         )
@@ -2642,7 +2627,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     /// A sink whose settle signal is wired to a real registry holding one
     /// published pool-wide distribution, so the test can watch it disappear.
     fn sink_and_published_distribution(
-        booker: Option<Arc<RecordingBooker>>,
+        booker: Arc<RecordingBooker>,
         chain: Option<ChainDemands>,
     ) -> (
         ProductionJdpBlockSink,
@@ -2695,7 +2680,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let sink = ProductionJdpBlockSink {
             network: BitcoinNetwork::Regtest,
             propagator: None,
-            booker: booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
+            booker,
             settle,
             chain: Arc::new(FixedChain(chain)),
             booked: StdMutex::new(VecDeque::new()),
@@ -2724,7 +2709,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn an_unbookable_distribution_is_still_settled() {
         let booker = Arc::new(RecordingBooker::default());
         let (sink, bridge, server) =
-            sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
+            sink_and_published_distribution(booker.clone(), Some(met_by_the_fixture()));
         assert!(
             bridge.read().unwrap().current_pool_wide().is_some(),
             "precondition: a distribution is published"
@@ -2760,7 +2745,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn an_unbookable_block_is_recorded_but_not_booked() {
         let booker = Arc::new(RecordingBooker::default());
         let (sink, _bridge, server) =
-            sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
+            sink_and_published_distribution(booker.clone(), Some(met_by_the_fixture()));
 
         push(
             &sink,
@@ -2796,7 +2781,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn a_base_protocol_block_is_not_recorded_twice() {
         let booker = Arc::new(RecordingBooker::default());
         let (sink, _bridge, server) =
-            sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
+            sink_and_published_distribution(booker.clone(), Some(met_by_the_fixture()));
 
         push(&sink, CandidateBacking::BaseProtocol, 1).await;
 
@@ -2825,7 +2810,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn a_bookable_block_leaves_the_settle_to_its_booking() {
         let booker = Arc::new(RecordingBooker::default());
         let (sink, bridge, server) =
-            sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
+            sink_and_published_distribution(booker.clone(), Some(met_by_the_fixture()));
 
         push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
 
@@ -2850,7 +2835,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     async fn a_booking_that_wrote_nothing_settles_nothing() {
         let booker = Arc::new(RecordingBooker::that_writes_nothing());
         let (sink, bridge, server) =
-            sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
+            sink_and_published_distribution(booker.clone(), Some(met_by_the_fixture()));
 
         push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
 
@@ -2878,7 +2863,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
     #[tokio::test(flavor = "current_thread")]
     async fn nothing_settles_without_a_published_distribution_or_without_proof() {
         let (sink, bridge, server) =
-            sink_and_published_distribution(None, Some(met_by_the_fixture()));
+            sink_and_published_distribution(Arc::default(), Some(met_by_the_fixture()));
         push(&sink, CandidateBacking::BaseProtocol, 1).await;
         assert!(
             bridge.read().unwrap().current_pool_wide().is_some(),
@@ -2892,7 +2877,8 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
             prev_hash: [0u8; 32],
             target: [0u8; 32],
         };
-        let (sink, bridge, server) = sink_and_published_distribution(None, Some(impossible));
+        let (sink, bridge, server) =
+            sink_and_published_distribution(Arc::default(), Some(impossible));
         push(
             &sink,
             CandidateBacking::UnbookableDistribution { distribution_id: 7 },
@@ -2934,7 +2920,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let booker = Arc::new(RecordingBooker::default());
         let sink = sink_with_halves(
             None,
-            Some(booker.clone()),
+            booker.clone(),
             Some(ChainDemands {
                 prev_hash: [0u8; 32],
                 target: [0xFFu8; 32],
@@ -2945,23 +2931,6 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
             *booker.booked.lock().unwrap(),
             vec![(5_000_000_000, [0x11; 32])]
         );
-    }
-
-    /// And the reverse: with no ledger wired the block still gets propagated.
-    /// The resubmit answers to nothing the ledger does.
-    #[tokio::test]
-    async fn propagation_does_not_hinge_on_a_wired_ledger() {
-        let propagator = Arc::new(RecordingPropagator::default());
-        let sink = sink_with_halves(
-            Some(propagator.clone()),
-            None,
-            Some(ChainDemands {
-                prev_hash: [0u8; 32],
-                target: [0xFFu8; 32],
-            }),
-        );
-        push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
-        assert_eq!(propagator.propagated.lock().unwrap().len(), 1);
     }
 
     /// The pool's own resubmit advances the pool's own tip. Judging the booking
@@ -2988,7 +2957,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
                 chain: chain.clone(),
                 to: moved_on,
             })),
-            booker: Some(booker.clone()),
+            booker: booker.clone(),
             settle: crate::settlement::SettlementSignal::local_only(),
             chain: Arc::new(chain),
             booked: StdMutex::new(VecDeque::new()),
@@ -3014,7 +2983,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let booker = Arc::new(RecordingBooker::default());
         let sink = sink_with_halves(
             None,
-            Some(booker.clone()),
+            booker.clone(),
             Some(ChainDemands {
                 prev_hash: pushed_block(1).header.block_hash().to_byte_array(),
                 target: unreachable_target,
@@ -3031,7 +3000,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let booker = Arc::new(RecordingBooker::default());
         let sink = sink_with_halves(
             None,
-            Some(booker.clone()),
+            booker.clone(),
             Some(ChainDemands {
                 prev_hash: [0x99u8; 32],
                 target: [0xFFu8; 32],
@@ -3110,7 +3079,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let booker = Arc::new(RecordingBooker::that_writes_nothing());
         let sink = sink_with_halves(
             None,
-            Some(booker.clone()),
+            booker.clone(),
             Some(ChainDemands {
                 prev_hash: [0u8; 32],
                 target: [0xFFu8; 32],
@@ -3132,7 +3101,7 @@ be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
         let booker = Arc::new(RecordingBooker::default());
         let sink = sink_with_halves(
             None,
-            Some(booker.clone()),
+            booker.clone(),
             Some(ChainDemands {
                 prev_hash: [0u8; 32],
                 target: [0xFFu8; 32],

@@ -996,16 +996,15 @@ async fn main() -> ExitCode {
                 // (all cheap handle clones), built by the same constructor as
                 // the Stratum ones, so a declared block books through the same
                 // path a pool-built one does.
-                let jdp_ledger_booker = Some(std::sync::Arc::new(
-                    crate::block_sink::TdpBlockSubmissionSink::wired(
+                let jdp_ledger_booker =
+                    std::sync::Arc::new(crate::block_sink::TdpBlockSubmissionSink::wired(
                         tdp_handle.clone(),
                         &cfg,
                         &handles,
                         &engines,
                         dispatcher.clone(),
                         settle_signal.clone(),
-                    ),
-                ));
+                    ));
                 let jdp = match jdp::spawn(
                     &cfg,
                     jdp_bridge,

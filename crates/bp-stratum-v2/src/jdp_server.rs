@@ -86,7 +86,7 @@ use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
 /// Resolve `(miner_address, encoded_coinbase_outputs)` for an
 /// inbound `AllocateMiningJobToken`. Production wiring parses
 /// `user_identifier` as a BTC address, then computes the pool's payout outputs via
-/// [`crate::hooks::PayoutResolver`] + [`crate::jdp::dynamic_outputs::encode_coinbase_outputs`].
+/// [`crate::hooks::PayoutResolver`] + [`crate::jdp::dynamic_outputs::designated_output_blob`].
 /// Tests use a no-op + a custom fixture.
 #[async_trait]
 pub trait JdpAllocateResolver: Send + Sync {
@@ -417,13 +417,11 @@ impl JdpAllocateResolver for NoOpJdpHooks {
         let Ok(parsed) = addr.as_str().parse::<bitcoin::Address<_>>() else {
             return AllocateOutcome::Ignored;
         };
-        let txout = bitcoin::TxOut {
-            value: bitcoin::Amount::ZERO,
-            script_pubkey: parsed.assume_checked().script_pubkey(),
-        };
         AllocateOutcome::Granted(AllocateTokenContext {
             miner_address: addr,
-            coinbase_outputs: bitcoin::consensus::serialize(&vec![txout]),
+            coinbase_outputs: crate::jdp::dynamic_outputs::designated_output_blob(
+                &parsed.assume_checked().script_pubkey(),
+            ),
         })
     }
 }

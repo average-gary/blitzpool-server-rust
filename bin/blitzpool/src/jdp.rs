@@ -118,9 +118,8 @@ pub(crate) async fn spawn(
     payout_resolver: Arc<ProductionPayoutResolver>,
     template_tx_cache: Option<Arc<TemplateTxCache>>,
     // Books a JDC-found block against the distribution its coinbase was
-    // proven to pay. `None` on a deployment with no ledger fan-out wired —
-    // such a block is then reported but not booked.
-    ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
+    // proven to pay.
+    ledger_booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
     // Allocator backing for the strictly-increasing ext 0x0003
     // `distribution_id` (ext 0x0003/SetPayoutDistribution).
     redis: redis::aio::ConnectionManager,

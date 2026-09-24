@@ -251,9 +251,9 @@ pub struct PushSolutionInput {
 /// 2. Resolves the pool's payout addresses via a `PayoutResolver`
 ///    hook — typically just the miner's address (single-output,
 ///    SV2 JDP/AllocateMiningJobToken.Success fallback).
-/// 3. Encodes the resolved address list into a consensus-serialised
-///    `Vec<TxOut>` blob via
-///    [`crate::jdp::dynamic_outputs::encode_coinbase_outputs`].
+/// 3. Encodes the designated payout script into the one-output
+///    consensus-serialised `Vec<TxOut>` blob via
+///    [`crate::jdp::dynamic_outputs::designated_output_blob`].
 /// 4. Passes the resolved `(miner_address, coinbase_outputs)` here.
 #[derive(Clone, Debug)]
 pub struct AllocateTokenContext {
@@ -635,7 +635,7 @@ pub fn handle_request_extensions(
 /// [`AllocateTokenContext`] before invoking by parsing the JDC's
 /// `user_identifier` as a BTC address. The caller also pre-encodes the pool's
 /// `coinbase_outputs` blob (consensus-serialised `Vec<TxOut>`) via
-/// [`crate::jdp::dynamic_outputs::encode_coinbase_outputs`].
+/// [`crate::jdp::dynamic_outputs::designated_output_blob`].
 ///
 /// - Pre-setup → silently dropped.
 /// - Rate-limited → silently dropped. The [`TokenStore::allocate`]
