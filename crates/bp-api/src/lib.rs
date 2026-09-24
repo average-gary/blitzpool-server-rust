@@ -65,7 +65,6 @@ where
         .merge(controllers::blockparty::routes())
         .merge(controllers::client::routes())
         .merge(controllers::invitation::routes())
-        .merge(controllers::external_share::routes())
         .merge(controllers::downstream_report::routes())
         .merge(controllers::email::routes())
         .merge(controllers::push::routes())

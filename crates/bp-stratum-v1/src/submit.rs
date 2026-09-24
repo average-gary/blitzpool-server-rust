@@ -132,8 +132,8 @@ pub struct ShareAccept {
     /// tracker (`addressSettings.bestDifficulty`); the block-found gate
     /// compares the hash itself against the network target.
     pub submission_difficulty: f64,
-    /// 80-byte block header that produced the hash. Forwarded to the
-    /// external-share-submitter when enabled.
+    /// 80-byte block header that produced the hash. The block-submit path
+    /// assembles a found block from it.
     pub header: [u8; 80],
     /// sha256d of the header — the share's identity.
     pub hash: [u8; 32],

@@ -7,8 +7,7 @@
 //! as `Vec<u8>` so the I/O layer (Task #9 server) can decide how to flush them.
 //!
 //! Side-effects (DB row insert, address-settings cache update, notification
-//! fan-out, PPLNS / group-solo `recordShare`, external-share submission,
-//! push notifications) land on the **trait boundaries** in `hooks.rs` (Task #9).
+//! fan-out, PPLNS / group-solo `recordShare`, push notifications) land on the **trait boundaries** in `hooks.rs` (Task #9).
 //! This module returns a typed [`SessionEvent`] alongside the wire frame so the
 //! server task can drive those hooks without re-deriving the state.
 //!

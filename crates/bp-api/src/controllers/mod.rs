@@ -10,7 +10,6 @@ pub(crate) mod client;
 pub(crate) mod custom_extranonce;
 pub(crate) mod downstream_report;
 pub(crate) mod email;
-pub(crate) mod external_share;
 pub(crate) mod groups;
 pub(crate) mod info;
 pub(crate) mod invitation;

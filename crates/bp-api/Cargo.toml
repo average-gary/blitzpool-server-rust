@@ -67,8 +67,7 @@ once_cell = "1"
 moka = { version = "0.12", features = ["future", "sync"] }
 bytes = "1"
 
-# bp-share for the external-share POST endpoint's difficulty
-# calculation (sha256d of the 80-byte header + Target-to-difficulty).
+# bp-share for the block-subsidy schedule behind the group coinbase figures.
 bp-share = { workspace = true }
 # bp-mining-job for per-address coinbase + block assembly inside the
 # /api/client/:address/block-template handler. bitcoin crate gives us

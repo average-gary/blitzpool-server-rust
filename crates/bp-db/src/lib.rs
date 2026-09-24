@@ -41,7 +41,6 @@ mod blockparty;
 mod client;
 mod custom_extranonce;
 mod email;
-mod external;
 mod group;
 mod notification;
 mod pool;
@@ -112,10 +111,6 @@ pub use email::{
     delete_expired_email_verifications, find_address_email, find_email_verification,
     insert_email_verification, upsert_address_email_verified, AddressEmailRow,
     EmailVerificationRow,
-};
-pub use external::{
-    find_external_share, find_external_share_top_difficulties, insert_external_share,
-    ExternalShareTopDifficulty, ExternalSharesRow,
 };
 pub use group::{
     bulk_insert_pplns_group_block_history, count_pplns_group_join_requests_pending_for_address,
