@@ -45,6 +45,7 @@
 use std::time::Duration;
 
 use bitcoin::Network;
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_mining_job::{
     build_block_header, build_mining_job_from_tdp, merkle_root_from_coinbase,
     version_meets_consensus_floor, PayoutEntry, TdpCoinbaseTemplate,
@@ -295,6 +296,7 @@ async fn run_block_submit_case(
         miner_extranonce_size,
         job_difficulty,
         [0xFFu8; 32],
+        LifecycleConfig::DEFAULT,
     );
     channel.extended_jobs.insert(job_id, ext_job.clone());
 
@@ -368,6 +370,7 @@ async fn run_block_submit_case(
         kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
+        job_lifecycle: *channel.standard_jobs.lifecycle(),
     };
     let validation = validate_submit_extended(
         &mut channel.submission_cache,

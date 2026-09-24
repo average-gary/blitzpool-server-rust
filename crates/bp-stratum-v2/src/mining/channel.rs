@@ -32,6 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_share::{Difficulty, Target, TargetMemo};
 
 use super::jobs::{ExtendedJob, StandardJobMaps};
@@ -144,6 +145,7 @@ impl ChannelState {
         extranonce_prefix: Vec<u8>,
         session_difficulty: Difficulty,
         declared_max_target: [u8; 32],
+        job_lifecycle: LifecycleConfig,
     ) -> Self {
         Self {
             channel_id,
@@ -153,7 +155,7 @@ impl ChannelState {
             session_difficulty,
             declared_max_target,
             last_declared_hash_rate: None,
-            standard_jobs: StandardJobMaps::new(),
+            standard_jobs: StandardJobMaps::new(job_lifecycle),
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
@@ -175,6 +177,7 @@ impl ChannelState {
         extranonce_size: u8,
         session_difficulty: Difficulty,
         declared_max_target: [u8; 32],
+        job_lifecycle: LifecycleConfig,
     ) -> Self {
         Self {
             channel_id,
@@ -184,7 +187,7 @@ impl ChannelState {
             session_difficulty,
             declared_max_target,
             last_declared_hash_rate: None,
-            standard_jobs: StandardJobMaps::new(),
+            standard_jobs: StandardJobMaps::new(job_lifecycle),
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
@@ -339,7 +342,13 @@ mod tests {
     /// Fresh Standard channel: zero extranonce_size, empty maps.
     #[test]
     fn standard_channel_starts_clean() {
-        let ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1024.0), max_target());
+        let ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1024.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.kind, ChannelKind::Standard);
         assert_eq!(ch.extranonce_size, 0);
         assert!(ch.standard_jobs.is_empty());
@@ -353,7 +362,14 @@ mod tests {
     /// Fresh Extended channel: extranonce_size > 0, Extended-cache.
     #[test]
     fn extended_channel_starts_clean() {
-        let ch = ChannelState::new_extended(2, vec![0; 4], 8, Difficulty(1024.0), max_target());
+        let ch = ChannelState::new_extended(
+            2,
+            vec![0; 4],
+            8,
+            Difficulty(1024.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.kind, ChannelKind::Extended);
         assert_eq!(ch.extranonce_size, 8);
         assert!(matches!(ch.submission_cache, SubmissionCache::Extended(_)));
@@ -368,7 +384,13 @@ mod tests {
         let mut tgt = [0u8; 32];
         tgt[0] = 0x01;
         tgt[31] = 0xFF;
-        let ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), tgt);
+        let ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            tgt,
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.declared_max_target, tgt);
     }
 
@@ -377,7 +399,13 @@ mod tests {
     /// Counters increment together; difficulty sum accumulates as f64.
     #[test]
     fn record_accepted_share_bumps_counters() {
-        let mut ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.record_accepted_share(Difficulty(1024.0));
         ch.record_accepted_share(Difficulty(2048.5));
         assert_eq!(ch.accepted_share_count, 2);
@@ -431,7 +459,13 @@ mod tests {
     /// trigger).
     #[test]
     fn clear_submission_cache_empties_dedup() {
-        let mut ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.submission_cache.insert_standard(StandardDedupKey {
             job_id: 1,
             nonce: 1,
@@ -448,11 +482,24 @@ mod tests {
     /// cache.
     #[test]
     fn cache_kind_is_preserved_after_clear() {
-        let mut ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.clear_submission_cache();
         assert!(matches!(ch.submission_cache, SubmissionCache::Standard(_)));
 
-        let mut ch = ChannelState::new_extended(2, vec![0; 4], 8, Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_extended(
+            2,
+            vec![0; 4],
+            8,
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.clear_submission_cache();
         assert!(matches!(ch.submission_cache, SubmissionCache::Extended(_)));
     }
@@ -462,7 +509,14 @@ mod tests {
     /// The diagnostic flag is mutable (callers flip it on first-share-log).
     #[test]
     fn diagnostic_flags_can_be_toggled() {
-        let mut ch = ChannelState::new_extended(1, vec![0; 4], 8, Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_extended(
+            1,
+            vec![0; 4],
+            8,
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.first_share_logged = true;
         assert!(ch.first_share_logged);
     }
@@ -476,9 +530,22 @@ mod tests {
     /// `handle_open_extended_mining_channel`.
     #[test]
     fn full_extranonce_size_is_sum_of_prefix_and_rollable() {
-        let ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());
+        let ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.full_extranonce_size(), 4);
-        let ch = ChannelState::new_extended(2, vec![0; 6], 6, Difficulty(1.0), max_target());
+        let ch = ChannelState::new_extended(
+            2,
+            vec![0; 6],
+            6,
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.full_extranonce_size(), 12);
     }
 }

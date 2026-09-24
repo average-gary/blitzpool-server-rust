@@ -445,6 +445,10 @@ fn ttl_site_info() -> u64 {
 fn ttl_pool_info() -> u64 {
     600
 }
+fn default_job_retention_ms() -> u64 {
+    600_000
+}
+
 fn default_cache_capacity() -> u64 {
     10_000
 }
@@ -458,8 +462,10 @@ pub struct StratumConfig {
     /// High-difficulty SV1 listener port.
     pub solo_high_diff_port: u16,
     pub high_diff_start_difficulty: u64,
-    /// How long an emitted job stays valid before the engine refuses
-    /// shares against it.
+    /// How long a retired job stays stored before aging drops it; a share
+    /// against a dropped job is rejected as an unknown job. Applies to SV1
+    /// and SV2. Defaults to 600 000 (10 min).
+    #[serde(default = "default_job_retention_ms")]
     pub job_retention_ms: u64,
     pub target_shares_per_minute: u32,
     pub high_diff_target_shares_per_minute: u32,
@@ -1450,7 +1456,6 @@ mod tests {
             solo_start_difficulty = 5000
             solo_high_diff_port = 3339
             high_diff_start_difficulty = 1000000
-            job_retention_ms = 90000
             target_shares_per_minute = 6
             high_diff_target_shares_per_minute = 6
             difficulty_check_interval_ms = 60000
@@ -1460,6 +1465,8 @@ mod tests {
         assert!(cfg.notifications.fcm.is_none());
         assert!(cfg.smtp.is_none());
         assert_eq!(cfg.solo.coinbase_weight_budget, 4_000);
+        // [stratum] job_retention_ms defaults to 10 min when unset.
+        assert_eq!(cfg.stratum.job_retention_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);
         // §6.4.9 makes propagating a pushed solution a MUST for the JDS, and

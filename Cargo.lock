@@ -528,6 +528,7 @@ dependencies = [
  "bp-geoip",
  "bp-group-mgmt-engine",
  "bp-group-solo-engine",
+ "bp-jobs-lifecycle",
  "bp-metrics",
  "bp-mining-job",
  "bp-mining-mode",

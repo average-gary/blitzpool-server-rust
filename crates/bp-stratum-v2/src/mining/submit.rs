@@ -57,6 +57,7 @@ use super::channel::{
     ChannelKind, ChannelState, ExtendedDedupKey, StandardDedupKey, SubmissionCache,
 };
 use super::jobs::{classify_extended_job, ExtendedJob};
+use bp_jobs_lifecycle::LifecycleConfig;
 
 // ── Wire codes (SV2 mining-protocol error strings) ───────────────────
 
@@ -471,6 +472,9 @@ pub struct ExtendedChannelView {
     /// `channel.target_for(job_difficulty)` — precomputed by the caller
     /// so the validator needs no `&mut` access to the channel's memo.
     pub job_target: Target,
+    /// The channel's lifecycle config (`channel.standard_jobs.lifecycle()`),
+    /// which the stale-share classification runs against.
+    pub job_lifecycle: LifecycleConfig,
 }
 
 /// Validate a `SubmitSharesExtended` frame. Pure function with the
@@ -534,7 +538,7 @@ pub fn validate_submit_extended(
         return ShareValidation::Rejected(RejectReason::DuplicateShare.into());
     }
 
-    let classification = classify_extended_job(ext_job, now_ms);
+    let classification = classify_extended_job(ext_job, now_ms, &view.job_lifecycle);
     if classification == JobClassification::StaleRejected {
         let retired_ago_ms = ext_job
             .retired_at
@@ -735,11 +739,24 @@ mod tests {
     }
 
     fn std_channel() -> ChannelState {
-        ChannelState::new_standard(1, vec![0u8; 4], Difficulty(1024.0), max_target())
+        ChannelState::new_standard(
+            1,
+            vec![0u8; 4],
+            Difficulty(1024.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        )
     }
 
     fn ext_channel() -> ChannelState {
-        ChannelState::new_extended(2, vec![0u8; 4], 8, Difficulty(1024.0), max_target())
+        ChannelState::new_extended(
+            2,
+            vec![0u8; 4],
+            8,
+            Difficulty(1024.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        )
     }
 
     fn ext_job(prev: [u8; 32], n_bits: u32) -> ExtendedJob {
@@ -819,6 +836,7 @@ mod tests {
             kind: ch.kind,
             extranonce_size: ch.extranonce_size,
             job_target,
+            job_lifecycle: *ch.standard_jobs.lifecycle(),
         };
         validate_submit_extended(
             &mut ch.submission_cache,

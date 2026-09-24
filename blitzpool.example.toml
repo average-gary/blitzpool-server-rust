@@ -134,7 +134,8 @@ solo_port = 3333
 solo_start_difficulty = 5000
 solo_high_diff_port = 3339
 high_diff_start_difficulty = 1000000
-job_retention_ms = 300000
+# How long a retired job is kept for late shares (SV1 and SV2).
+job_retention_ms = 600000
 target_shares_per_minute = 15
 high_diff_target_shares_per_minute = 10
 difficulty_check_interval_ms = 240000

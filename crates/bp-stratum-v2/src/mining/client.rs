@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use bitcoin::Network;
 use bp_common::{normalize_btc_address, AddressId, StreamKind};
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_mining_job::{
     address_to_script, merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError,
     PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
@@ -705,6 +706,8 @@ pub struct MiningSessionState<C: Clock> {
     /// quiet channel's difficulty down (see [`bp_vardiff`]'s module doc,
     /// "Silence easing"). Off by default.
     pub vardiff_silence_easing: bool,
+    /// Job lifecycle handed to every channel this connection opens.
+    pub job_lifecycle: LifecycleConfig,
     /// Clock reading of the last vardiff evaluation, timer or inline.
     /// Gates the post-share inline check so it cannot run more often than
     /// `vardiff_interval_ms` — see [`Self::vardiff_cooldown_elapsed`].
@@ -742,6 +745,9 @@ pub struct PortConfig {
     /// Whether vardiff may use elapsed silence as evidence and walk a
     /// quiet channel's difficulty down. Off by default.
     pub vardiff_silence_easing: bool,
+    /// Retire-not-clear job lifecycle every channel opened on this port
+    /// ages its jobs under (`retention_ms` from `[stratum] job_retention_ms`).
+    pub job_lifecycle: LifecycleConfig,
 }
 
 impl<C: Clock + Clone> MiningSessionState<C> {
@@ -783,6 +789,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             target_shares_per_minute: port.target_shares_per_minute,
             vardiff_interval_ms: port.vardiff_interval_ms,
             vardiff_silence_easing: port.vardiff_silence_easing,
+            job_lifecycle: port.job_lifecycle,
             last_difficulty_check_ms: 0,
             share_logs: false,
             uses_custom_extranonce: false,
@@ -1046,6 +1053,7 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
         extranonce_prefix.clone(),
         ctx.assigned_difficulty,
         input.max_target,
+        state.job_lifecycle,
     );
     state.channels.insert(channel_id, channel);
     let engine = state.new_channel_vardiff(ctx.assigned_difficulty);
@@ -1170,6 +1178,7 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
         rollable_size,
         ctx.assigned_difficulty,
         input.max_target,
+        state.job_lifecycle,
     );
     state.channels.insert(channel_id, channel);
     let engine = state.new_channel_vardiff(ctx.assigned_difficulty);
@@ -1546,6 +1555,7 @@ pub fn handle_submit_shares_extended<C: Clock>(
         kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
+        job_lifecycle: *channel.standard_jobs.lifecycle(),
     };
 
     let validation = validate_submit_extended(
@@ -2114,7 +2124,11 @@ pub fn apply_template_broadcast<C: Clock>(
             channel.standard_jobs.retire(now_ms);
             channel.standard_jobs.cleanup_expired(now_ms);
             retire_extended_jobs(&mut channel.extended_jobs, now_ms);
-            cleanup_retired_extended_jobs(&mut channel.extended_jobs, now_ms);
+            cleanup_retired_extended_jobs(
+                &mut channel.extended_jobs,
+                now_ms,
+                channel.standard_jobs.lifecycle(),
+            );
             channel.clear_submission_cache();
             channel.latest_extended_prev_hash = Some(template.prev_hash);
             channel.latest_extended_n_bits = Some(template.n_bits);
@@ -2479,7 +2493,11 @@ pub fn apply_template_broadcast<C: Clock>(
                 channel.standard_jobs.retire(now_ms);
                 channel.standard_jobs.cleanup_expired(now_ms);
                 retire_extended_jobs(&mut channel.extended_jobs, now_ms);
-                cleanup_retired_extended_jobs(&mut channel.extended_jobs, now_ms);
+                cleanup_retired_extended_jobs(
+                    &mut channel.extended_jobs,
+                    now_ms,
+                    channel.standard_jobs.lifecycle(),
+                );
                 channel.clear_submission_cache();
                 channel.latest_extended_prev_hash = Some(template.prev_hash);
                 channel.latest_extended_n_bits = Some(template.n_bits);
@@ -3243,6 +3261,7 @@ pub(crate) mod tests {
             kind: ch.kind,
             extranonce_size: ch.extranonce_size,
             job_target,
+            job_lifecycle: *ch.standard_jobs.lifecycle(),
         };
         validate_submit_extended(
             &mut ch.submission_cache,
@@ -3264,6 +3283,7 @@ pub(crate) mod tests {
             target_shares_per_minute: 6.0,
             vardiff_interval_ms: 60_000,
             vardiff_silence_easing: false,
+            job_lifecycle: LifecycleConfig::DEFAULT,
         }
     }
 
@@ -6216,6 +6236,73 @@ pub(crate) mod tests {
             ch.standard_jobs.classify(7, 1_000),
             Some(bp_jobs_lifecycle::JobClassification::StaleCreditable),
             "pre-existing standard entry must be retired (not deleted)"
+        );
+    }
+
+    /// `[stratum] job_retention_ms` reaches SV2: a port configured with a
+    /// 60 s retention ages out an extended job retired 120 s ago on the next
+    /// block change, while the 600 s default keeps it. Four retired jobs so
+    /// the 3-entry floor leaves exactly the oldest one GC-eligible.
+    #[test]
+    fn template_broadcast_ages_extended_jobs_under_configured_retention() {
+        fn retired_job_survives(retention_ms: u64) -> bool {
+            let mut s = MiningSessionState::new(
+                Arc::new(TestClock::new(0)),
+                1,
+                PortConfig {
+                    job_lifecycle: LifecycleConfig {
+                        retention_ms,
+                        ..LifecycleConfig::DEFAULT
+                    },
+                    ..port_cfg()
+                },
+            );
+            handle_setup_connection(&mut s, &good_setup());
+            let _ = handle_open_extended_mining_channel(
+                &mut s,
+                &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
+                vec![0xAA, 0xBB, 0xCC, 0xDD],
+            );
+            let cid = s.primary_channel.unwrap();
+            let ch = s.channels.get_mut(&cid).unwrap();
+            for (job_id, created_at) in [(90u32, 500u64), (91, 501), (92, 502), (93, 503)] {
+                ch.extended_jobs.insert(
+                    job_id,
+                    ExtendedJob {
+                        payouts_fingerprint: [0u8; 32],
+                        coinbase_prefix: vec![],
+                        coinbase_suffix: vec![],
+                        merkle_path: vec![],
+                        extranonce_prefix: vec![],
+                        version: 0,
+                        prev_hash: [0; 32],
+                        n_bits: 0,
+                        min_ntime: 0,
+                        difficulty: Difficulty(1.0),
+                        coinbase_tx_value_remaining: 5_000_000_000,
+                        template_id: None,
+                        jdp_claims_the_block: false,
+                        created_at,
+                        retired_at: Some(1_000),
+                    },
+                );
+            }
+            let _ = apply_template_broadcast(
+                &mut s,
+                &broadcast(TemplateChange::NewBlock, [0xCC; 32]),
+                &synthetic_mining_job_inputs(),
+                1_000 + 120_000,
+                None,
+            );
+            s.channels[&cid].extended_jobs.contains_key(&90)
+        }
+        assert!(
+            !retired_job_survives(60_000),
+            "retired 120 s ago under a 60 s retention: must be aged out"
+        );
+        assert!(
+            retired_job_survives(LifecycleConfig::DEFAULT.retention_ms),
+            "retired 120 s ago under the 600 s default: must still be stored"
         );
     }
 

@@ -1022,12 +1022,12 @@ mod tests {
     }
 
     /// Test fixture: builds a `SubscribeRequest` with the **refined** UA
-    /// (`refine_user_agent` strips `/version` and collapses known firmware
+    /// (`bp_common::normalize_user_agent` strips `/version` and collapses known firmware
     /// tags). Pass the raw UA; the fixture mirrors the parser's behavior
     /// so the in-engine `== "cpuminer"` check fires as it would in prod.
     fn subscribe_req(raw_ua: Option<&str>) -> SubscribeRequest {
         let refined = raw_ua
-            .map(crate::frame::refine_user_agent)
+            .map(bp_common::normalize_user_agent)
             .unwrap_or_else(|| "unknown".to_string());
         SubscribeRequest {
             id: RpcId::from(1),

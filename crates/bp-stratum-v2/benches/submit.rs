@@ -34,6 +34,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_share::{calculate_difficulty, Difficulty};
 use bp_stratum_v2::mining::channel::ChannelState;
 use bp_stratum_v2::mining::jobs::ExtendedJob;
@@ -81,7 +82,14 @@ const MERKLE_DEPTH_SHALLOW: usize = 1;
 
 fn ext_channel() -> ChannelState {
     // channel_id=2, 4-byte extranonce prefix, 8-byte extranonce size.
-    ChannelState::new_extended(2, vec![0u8; 4], 8, Difficulty(1024.0), [0xFF; 32])
+    ChannelState::new_extended(
+        2,
+        vec![0u8; 4],
+        8,
+        Difficulty(1024.0),
+        [0xFF; 32],
+        LifecycleConfig::DEFAULT,
+    )
 }
 
 fn ext_job(merkle_depth: usize) -> ExtendedJob {
@@ -135,6 +143,7 @@ fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job
         kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
+        job_lifecycle: *channel.standard_jobs.lifecycle(),
     };
     let v = validate_submit_extended(
         &mut channel.submission_cache,

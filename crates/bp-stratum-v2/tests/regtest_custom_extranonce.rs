@@ -154,6 +154,7 @@ async fn sv2_custom_extranonce_applies_at_open_and_live_and_leaves_others_untouc
         target_shares_per_minute: 6.0,
         vardiff_interval_ms: 200,
         vardiff_silence_easing: false,
+        job_lifecycle: bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
     };
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {

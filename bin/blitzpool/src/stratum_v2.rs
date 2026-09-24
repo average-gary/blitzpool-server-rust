@@ -38,6 +38,7 @@ use std::sync::{Arc, RwLock};
 
 use bp_common::MiningMode;
 use bp_config::AppConfig;
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_share::Difficulty;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
@@ -232,6 +233,10 @@ pub(crate) fn build_per_port_servers(
             target_shares_per_minute: sv1_port_config.target_shares_per_minute,
             vardiff_interval_ms: cfg.stratum.difficulty_check_interval_ms,
             vardiff_silence_easing: cfg.stratum.vardiff_silence_easing_enabled,
+            job_lifecycle: LifecycleConfig {
+                retention_ms: cfg.stratum.job_retention_ms,
+                ..LifecycleConfig::DEFAULT
+            },
         };
         info!(
             port = sv1_port_config.port,

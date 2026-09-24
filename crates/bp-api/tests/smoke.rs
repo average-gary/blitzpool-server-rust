@@ -649,4 +649,7 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     // Diff-1 weights ride along per reason and must not be cross-wired.
     assert_eq!(n("rejectedVersionRollingDiff1"), 0.0625);
     assert_eq!(n("rejectedStaleDiff1"), 0.03125);
+    // Hashrate is rounded like every chart endpoint: 10 × 2^32 / 600 s is
+    // 71_582_788.27 H/s unrounded.
+    assert_eq!(n("data"), 71_582_788.0);
 }

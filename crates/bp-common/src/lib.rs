@@ -35,6 +35,8 @@ pub mod extranonce;
 pub use extranonce::{ExtranonceError, SharedExtranonceAllocator};
 
 pub mod live_client_key;
+pub mod user_agent;
+pub use user_agent::normalize_user_agent;
 
 #[cfg(feature = "sqlx")]
 mod sqlx_impls;

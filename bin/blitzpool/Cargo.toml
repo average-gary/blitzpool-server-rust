@@ -64,6 +64,7 @@ jd_server_sv2 = { workspace = true }
 stratum-core = { workspace = true }
 bitcoin_core_sv2 = { workspace = true }
 bp-share = { workspace = true }
+bp-jobs-lifecycle = { workspace = true }
 bp-mining-job = { workspace = true }
 # `bitcoin::Network` for the test fixture.
 bitcoin = { workspace = true }

@@ -83,9 +83,9 @@ pub enum JobClassification {
 // ── LifecycleConfig ──────────────────────────────────────────────────
 
 /// Lifecycle parameters. Consumers either use [`LifecycleConfig::DEFAULT`]
-/// or build their own from a server config struct
-/// (SV1 reads them out of `ServerConfig`; SV2 will read them out of env
-/// vars when the bin/blitzpool wiring lands).
+/// or build their own from a server config struct (SV1 reads them out of
+/// `ServerConfig`, SV2 out of its per-port `PortConfig`; the binary fills
+/// `retention_ms` from `[stratum] job_retention_ms` for both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LifecycleConfig {
     /// Shares against a job retired ≤ this many ms ago are

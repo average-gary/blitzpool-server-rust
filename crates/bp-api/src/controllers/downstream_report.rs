@@ -103,7 +103,7 @@ where
 }
 
 /// Pick the most-common vendor across `report.miners`, normalised
-/// by collapsing common firmware spellings.
+/// via [`normalize_vendor`].
 fn primary_vendor(report: &DownstreamMinerReport) -> Option<String> {
     if report.miners.is_empty() {
         return None;
@@ -116,28 +116,15 @@ fn primary_vendor(report: &DownstreamMinerReport) -> Option<String> {
     counts.into_iter().max_by_key(|(_, c)| *c).map(|(v, _)| v)
 }
 
+/// [`bp_common::normalize_user_agent`] — the same normalisation SV1 and the
+/// SV2 SetupConnection vendor get — with an empty result counted as
+/// `"unknown"`.
 fn normalize_vendor(raw: &str) -> String {
-    let trimmed = raw
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split('V')
-        .next()
-        .unwrap_or("");
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.contains("bosminer") || lower.contains("bos") {
-        return "Braiins OS".to_string();
-    }
-    if lower.contains("cpuminer") {
-        return "cpuminer".to_string();
-    }
-    if trimmed.is_empty() {
+    let normalized = bp_common::normalize_user_agent(raw);
+    if normalized.is_empty() {
         "unknown".to_string()
     } else {
-        trimmed.to_string()
+        normalized
     }
 }
 

@@ -516,7 +516,7 @@ where
                 entry.rejected_stale_diff1 += r.rejected_stale_diff1 as f64;
             }
             for e in grouped.values_mut() {
-                e.data = e.accepted * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS;
+                e.data = (e.accepted * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round();
             }
             let chart_data: Vec<WorkerChartEntry> = grouped.into_values().collect();
             Ok(WorkerResponse {
@@ -595,7 +595,7 @@ where
                     .into_iter()
                     .map(|(t, shares)| ChartPoint {
                         label: crate::time_range::format_iso_ms(t),
-                        data: shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS,
+                        data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
                     })
                     .collect();
 

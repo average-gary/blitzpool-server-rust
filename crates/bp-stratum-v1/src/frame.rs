@@ -521,7 +521,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             let raw_ua = arr.first().and_then(|v| v.as_str()).map(String::from);
             let user_agent = raw_ua
                 .as_deref()
-                .map(refine_user_agent)
+                .map(bp_common::normalize_user_agent)
                 .unwrap_or_else(|| "unknown".to_string());
             Ok(SV1Request::Subscribe(SubscribeRequest {
                 id,
@@ -609,30 +609,6 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             id,
             method: other.to_string(),
         }),
-    }
-}
-
-/// User-agent normalisation:
-/// take the first whitespace-/`/`-/`V`-bounded token, then collapse
-/// known firmware tags ("bosminer", "bOS" → "Braiins OS"; "cpuminer" → "cpuminer").
-pub(crate) fn refine_user_agent(raw: &str) -> String {
-    let first_token = raw
-        .split(' ')
-        .next()
-        .unwrap_or("")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split('V')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if first_token.contains("bosminer") || first_token.contains("bOS") {
-        "Braiins OS".to_string()
-    } else if first_token.contains("cpuminer") {
-        "cpuminer".to_string()
-    } else {
-        first_token
     }
 }
 
@@ -1367,26 +1343,6 @@ mod tests {
             s(&bytes),
             "{\"id\":null,\"result\":null,\"error\":[20,\"Invalid subscription message\",\"\"]}\n"
         );
-    }
-
-    // ─ User-agent refinement ──────────────────────────────────────────
-
-    #[test]
-    fn refine_user_agent_strips_after_separators() {
-        assert_eq!(refine_user_agent("cgminer/4.11.1"), "cgminer");
-        assert_eq!(refine_user_agent("bfgminer 5.5.0"), "bfgminer");
-        assert_eq!(refine_user_agent("antminerV1.2.3"), "antminer");
-    }
-
-    #[test]
-    fn refine_user_agent_collapses_braiins_firmware() {
-        assert_eq!(refine_user_agent("bosminer-plus/1.0"), "Braiins OS");
-        assert_eq!(refine_user_agent("S9-bOS+/9.0"), "Braiins OS");
-    }
-
-    #[test]
-    fn refine_user_agent_collapses_cpuminer() {
-        assert_eq!(refine_user_agent("cpuminer/2.5.0"), "cpuminer");
     }
 
     // ─ RpcId roundtrips ──────────────────────────────────────────────

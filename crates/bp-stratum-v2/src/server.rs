@@ -1072,10 +1072,12 @@ async fn run_mining_connection(
 }
 
 /// `"{vendor}/sv2"`: the user agent a connection's SetupConnection `vendor`
-/// is recorded under (`bitaxe/sv2`, `NerdQAxe++/sv2`); `None` for an empty
-/// vendor.
+/// is recorded under (`bitaxe/sv2`, `NerdQAxe++/sv2`), with the vendor
+/// normalised the way SV1 normalises its user agent
+/// ([`bp_common::normalize_user_agent`]); `None` when that leaves nothing.
 fn vendor_user_agent(vendor: &str) -> Option<String> {
-    (!vendor.is_empty()).then(|| format!("{vendor}/sv2"))
+    let normalized = bp_common::normalize_user_agent(vendor);
+    (!normalized.is_empty()).then(|| format!("{normalized}/sv2"))
 }
 
 /// [`vendor_user_agent`], with an empty vendor recorded as the
@@ -1806,6 +1808,7 @@ mod tests {
             target_shares_per_minute: 6.0,
             vardiff_interval_ms: 60_000,
             vardiff_silence_easing: false,
+            job_lifecycle: bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
         }
     }
 
@@ -1854,6 +1857,7 @@ mod tests {
                 8,
                 Difficulty(1024.0),
                 [0xFF; 32],
+                bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
             ),
         );
         // First channel opened is the primary — the only one the override targets.
@@ -1936,6 +1940,7 @@ mod tests {
                 vec![0x00, 0x00, 0x00, 0x05],
                 Difficulty(1024.0),
                 [0xFF; 32],
+                bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
             ),
         );
         let hooks = hooks_with_override(ADDR, "wrk", [0xC0, 0xDE, 0xBA, 0xBE]);
@@ -2063,6 +2068,7 @@ mod tests {
                 8,
                 Difficulty(1024.0),
                 [0xFF; 32],
+                bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
             ),
         );
     }
@@ -2334,7 +2340,13 @@ mod tests {
         use crate::mining::channel::ChannelState;
 
         let mk_channel = |cid: u32| {
-            ChannelState::new_standard(cid, vec![0u8; 4], Difficulty(1024.0), [0xffu8; 32])
+            ChannelState::new_standard(
+                cid,
+                vec![0u8; 4],
+                Difficulty(1024.0),
+                [0xffu8; 32],
+                bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
+            )
         };
 
         // One channel (direct miner) → count 1.
@@ -2595,6 +2607,17 @@ mod tests {
         assert_eq!(vendor_user_agent(""), None);
         assert_eq!(session_user_agent("bitaxe"), "bitaxe/sv2");
         assert_eq!(session_user_agent(""), "jd-client/sv2");
+    }
+
+    /// The vendor is normalised like an SV1 user agent before `/sv2` is
+    /// appended: version stripped, Braiins firmware collapsed.
+    #[test]
+    fn user_agent_normalises_vendor_like_sv1() {
+        assert_eq!(session_user_agent("cgminer/4.11.1"), "cgminer/sv2");
+        assert_eq!(
+            session_user_agent("bosminer-plus-tuner x"),
+            "Braiins OS/sv2"
+        );
     }
 
     // ── ServerConfig defaults ─────────────────────────────────────
