@@ -274,13 +274,20 @@ async fn reconcile(
         // nothing to settle against and the block is an operator
         // reprocess.
         let Some(actual) = pb.actual_coinbase.clone() else {
+            // Park, don't destroy: same rule as a terminal settle failure
+            // below. The blob is still the only record of this block.
+            let parked = park_unbookable_block(&mut conn, &pb).await.is_ok();
             error!(
                 block_hash = %pb.block_hash,
                 height = pb.block_height,
-                "block-confirmation: parked block carries no parsed coinbase — discarding, \
-                 reprocess from the block's own coinbase"
+                parked,
+                unbookable_key = UNBOOKABLE_KEY,
+                "block-confirmation: parked block carries no parsed coinbase — moved to the \
+                 unbookable store; reprocess it from the block's own coinbase"
             );
-            let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+            if parked {
+                let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+            }
             continue;
         };
 
@@ -489,6 +496,8 @@ mod declared_block_booking_regtest {
     const DB_GROUP_NO_OVERWRITE: u8 = 22;
     const DB_GROUP_REFUSES_WITHOUT_COINBASE: u8 = 23;
     const DB_UNUSABLE_GROUP: u8 = 30;
+    const DB_NO_PARSED_COINBASE: u8 = 31;
+    const DB_LOST_SUBMIT: u8 = 0;
 
     /// The production default of `[pplns] confirmation_depth`.
     const DEPTH: u32 = 3;
@@ -649,7 +658,13 @@ mod declared_block_booking_regtest {
             // That is the production code behaving correctly; the collision is
             // the test's fault. Spread them 10 apart so it cannot happen, in
             // parallel runs either.
-            let spread = u32::from(redis_db - DB_BOOKS_THE_COINBASE) * 10;
+            // DB 0 is the one free index below the rest; give it a height
+            // slot none of them uses.
+            let slot = match redis_db {
+                DB_LOST_SUBMIT => 16,
+                n => n - DB_BOOKS_THE_COINBASE,
+            };
+            let spread = u32::from(slot) * 10;
             node.generate_to_self(101 + spread)
                 .await
                 .expect("mine for IBD-exit + coinbase maturity");
@@ -1210,6 +1225,122 @@ mod declared_block_booking_regtest {
         );
 
         c.teardown().await;
+    }
+
+    /// A parked block without a parsed coinbase (a blob written before every
+    /// park carried one) can be settled by nothing either. Same rule as the
+    /// unusable group id above: its blob is the only record of the block, so
+    /// it moves to the unbookable store instead of being deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_block_without_a_parsed_coinbase_parks_as_unbookable() {
+        let Some(c) = Chain::setup(DB_NO_PARSED_COINBASE).await else {
+            return;
+        };
+        c.node
+            .generate_to_self(DEPTH)
+            .await
+            .expect("bury to confirmation depth");
+        let mut conn = c.redis.clone();
+        crate::pending_blocks::put_pending_block(
+            &mut conn,
+            &crate::pending_blocks::PendingBlock {
+                block_hash: c.block_hash.clone(),
+                found_at_ms: 0,
+                block_height: c.height as i32,
+                weight_snapshot: None,
+                actual_coinbase: None,
+                payouts_fingerprint: Some(c.fingerprint),
+                group: None,
+            },
+        )
+        .await
+        .expect("park the block");
+        let unbookable_before = c.unbookable_count().await;
+
+        c.reconcile_once().await;
+
+        let still_pending =
+            crate::pending_blocks::count_pending_at(&mut conn, crate::pending_blocks::PENDING_KEY)
+                .await
+                .expect("count pending");
+        assert_eq!(
+            still_pending, 0,
+            "precondition: the watcher must have confirmed and handled the block"
+        );
+        assert!(
+            c.unbookable_count().await > unbookable_before,
+            "a block without a parsed coinbase must PARK as unbookable, not be discarded"
+        );
+
+        c.teardown().await;
+    }
+
+    /// A solution the pool could not hand to bitcoin-core never reached the
+    /// chain, so it must not be reported as a found block: no pending park,
+    /// no found-block row, no push. `submit_solution` only fails when the TDP
+    /// worker is gone, which is exactly that case.
+    ///
+    /// Negative control first, on the same fixture: with the worker alive the
+    /// same call DOES park the block, so the assertion below can see a park.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_solution_that_never_reached_core_is_not_reported_found() {
+        let Some(c) = Chain::setup(DB_LOST_SUBMIT).await else {
+            return;
+        };
+        let block_bytes = hex::decode(&c.block_hex).expect("block hex");
+        let header: [u8; 80] = block_bytes[..80].try_into().expect("80-byte header");
+        let coinbase_tx = bitcoin::consensus::serialize(&c.coinbase_tx);
+        let submit = |sink: TdpBlockSubmissionSink| {
+            let coinbase_tx = coinbase_tx.clone();
+            let miner = c.miners[0].clone();
+            let fingerprint = c.fingerprint;
+            async move {
+                sink.submit_and_emit(
+                    crate::block_sink::PoolBuiltSolution {
+                        protocol: "SV1",
+                        template_id: 0,
+                        header: &header,
+                        coinbase_tx,
+                        reward_sats: 5_000_000_000,
+                        payouts_fingerprint: fingerprint,
+                    },
+                    &miner,
+                    "rig1",
+                    "a1b2c3d4",
+                    bp_common::StreamKind::Pplns,
+                )
+                .await;
+            }
+        };
+        let mut conn = c.redis.clone();
+        let pending = |mut conn: redis::aio::ConnectionManager| async move {
+            crate::pending_blocks::count_pending_at(&mut conn, crate::pending_blocks::PENDING_KEY)
+                .await
+                .expect("count pending")
+        };
+
+        let before = pending(conn.clone()).await;
+        submit(c.sink()).await;
+        let after_live = pending(conn.clone()).await;
+        assert_eq!(
+            after_live,
+            before + 1,
+            "precondition: with the TDP worker alive the block is parked for booking"
+        );
+        let _ = crate::pending_blocks::remove_pending_block(&mut conn, &c.block_hash).await;
+
+        c.tdp.shutdown().expect("stop the TDP worker");
+        submit(c.sink()).await;
+        assert_eq!(
+            pending(conn.clone()).await,
+            before,
+            "a solution that never reached bitcoin-core must not be reported as found"
+        );
+
+        // `teardown` would stop the TDP worker a second time.
+        Chain::purge(&c.pg, &c.miners, &c.fee_addr).await;
+        c.pplns.shutdown();
+        c.node.shutdown().await.expect("regtest clean shutdown");
     }
 
     // ── Group-Solo: the same door, a different ledger ────────────────

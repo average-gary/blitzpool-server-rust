@@ -1340,17 +1340,17 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
 
 /// A solution on a job whose coinbase the pool built, as either protocol
 /// hands it over.
-struct PoolBuiltSolution<'a> {
+pub(crate) struct PoolBuiltSolution<'a> {
     /// Log label only.
-    protocol: &'static str,
-    template_id: u64,
-    header: &'a [u8; 80],
+    pub(crate) protocol: &'static str,
+    pub(crate) template_id: u64,
+    pub(crate) header: &'a [u8; 80],
     /// The witness-form coinbase of the winning job.
-    coinbase_tx: Vec<u8>,
+    pub(crate) coinbase_tx: Vec<u8>,
     /// Block-reward portion the job's coinbase claims, pinned at job send
     /// time.
-    reward_sats: u64,
-    payouts_fingerprint: [u8; 32],
+    pub(crate) reward_sats: u64,
+    pub(crate) payouts_fingerprint: [u8; 32],
 }
 
 /// `(version, header_timestamp, header_nonce)` from an assembled 80-byte
@@ -1371,7 +1371,7 @@ impl TdpBlockSubmissionSink {
     ///
     /// The submit is best-effort (a failure only logs): the block-found is
     /// emitted either way, as it always was.
-    async fn submit_and_emit(
+    pub(crate) async fn submit_and_emit(
         &self,
         solution: PoolBuiltSolution<'_>,
         address: &str,
@@ -1405,6 +1405,10 @@ impl TdpBlockSubmissionSink {
             "block-found: submitting solution via TDP"
         );
 
+        // `submit_solution` only queues the solution for the TDP worker, and
+        // fails only when that worker is gone: the block then never reached
+        // bitcoin-core. Reporting it anyway would record a found block, send
+        // a "block found" push and park a booking that can never confirm.
         if let Err(err) = self
             .select_handle(stream)
             .submit_solution(
@@ -1416,15 +1420,17 @@ impl TdpBlockSubmissionSink {
             )
             .await
         {
-            warn!(
+            error!(
                 %err,
                 protocol,
                 template_id,
                 address,
                 worker,
                 session_id,
-                "block-found: TDP submit_solution failed (best-effort)"
+                "block-found: TDP submit_solution failed — the block did NOT reach \
+                 bitcoin-core and is lost; not reported as found"
             );
+            return;
         }
 
         self.emit_block_found(BlockFoundInputs {
