@@ -316,16 +316,7 @@ async fn reconcile(
             // The engine this block belongs to is not wired on this
             // process. Leave it parked — another process may own it.
             Err(SettleFailure::NoEngine) => continue,
-            Err(SettleFailure::UnusableGroup) => {
-                error!(
-                    block_hash = %pb.block_hash,
-                    group_id = pb.group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
-                    "block-confirmation: parked Group-Solo block has an unusable group id \
-                     or finder — discarding"
-                );
-                let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
-            }
-            Err(SettleFailure::Engine(err)) if err.is_terminal() => {
+            Err(err) if err.is_terminal() => {
                 // Park, don't destroy: the frozen blob is the only record
                 // of what this block paid every miner.
                 let parked = put_pending_at(&mut conn, UNBOOKABLE_KEY, &pb).await.is_ok();
@@ -343,7 +334,7 @@ async fn reconcile(
                     let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
                 }
             }
-            Err(SettleFailure::Engine(err)) => warn!(
+            Err(err) => warn!(
                 %err,
                 block_hash = %pb.block_hash,
                 "block-confirmation: apply failed; will retry next tick"
@@ -402,13 +393,29 @@ pub(crate) async fn settle_block(
 }
 
 /// Why [`settle_block`] booked nothing.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum SettleFailure {
     /// This process has no engine for the block's mode.
+    #[error("no engine wired for this block's mode")]
     NoEngine,
     /// A Group-Solo block whose group id or finder does not parse.
+    #[error("unusable Group-Solo group id or finder")]
     UnusableGroup,
+    #[error(transparent)]
     Engine(SettleError),
+}
+
+impl SettleFailure {
+    /// Will a retry fail the same way? An unparsable group id stays
+    /// unparsable, so it is terminal like the engines' own verdicts. A
+    /// missing engine is not: another process may own the block.
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self {
+            SettleFailure::NoEngine => false,
+            SettleFailure::UnusableGroup => true,
+            SettleFailure::Engine(e) => e.is_terminal(),
+        }
+    }
 }
 
 /// The two engines' errors, so one loop can treat them alike.
@@ -421,7 +428,7 @@ pub(crate) enum SettleError {
 }
 
 impl SettleError {
-    pub(crate) fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         match self {
             SettleError::Pplns(e) => e.is_terminal(),
             SettleError::GroupSolo(e) => e.is_terminal(),
@@ -485,6 +492,7 @@ mod declared_block_booking_regtest {
     const DB_GROUP_BOOKS_THE_COINBASE: u8 = 21;
     const DB_GROUP_NO_OVERWRITE: u8 = 22;
     const DB_GROUP_REFUSES_WITHOUT_COINBASE: u8 = 23;
+    const DB_UNUSABLE_GROUP: u8 = 30;
 
     /// The production default of `[pplns] confirmation_depth`.
     const DEPTH: u32 = 3;
@@ -1152,6 +1160,59 @@ mod declared_block_booking_regtest {
             c.unbookable_count().await > unbookable_before,
             "the conflict must PARK as unbookable, not report success — a silent \
              Ok lets the watcher drop a block whose miners were paid on-chain"
+        );
+
+        c.teardown().await;
+    }
+
+    /// A parked Group-Solo block whose group id does not parse can be
+    /// booked by nothing — but its blob is still the only record of what
+    /// the coinbase paid, so it must move to the unbookable store, not be
+    /// deleted. Leaving the pending store holds either way; only the
+    /// unbookable count tells a park from a discard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_group_block_with_an_unusable_group_id_parks_as_unbookable() {
+        let Some(c) = Chain::setup(DB_UNUSABLE_GROUP).await else {
+            return;
+        };
+        c.node
+            .generate_to_self(DEPTH)
+            .await
+            .expect("bury to confirmation depth");
+        let mut conn = c.redis.clone();
+        crate::pending_blocks::put_pending_block(
+            &mut conn,
+            &crate::pending_blocks::PendingBlock {
+                block_hash: c.block_hash.clone(),
+                found_at_ms: 0,
+                block_height: c.height as i32,
+                weight_snapshot: None,
+                actual_coinbase: Some(c.actual.clone()),
+                payouts_fingerprint: Some(c.fingerprint),
+                group: Some(crate::pending_blocks::PendingGroup {
+                    group_id: "not-a-uuid".to_string(),
+                    finder: c.miners[0].clone(),
+                }),
+            },
+        )
+        .await
+        .expect("park the block");
+        let unbookable_before = c.unbookable_count().await;
+
+        c.reconcile_once().await;
+
+        let still_pending =
+            crate::pending_blocks::count_pending_at(&mut conn, crate::pending_blocks::PENDING_KEY)
+                .await
+                .expect("count pending");
+        assert_eq!(
+            still_pending, 0,
+            "precondition: the watcher must have confirmed and handled the block"
+        );
+        assert!(
+            c.unbookable_count().await > unbookable_before,
+            "a block nothing can book must PARK as unbookable — deleting it throws \
+             away the only record of what its coinbase paid"
         );
 
         c.teardown().await;
