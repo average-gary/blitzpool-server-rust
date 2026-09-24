@@ -7,7 +7,7 @@
 //! - [`ServerConfig`]: process-wide defaults (network, pool identifier,
 //!   dev-fee, lifecycle constants). Built once at startup.
 //! - [`PortConfig`]: per-listener overrides (initial difficulty, payout
-//!   mode, vardiff floor, warmup gate). One per TCP port the operator
+//!   mode, vardiff floor). One per TCP port the operator
 //!   exposes.
 //!
 //! Default values are tuned for production deployments and require no
@@ -239,12 +239,6 @@ pub struct PortConfig {
     /// to at least this. Used on payout-mode ports to keep sub-dust
     /// devices off the ledger.
     pub minimum_difficulty: f64,
-    /// Payout-mode warmup gate. The first `N` accepted shares of a fresh
-    /// session are still validated and counted in per-session statistics,
-    /// but skip the PPLNS / group-solo ledger write. Filters short-lived
-    /// CPU/low-hashrate miners that briefly clear the minimum difficulty.
-    /// `0` disables (every share counts from the first).
-    pub ledger_warmup_shares: u32,
 }
 
 impl PortConfig {
@@ -259,7 +253,6 @@ impl PortConfig {
             target_shares_per_minute: DEFAULT_TARGET_SHARES_PER_MINUTE,
             payout_mode: MiningMode::Solo,
             minimum_difficulty: 0.0,
-            ledger_warmup_shares: 0,
         }
     }
 
@@ -424,7 +417,6 @@ mod tests {
         assert_eq!(p.target_shares_per_minute, 6.0);
         assert_eq!(p.payout_mode, MiningMode::Solo);
         assert_eq!(p.minimum_difficulty, 0.0);
-        assert_eq!(p.ledger_warmup_shares, 0);
     }
 
     #[test]

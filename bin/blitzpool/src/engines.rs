@@ -275,7 +275,6 @@ fn to_pplns_engine_config(
         min_payout_sats: Sats(cfg.min_payout_sats),
         coinbase_weight_budget: cfg.coinbase_weight_budget,
         min_difficulty: cfg.min_difficulty,
-        warmup_shares: cfg.warmup_shares,
         dust_sweep_enabled: cfg.dust_sweep_enabled,
         abandoned_balance_days: cfg.abandoned_balance_days,
         bucket_shares: cfg.bucket_shares,
@@ -927,7 +926,6 @@ mod tests {
              fee_percent = 1.5\n\
              coinbase_weight_budget = 35000\n\
              min_difficulty = 500\n\
-             warmup_shares = 5\n\
              min_payout_sats = 12345\n"
         ))
         .expect("parse config with [pplns]");

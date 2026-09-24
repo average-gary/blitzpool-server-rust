@@ -621,9 +621,6 @@ pub struct PplnsConfig {
     pub coinbase_weight_budget: u32,
     /// VarDiff floor for the PPLNS port (sub-ASIC hardware gate).
     pub min_difficulty: u64,
-    /// Per-session share warmup — first N accepted shares are
-    /// counted in stats but NOT recorded in the PPLNS ledger.
-    pub warmup_shares: u32,
     /// Minimum on-chain payout in sats. Outputs below this stay as
     /// pending credit in the signed ledger. Always clamped upward
     /// to `DUST_LIMIT_SATS` (546) by the engine.
@@ -1380,7 +1377,6 @@ mod tests {
             fee_percent = 1.5
             coinbase_weight_budget = 50000
             min_difficulty = 500
-            warmup_shares = 5
             min_payout_sats = 5000
             dust_sweep_enabled = false
             abandoned_balance_days = 45

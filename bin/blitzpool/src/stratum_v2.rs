@@ -381,7 +381,6 @@ mod tests {
                 fee_percent: 1.5,
                 coinbase_weight_budget: 100_000,
                 min_difficulty: 1024,
-                warmup_shares: 5,
                 min_payout_sats: 100_000,
                 dust_sweep_enabled: true,
                 abandoned_balance_days: 90,

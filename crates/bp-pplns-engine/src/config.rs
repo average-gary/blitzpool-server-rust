@@ -8,9 +8,8 @@
 //! so the caller sees field-level errors before the engine spins up.
 //!
 //! Only knobs the *engine itself* needs at construction live here. Things
-//! like the listener port, vardiff start-difficulty, warmup-shares-per-
-//! session are bp-stratum-v1/v2's concern (warmup specifically lives in
-//! `SessionState` per the 2026-05-16 decision) and not duplicated here.
+//! like the listener port and vardiff start-difficulty are
+//! bp-stratum-v1/v2's concern and not duplicated here.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
@@ -122,12 +121,6 @@ pub struct PplnsEngineConfig {
     /// without taking a dep on bp-stratum-v1.
     pub min_difficulty: u64,
 
-    /// Per-session ledger-warmup gate: first N accepted shares of a
-    /// new session are validated but not credited to the PPLNS
-    /// ledger. Mirrored from the per-port toml for the same reason
-    /// as `min_difficulty`.
-    pub warmup_shares: u32,
-
     /// Blocks between subsidy halvings on the network this pool runs
     /// on — the input to the settlement gate's floor
     /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
@@ -152,7 +145,6 @@ impl Default for PplnsEngineConfig {
             dust_sweep_enabled: true,
             abandoned_balance_days: 90,
             min_difficulty: 500,
-            warmup_shares: 5,
             subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }

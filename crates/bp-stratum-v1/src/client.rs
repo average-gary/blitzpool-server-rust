@@ -101,7 +101,6 @@ pub struct SessionState<C: Clock> {
     pub vardiff: VarDiffEngine<C>,
     pub last_difficulty_check_ms: u64,
     pub share_cache: SessionShareCache,
-    pub accepted_share_count: u32,
 
     // Live caches mirrored back from vardiff
     pub hash_rate: f64,
@@ -185,7 +184,6 @@ impl<C: Clock> SessionState<C> {
             vardiff,
             last_difficulty_check_ms: 0,
             share_cache: SessionShareCache::new(),
-            accepted_share_count: 0,
             hash_rate: 0.0,
             no_fee: false,
             extranonce_subscribed: false,
@@ -336,7 +334,7 @@ pub fn dispatch<C: Clock>(
         SV1Request::SuggestDifficulty(req) => {
             handle_suggest_difficulty(state, port_config, registry, req, now_ms)
         }
-        SV1Request::Submit(req) => handle_submit(state, port_config, registry, req, now_ms),
+        SV1Request::Submit(req) => handle_submit(state, registry, req, now_ms),
         SV1Request::ExtranonceSubscribe(id) => handle_extranonce_subscribe(state, id),
         SV1Request::Other { .. } => HandlerOutcome::default(),
     }
@@ -623,7 +621,6 @@ pub fn handle_suggest_difficulty<C: Clock>(
 
 pub fn handle_submit<C: Clock>(
     state: &mut SessionState<C>,
-    port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
     request: SubmitRequest,
     now_ms: u64,
@@ -683,7 +680,6 @@ pub fn handle_submit<C: Clock>(
     match validation {
         ShareValidation::Accepted(accept) => {
             out.push_frame(write_submit_success(&id));
-            state.accepted_share_count = state.accepted_share_count.saturating_add(1);
             // Feed vardiff. is_current_diff = (effective == session)
             // `effectiveDiff === sessionDifficulty`.
             let is_current = accept.effective_difficulty == state.session_difficulty;
@@ -693,9 +689,6 @@ pub fn handle_submit<C: Clock>(
             state.hash_rate = state.vardiff.hash_rate();
             // The caller drives per-mode share-stats + block-found fan-
             // out via the event; pass the full ShareAccept through.
-            // (Borrow-checked: `port_config` is not held mutably across
-            // this point.)
-            let _ = port_config; // payout-mode routing lands with the hooks
             out.push_event(SessionEvent::ShareAccepted(accept));
         }
         ShareValidation::Rejected(reject) => {
@@ -1612,7 +1605,7 @@ mod tests {
         let mut state = fresh_state(TestClock::new(0), &port);
         state.stratum_initialized = true;
         let reg = empty_registry();
-        let out = handle_submit(&mut state, &port, &reg, submit_req("1"), 0);
+        let out = handle_submit(&mut state, &reg, submit_req("1"), 0);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("Unauthorized worker"));
     }
@@ -1624,7 +1617,7 @@ mod tests {
         state.authorization = Some(authorize_req(REGTEST_ADDR));
         // stratum_initialized stays false.
         let reg = empty_registry();
-        let out = handle_submit(&mut state, &port, &reg, submit_req("1"), 0);
+        let out = handle_submit(&mut state, &reg, submit_req("1"), 0);
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("Not subscribed"));
     }
@@ -1807,7 +1800,7 @@ mod tests {
         clock.advance_ms(390_000);
         // Rejected share at t+390 s — unknown job → validation reject.
         let reg = empty_registry();
-        let out = handle_submit(&mut state, &port, &reg, submit_req("1"), clock.now_ms());
+        let out = handle_submit(&mut state, &reg, submit_req("1"), clock.now_ms());
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("error"), "expected a reject frame, got {s}");
         clock.advance_ms(10_000);

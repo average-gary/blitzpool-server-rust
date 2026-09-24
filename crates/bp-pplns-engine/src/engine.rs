@@ -26,8 +26,7 @@
 //! Public API:
 //!
 //! - [`PplnsEngine::record_share`] — hot path; called per accepted share
-//!   *after* the stratum layer has resolved mode = PPLNS and consumed
-//!   any per-session warmup quota.
+//!   *after* the stratum layer has resolved mode = PPLNS.
 //! - [`PplnsEngine::build_distribution`] — called by the
 //!   template-build path (and the JDP coinbase-outputs request path),
 //!   wraps the inflight cache.
@@ -290,7 +289,7 @@ impl PplnsEngine {
     }
 
     /// Hot path. Called per accepted share AFTER the stratum layer has
-    /// resolved mode = PPLNS and the per-session warmup is past.
+    /// resolved mode = PPLNS.
     ///
     /// Atomically appends the share to the window (Redis MULTI/EXEC),
     /// records the `lastAcceptedShareAt` touch (60s-buffered to PG),

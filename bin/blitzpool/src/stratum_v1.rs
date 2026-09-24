@@ -228,7 +228,6 @@ pub(crate) fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
             payout_mode: MiningMode::Pplns,
             target_shares_per_minute: pplns.target_shares_per_minute as f64,
             minimum_difficulty: pplns.min_difficulty as f64,
-            ledger_warmup_shares: pplns.warmup_shares,
             ..PortConfig::new(pplns.port, pplns.start_difficulty as f64)
         });
 
@@ -240,7 +239,6 @@ pub(crate) fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
             payout_mode: MiningMode::Pplns,
             target_shares_per_minute: cfg.stratum.high_diff_target_shares_per_minute as f64,
             minimum_difficulty: pplns.min_difficulty as f64,
-            ledger_warmup_shares: pplns.warmup_shares,
             allow_suggested_difficulty: false,
             ..PortConfig::new(
                 pplns.high_diff_port,
@@ -572,7 +570,6 @@ mod tests {
             fee_percent: 1.5,
             coinbase_weight_budget: 100_000,
             min_difficulty: 1024,
-            warmup_shares: 5,
             min_payout_sats: 100_000,
             dust_sweep_enabled: true,
             abandoned_balance_days: 90,
@@ -611,7 +608,6 @@ mod tests {
         assert_eq!(ports[2].port, 3340);
         assert_eq!(ports[3].port, 3349);
         assert_eq!(ports[2].minimum_difficulty, 1024.0);
-        assert_eq!(ports[2].ledger_warmup_shares, 5);
         // PPLNS high-diff mirrors high_diff_start_difficulty.
         assert_eq!(ports[3].initial_difficulty, 1_000_000.0);
         assert!(ports[0].allow_suggested_difficulty);

@@ -287,7 +287,6 @@ struct FeesResponse {
     max_miner_outputs: u32,
     max_miner_outputs_adaptive: u32,
     min_difficulty: u64,
-    warmup_shares: u32,
 }
 
 async fn fees<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
@@ -344,7 +343,6 @@ where
                     max_miner_outputs,
                     max_miner_outputs_adaptive,
                     min_difficulty: raw_cfg.min_difficulty,
-                    warmup_shares: raw_cfg.warmup_shares,
                 })
             },
         )
