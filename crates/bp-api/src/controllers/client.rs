@@ -38,6 +38,10 @@ where
         .route("/api/client/:address/workers", get(workers::<H, M>))
         .route("/api/client/:address/rejected", get(rejected::<H, M>))
         .route("/api/client/:address/diff-scores", get(diff_scores::<H, M>))
+        .route(
+            "/api/client/:address/best-difficulty/today",
+            get(best_difficulty_today::<H, M>),
+        )
         .route("/api/client/:address/reset", post(reset_address::<H, M>))
         .route(
             "/api/client/:address/delete-stats",
@@ -874,6 +878,82 @@ where
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+// ─── GET /api/client/:address/best-difficulty/today ──────────────
+//
+// The address's best share difficulty since `since` (epoch ms), which
+// the caller sets to its own local midnight. Read from the same hourly
+// rows as `diff-scores` (`client_difficulty_statistics_entity`), maxed
+// over every worker of the address.
+//
+// The filter is `"slotTime" >= since`, with no flooring to the hour: a
+// value from before the caller's midnight must never show after the
+// reset. The rows are UTC hours, so for a timezone with a half- or
+// quarter-hour offset the partial hour right after local midnight is
+// not counted.
+//
+// Not cached: `since` differs per timezone, and the query is a range
+// scan on the `(address, "slotTime")` index.
+
+/// Oldest `since` accepted, relative to now. A local midnight is at most
+/// 24 h back, 25 h on a DST fall-back day; the extra hour is room for
+/// client clock skew. The rows are kept longer, so the bound is on the
+/// meaning of "today", not on retention.
+const BEST_TODAY_MAX_LOOKBACK_MS: i64 = 26 * 60 * 60 * 1000;
+/// Newest `since` accepted, relative to now — room for client clock skew.
+const BEST_TODAY_MAX_LOOKAHEAD_MS: i64 = 60 * 60 * 1000;
+
+#[derive(Deserialize)]
+struct BestDifficultyTodayQuery {
+    // Taken as a string and parsed here, so a non-numeric value gets the
+    // JSON error envelope instead of axum's plain-text query rejection.
+    since: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BestDifficultyTodayResponse {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    best_difficulty: f64,
+}
+
+async fn best_difficulty_today<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(address): Path<String>,
+    Query(q): Query<BestDifficultyTodayQuery>,
+) -> Result<Json<BestDifficultyTodayResponse>, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
+    let since: i64 = q
+        .since
+        .as_deref()
+        .ok_or(ApiError::InvalidQuery("since is required (epoch ms)"))?
+        .parse()
+        .map_err(|_| ApiError::InvalidQuery("since must be an integer (epoch ms)"))?;
+    let now = bp_common::now_ms();
+    if since < now - BEST_TODAY_MAX_LOOKBACK_MS || since > now + BEST_TODAY_MAX_LOOKAHEAD_MS {
+        return Err(ApiError::InvalidQuery(
+            "since must be within the last 26 h and at most 1 h ahead",
+        ));
+    }
+    let best = sqlx::query_scalar!(
+        r#"SELECT MAX("maxDifficulty") AS "max_diff: f32"
+           FROM client_difficulty_statistics_entity
+           WHERE address = $1
+             AND "slotTime" >= $2"#,
+        addr.as_str(),
+        since,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    Ok(Json(BestDifficultyTodayResponse {
+        best_difficulty: best.map_or(0.0, f64::from),
+    }))
 }
 
 #[cfg(test)]
