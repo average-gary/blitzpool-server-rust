@@ -440,7 +440,14 @@ where
                             .expect("group-solo resolves with its group");
                         match s.group_solo.as_ref() {
                             Some(engine) => {
-                                match engine.build_distribution(gid, reward_sats, &addr).await {
+                                let window = engine
+                                    .reader()
+                                    .round_stats(gid)
+                                    .await
+                                    .map(|stats| stats.per_address)
+                                    .unwrap_or_default();
+                                let finder = preview_finder(&addr, &window);
+                                match engine.build_distribution(gid, reward_sats, &finder).await {
                                     // The §4 evaluation at this template's
                                     // revenue — what the real coinbase pays.
                                     Ok(dist) => dist
@@ -566,6 +573,35 @@ where
 /// is byte-stable across renders. The block carries every tx the
 /// template proposed plus the just-built coinbase, with a zero nonce
 /// in the header (preview, never submitted).
+/// Who the Group-Solo preview names as the block's finder.
+///
+/// A member's miner mines a job that names that member as finder, so for an
+/// address with shares in the current window the preview is its own job.
+/// An address with no shares there cannot find the block; naming it would
+/// pay it a finder bonus no real coinbase will pay. The preview then shows
+/// the most likely block instead: the member with the largest window share
+/// as finder. With no shares in the window at all, the asking address
+/// stays the finder (that is how the first block of an empty window is
+/// built).
+fn preview_finder(
+    requester: &bp_common::AddressId,
+    window: &std::collections::HashMap<String, f64>,
+) -> bp_common::AddressId {
+    if window
+        .get(requester.as_str())
+        .is_some_and(|shares| *shares > 0.0)
+    {
+        return requester.clone();
+    }
+    window
+        .iter()
+        .filter(|(_, shares)| **shares > 0.0)
+        // Ties resolve by address so the preview does not flip between polls.
+        .max_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| b.cmp(a)))
+        .and_then(|(address, _)| bp_common::AddressId::new(address.clone()).ok())
+        .unwrap_or_else(|| requester.clone())
+}
+
 fn assemble_block_preview(
     template: &serde_json::Value,
     payouts: &[PayoutInfoEntry],
@@ -1537,6 +1573,31 @@ mod slot_json_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_finder_is_the_asker_only_when_it_has_window_shares() {
+        use bp_common::AddressId;
+        use std::collections::HashMap;
+        let asker =
+            AddressId::new("bc1qs84n0jqe6qdu4dzk4vjjfnnk9n8ulz5v72tts8".to_string()).unwrap();
+        let top = "bc1qxd6lw5eeuv82sjl6qelac6er98grz5cnjc53v8".to_string();
+        let small = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string();
+
+        // Mining: the preview is the asker's own job.
+        let mining = HashMap::from([(asker.as_str().to_string(), 5.0), (top.clone(), 3_000.0)]);
+        assert_eq!(preview_finder(&asker, &mining), asker);
+
+        // Not mining: the largest window share is the finder, not the asker.
+        let idle = HashMap::from([(top.clone(), 3_673_618_500.0), (small, 1_172.0)]);
+        assert_eq!(preview_finder(&asker, &idle).as_str(), top);
+
+        // A zero entry is no share either.
+        let zero = HashMap::from([(asker.as_str().to_string(), 0.0), (top.clone(), 10.0)]);
+        assert_eq!(preview_finder(&asker, &zero).as_str(), top);
+
+        // Empty window: nobody else to name, the asker bootstraps it.
+        assert_eq!(preview_finder(&asker, &HashMap::new()), asker);
+    }
+
     use super::*;
 
     #[test]
