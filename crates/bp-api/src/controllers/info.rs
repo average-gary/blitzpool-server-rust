@@ -393,6 +393,12 @@ struct ClientBlockTemplateResponse {
     /// Per-address coinbase tx hex (witness form, zero extranonces).
     /// Same fallback behaviour as `blockHex`.
     coinbase_tx_hex: String,
+    /// Group-Solo only: the member the preview names as finder, the one its
+    /// finder bonus is paid to. The asking address when it has shares in
+    /// the window, otherwise the member with the largest window share
+    /// (see `preview_finder`). Absent for the modes without a finder bonus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_finder: Option<String>,
 }
 
 async fn client_block_template<H, M>(
@@ -433,6 +439,7 @@ where
                 // the preview shows the mode the pool is actually using.
                 let resolved = crate::mode::resolve_address_mode(&s, &addr).await?;
 
+                let mut previewed_finder: Option<String> = None;
                 let payouts: Vec<PayoutInfoEntry> = match resolved.mode {
                     MiningMode::GroupSolo => {
                         let gid = resolved
@@ -447,6 +454,7 @@ where
                                     .map(|stats| stats.per_address)
                                     .unwrap_or_default();
                                 let finder = preview_finder(&addr, &window);
+                                previewed_finder = Some(finder.as_str().to_string());
                                 match engine.build_distribution(gid, reward_sats, &finder).await {
                                     // The §4 evaluation at this template's
                                     // revenue — what the real coinbase pays.
@@ -560,6 +568,7 @@ where
                     group_id: resolved.group_id.map(|g| g.to_string()),
                     block_hex,
                     coinbase_tx_hex,
+                    preview_finder: previewed_finder,
                 })
             },
         )
@@ -1573,6 +1582,25 @@ mod slot_json_tests {
 
 #[cfg(test)]
 mod tests {
+    /// `previewFinder` is present for Group-Solo only; every other mode's
+    /// JSON stays exactly as it was (no null, no key).
+    #[test]
+    fn preview_finder_field_is_absent_unless_set() {
+        let response = |finder: Option<&str>| ClientBlockTemplateResponse {
+            block_template: serde_json::json!({}),
+            mode: "pplns",
+            payout_information: Vec::new(),
+            group_id: None,
+            block_hex: String::new(),
+            coinbase_tx_hex: String::new(),
+            preview_finder: finder.map(str::to_string),
+        };
+        let without = serde_json::to_value(response(None)).unwrap();
+        assert!(without.get("previewFinder").is_none());
+        let with = serde_json::to_value(response(Some("bc1qfinder"))).unwrap();
+        assert_eq!(with["previewFinder"], "bc1qfinder");
+    }
+
     #[test]
     fn preview_finder_is_the_asker_only_when_it_has_window_shares() {
         use bp_common::AddressId;
