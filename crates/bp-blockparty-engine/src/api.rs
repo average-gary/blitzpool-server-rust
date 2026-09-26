@@ -132,6 +132,13 @@ pub trait BlockpartyApi: Send + Sync {
         address: &AddressId,
         member_token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError>;
+    /// Admin-token gate for read paths that show the admin more (the full
+    /// member addresses in `GET /:id`). Same errors as every admin action.
+    async fn verify_admin_token(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<(), BlockpartyServiceError>;
     /// Member-token gate for `GET /:id/member-view/:address`. Returns
     /// `Ok(())` when the token verifies; surfaces the typed errors
     /// otherwise.
@@ -315,6 +322,16 @@ impl<H: BlockpartyHooks + 'static> BlockpartyApi for BlockpartyService<H> {
         member_token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError> {
         BlockpartyService::confirm_as_member(self, group_id, address, member_token).await
+    }
+
+    async fn verify_admin_token(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<(), BlockpartyServiceError> {
+        BlockpartyService::require_admin_token(self, group_id, token)
+            .await
+            .map(|_| ())
     }
 
     async fn verify_member_token(

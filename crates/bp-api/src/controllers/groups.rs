@@ -35,7 +35,6 @@ use bp_group_mgmt_engine::{
 };
 use bp_group_solo_engine::reader::WindowTimeline;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -43,6 +42,7 @@ use crate::middleware::admin_auth::{require_admin, AdminAuth};
 use crate::middleware::rate_limit;
 use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::SharedState;
+use crate::utils::{build_member_labels, member_id};
 
 pub(crate) fn routes<H, M>(state: SharedState<H, M>) -> Router<SharedState<H, M>>
 where
@@ -1011,51 +1011,6 @@ where
         )
         .await?;
     Ok(JsonBytes(bytes))
-}
-
-// ─── member pseudonymisation ─────────────────────────────────────
-//
-// The group-detail endpoints are anonymous (a group id alone opens them), so
-// they must never hand out a member's full payout address — the id would then
-// be a scraper key for every member's on-chain address. Instead each member is
-// exposed as an opaque `memberId` (the stable join key the UI uses across the
-// detail endpoints) plus a masked `addressLabel` for display. The full address
-// never leaves the server; the viewer's own row is flagged via `?viewer=`, and
-// the UI already knows its own address (from the route) for the self-link.
-
-/// Opaque, stable per-(group, member) id. Deterministic so every detail
-/// endpoint produces the same id for the same member (the UI joins on it), and
-/// one-way + group-scoped so it reveals neither the address nor cross-group
-/// membership.
-fn member_id(group_id: Uuid, address: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(group_id.as_bytes());
-    h.update([0u8]); // domain-separate the two fields
-    h.update(address.as_bytes());
-    hex::encode(&h.finalize()[..8]) // 64-bit → collision-free within a group
-}
-
-/// Masked labels for a group's members, guaranteed unique within the group.
-/// Base = last-5 (like the UI); if two members would collapse to the same
-/// label, both are widened to last-9, which makes an intra-group visual
-/// collision astronomically unlikely. (The `memberId` join is collision-free
-/// regardless — this only keeps two rows from *looking* identical.)
-fn build_member_labels(addresses: &[String]) -> HashMap<String, String> {
-    let mut base_counts: HashMap<String, usize> = HashMap::new();
-    for a in addresses {
-        *base_counts.entry(bp_common::short_address(a)).or_insert(0) += 1;
-    }
-    let mut out = HashMap::with_capacity(addresses.len());
-    for a in addresses {
-        let base = bp_common::short_address(a);
-        let label = if base_counts.get(&base).copied().unwrap_or(0) > 1 {
-            bp_common::short_address_with_tail(a, 9)
-        } else {
-            base
-        };
-        out.insert(a.clone(), label);
-    }
-    out
 }
 
 // ─── GET /api/groups/:id ─────────────────────────────────────────
@@ -2392,23 +2347,6 @@ mod tests {
     }
 
     #[test]
-    fn member_id_is_stable_group_scoped_and_opaque() {
-        let g1 = Uuid::from_u128(1);
-        let g2 = Uuid::from_u128(2);
-        let a = "bc1qsomeaddressaaaa";
-        // Deterministic.
-        assert_eq!(member_id(g1, a), member_id(g1, a));
-        // Group-scoped: same address, different group → different id.
-        assert_ne!(member_id(g1, a), member_id(g2, a));
-        // Different address → different id.
-        assert_ne!(member_id(g1, a), member_id(g1, "bc1qsomeaddressbbbb"));
-        // Opaque: doesn't leak the address, fixed 16-hex width.
-        let id = member_id(g1, a);
-        assert_eq!(id.len(), 16);
-        assert!(!id.contains("address"));
-    }
-
-    #[test]
     fn distribution_entries_keep_a_reject_only_member_as_a_zero_share_row() {
         let gid = Uuid::nil();
         let per_address = HashMap::from([("bc1qAAAAAAAAA11111".to_string(), 75.0)]);
@@ -2429,21 +2367,6 @@ mod tests {
         // Sum of the rows is the figure the mini-card shows, in both columns.
         let rejected_sum: f64 = rows.iter().map(|r| r.total_rejected).sum();
         assert_eq!(rejected_sum, 14.0);
-    }
-
-    #[test]
-    fn build_member_labels_disambiguates_collisions() {
-        // Same first-4 ("bc1q") AND same last-5 ("12345") → base labels collide
-        // → both widened so two rows never render identically.
-        let a = "bc1qAAAAAAAAA12345".to_string();
-        let b = "bc1qBBBBBBBBB12345".to_string();
-        let labels = build_member_labels(&[a.clone(), b.clone()]);
-        assert_eq!(bp_common::short_address(&a), bp_common::short_address(&b)); // base collides
-        assert_ne!(labels[&a], labels[&b], "colliding labels must be widened");
-        // A non-colliding address keeps the short last-5 label.
-        let c = "bc1qCCCCCCCCCC99999".to_string();
-        let labels2 = build_member_labels(&[a, c.clone()]);
-        assert_eq!(labels2[&c], bp_common::short_address(&c));
     }
 
     #[test]
