@@ -146,6 +146,9 @@ mod tests {
         // Opaque: doesn't leak the address, fixed 16-hex width.
         let id = member_id(g1, a);
         assert_eq!(id.len(), 16);
+        // Pinned: the blitzpool-ui sidecar recomputes this id, so a change of
+        // the algorithm must not pass silently.
+        assert_eq!(id, "0fffe6b3af2a8384");
         assert!(!id.contains("address"));
     }
 
