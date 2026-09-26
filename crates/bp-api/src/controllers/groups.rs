@@ -740,6 +740,30 @@ fn admin_token(headers: &HeaderMap) -> Option<&str> {
     headers.get("x-admin-token").and_then(|v| v.to_str().ok())
 }
 
+/// The admin token from `x-admin-token`, checked against the group — `None`
+/// when the header is absent, an error when it is present and wrong.
+///
+/// Call this BEFORE a response-cache lookup whose key carries the admin
+/// flag. A check inside the cached computation only runs on a miss, so any
+/// token would read the admin body a real admin just cached.
+async fn verified_admin_token<'h, H, M>(
+    state: &SharedState<H, M>,
+    id: Uuid,
+    headers: &'h HeaderMap,
+) -> Result<Option<&'h str>, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let Some(token) = admin_token(headers) else {
+        return Ok(None);
+    };
+    require_group_service(state)?
+        .require_admin_token(id, Some(token))
+        .await?;
+    Ok(Some(token))
+}
+
 // ─── DTOs ────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -1088,19 +1112,9 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    // Validate the admin token (if supplied) BEFORE cache lookup so a
-    // bad token returns 401 instead of a stale cached body. The cache
-    // key includes the `admin` flag so admin + non-admin views are
-    // stored separately.
-    let svc = require_group_service(&state)?;
-    let token = admin_token(&headers);
-    let is_admin = match token {
-        None => false,
-        Some(t) => match svc.require_admin_token(id, Some(t)).await {
-            Ok(_) => true,
-            Err(e) => return Err(e.into()),
-        },
-    };
+    // The cache key includes the `admin` flag so admin + non-admin views
+    // are stored separately.
+    let is_admin = verified_admin_token(&state, id, &headers).await?.is_some();
     // Viewer's own address (from the UI route) — only ever used to flag their
     // own row `isSelf`; never echoed back for other members. Keyed into the
     // cache so the self-flag is per-viewer (anonymous viewers share "none").
@@ -1716,7 +1730,9 @@ where
     // Admin and non-admin responses both omit the secret token when
     // the caller isn't an admin — key on `is_admin` so we don't leak
     // the admin variant to a public viewer via shared cache.
-    let token = admin_token(&headers).map(|s| s.to_string());
+    let token = verified_admin_token(&state, id, &headers)
+        .await?
+        .map(str::to_string);
     let is_admin = token.is_some();
     let key = format!(
         "GROUP_OPEN_INVITE_ACTIVE_{id}_{}",
@@ -1795,7 +1811,9 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let token = admin_token(&headers).map(|s| s.to_string());
+    let token = verified_admin_token(&state, id, &headers)
+        .await?
+        .map(str::to_string);
     let is_admin = token.is_some();
     let include_decided = q
         .include_decided
