@@ -984,8 +984,16 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             }
         }
 
+        // Members and join link go with the status flip, in one TX: a dissolved
+        // party must not keep its addresses (UNIQUE (address) would lock them
+        // out of every later party, and the custom-extranonce Solo check
+        // reads the same rows). The history keeps its own split snapshot.
         let now = now_ms();
-        bp_db::update_blockparty_group_dissolved(&self.pool, group_id, now, now).await?;
+        let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
+        bp_db::delete_blockparty_members_for_group(&mut *tx, group_id).await?;
+        bp_db::delete_blockparty_join_link(&mut *tx, group_id).await?;
+        bp_db::update_blockparty_group_dissolved(&mut *tx, group_id, now, now).await?;
+        tx.commit().await.map_err(bp_db::DbError::from)?;
         self.cache
             .set_admin_status(&group.admin_address, group_id, BlockpartyStatus::Dissolved)
             .await;

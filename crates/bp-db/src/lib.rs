@@ -74,8 +74,8 @@ pub use block::{
     FoundBlockRow, RpcBlockRow,
 };
 pub use blockparty::{
-    delete_blockparty_join_link, delete_blockparty_member, find_blockparty_group,
-    find_blockparty_group_by_admin_address, find_blockparty_group_by_name,
+    delete_blockparty_join_link, delete_blockparty_member, delete_blockparty_members_for_group,
+    find_blockparty_group, find_blockparty_group_by_admin_address, find_blockparty_group_by_name,
     find_blockparty_join_link_by_token, find_blockparty_join_link_for_group,
     find_blockparty_member_by_address, find_blockparty_member_in_group,
     insert_blockparty_block_history, insert_blockparty_group, insert_blockparty_member,

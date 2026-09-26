@@ -1581,8 +1581,6 @@ ALTER TABLE ONLY public.blockparty_group
     ADD CONSTRAINT "PK_blockparty_group" PRIMARY KEY (id);
 ALTER TABLE ONLY public.blockparty_group
     ADD CONSTRAINT "UQ_blockparty_group_name" UNIQUE (name);
-ALTER TABLE ONLY public.blockparty_group
-    ADD CONSTRAINT "UQ_blockparty_group_admin_address" UNIQUE ("adminAddress");
 
 ALTER TABLE ONLY public.blockparty_member
     ADD CONSTRAINT "PK_blockparty_member" PRIMARY KEY (id);
@@ -1606,6 +1604,8 @@ ALTER TABLE ONLY public.blockparty_block_history
     ADD CONSTRAINT "FK_blockparty_block_history_group" FOREIGN KEY ("groupId") REFERENCES public.blockparty_group(id) ON DELETE CASCADE;
 
 CREATE INDEX "IDX_blockparty_group_status" ON public.blockparty_group(status);
+CREATE UNIQUE INDEX "UQ_blockparty_group_admin_address_live"
+    ON public.blockparty_group("adminAddress") WHERE status <> 'dissolved';
 CREATE INDEX "IDX_blockparty_member_group" ON public.blockparty_member("groupId");
 CREATE INDEX "IDX_blockparty_invitation_group" ON public.blockparty_invitation("groupId");
 CREATE INDEX "IDX_blockparty_invitation_address" ON public.blockparty_invitation(address);
