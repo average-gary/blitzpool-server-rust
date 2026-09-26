@@ -102,6 +102,14 @@ where
             "/api/pplns/groups/by-address/:address",
             get(by_address::<H, M>),
         )
+        .route(
+            "/api/pplns/groups/membership/:address",
+            get(membership::<H, M>),
+        )
+        .route(
+            "/api/pplns/groups/:id/admin-check",
+            get(admin_check::<H, M>),
+        )
         .route("/api/pplns/groups/:id/hashrate", get(hashrate::<H, M>))
         .route("/api/pplns/groups/:id/chart", get(group_chart::<H, M>))
         .route(
@@ -1285,6 +1293,75 @@ where
         viewer: Some(addr.as_str().to_string()),
     });
     by_id(State(state), Path(member.group_id), viewer, headers).await
+}
+
+// ─── GET /api/pplns/groups/membership/:address ───────────────────
+
+/// `{ groupId, groupName, role }` for a member, `{ groupId: null }` otherwise
+/// — the Blockparty `by-address` shape minus its status FSM (a Group-Solo
+/// member's group is never dissolved: the dissolve deletes the members).
+/// A yes/no answer without the roster, hashrate and sessions that
+/// `by-address` computes.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MembershipResponse {
+    Member {
+        #[serde(rename = "groupId")]
+        group_id: Uuid,
+        #[serde(rename = "groupName")]
+        group_name: String,
+        role: String,
+    },
+    None {
+        // Always `None` — emits `{ "groupId": null }`.
+        #[serde(rename = "groupId")]
+        group_id: Option<Uuid>,
+    },
+}
+
+async fn membership<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(address): Path<String>,
+) -> Result<Json<MembershipResponse>, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
+    let none = || Json(MembershipResponse::None { group_id: None });
+    let Some(member) = bp_db::find_group_member_by_address(&state.pool, &addr).await? else {
+        return Ok(none());
+    };
+    let Some(group) = require_group_service(&state)?
+        .get_group(member.group_id)
+        .await?
+    else {
+        return Ok(none());
+    };
+    Ok(Json(MembershipResponse::Member {
+        group_id: group.id,
+        group_name: group.name,
+        role: member.role,
+    }))
+}
+
+// ─── GET /api/pplns/groups/:id/admin-check ───────────────────────
+
+/// 204 when `x-admin-token` is this group's admin token; 401 when missing or
+/// wrong, 404 for an unknown or dissolved group. Nothing else is read.
+async fn admin_check<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    require_group_service(&state)?
+        .require_admin_token(id, admin_token(&headers))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─── GET /api/groups/:id/hashrate ────────────────────────────────

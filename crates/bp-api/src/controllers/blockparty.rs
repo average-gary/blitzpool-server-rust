@@ -270,6 +270,7 @@ where
         )
         .route("/api/blockparty/:id", get(detail::<H, M>))
         .route("/api/blockparty/:id/history", get(history::<H, M>))
+        .route("/api/blockparty/:id/admin-check", get(admin_check::<H, M>))
         .route(
             "/api/blockparty/:id/member-view/:address",
             get(member_view::<H, M>),
@@ -422,6 +423,24 @@ where
         group: GroupPublicView::from_row(&group),
         members: member_views(id, &members, &owned, &viewer),
     }))
+}
+
+/// 204 when `x-blockparty-admin-token` is this party's admin token; 401 when
+/// missing or wrong, 404 for an unknown or dissolved party. Same contract as
+/// `GET /api/pplns/groups/:id/admin-check`.
+async fn admin_check<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    require_blockparty(&state)?
+        .verify_admin_token(id, admin_token(&headers).as_deref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn history<H, M>(
