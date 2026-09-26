@@ -27,15 +27,11 @@
 //! - [`ledger`] — Postgres-backed signed credit/debit ledger.
 //!   Balance bulk-upsert + history bulk-insert in one TX, lastAcceptedShareAt
 //!   60s flush buffer.
-//! - [`distribution`] — `build_distribution` wrapper around
-//!   `bp_pplns::build_coinbase_distribution` with snapshot-readback +
-//!   recompute-fallback.
+//! - [`distribution`] — `build_distribution` wrapper around the shared
+//!   weight build + snapshot write, `bp_coinbase_snapshot::build_and_snapshot`.
 //! - [`sweep`] — daily 03:00 UTC `tokio`-loop that pair-cancels
 //!   abandoned credits ↔ debits. Group-solo dust-absorption lives in
 //!   the future `bp-group-solo-engine` crate.
-//! - [`inflight`] — per-block-reward dedup of concurrent
-//!   `build_distribution` calls (in-flight-future shared via
-//!   `tokio::sync::watch` / `OnceCell`-based dedup with TTL).
 //! - [`hooks`] — `bp_stratum_v1::hooks::{AcceptedShareSink,
 //!   BlockSubmissionSink}` impls (and SV2 equivalents once that hook
 //!   surface lands). Mode-aware: only records if the share's address
@@ -55,13 +51,6 @@ pub mod ledger;
 pub mod reader;
 pub mod sweep;
 pub mod window;
-
-// `InflightResultCache` extracted to the shared `bp-inflight-cache`
-// crate so `bp-group-solo-engine` (and future engines) can share the
-// dedup-plus-TTL pattern without duplicating ~350 LoC. Re-export so
-// existing call sites that imported `bp_pplns_engine::inflight::…`
-// keep working.
-pub use bp_inflight_cache as inflight;
 
 // Re-export the coinbase-weight constants + dust floor so consumers
 // (bp-api in particular) can render them on the /api/pplns/fees

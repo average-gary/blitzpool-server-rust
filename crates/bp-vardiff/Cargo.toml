@@ -11,4 +11,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# Pure-math leaf — no internal deps. Std-only.
+# Pure math. Only internal dep: bp-common for the shared
+# hashes-per-difficulty-1 constant.
+bp-common = { workspace = true }

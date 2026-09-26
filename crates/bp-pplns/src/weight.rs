@@ -8,10 +8,7 @@ use std::str::FromStr;
 use bitcoin::{Address, AddressType};
 use bp_common::Sats;
 
-/// Bitcoin Core's default dust policy value for P2PKH at
-/// `dustRelayFee = 3000 sat/kvB`. Outputs below this can't be relayed as
-/// standard transactions.
-pub const DUST_LIMIT_SATS: u64 = 546;
+pub use bp_common::DUST_LIMIT_SATS;
 
 /// Pool's default minimum on-chain payout. Outputs below stay as pending
 /// credit in the signed ledger until they accumulate past the threshold.
@@ -243,26 +240,39 @@ pub fn max_coinbase_outputs(budget: u32) -> u64 {
 }
 
 /// Field-level validation error for the fee / min-payout / coinbase-budget
-/// knobs shared by the PPLNS and Group-Solo engine configs. Each engine maps
-/// this into its own `ConfigError` (via `From`) so the identical checks —
-/// and their thresholds — live in exactly one place.
-#[derive(Debug, Clone, PartialEq)]
+/// knobs shared by the PPLNS and Group-Solo engine configs. Each engine's
+/// `ConfigError` carries it through unchanged, so the identical checks, their
+/// thresholds and the messages an operator sees at boot live in exactly one
+/// place.
+#[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum FeePayoutBudgetError {
     /// No pool-output recipient configured. Structural under §4, not a
     /// preference — see [`validate_fee_payout_budget`].
+    #[error(
+        "no fee_address configured — the pool output is structural under the \
+         weight model (SV2 ext 0x0003 §4). Without it every block of this mode \
+         falls back to a solo coinbase paying 100 % to one miner"
+    )]
     MissingFeeAddress,
     /// A pool-output recipient was configured but is not a usable payout
     /// address. `AddressId` only checks the SHAPE (ASCII, length), so a
     /// typo'd address gets this far; the same silent failure as no
     /// address at all, and likelier.
+    #[error(
+        "fee_address {value:?} is not a usable payout address — same effect as \
+         none at all: every block falls back to a solo coinbase"
+    )]
     InvalidFeeAddress { value: String },
     /// `fee_percent` was non-finite or outside `[0.0, 100.0]`.
+    #[error("fee_percent must be in [0.0, 100.0] and finite, got {value}")]
     InvalidFeePercent { value: f64 },
     /// `min_payout_sats` below the relay-policy dust floor.
+    #[error("min_payout_sats must be ≥ DUST_LIMIT_SATS ({dust}), got {value}")]
     MinPayoutBelowDust { value: i64, dust: u64 },
     /// `coinbase_weight_budget` below [`MIN_COINBASE_WEIGHT_BUDGET`] —
     /// too small to publish even one miner output, which would hand the
     /// pool every block. `min` is the smallest ACCEPTED value.
+    #[error("coinbase_weight_budget must be > {min} (base + safety margin), got {value}")]
     WeightBudgetTooLow { value: u32, min: u32 },
 }
 

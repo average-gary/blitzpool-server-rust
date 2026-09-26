@@ -649,6 +649,155 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     // Diff-1 weights ride along per reason and must not be cross-wired.
     assert_eq!(n("rejectedVersionRollingDiff1"), 0.0625);
     assert_eq!(n("rejectedStaleDiff1"), 0.03125);
+    // Hashrate is rounded like every chart endpoint: 10 × 2^32 / 600 s is
+    // 71_582_788.27 H/s unrounded.
+    assert_eq!(n("data"), 71_582_788.0);
+}
+
+/// GET a path on a fresh router; returns status + parsed JSON body.
+async fn get_json(pool: PgPool, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = build_router(minimal_state(pool))
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("non-JSON body for {uri} ({e}): {bytes:?}"));
+    (status, json)
+}
+
+#[tokio::test]
+async fn best_difficulty_today_maxes_workers_and_slots_from_since() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Own address: no sibling test in this binary touches it.
+    let addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    let hour: i64 = 60 * 60 * 1000;
+    // `since` on an hour boundary, one hour back, so `since + 1h` is the
+    // current hour and every seeded slot lies inside the accepted window.
+    let since = (bp_common::now_ms() / hour) * hour - hour;
+    // Values exactly representable as f32 (the column is `real`). The
+    // highest one sits in the slot BEFORE `since`, so it only shows up in
+    // the answer if the boundary is wrong.
+    let rows: [(&str, i64, f32); 4] = [
+        ("rig_a", since - hour, 9_000.5),
+        ("rig_a", since, 1_500.25),
+        ("rig_b", since, 800.0),
+        ("rig_b", since + hour, 2_048.75),
+    ];
+    let cleanup = || async {
+        let _ = sqlx::query("DELETE FROM client_difficulty_statistics_entity WHERE address = $1")
+            .bind(addr)
+            .execute(&pool)
+            .await;
+    };
+    cleanup().await;
+    for (worker, slot, max) in rows {
+        sqlx::query(
+            r#"INSERT INTO client_difficulty_statistics_entity
+                 (address, "clientName", "slotTime", "maxDifficulty")
+               VALUES ($1, $2, $3, $4)"#,
+        )
+        .bind(addr)
+        .bind(worker)
+        .bind(slot)
+        .bind(max)
+        .execute(&pool)
+        .await
+        .expect("seed diff stat");
+    }
+
+    let today = get_json(
+        pool.clone(),
+        &format!("/api/client/{addr}/best-difficulty/today?since={since}"),
+    )
+    .await;
+    // Negative control: one hour earlier the pre-`since` row is in range,
+    // so it exists and a missing 9000.5 above is the filter, not the seed.
+    let earlier = get_json(
+        pool.clone(),
+        &format!(
+            "/api/client/{addr}/best-difficulty/today?since={}",
+            since - hour
+        ),
+    )
+    .await;
+    // One ms past the slot start excludes that slot: no flooring to the hour.
+    let past_slot = get_json(
+        pool.clone(),
+        &format!(
+            "/api/client/{addr}/best-difficulty/today?since={}",
+            since - hour + 1
+        ),
+    )
+    .await;
+    cleanup().await;
+
+    assert_eq!(today.0, StatusCode::OK, "{}", today.1);
+    assert_eq!(today.1["bestDifficulty"], serde_json::json!(2048.75));
+    assert_eq!(earlier.0, StatusCode::OK, "{}", earlier.1);
+    assert_eq!(earlier.1["bestDifficulty"], serde_json::json!(9000.5));
+    assert_eq!(past_slot.0, StatusCode::OK, "{}", past_slot.1);
+    assert_eq!(past_slot.1["bestDifficulty"], serde_json::json!(2048.75));
+}
+
+#[tokio::test]
+async fn best_difficulty_today_without_rows_is_zero() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // P2WSH address nothing in the suite writes rows for.
+    let addr = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    let since = bp_common::now_ms() - 60 * 60 * 1000;
+    let (status, json) = get_json(
+        pool,
+        &format!("/api/client/{addr}/best-difficulty/today?since={since}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    // Whole number → JSON integer, like every `ser_f64_jsnum` field.
+    assert_eq!(json["bestDifficulty"], serde_json::json!(0));
+}
+
+#[tokio::test]
+async fn best_difficulty_today_rejects_missing_or_out_of_window_since() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    let now = bp_common::now_ms();
+    let hour: i64 = 60 * 60 * 1000;
+    let base = format!("/api/client/{addr}/best-difficulty/today");
+    for uri in [
+        base.clone(),
+        format!("{base}?since="),
+        format!("{base}?since=yesterday"),
+        format!("{base}?since=1.5"),
+        format!("{base}?since={}", now - 27 * hour),
+        format!("{base}?since={}", now + 2 * hour),
+    ] {
+        let (status, json) = get_json(pool.clone(), &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+        assert_eq!(json["code"], "invalid-query", "{uri}: {json}");
+    }
+    // Bad address is still the address error, checked before `since`.
+    let (status, json) = get_json(
+        pool,
+        &format!(
+            "/api/client/{}/best-difficulty/today?since={now}",
+            "a".repeat(100)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["code"], "invalid-address");
 }
 
 /// `POST /api/identity/resolve` records the identity it resolves, so the pool

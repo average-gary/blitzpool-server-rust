@@ -1,89 +1,53 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bridges the SV1-specific [`AcceptedShareSink`]
-//! trait to the protocol-agnostic
-//! [`SharedAcceptedShareSink`].
+//! Projects SV1's native share types into the protocol-agnostic
+//! `bp_share_hook` views the server hands its sinks.
 //!
 //! Engines (PPLNS, group-solo, share-stats-sink, session-persistence)
-//! implement `SharedAcceptedShareSink` once and the SV1 server uses
-//! this adapter to project its native [`ShareAccept`]
-//! into the shared view. The SV2 server provides a symmetric adapter
-//! in `bp-stratum-v2`. See the `bp-share-hook` crate-level docs for
-//! the full picture.
+//! implement the shared sink traits once; the SV1 server calls them
+//! directly with what these functions build. SV2 has the symmetric pair
+//! in `bp-stratum-v2`. See the `bp-share-hook` crate-level docs for the
+//! full picture.
 
-use std::sync::Arc;
+use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
 
-use async_trait::async_trait;
-use bp_share_hook::{
-    RejectedReason, SharedAcceptedShare, SharedAcceptedShareSink, SharedRejectedShare,
-    SharedRejectedShareSink, SharedSessionPersistence,
-};
+use crate::submit::{RejectReason, ShareAccept};
 
-use crate::hooks::{AcceptedShareSink, RejectedShareSink, SessionPersistence};
-use crate::{RejectReason, ShareAccept};
-
-/// SV1 → shared adapter. Cheap to clone (single `Arc`).
-pub struct Sv1AcceptedShareAdapter<S: SharedAcceptedShareSink + ?Sized> {
-    inner: Arc<S>,
-}
-
-impl<S: SharedAcceptedShareSink + ?Sized> Sv1AcceptedShareAdapter<S> {
-    pub fn new(inner: Arc<S>) -> Self {
-        Self { inner }
+/// The shared view of an accepted SV1 share.
+pub(crate) fn shared_accepted<'a>(
+    address: &'a str,
+    worker: &'a str,
+    session_id: &'a str,
+    user_agent: Option<&'a str>,
+    accept: &ShareAccept,
+    hash_rate: f64,
+) -> SharedAcceptedShare<'a> {
+    SharedAcceptedShare {
+        address,
+        worker,
+        session_id,
+        user_agent,
+        effective_difficulty: accept.effective_difficulty,
+        submission_difficulty: accept.submission_difficulty,
+        is_block_candidate: accept.is_block_candidate,
+        hash_rate,
+        // SV1 is one device per connection — never bundled.
+        channel_count: 1,
+        ts_ms: bp_common::now_ms(),
+        // Producer-assigned downstream at the single fan-out point; the
+        // protocol side has no global share sequence and no mode-gate, so it
+        // leaves share_id/mode/group_id blank.
+        share_id: "",
+        mode: bp_common::MiningMode::Solo,
+        group_id: None,
     }
 }
 
-#[async_trait]
-impl<S: SharedAcceptedShareSink + ?Sized> AcceptedShareSink for Sv1AcceptedShareAdapter<S> {
-    async fn record_accepted(
-        &self,
-        address: &str,
-        worker: &str,
-        session_id: &str,
-        user_agent: Option<&str>,
-        accept: &ShareAccept,
-        hash_rate: f64,
-    ) {
-        self.inner
-            .record_accepted(SharedAcceptedShare {
-                address,
-                worker,
-                session_id,
-                user_agent,
-                effective_difficulty: accept.effective_difficulty,
-                submission_difficulty: accept.submission_difficulty,
-                is_block_candidate: accept.is_block_candidate,
-                hash_rate,
-                // SV1 is one device per connection — never bundled.
-                channel_count: 1,
-                ts_ms: bp_common::now_ms(),
-                // Producer-assigned downstream at the single fan-out point;
-                // the per-protocol adapter has no global share sequence and
-                // no mode-gate, so it leaves share_id/mode/group_id blank.
-                share_id: "",
-                mode: bp_common::MiningMode::Solo,
-                group_id: None,
-            })
-            .await;
-    }
-}
-
-/// SV1 → shared rejected-share adapter. Maps SV1's 4-variant
-/// `RejectReason` (Duplicate / JobNotFound / Stale / LowDifficulty)
-/// into the canonical 3-variant `bp_stats::RejectedReason`. `Stale`
-/// collapses into `JobNotFound` because both share the same reject
+/// Maps SV1's 4-variant `RejectReason` (Duplicate / JobNotFound / Stale /
+/// LowDifficulty) into the canonical 3-variant `bp_stats::RejectedReason`.
+/// `Stale` collapses into `JobNotFound` because both share the same reject
 /// accumulator bucket (see `bp_share_stats_sink::hooks::map_reject_reason`
-/// for the same mapping at the sink-side — adapter centralizes it here).
-pub struct Sv1RejectedShareAdapter<S: SharedRejectedShareSink + ?Sized> {
-    inner: Arc<S>,
-}
-
-impl<S: SharedRejectedShareSink + ?Sized> Sv1RejectedShareAdapter<S> {
-    pub fn new(inner: Arc<S>) -> Self {
-        Self { inner }
-    }
-}
-
+/// for the same mapping at the sink-side — centralized here).
 fn map_sv1_reject(reason: RejectReason) -> RejectedReason {
     match reason {
         RejectReason::JobNotFound | RejectReason::Stale => RejectedReason::JobNotFound,
@@ -93,85 +57,30 @@ fn map_sv1_reject(reason: RejectReason) -> RejectedReason {
     }
 }
 
-#[async_trait]
-impl<S: SharedRejectedShareSink + ?Sized> RejectedShareSink for Sv1RejectedShareAdapter<S> {
-    async fn record_rejected(
-        &self,
-        address: Option<&str>,
-        worker: Option<&str>,
-        session_id: &str,
-        reason: RejectReason,
-        difficulty: f64,
-    ) {
-        self.inner
-            .record_rejected(SharedRejectedShare {
-                address,
-                worker,
-                session_id,
-                reason: map_sv1_reject(reason),
-                difficulty,
-                // The producer (Core composite) stamps the group id from the
-                // mode gate; the protocol adapter has none.
-                group_id: None,
-            })
-            .await;
-    }
-}
-
-/// SV1 → shared session-persistence adapter. Already protocol-agnostic
-/// in shape — just forwards.
-pub struct Sv1SessionPersistenceAdapter<S: SharedSessionPersistence + ?Sized> {
-    inner: Arc<S>,
-}
-
-impl<S: SharedSessionPersistence + ?Sized> Sv1SessionPersistenceAdapter<S> {
-    pub fn new(inner: Arc<S>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait]
-impl<S: SharedSessionPersistence + ?Sized> SessionPersistence for Sv1SessionPersistenceAdapter<S> {
-    async fn register_session(
-        &self,
-        session_id: &str,
-        address: &str,
-        worker: &str,
-        user_agent: Option<&str>,
-    ) {
-        self.inner
-            .register_session(session_id, address, worker, user_agent)
-            .await;
-    }
-    async fn deregister_session(&self, session_id: &str) {
-        self.inner.deregister_session(session_id).await;
+/// The shared view of a rejected SV1 share.
+pub(crate) fn shared_rejected<'a>(
+    address: Option<&'a str>,
+    worker: Option<&'a str>,
+    session_id: &'a str,
+    reason: RejectReason,
+    difficulty: f64,
+) -> SharedRejectedShare<'a> {
+    SharedRejectedShare {
+        address,
+        worker,
+        session_id,
+        reason: map_sv1_reject(reason),
+        difficulty,
+        // The producer (Core composite) stamps the group id from the mode
+        // gate; the protocol side has none.
+        group_id: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    struct CapturingSink {
-        captured: Mutex<Vec<SharedTuple>>,
-    }
-    type SharedTuple = (String, String, String, f64, f64, bool, Option<String>);
-
-    #[async_trait]
-    impl SharedAcceptedShareSink for CapturingSink {
-        async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-            self.captured.lock().unwrap().push((
-                share.address.to_string(),
-                share.worker.to_string(),
-                share.session_id.to_string(),
-                share.effective_difficulty,
-                share.submission_difficulty,
-                share.is_block_candidate,
-                share.user_agent.map(str::to_string),
-            ));
-        }
-    }
+    use std::sync::Arc;
 
     fn synthetic_accept(eff: f64, sub: f64, candidate: bool) -> ShareAccept {
         use crate::ActiveSV1Template;
@@ -206,104 +115,75 @@ mod tests {
             hash: [0u8; 32],
             is_block_candidate: candidate,
             mining_job: Arc::new(job),
-            template: Arc::new(ActiveSV1Template {
-                template_id: 1,
-                version: 0x2000_0000,
-                prev_hash: [0u8; 32],
-                n_bits: 0x1d00_ffff,
-                header_timestamp: 0,
-                network_target: [0xff; 32],
-                network_difficulty: 1.0,
-                coinbase_prefix: vec![],
-                coinbase_tx_version: 2,
-                coinbase_tx_input_sequence: 0xffff_ffff,
-                coinbase_tx_value_remaining: 5_000_000_000,
-                coinbase_tx_outputs: vec![],
-                coinbase_tx_outputs_count: 0,
-                coinbase_tx_locktime: 0,
-                merkle_path: vec![],
-                merkle_branch_hex: vec![],
-                prev_hash_hex: String::new(),
-                version_hex: String::new(),
-                n_bits_hex: String::new(),
-                header_timestamp_hex: String::new(),
-            }),
+            template: Arc::new(ActiveSV1Template::from_template(
+                bp_template_distribution::ActiveTemplate {
+                    template_id: 1,
+                    version: 0x2000_0000,
+                    prev_hash: [0u8; 32],
+                    n_bits: 0x1d00_ffff,
+                    header_timestamp: 0,
+                    coinbase_prefix: vec![],
+                    coinbase_tx_version: 2,
+                    coinbase_tx_input_sequence: 0xffff_ffff,
+                    coinbase_tx_value_remaining: 5_000_000_000,
+                    coinbase_tx_outputs: vec![],
+                    coinbase_tx_outputs_count: 0,
+                    coinbase_tx_locktime: 0,
+                    merkle_path: vec![],
+                },
+            )),
             enonce1: [0u8; 4],
             extranonce2: [0u8; 8],
         }
     }
 
-    #[tokio::test]
-    async fn adapter_projects_share_accept_into_shared_view() {
-        let inner = Arc::new(CapturingSink {
-            captured: Mutex::new(Vec::new()),
-        });
-        let adapter = Sv1AcceptedShareAdapter::new(inner.clone());
+    #[test]
+    fn projects_share_accept_into_shared_view() {
         let accept = synthetic_accept(1024.0, 2048.0, false);
-        adapter
-            .record_accepted(
-                "bc1qalice",
-                "rig1",
-                "sess0001",
-                Some("bitaxe/1.0"),
-                &accept,
-                0.0,
-            )
-            .await;
-        let cap = inner.captured.lock().unwrap();
-        assert_eq!(cap.len(), 1);
-        assert_eq!(cap[0].0, "bc1qalice");
-        assert_eq!(cap[0].1, "rig1");
-        assert_eq!(cap[0].2, "sess0001");
-        assert_eq!(cap[0].3, 1024.0);
-        assert_eq!(cap[0].4, 2048.0);
-        assert!(!cap[0].5);
-        assert_eq!(cap[0].6.as_deref(), Some("bitaxe/1.0"));
+        let share = shared_accepted(
+            "bc1qalice",
+            "rig1",
+            "sess0001",
+            Some("bitaxe/1.0"),
+            &accept,
+            0.0,
+        );
+        assert_eq!(share.address, "bc1qalice");
+        assert_eq!(share.worker, "rig1");
+        assert_eq!(share.session_id, "sess0001");
+        assert_eq!(share.effective_difficulty, 1024.0);
+        assert_eq!(share.submission_difficulty, 2048.0);
+        assert!(!share.is_block_candidate);
+        assert_eq!(share.user_agent, Some("bitaxe/1.0"));
+        assert_eq!(share.channel_count, 1, "SV1 is one device per connection");
     }
 
-    #[tokio::test]
-    async fn adapter_propagates_block_candidate_flag() {
-        let inner = Arc::new(CapturingSink {
-            captured: Mutex::new(Vec::new()),
-        });
-        let adapter = Sv1AcceptedShareAdapter::new(inner.clone());
+    #[test]
+    fn propagates_block_candidate_flag() {
         let accept = synthetic_accept(100.0, 1e15, true);
-        adapter
-            .record_accepted("a", "w", "s", None, &accept, 0.0)
-            .await;
-        assert!(inner.captured.lock().unwrap()[0].5);
+        assert!(shared_accepted("a", "w", "s", None, &accept, 0.0).is_block_candidate);
     }
 
-    /// The adapter is the birth point of `ts_ms` — it must stamp the
-    /// Core accept time so downstream sinks (and, later, the Core→Satellite
-    /// stream) carry the real share time instead of a sink-side `now()`.
-    #[tokio::test]
-    async fn adapter_stamps_accept_time() {
-        struct TsSink {
-            ts: Mutex<Option<i64>>,
-        }
-        #[async_trait]
-        impl SharedAcceptedShareSink for TsSink {
-            async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-                *self.ts.lock().unwrap() = Some(share.ts_ms);
-            }
-        }
-
+    /// The projection is the birth point of `ts_ms` — it must stamp the
+    /// Core accept time so downstream sinks (and the Core→Satellite stream)
+    /// carry the real share time instead of a sink-side `now()`.
+    #[test]
+    fn stamps_accept_time() {
         let before = bp_common::now_ms();
-        let inner = Arc::new(TsSink {
-            ts: Mutex::new(None),
-        });
-        let adapter = Sv1AcceptedShareAdapter::new(inner.clone());
         let accept = synthetic_accept(1024.0, 2048.0, false);
-        adapter
-            .record_accepted("a", "w", "s", None, &accept, 0.0)
-            .await;
+        let ts = shared_accepted("a", "w", "s", None, &accept, 0.0).ts_ms;
         let after = bp_common::now_ms();
-
-        let ts = inner.ts.lock().unwrap().expect("share recorded");
         assert!(
             ts >= before && ts <= after,
             "ts_ms must be stamped at accept time (got {ts}, window [{before}, {after}])"
         );
+    }
+
+    /// Stale and job-not-found share one reject bucket.
+    #[test]
+    fn a_stale_reject_lands_in_the_job_not_found_bucket() {
+        let share = shared_rejected(Some("a"), Some("w"), "s", RejectReason::Stale, 8.0);
+        assert_eq!(share.reason, RejectedReason::JobNotFound);
+        assert_eq!(share.difficulty, 8.0);
     }
 }

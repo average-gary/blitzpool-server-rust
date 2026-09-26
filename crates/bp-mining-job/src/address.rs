@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! BTC address → `scriptPubKey` derivation.
-//!
-//! The normalization rule that used to live here moved to
-//! `bp_common::normalize_btc_address` — it had been copied into both engines
-//! (which cannot depend on this crate: it is only a dev-dependency of theirs),
-//! and the "must agree byte-for-byte" invariant the copies documented was
-//! checked by nothing. `bp-common` is a dependency of all of them.
+//! BTC address → scriptPubKey derivation. Normalization lives in
+//! `bp_common::normalize_btc_address`.
 
 use std::str::FromStr;
 

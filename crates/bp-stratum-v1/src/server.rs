@@ -12,7 +12,7 @@
 //! 2. **Translator task** — consumes
 //!    [`bp_template_distribution::TemplateUpdate`] from a
 //!    `broadcast::Receiver` (= `TdpHandle::subscribe()` in production),
-//!    feeds them to an [`SV1TemplateAssembler`], and re-broadcasts the
+//!    feeds them to a [`TemplateAssembler`], and re-broadcasts the
 //!    resulting `(ActiveSV1Template, TemplateChange)` pairs to every
 //!    per-connection task. Also maintains a `Mutex<Option<ActiveSV1Template>>`
 //!    snapshot so freshly-accepted connections can boot from the current
@@ -31,10 +31,9 @@
 //! and exit.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bp_common::ExtranonceAllocator;
+use bp_common::SharedExtranonceAllocator;
 use bp_common::StreamKind;
 use bp_template_distribution::TemplateUpdate;
 use futures::StreamExt;
@@ -61,8 +60,9 @@ use crate::client::{
 use crate::config::{PortConfig, ServerConfig};
 use crate::hooks::ServerHooks;
 use crate::jobs::JobRegistry;
-use crate::notify::{ActiveSV1Template, SV1TemplateAssembler, TemplateChange};
+use crate::notify::ActiveSV1Template;
 use bp_mining_job::{MiningJobCache, ResolvedPayouts};
+use bp_template_distribution::{TemplateAssembler, TemplateChange};
 use bp_vardiff::{Clock, SystemClock};
 
 /// Pool-wide (across every SV1 port) collision-free extranonce1 allocator
@@ -70,17 +70,14 @@ use bp_vardiff::{Clock, SystemClock};
 /// and shared into every [`StratumV1Server`] so two miners — even on
 /// different ports — can never be handed the same extranonce1.
 ///
-/// Cheap to clone (both fields are `Arc`). Each connection calls
+/// Cheap to clone. Each connection calls
 /// [`allocate`](Self::allocate) exactly once at accept time; the returned
 /// `PrefixGuard` releases the prefix back to the pool when the
 /// connection task ends (any exit path — EOF, cancel, IO error).
 #[derive(Clone)]
 pub struct SharedExtranonce {
-    allocator: Arc<Mutex<ExtranonceAllocator>>,
-    /// Monotonic per-connection key. The allocator only needs the key to
-    /// be unique within this (SV1) instance, so a plain counter suffices
-    /// — SV2's separate instance never shares this map.
-    next_key: Arc<AtomicU64>,
+    /// One key per connection: SV1 holds exactly one prefix per connection.
+    shared: SharedExtranonceAllocator,
 }
 
 impl SharedExtranonce {
@@ -89,10 +86,9 @@ impl SharedExtranonce {
     /// into every port.
     pub fn new() -> Self {
         Self {
-            allocator: Arc::new(Mutex::new(ExtranonceAllocator::new_default_on_worker(
+            shared: SharedExtranonceAllocator::new_default_on_worker(
                 bp_common::extranonce::SV1_WORKER_ID,
-            ))),
-            next_key: Arc::new(AtomicU64::new(1)),
+            ),
         }
     }
 
@@ -102,36 +98,19 @@ impl SharedExtranonce {
     /// is exhausted — the caller then keeps the session-id-derived
     /// extranonce1, i.e. the pre-unification random behaviour.
     pub fn allocate(&self) -> PrefixGuard {
-        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
-        // Recover a poisoned lock rather than degrading silently: the
-        // allocator is never left half-updated (its ops don't panic
-        // mid-mutation), so a panic elsewhere must NOT permanently force
-        // every future connection onto the non-unique session-id-derived
-        // fallback. A `None` prefix below therefore means genuine
-        // partition exhaustion, which the caller logs.
-        let mut alloc = self
-            .allocator
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let prefix = alloc
-            .allocate(key)
-            .ok()
-            .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok());
-        drop(alloc);
+        let key = self.shared.next_key();
+        let prefix = self.shared.allocate(key).ok();
         PrefixGuard {
             key,
             prefix,
-            allocator: self.allocator.clone(),
+            shared: self.shared.clone(),
         }
     }
 
     /// Number of extranonce1 prefixes currently checked out (one per live
     /// connection). Exposed for tests + potential metrics.
     pub fn allocated_count(&self) -> usize {
-        self.allocator
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .allocated_count()
+        self.shared.allocated_count()
     }
 }
 
@@ -146,7 +125,7 @@ impl Default for SharedExtranonce {
 pub struct PrefixGuard {
     key: u64,
     prefix: Option<[u8; 4]>,
-    allocator: Arc<Mutex<ExtranonceAllocator>>,
+    shared: SharedExtranonceAllocator,
 }
 
 impl PrefixGuard {
@@ -159,13 +138,7 @@ impl PrefixGuard {
 
 impl Drop for PrefixGuard {
     fn drop(&mut self) {
-        // Recover a poisoned lock so the prefix is always returned to the
-        // pool — otherwise a single panic elsewhere would leak prefixes
-        // toward exhaustion.
-        self.allocator
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .release(self.key);
+        self.shared.release(self.key);
     }
 }
 
@@ -174,7 +147,7 @@ impl Drop for PrefixGuard {
 /// template by reference; the production tracer/observability layer may
 /// also tee these for metrics.
 #[derive(Clone, Debug)]
-pub struct TemplateBroadcast {
+pub(crate) struct TemplateBroadcast {
     /// `Arc` so the tokio broadcast channel hands each of the N connected
     /// sessions a refcount bump rather than a full deep copy of the
     /// template (merkle path + hex branches + coinbase buffers) on every
@@ -245,7 +218,7 @@ struct AltStreamHandle {
 impl StratumV1Server {
     /// Spawn the server. `updates_rx` is typically
     /// `tdp_handle.subscribe()`; the translator drives an internal
-    /// [`SV1TemplateAssembler`] and re-broadcasts pair-completed
+    /// [`TemplateAssembler`] and re-broadcasts pair-completed
     /// templates.
     ///
     /// `initial_snapshot` should be the result of
@@ -330,10 +303,6 @@ impl StratumV1Server {
         }
     }
 
-    pub fn server_config(&self) -> &Arc<ServerConfig> {
-        &self.inner.server_config
-    }
-
     pub fn job_registry(&self) -> &Arc<JobRegistry> {
         &self.inner.registry
     }
@@ -355,8 +324,8 @@ impl StratumV1Server {
     /// the connection runs until the socket closes, the cancel token
     /// fires, or the session signals `Disconnect`.
     ///
-    /// The TCP-accept loop calls this for each socket the
-    /// `bp_protocol_detect` router has identified as SV1.
+    /// The TCP-accept loop in `bin/blitzpool` calls this for each socket
+    /// its first-byte detection has classified as SV1.
     pub fn accept_connection(&self, socket: TcpStream, port_config: PortConfig) -> JoinHandle<()> {
         let server_config = self.inner.server_config.clone();
         let registry = self.inner.registry.clone();
@@ -440,7 +409,7 @@ impl StratumV1Server {
 
 // ── Translator task ──────────────────────────────────────────────────
 
-/// Consume TDP updates, feed an `SV1TemplateAssembler`, and re-broadcast
+/// Consume TDP updates, feed a `TemplateAssembler`, and re-broadcast
 /// the resulting `(template, change)` pairs. Maintains
 /// `current_template` so freshly-accepted connections can boot from the
 /// most recent state without waiting for the next TDP message.
@@ -456,7 +425,7 @@ async fn run_translator(
     job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
 ) {
-    let mut assembler = SV1TemplateAssembler::new();
+    let mut assembler = TemplateAssembler::<ActiveSV1Template>::new();
 
     // Bootstrap the assembler from the TdpHandle snapshot. The handle's
     // internal tap subscribes BEFORE the worker thread starts so it
@@ -466,10 +435,7 @@ async fn run_translator(
     // takes long enough that bridge_out emits the pair before this
     // subscribe gets installed. Without the bootstrap, current_template
     // stays None until the next on-chain block arrives.
-    if let Some((active, change)) = bp_template_distribution::bootstrap_assembler_from_snapshot(
-        &mut assembler,
-        initial_snapshot,
-    ) {
+    if let Some((active, change)) = assembler.bootstrap_from_snapshot(initial_snapshot) {
         // Wrap once; the snapshot store and every broadcast subscriber
         // then share this allocation via Arc refcounting.
         let active = Arc::new(active);
@@ -1092,27 +1058,16 @@ async fn resolve_payouts_for_state<C: bp_vardiff::Clock>(
 /// Translate a [`SessionEvent`] into the relevant hook calls. Returns
 /// `false` on `Disconnect`.
 ///
-/// Pulled out as a pub(crate) free function so unit tests can drive it
-/// against a fake `SessionState` + recording hooks without ever
-/// touching a `TcpStream`.
-pub(crate) async fn process_event(
-    event: SessionEvent,
-    state: &SessionState<SystemClock>,
-    hooks: &ServerHooks,
-) -> bool {
-    process_event_generic(event, state, hooks).await
-}
-
-/// Generic variant — exposed only to the test module so the recording
-/// hooks can drive it with a `SessionState<Arc<TestClock>>`.
-pub(crate) async fn process_event_generic<C: bp_vardiff::Clock>(
+/// Generic over the clock and free of any socket, so unit tests drive it
+/// with a `SessionState<Arc<TestClock>>` + recording hooks.
+pub(crate) async fn process_event<C: bp_vardiff::Clock>(
     event: SessionEvent,
     state: &SessionState<C>,
     hooks: &ServerHooks,
 ) -> bool {
     match event {
         SessionEvent::Subscribed => true,
-        SessionEvent::DifficultyChanged { .. } => {
+        SessionEvent::DifficultyChanged => {
             // Retarget counter. Without it the vardiff controller is
             // invisible in production: nothing else on either protocol
             // reports that a difficulty moved, so there is no way to tell a
@@ -1144,14 +1099,14 @@ pub(crate) async fn process_event_generic<C: bp_vardiff::Clock>(
                 .unwrap_or(("", ""));
             hooks
                 .accepted_sink
-                .record_accepted(
+                .record_accepted(crate::shared_adapter::shared_accepted(
                     address,
                     worker,
                     &state.session_id_hex,
                     state.subscription.as_ref().map(|s| s.user_agent.as_str()),
                     &accept,
                     state.hash_rate,
-                )
+                ))
                 .await;
             if accept.is_block_candidate {
                 hooks
@@ -1172,7 +1127,13 @@ pub(crate) async fn process_event_generic<C: bp_vardiff::Clock>(
             let worker = state.authorization.as_ref().map(|a| a.worker.as_str());
             hooks
                 .rejected_sink
-                .record_rejected(address, worker, &state.session_id_hex, reason, difficulty)
+                .record_rejected(crate::shared_adapter::shared_rejected(
+                    address,
+                    worker,
+                    &state.session_id_hex,
+                    reason,
+                    difficulty,
+                ))
                 .await;
             true
         }
@@ -1521,14 +1482,12 @@ mod tests {
         use bp_mining_job::{
             build_mining_job_from_tdp, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
         };
-        let active = ActiveSV1Template {
+        let active = ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 42,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
             header_timestamp: 0x65a1_b2c3,
-            network_target: [0xff; 32],
-            network_difficulty: 1.0,
             coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -1543,12 +1502,7 @@ mod tests {
             coinbase_tx_outputs_count: 1,
             coinbase_tx_locktime: 0,
             merkle_path: vec![[0x11; 32]],
-            merkle_branch_hex: vec![],
-            prev_hash_hex: String::new(),
-            version_hex: String::new(),
-            n_bits_hex: String::new(),
-            header_timestamp_hex: String::new(),
-        };
+        });
         let template = TdpCoinbaseTemplate {
             coinbase_prefix: &active.coinbase_prefix,
             coinbase_tx_version: active.coinbase_tx_version,
@@ -1598,7 +1552,7 @@ mod tests {
         let state = fresh_state(&port);
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let keep = process_event_generic(
+        let keep = process_event(
             SessionEvent::Authorized {
                 address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
                 worker: "w".into(),
@@ -1636,7 +1590,7 @@ mod tests {
         });
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let keep = process_event_generic(
+        let keep = process_event(
             SessionEvent::ShareAccepted(dummy_share_accept(false)),
             &state,
             &hooks,
@@ -1663,7 +1617,7 @@ mod tests {
         });
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let _ = process_event_generic(
+        let _ = process_event(
             SessionEvent::ShareAccepted(dummy_share_accept(true)),
             &state,
             &hooks,
@@ -1689,7 +1643,7 @@ mod tests {
         });
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let _ = process_event_generic(
+        let _ = process_event(
             SessionEvent::ShareRejected {
                 reason: crate::submit::RejectReason::LowDifficulty,
                 difficulty: 4096.0,
@@ -1709,7 +1663,7 @@ mod tests {
         let state = fresh_state(&port);
         let rec = RecordingHooks::new();
         let hooks = rec.as_server_hooks();
-        let keep = process_event_generic(SessionEvent::Disconnect, &state, &hooks).await;
+        let keep = process_event(SessionEvent::Disconnect, &state, &hooks).await;
         assert!(!keep);
     }
 

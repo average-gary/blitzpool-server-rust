@@ -229,7 +229,7 @@ pub enum PayoutIdentity {
         /// formula gives 44 for `bcrt1q`, which is what the node hands the
         /// regtests), so narrowing this would have failed passing tests. That
         /// break is fixed — [`crate::MAX_ADDRESS_LEN`] is 90 and migration
-        /// `0017_widen_identity_columns.sql` widened the columns behind it.
+        /// `0018_widen_identity_columns.sql` widened the columns behind it.
         ///
         /// What survives is the weaker but still sufficient reason: this is the
         /// same unconstrained `String` the coinbase seam carries, and
@@ -387,44 +387,6 @@ impl PayoutIdentity {
     }
 }
 
-/// Split a wire identity into its payout part and its worker part.
-///
-/// **The one implementation of this rule.** It existed four times — once per
-/// protocol path that reads a `user_identity`:
-///
-/// | Site | Form |
-/// |---|---|
-/// | `bp-stratum-v1/src/frame.rs` | `split_once('.')`, worker defaults to `"worker"` |
-/// | `bp-stratum-v2/src/mining/client.rs` | `find('.')`, worker defaults to `"default"` |
-/// | `bp-stratum-v2/src/jdp/client.rs` | `find('.')`, worker discarded |
-/// | `bp-stratum-v2/src/extensions.rs` | `find('.')` for the Worker-ID TLV, worker attribution only |
-///
-/// All four agreed on the rule and each said so in its own words. The JDP one
-/// records the money consequence of getting it wrong: *"otherwise the trailing
-/// `.worker` makes `address_to_script` reject the address at coinbase-output
-/// encode time, collapsing the pool payout to an empty output set
-/// (`coinbase_tx_outputs = 0x00`)."*
-///
-/// Split on the **first** dot; the worker name keeps any further dots.
-///
-/// The worker part is `Option`, not a defaulted `&str`, because *no dot* and *an
-/// empty worker after a dot* are different inputs and the four sites do not
-/// treat them the same way — SV1 defaults `"addr"` to worker `"worker"` but
-/// leaves `"addr."` as the empty string. Returning `""` for both would silently
-/// change SV1's behaviour. Nothing is trimmed: the address part is trimmed
-/// downstream by [`normalize_btc_address`], and trimming the worker part here
-/// would change what SV2 reports as a worker name.
-///
-/// This is the split ONLY. It does not decide whether the payout part is an
-/// address or an xpub — that is [`parse_payout_identity`]'s job, so the four
-/// sites do not each have to learn a new grammar.
-pub fn split_identity_and_worker(raw: &str) -> (&str, Option<&str>) {
-    match raw.find('.') {
-        Some(idx) => (&raw[..idx], Some(&raw[idx + 1..])),
-        None => (raw, None),
-    }
-}
-
 /// The pool's rotating-identity intake, as seen from a protocol crate.
 ///
 /// **Why this is a trait and not a function.** Turning a wire string into a
@@ -565,7 +527,7 @@ pub fn parse_payout_identity_with<'a>(
     raw: &'a str,
     rotating: Option<&dyn RotatingIntake>,
 ) -> Result<(PayoutIdentity, Option<&'a str>), IdentityParseError> {
-    let (payout_part, worker) = split_identity_and_worker(raw);
+    let (payout_part, worker) = crate::split_user_identity(raw);
     if let Some(intake) = rotating {
         match intake.intake(payout_part) {
             Ok(Some(identity)) => return Ok((identity, worker)),
@@ -590,41 +552,6 @@ pub fn parse_payout_identity_with<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- split_identity_and_worker ----
-
-    #[test]
-    fn split_takes_the_first_dot_and_the_worker_keeps_the_rest() {
-        assert_eq!(
-            split_identity_and_worker("bc1qfoo.rig1.board2"),
-            ("bc1qfoo", Some("rig1.board2"))
-        );
-    }
-
-    #[test]
-    fn split_distinguishes_no_dot_from_an_empty_worker() {
-        // The distinction SV1 depends on: no dot defaults the worker to
-        // "worker", a trailing dot leaves it empty. Collapsing both to `""`
-        // would change SV1's authorize behaviour.
-        assert_eq!(split_identity_and_worker("bc1qfoo"), ("bc1qfoo", None));
-        assert_eq!(split_identity_and_worker("bc1qfoo."), ("bc1qfoo", Some("")));
-    }
-
-    #[test]
-    fn split_reports_an_empty_payout_part_rather_than_guessing() {
-        assert_eq!(split_identity_and_worker(".rig1"), ("", Some("rig1")));
-        assert_eq!(split_identity_and_worker(""), ("", None));
-    }
-
-    #[test]
-    fn split_does_not_trim() {
-        // The address part is trimmed downstream by `normalize_btc_address`;
-        // trimming the worker here would change what SV2 reports.
-        assert_eq!(
-            split_identity_and_worker("  bc1qfoo  .  rig1  "),
-            ("  bc1qfoo  ", Some("  rig1  "))
-        );
-    }
 
     // ---- parse_payout_identity ----
 
@@ -693,7 +620,7 @@ mod tests {
     /// This pair of assertions used to read the other way round — `AddressId`
     /// rejecting it with `TooLong(64)` as a "negative control" for why `Static`
     /// holds a `String`. That was the latent break; migration
-    /// `0017_widen_identity_columns.sql` and [`crate::MAX_ADDRESS_LEN`] fixed it,
+    /// `0018_widen_identity_columns.sql` and [`crate::MAX_ADDRESS_LEN`] fixed it,
     /// and this is the test that would have failed before them.
     #[test]
     fn a_regtest_p2tr_address_is_64_chars_and_fits_everywhere_now() {

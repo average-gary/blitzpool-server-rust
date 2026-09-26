@@ -18,16 +18,30 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// Expected hashes per unit of difficulty-1 work (`2^32`). `Σdifficulty ×
+/// this / seconds` is a hashrate in H/s — the one conversion vardiff, the
+/// live hashrate sampler and the API charts all use.
+pub const HASHES_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
+
+/// Bitcoin Core's default dust policy value for P2PKH at
+/// `dustRelayFee = 3000 sat/kvB`. Outputs below this can't be relayed as
+/// standard transactions. Every payout mode floors its coinbase outputs
+/// here.
+pub const DUST_LIMIT_SATS: u64 = 546;
+
+pub mod display;
+pub use display::{short_address, short_address_with_tail};
 pub mod extranonce;
-pub use extranonce::{ExtranonceAllocator, ExtranonceError};
+pub use extranonce::{ExtranonceError, SharedExtranonceAllocator};
 
 pub mod live_client_key;
 pub mod payout_identity;
 pub use payout_identity::{
-    parse_payout_identity, parse_payout_identity_with, split_identity_and_worker,
-    IdentityParseError, IdentityRefused, PayoutIdentity, RotatingDescriptor, RotatingIntake,
-    RotatingScriptSource, RotationError,
+    parse_payout_identity, parse_payout_identity_with, IdentityParseError, IdentityRefused,
+    PayoutIdentity, RotatingDescriptor, RotatingIntake, RotatingScriptSource, RotationError,
 };
+pub mod user_agent;
+pub use user_agent::normalize_user_agent;
 
 #[cfg(feature = "sqlx")]
 mod sqlx_impls;
@@ -49,8 +63,6 @@ pub struct Sats(pub i64);
 
 impl Sats {
     pub const ZERO: Sats = Sats(0);
-    /// One whole bitcoin in sats.
-    pub const ONE_BTC: Sats = Sats(100_000_000);
 
     /// Returns the raw signed integer value.
     pub fn to_i64(self) -> i64 {
@@ -72,10 +84,6 @@ impl Sats {
 
     pub fn checked_sub(self, rhs: Sats) -> Option<Sats> {
         self.0.checked_sub(rhs.0).map(Sats)
-    }
-
-    pub fn is_negative(self) -> bool {
-        self.0 < 0
     }
 
     pub fn is_zero(self) -> bool {
@@ -162,6 +170,14 @@ impl AddressId {
         Ok(AddressId(s))
     }
 
+    /// [`normalize_btc_address`] a user-supplied address, then validate its
+    /// shape. The one way raw input becomes an `AddressId` wherever it is
+    /// compared against stored rows: normalizing first is what lets a
+    /// mixed-case bech32 or a verbatim Base58 address find its row.
+    pub fn normalized(raw: &str) -> Result<Self, InvalidAddressError> {
+        Self::new(normalize_btc_address(raw))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -173,28 +189,15 @@ impl AddressId {
 
 /// Normalize a BTC address for storage / equality comparison.
 ///
-/// **The one implementation of this rule.** It lived in three places
-/// (`bp_mining_job::address`, and a hand copy in each of the group-mgmt and
-/// blockparty engines) because `bp-mining-job` is only a dev-dependency of the
-/// engines, so they could not import it. Two of the three carried a doc comment
-/// requiring byte-for-byte agreement with the first — an invariant nothing
-/// checked. The blockparty copy records what the last drift cost: an
-/// unconditional `to_ascii_lowercase` corrupted Base58 case, so a
-/// signature-verified legacy address never matched the case-preserved row the
-/// verify path wrote, and any Base58 coinbase output was built from a mangled
-/// address. It lives here because `bp-common` already owns [`AddressId`], every
-/// one of those crates already depends on it, and the rule is pure string
-/// manipulation — no `bitcoin` dependency needed.
+/// Bech32 / bech32m (BIP-173 / BIP-350) are case-insensitive by spec —
+/// wallets may present them uppercase (QR-code optimization) but the
+/// canonical wire form is lowercase. Legacy P2PKH / P2SH (base58) IS
+/// case-sensitive — different cases are different addresses with
+/// different checksums — and is left untouched. Lowercasing everything
+/// instead once mangled Base58 addresses, so a verified legacy address
+/// never matched its own row.
 ///
-/// Bech32 / bech32m (BIP-173 / BIP-350) are case-insensitive by spec — wallets
-/// may present them uppercase (QR-code optimization) but the canonical wire form
-/// is lowercase. Legacy P2PKH / P2SH (base58) IS case-sensitive — different
-/// cases are different addresses with different checksums — and is left
-/// untouched.
-///
-/// Whitespace is trimmed. Empty input maps to empty output; callers that need
-/// empty rejected get that from [`AddressId::new`], which returns
-/// [`InvalidAddressError::Empty`].
+/// Whitespace is trimmed. Empty input maps to empty output.
 pub fn normalize_btc_address(address: &str) -> String {
     let trimmed = address.trim();
     if trimmed.is_empty() {
@@ -212,14 +215,15 @@ pub fn normalize_btc_address(address: &str) -> String {
     }
 }
 
-/// [`normalize_btc_address`] followed by [`AddressId::new`] — normalize, then
-/// shape-validate.
-///
-/// The two-step composition the engines and the API layer all perform. Exposed
-/// so a caller cannot normalize and forget to validate, or validate a
-/// non-normalized string; the engines map the error into their own type.
-pub fn normalized_address_id(raw: &str) -> Result<AddressId, InvalidAddressError> {
-    AddressId::new(normalize_btc_address(raw))
+/// Split a stratum `address.worker` identity at its FIRST dot; the worker
+/// keeps any further dots. The worker is `None` when there is no dot and
+/// `Some("")` for a trailing dot. Which default an absent or empty worker
+/// gets is the caller's business, and so is validating the address part.
+pub fn split_user_identity(identity: &str) -> (&str, Option<&str>) {
+    match identity.split_once('.') {
+        Some((address, worker)) => (address, Some(worker)),
+        None => (identity, None),
+    }
 }
 
 /// The widest string an identity column holds, and the cap
@@ -230,7 +234,7 @@ pub fn normalized_address_id(raw: &str) -> Result<AddressId, InvalidAddressError
 /// address with zero spare. A **regtest** taproot address (`bcrt1p…`) is 64, so
 /// the first attempt to pay one met `TooLong(64)` — a latent break with nothing
 /// to do with xpubs, fixed in its own commit with migration
-/// `0017_widen_identity_columns.sql`, which widens the 32 identity columns to
+/// `0018_widen_identity_columns.sql`, which widens the 32 identity columns to
 /// match. The two numbers are one fact and must move together: this cap is what
 /// keeps an over-long value from reaching a column, and the column width is what
 /// makes the cap load-bearing rather than decorative.
@@ -545,170 +549,10 @@ pub use tracing;
 mod tests {
     use super::*;
 
-    // ---- normalize_btc_address ----
-
-    /// The shared vector table for the normalizer agreement test.
-    ///
-    /// Covers what the three pre-unification implementations disagreed about or
-    /// could have: mixed-case Base58 (the case a past unconditional lowercase
-    /// corrupted), uppercase bech32 across all four HRPs (`bc1`/`tb1`/`bcrt1`/
-    /// `sb1`), whitespace, and empty input.
-    fn normalizer_vectors() -> Vec<&'static str> {
-        vec![
-            // mixed-case Base58 — MUST be preserved verbatim
-            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
-            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
-            "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn",
-            "2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc",
-            // uppercase bech32, all four HRPs — MUST be lowercased
-            "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
-            "TB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KXPJZSX",
-            "BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080",
-            "SB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
-            // already-lowercase bech32 — unchanged
-            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-            // mixed-case bech32
-            "Bc1QW508d6qejxtdg4y5r3zarvary0c5XW7Kv8f3t4",
-            // taproot (mainnet 62 chars, regtest 64 — both inside MAX_ADDRESS_LEN)
-            "BC1PW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KW508D6QEJXTDG4Y5R3ZARVARY0C5XW7K0YLH7D",
-            // whitespace
-            "  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  ",
-            "  1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2  ",
-            "\t1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\n",
-            // empty / whitespace-only
-            "",
-            "   ",
-            // prefix-adjacent strings that must NOT be treated as bech32
-            "bc2qsomething",
-            "BC2QSOMETHING",
-            "sb2qsomething",
-            "notanaddress",
-            "NOTANADDRESS",
-        ]
-    }
-
-    /// The rule as it stood at `crates/bp-mining-job/src/address.rs:18`
-    /// (`normalize_btc_address`), copied VERBATIM.
-    fn old_mining_job_impl(address: &str) -> String {
-        let trimmed = address.trim();
-        if trimmed.is_empty() {
-            return String::new();
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("bc1")
-            || lower.starts_with("tb1")
-            || lower.starts_with("bcrt1")
-            || lower.starts_with("sb1")
-        {
-            lower
-        } else {
-            trimmed.to_string()
-        }
-    }
-
-    /// The rule as it stood in BOTH engine hand copies
-    /// (`bp-group-mgmt-engine/src/util.rs:22`,
-    /// `bp-blockparty-engine/src/util.rs:22`), copied VERBATIM. The two were
-    /// byte-identical apart from the error type they mapped into, so one copy
-    /// here represents both; `Err` stands for "rejected", which is what both
-    /// `InvalidAddress` variants meant.
-    fn old_engine_impl(raw: &str) -> Result<String, ()> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err(());
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        let normalized = if lower.starts_with("bc1")
-            || lower.starts_with("tb1")
-            || lower.starts_with("bcrt1")
-            || lower.starts_with("sb1")
-        {
-            lower
-        } else {
-            trimmed.to_string()
-        };
-        AddressId::new(normalized)
-            .map(|a| a.into_inner())
-            .map_err(|_| ())
-    }
-
-    /// **The Phase 0 gate.** The new single implementation must agree
-    /// byte-for-byte with all three it replaces, over the shared vector table.
-    ///
-    /// Run against the three old implementations while they still existed, so
-    /// the deletion that follows is evidenced rather than assumed. The old
-    /// bodies are inlined above rather than imported because two of the three
-    /// were `pub(crate)` in crates that (still) cannot depend on the third —
-    /// which is the whole reason the duplication existed.
-    #[test]
-    fn new_normalizer_agrees_byte_for_byte_with_all_three_it_replaced() {
-        for raw in normalizer_vectors() {
-            let new = normalize_btc_address(raw);
-
-            // 1. bp-mining-job's `normalize_btc_address` — same signature, so
-            //    the comparison is direct and total (empty in → empty out).
-            assert_eq!(
-                new,
-                old_mining_job_impl(raw),
-                "disagreed with the bp-mining-job normalizer on {raw:?}"
-            );
-
-            // 2/3. The engine copies additionally ran `AddressId::new`, so they
-            //      are compared through the same composition
-            //      (`normalized_address_id`). Both directions are asserted: an
-            //      input the old one rejected must still be rejected, and one it
-            //      accepted must normalize to the same bytes — otherwise this
-            //      test would pass on everything being rejected.
-            match old_engine_impl(raw) {
-                Ok(old) => {
-                    let got = normalized_address_id(raw)
-                        .unwrap_or_else(|e| panic!("{raw:?} was accepted before, now {e}"));
-                    assert_eq!(
-                        got.as_str(),
-                        old,
-                        "disagreed with the engine normalizer on {raw:?}"
-                    );
-                    // and it agrees with the bare string rule too
-                    assert_eq!(got.as_str(), new, "composition drifted from the rule");
-                }
-                Err(()) => assert!(
-                    normalized_address_id(raw).is_err(),
-                    "{raw:?} was rejected before but is accepted now"
-                ),
-            }
-        }
-    }
-
-    /// Negative control for the agreement test: the vector table must actually
-    /// contain inputs that distinguish the rule from the two ways of getting it
-    /// wrong. Without this, the test above would pass against an
-    /// unconditional-lowercase implementation (the money bug the blockparty
-    /// copy documents) or against a no-op one.
-    #[test]
-    fn the_vector_table_would_catch_both_historical_mistakes() {
-        let vectors = normalizer_vectors();
-
-        // A. unconditional lowercase — the Base58-corrupting bug.
-        assert!(
-            vectors.iter().any(|raw| {
-                let wrong = raw.trim().to_ascii_lowercase();
-                !raw.trim().is_empty() && wrong != normalize_btc_address(raw)
-            }),
-            "no vector distinguishes the rule from unconditional lowercase"
-        );
-
-        // B. no-op (never lowercase bech32).
-        assert!(
-            vectors.iter().any(|raw| {
-                let wrong = raw.trim().to_string();
-                !raw.trim().is_empty() && wrong != normalize_btc_address(raw)
-            }),
-            "no vector distinguishes the rule from a no-op"
-        );
-    }
+    // ── normalize_btc_address / AddressId::normalized ────────────────
 
     #[test]
-    fn normalize_btc_address_lowercases_every_bech32_hrp() {
+    fn bech32_normalized_to_lowercase() {
         assert_eq!(
             normalize_btc_address("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4"),
             "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
@@ -721,38 +565,75 @@ mod tests {
             normalize_btc_address("BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080"),
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
         );
-        assert_eq!(normalize_btc_address("SB1QFOO"), "sb1qfoo");
+        assert_eq!(normalize_btc_address("SB1qFooBarBaz"), "sb1qfoobarbaz");
     }
 
     #[test]
-    fn normalize_btc_address_preserves_base58_case() {
-        for a in [
-            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
-            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
-        ] {
-            assert_eq!(normalize_btc_address(a), a);
-        }
+    fn legacy_base58_preserves_case() {
+        assert_eq!(
+            normalize_btc_address("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"),
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+        );
+        assert_eq!(
+            normalize_btc_address("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"),
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"
+        );
     }
 
     #[test]
-    fn normalize_btc_address_trims_and_maps_empty_to_empty() {
-        assert_eq!(normalize_btc_address("  bc1qfoo  "), "bc1qfoo");
+    fn whitespace_trimmed_before_the_prefix_check() {
+        assert_eq!(
+            normalize_btc_address("  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  "),
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
+        assert_eq!(normalize_btc_address("   BC1qabc   "), "bc1qabc");
+        assert_eq!(normalize_btc_address("   1BvBMSEY   "), "1BvBMSEY");
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
         assert_eq!(normalize_btc_address(""), "");
         assert_eq!(normalize_btc_address("   "), "");
     }
 
+    // ── split_user_identity ──────────────────────────────────────────
+
+    /// The cases the SV1 authorize, the SV2 channel open, the JDP allocate
+    /// and the ext 0x0002 Worker-ID resolution rely on.
     #[test]
-    fn normalized_address_id_rejects_what_address_id_rejects() {
-        // empty → Empty, not an Ok("") — the engines relied on this rejection.
+    fn split_user_identity_splits_at_the_first_dot() {
+        assert_eq!(split_user_identity("addr.rig1"), ("addr", Some("rig1")));
+        // The worker keeps every further dot.
         assert_eq!(
-            normalized_address_id("   "),
-            Err(InvalidAddressError::Empty)
+            split_user_identity("addr.farm.rig5"),
+            ("addr", Some("farm.rig5"))
         );
-        // over MAX_ADDRESS_LEN → TooLong. A 111-char xpub lands here.
-        let xpub = "x".repeat(111);
+        // No dot: no worker, and the whole string is the first part.
+        assert_eq!(split_user_identity("addr"), ("addr", None));
+        // Trailing dot: an empty worker, distinct from no dot at all.
+        assert_eq!(split_user_identity("addr."), ("addr", Some("")));
+        // Leading dot: an empty address part.
+        assert_eq!(split_user_identity(".rig"), ("", Some("rig")));
+        assert_eq!(split_user_identity(""), ("", None));
+        // Nothing is trimmed: the address part is trimmed downstream by
+        // `normalize_btc_address`, and trimming the worker would change what
+        // SV2 reports as a worker name.
         assert_eq!(
-            normalized_address_id(&xpub),
-            Err(InvalidAddressError::TooLong(111))
+            split_user_identity("  bc1qfoo  .  rig1  "),
+            ("  bc1qfoo  ", Some("  rig1  "))
+        );
+    }
+
+    #[test]
+    fn normalized_address_id_normalizes_then_validates() {
+        let a = AddressId::normalized("  BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4  ")
+            .expect("valid bech32");
+        assert_eq!(a.as_str(), "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        let b = AddressId::normalized("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").expect("base58");
+        assert_eq!(b.as_str(), "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2");
+        assert_eq!(
+            AddressId::normalized("   "),
+            Err(InvalidAddressError::Empty)
         );
     }
 
@@ -807,11 +688,6 @@ mod tests {
     }
 
     #[test]
-    fn sats_one_btc_constant() {
-        assert_eq!(Sats::ONE_BTC.to_i64(), 100_000_000);
-    }
-
-    #[test]
     fn sats_arithmetic() {
         assert_eq!(Sats(100) + Sats(50), Sats(150));
         assert_eq!(Sats(100) - Sats(50), Sats(50));
@@ -838,8 +714,6 @@ mod tests {
 
     #[test]
     fn sats_predicates() {
-        assert!(Sats(-5).is_negative());
-        assert!(!Sats(5).is_negative());
         assert!(Sats::ZERO.is_zero());
         assert!(!Sats(1).is_zero());
         assert_eq!(Sats(-5).abs(), Sats(5));
@@ -920,7 +794,7 @@ mod tests {
     ///
     /// It was 62 until 2026-08-12 — exactly a mainnet `bc1p…` — which made a
     /// **regtest** taproot address (64) unpayable. See [`MAX_ADDRESS_LEN`] and
-    /// migration `0017_widen_identity_columns.sql`. Both assertions below fail
+    /// migration `0018_widen_identity_columns.sql`. Both assertions below fail
     /// against the old cap: the first because 64 > 62, the second because the
     /// arithmetic it states was false.
     #[test]

@@ -26,7 +26,6 @@ use bp_db::{
     bulk_insert_pplns_payout_history, bulk_upsert_pplns_balances, BalanceUpsert,
     PayoutHistoryInsert,
 };
-use bp_pplns::CoinbaseDistributionEntry;
 
 pub use bp_db::TouchUpdate;
 // Shared with Group-Solo — one source of truth for the rowType wire
@@ -35,27 +34,16 @@ pub use bp_coinbase_snapshot::{ApplyDistributionResult, LedgerError, PayoutRowTy
 
 /// One row in the apply-distribution audit log.
 ///
-/// The engine builds these from the 5-phase `bp_pplns::build_coinbase_distribution`
-/// output: one row per coinbase entry, one row per ledger debit/credit
-/// that didn't land on-chain, optionally one row per "late arrival"
-/// observed between snapshot and block-found.
+/// The engine builds these from the block's own coinbase settled against
+/// the weight snapshot: one row per address the coinbase paid, one row per
+/// ledger debit/credit that didn't land on-chain, and one zero row per
+/// "late arrival" observed between snapshot and block-found.
 #[derive(Clone, Debug)]
 pub struct AuditRow {
     pub address: AddressId,
     pub paid_sats: Sats,
     pub percent: f32,
     pub row_type: PayoutRowType,
-}
-
-/// Convenience constructor: a coinbase output (positive sats, the
-/// percent slot the entry takes in the block reward).
-pub fn coinbase_row(entry: &CoinbaseDistributionEntry) -> AuditRow {
-    AuditRow {
-        address: entry.address.clone(),
-        paid_sats: entry.sats,
-        percent: entry.percent as f32,
-        row_type: PayoutRowType::Coinbase,
-    }
 }
 
 /// Convenience constructor: a pending ledger row (signed delta, no
@@ -236,20 +224,6 @@ mod tests {
         assert_eq!(PayoutRowType::Coinbase.as_wire(), "coinbase");
         assert_eq!(PayoutRowType::Pending.as_wire(), "pending");
         assert_eq!(PayoutRowType::DustSweep.as_wire(), "dust-sweep");
-    }
-
-    #[test]
-    fn coinbase_row_carries_entry_fields() {
-        let entry = CoinbaseDistributionEntry {
-            address: AddressId::new("bc1qfoo").unwrap(),
-            percent: 42.5,
-            sats: Sats(1_000_000),
-        };
-        let row = coinbase_row(&entry);
-        assert_eq!(row.address.as_str(), "bc1qfoo");
-        assert!((row.percent - 42.5).abs() < 1e-4);
-        assert_eq!(row.paid_sats.0, 1_000_000);
-        assert_eq!(row.row_type, PayoutRowType::Coinbase);
     }
 
     #[test]

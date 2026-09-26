@@ -17,8 +17,9 @@
 //! (SV2 Mining/Group Channel / SV2 Mining/Extended Extranonce): the group's
 //! single `coinbase_tx_prefix` carries a fixed scriptSig-length varint, so the
 //! coinbase slot size must be identical for every member. We therefore key one
-//! group per `(connection, full_extranonce_size)` and reject a member whose
-//! size disagrees.
+//! group per `(connection, full_extranonce_size)`: a channel only ever joins
+//! the group of its own size ([`GroupChannelRegistry::join_group_for_size`]),
+//! so a mismatched member cannot be built.
 //!
 //! ## Shared job id
 //!
@@ -34,30 +35,12 @@
 //! (per-connection). The `group_channel_id` MUST live in the SAME namespace as
 //! `channel_id` and never collide (SV2 Mining/Group Channel), so the
 //! **caller** allocates the id from the session's `next_channel_id` counter
-//! and passes it to [`GroupChannelRegistry::create`] — the registry never
-//! invents ids.
+//! and hands it to [`GroupChannelRegistry::join_group_for_size`] — the
+//! registry never invents ids.
 
 use std::collections::{HashMap, HashSet};
 
 use super::jobs::ExtendedJob;
-
-/// Errors returned by [`GroupChannelRegistry`] mutations. All are
-/// caller-bug / policy conditions; the SV2 spec has no `SetGroupChannelError`
-/// wire message, so we surface a typed error for the caller to log/assert.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum GroupError {
-    /// `group_channel_id` doesn't exist in the registry.
-    #[error("unknown group channel {0}")]
-    UnknownGroup(u32),
-    /// A channel's full extranonce size disagrees with its group's fixed
-    /// size — SV2 Mining/Group Channel forbids mixing sizes in one group.
-    #[error("group {group_id} expects full extranonce size {expected}, got {got}")]
-    FullExtranonceSizeMismatch {
-        group_id: u32,
-        expected: usize,
-        got: usize,
-    },
-}
 
 /// A single group: its id, the member channel ids, the shared full
 /// extranonce size that defines it, and the monotonic job-id counter used
@@ -85,11 +68,9 @@ pub struct GroupChannel {
     /// The coinbase TEMPLATE of the group's current broadcast job, or `None`
     /// before the first broadcast. Stored at broadcast time so the onboard
     /// path can hand a freshly-opened member the current job WITHOUT scanning
-    /// existing members — which would fail for a Standard-only group (Standard
-    /// members store only a pre-computed merkle root, not the raw coinbase
-    /// parts) or an emptied-then-refilled group. The `difficulty` field is a
-    /// placeholder; the onboard path overrides it with the new member's own
-    /// session difficulty.
+    /// existing members — which would find nothing in an emptied-then-refilled
+    /// group. The `difficulty` field is a placeholder; the onboard path
+    /// overrides it with the new member's own session difficulty.
     current_job: Option<ExtendedJob>,
 }
 
@@ -148,24 +129,6 @@ impl GroupChannelRegistry {
         self.groups.is_empty()
     }
 
-    /// Create an empty group with a caller-supplied `group_id` (drawn from
-    /// the session's channel-id namespace so it can never collide with a
-    /// channel id) and the full extranonce size that defines it. Channels
-    /// are added via [`Self::add_channel`].
-    pub fn create(&mut self, group_id: u32, full_extranonce_size: usize) {
-        self.groups.insert(
-            group_id,
-            GroupChannel {
-                id: group_id,
-                channel_ids: HashSet::new(),
-                full_extranonce_size,
-                next_job_id: 1,
-                current_job_id: None,
-                current_job: None,
-            },
-        );
-    }
-
     pub fn get(&self, group_id: u32) -> Option<&GroupChannel> {
         self.groups.get(&group_id)
     }
@@ -182,37 +145,43 @@ impl GroupChannelRegistry {
             .find_map(|(&id, g)| g.channel_ids.contains(&channel_id).then_some(id))
     }
 
-    /// The existing group for a given full extranonce size, or `None`. Used
-    /// by the open handler to find-or-create one group per size.
-    pub fn group_for_size(&self, full_extranonce_size: usize) -> Option<u32> {
-        self.groups
-            .iter()
-            .find_map(|(&id, g)| (g.full_extranonce_size == full_extranonce_size).then_some(id))
-    }
-
-    /// Add a channel to a group. Rejects with [`GroupError::UnknownGroup`] if
-    /// the group doesn't exist, or [`GroupError::FullExtranonceSizeMismatch`]
-    /// if the channel's full extranonce size disagrees with the group's.
-    /// Idempotent: re-adding the same channel to the same group is a no-op.
-    pub fn add_channel(
+    /// Add `channel_id` to the group of its `full_extranonce_size`, creating
+    /// that group under `new_group_id()` when there is none yet, and return
+    /// the group's id. The id is drawn only when a group is created; the
+    /// caller takes it from the session's channel-id namespace so it can
+    /// never collide with a channel id. Idempotent: re-adding a member is a
+    /// no-op.
+    pub fn join_group_for_size(
         &mut self,
-        group_id: u32,
         channel_id: u32,
         full_extranonce_size: usize,
-    ) -> Result<(), GroupError> {
-        let group = self
+        new_group_id: impl FnOnce() -> u32,
+    ) -> u32 {
+        let group_id = self
             .groups
-            .get_mut(&group_id)
-            .ok_or(GroupError::UnknownGroup(group_id))?;
-        if group.full_extranonce_size != full_extranonce_size {
-            return Err(GroupError::FullExtranonceSizeMismatch {
-                group_id,
-                expected: group.full_extranonce_size,
-                got: full_extranonce_size,
+            .iter()
+            .find_map(|(&id, g)| (g.full_extranonce_size == full_extranonce_size).then_some(id))
+            .unwrap_or_else(|| {
+                let group_id = new_group_id();
+                self.groups.insert(
+                    group_id,
+                    GroupChannel {
+                        id: group_id,
+                        channel_ids: HashSet::new(),
+                        full_extranonce_size,
+                        next_job_id: 1,
+                        current_job_id: None,
+                        current_job: None,
+                    },
+                );
+                group_id
             });
-        }
-        group.channel_ids.insert(channel_id);
-        Ok(())
+        self.groups
+            .get_mut(&group_id)
+            .expect("found or inserted above")
+            .channel_ids
+            .insert(channel_id);
+        group_id
     }
 
     /// Drop a channel from whichever group it's in (no-op if un-grouped).
@@ -256,69 +225,42 @@ impl GroupChannelRegistry {
 mod tests {
     use super::*;
 
-    // ── create + lookup ────────────────────────────────────────────
+    // ── join_group_for_size + size invariant ───────────────────────
 
     #[test]
-    fn create_with_caller_supplied_id_and_size() {
+    fn join_creates_a_group_under_the_caller_supplied_id() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
+        assert_eq!(reg.join_group_for_size(2, 12, || 7), 7);
         let g = reg.get(7).unwrap();
         assert_eq!(g.id, 7);
         assert_eq!(g.full_extranonce_size, 12);
-        assert!(g.channel_ids.is_empty());
+        assert_eq!(g.channel_ids, [2].into_iter().collect());
     }
 
+    /// A channel of an existing size joins that group without drawing an id;
+    /// a channel of another size gets a group of its own, so no group ever
+    /// mixes sizes (SV2 Mining/Group Channel).
     #[test]
-    fn group_for_size_finds_existing() {
+    fn join_groups_by_full_extranonce_size() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.create(8, 16);
-        assert_eq!(reg.group_for_size(12), Some(7));
-        assert_eq!(reg.group_for_size(16), Some(8));
-        assert_eq!(reg.group_for_size(99), None);
-    }
-
-    // ── add_channel + size invariant ───────────────────────────────
-
-    #[test]
-    fn add_channel_matching_size_succeeds() {
-        let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        assert_eq!(reg.add_channel(7, 2, 12), Ok(()));
-        assert_eq!(reg.add_channel(7, 3, 12), Ok(()));
-        assert_eq!(reg.get(7).unwrap().channel_ids.len(), 2);
-    }
-
-    #[test]
-    fn add_channel_size_mismatch_rejects() {
-        let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
+        assert_eq!(reg.join_group_for_size(2, 12, || 7), 7);
         assert_eq!(
-            reg.add_channel(7, 2, 16),
-            Err(GroupError::FullExtranonceSizeMismatch {
-                group_id: 7,
-                expected: 12,
-                got: 16,
-            })
+            reg.join_group_for_size(3, 12, || unreachable!("the size-12 group exists")),
+            7
         );
-        assert!(reg.get(7).unwrap().channel_ids.is_empty());
-    }
-
-    #[test]
-    fn add_channel_unknown_group_rejects() {
-        let mut reg = GroupChannelRegistry::new();
+        assert_eq!(reg.join_group_for_size(4, 16, || 8), 8);
         assert_eq!(
-            reg.add_channel(99, 2, 12),
-            Err(GroupError::UnknownGroup(99))
+            reg.get(7).unwrap().channel_ids,
+            [2, 3].into_iter().collect()
         );
+        assert_eq!(reg.get(8).unwrap().channel_ids, [4].into_iter().collect());
     }
 
     #[test]
-    fn add_channel_is_idempotent() {
+    fn join_is_idempotent() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.add_channel(7, 2, 12).unwrap();
-        reg.add_channel(7, 2, 12).unwrap();
+        reg.join_group_for_size(2, 12, || 7);
+        reg.join_group_for_size(2, 12, || unreachable!("the size-12 group exists"));
         assert_eq!(reg.get(7).unwrap().channel_ids.len(), 1);
     }
 
@@ -327,8 +269,7 @@ mod tests {
     #[test]
     fn group_for_channel_finds_membership() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.add_channel(7, 2, 12).unwrap();
+        reg.join_group_for_size(2, 12, || 7);
         assert_eq!(reg.group_for_channel(2), Some(7));
         assert_eq!(reg.group_for_channel(99), None);
     }
@@ -338,7 +279,7 @@ mod tests {
     #[test]
     fn alloc_job_id_is_monotonic_and_shared_per_group() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
+        reg.join_group_for_size(1, 12, || 7);
         assert_eq!(reg.alloc_job_id(7), Some(1));
         assert_eq!(reg.alloc_job_id(7), Some(2));
         assert_eq!(reg.alloc_job_id(7), Some(3));
@@ -348,7 +289,7 @@ mod tests {
     #[test]
     fn current_job_id_tracks_last_alloc() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
+        reg.join_group_for_size(1, 12, || 7);
         assert_eq!(reg.get(7).unwrap().current_job_id(), None);
         let j = reg.alloc_job_id(7).unwrap();
         assert_eq!(reg.get(7).unwrap().current_job_id(), Some(j));
@@ -360,8 +301,8 @@ mod tests {
     #[test]
     fn alloc_job_id_independent_across_groups() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.create(8, 16);
+        reg.join_group_for_size(1, 12, || 7);
+        reg.join_group_for_size(2, 16, || 8);
         assert_eq!(reg.alloc_job_id(7), Some(1));
         assert_eq!(reg.alloc_job_id(8), Some(1));
         assert_eq!(reg.alloc_job_id(7), Some(2));
@@ -372,8 +313,7 @@ mod tests {
     #[test]
     fn remove_channel_drops_from_group() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.add_channel(7, 2, 12).unwrap();
+        reg.join_group_for_size(2, 12, || 7);
         reg.remove_channel(2);
         assert!(reg.get(7).unwrap().channel_ids.is_empty());
         assert_eq!(reg.group_for_channel(2), None);
@@ -382,9 +322,9 @@ mod tests {
     #[test]
     fn remove_channel_unknown_is_noop() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
+        reg.join_group_for_size(2, 12, || 7);
         reg.remove_channel(999); // must not panic
-        assert!(reg.get(7).unwrap().channel_ids.is_empty());
+        assert_eq!(reg.get(7).unwrap().channel_ids.len(), 1);
     }
 
     fn dummy_job() -> ExtendedJob {
@@ -399,7 +339,6 @@ mod tests {
             n_bits: 0x1d00_ffff,
             min_ntime: 0,
             difficulty: bp_share::Difficulty(1024.0),
-            network_difficulty: bp_share::Difficulty(1e9),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: Some(1),
             jdp_claims_the_block: false,
@@ -414,8 +353,7 @@ mod tests {
     #[test]
     fn remove_last_channel_clears_current_job_state() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.add_channel(7, 2, 12).unwrap();
+        reg.join_group_for_size(2, 12, || 7);
         reg.alloc_job_id(7); // current_job_id = Some(1)
         reg.get_mut(7).unwrap().set_current_job(dummy_job());
         assert_eq!(reg.get(7).unwrap().current_job_id(), Some(1));
@@ -440,9 +378,8 @@ mod tests {
     #[test]
     fn remove_non_last_channel_keeps_current_job_state() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.add_channel(7, 2, 12).unwrap();
-        reg.add_channel(7, 3, 12).unwrap();
+        reg.join_group_for_size(2, 12, || 7);
+        reg.join_group_for_size(3, 12, || 7);
         reg.alloc_job_id(7);
         reg.get_mut(7).unwrap().set_current_job(dummy_job());
 
@@ -455,8 +392,7 @@ mod tests {
     #[test]
     fn remove_group_drops_entire_group() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.add_channel(7, 2, 12).unwrap();
+        reg.join_group_for_size(2, 12, || 7);
         let dropped = reg.remove_group(7).unwrap();
         assert!(dropped.channel_ids.contains(&2));
         assert_eq!(reg.len(), 0);
@@ -468,8 +404,8 @@ mod tests {
     #[test]
     fn iter_yields_all_groups() {
         let mut reg = GroupChannelRegistry::new();
-        reg.create(7, 12);
-        reg.create(8, 16);
+        reg.join_group_for_size(1, 12, || 7);
+        reg.join_group_for_size(2, 16, || 8);
         let ids: HashSet<u32> = reg.iter().map(|(id, _)| id).collect();
         assert_eq!(ids, [7, 8].into_iter().collect());
     }

@@ -18,9 +18,8 @@
 //!   `Serialize`-derived structs (no `BTreeMap` reorder) to ensure
 //!   consistent byte-for-byte JSON output for each message shape.
 //!
-//! `mining.notify` and `mining.set_extranonce` emission live in
-//! `notify.rs` (Task #4) because they depend on a per-template state
-//! the frame layer doesn't see.
+//! `mining.notify` emission lives in `notify.rs` because it depends on
+//! per-template state the frame layer doesn't see.
 
 use std::borrow::Cow;
 
@@ -33,34 +32,35 @@ use serde_json::value::RawValue;
 /// SV1 wire-level error codes. Wire-level "stale" reuses [`ERR_JOB_NOT_FOUND`]
 /// because SV1 has no separate stale code (the internal stat counter is
 /// distinct via [`REJECT_STALE`], but miners only see code 21).
-pub const ERR_OTHER_UNKNOWN: i64 = 20;
-pub const ERR_JOB_NOT_FOUND: i64 = 21;
-pub const ERR_DUPLICATE_SHARE: i64 = 22;
-pub const ERR_LOW_DIFFICULTY_SHARE: i64 = 23;
-pub const ERR_UNAUTHORIZED_WORKER: i64 = 24;
-pub const ERR_NOT_SUBSCRIBED: i64 = 25;
+pub(crate) const ERR_OTHER_UNKNOWN: i64 = 20;
+pub(crate) const ERR_JOB_NOT_FOUND: i64 = 21;
+pub(crate) const ERR_DUPLICATE_SHARE: i64 = 22;
+pub(crate) const ERR_LOW_DIFFICULTY_SHARE: i64 = 23;
+pub(crate) const ERR_UNAUTHORIZED_WORKER: i64 = 24;
+pub(crate) const ERR_NOT_SUBSCRIBED: i64 = 25;
 
 /// Submit-path reject-reason strings. **These bytes are observable** and
 /// some monitoring tooling parses them; do not paraphrase.
-pub const REJECT_JOB_NOT_FOUND: &str = "Job not found";
-pub const REJECT_DUPLICATE: &str = "Duplicate share";
-pub const REJECT_LOW_DIFF: &str = "Difficulty too low";
-pub const REJECT_STALE: &str = "stale";
-pub const REJECT_UNAUTHORIZED: &str = "Unauthorized worker";
-pub const REJECT_NOT_SUBSCRIBED: &str = "Not subscribed";
+pub(crate) const REJECT_JOB_NOT_FOUND: &str = "Job not found";
+pub(crate) const REJECT_DUPLICATE: &str = "Duplicate share";
+pub(crate) const REJECT_LOW_DIFF: &str = "Difficulty too low";
+pub(crate) const REJECT_STALE: &str = "stale";
+pub(crate) const REJECT_UNAUTHORIZED: &str = "Unauthorized worker";
+pub(crate) const REJECT_NOT_SUBSCRIBED: &str = "Not subscribed";
 /// Emitted when a miner changes version bits outside the mask it negotiated
 /// (BIP-310). New string — no historical tooling parses it yet.
-pub const REJECT_VERSION_ROLLING: &str = "Version rolling not allowed";
-pub const REJECT_SUGGEST_DISABLED: &str = "Suggest difficulty is disabled for this connection";
-pub const REJECT_INVALID_ADDR: &str = "Invalid Bitcoin address";
+pub(crate) const REJECT_VERSION_ROLLING: &str = "Version rolling not allowed";
+pub(crate) const REJECT_SUGGEST_DISABLED: &str =
+    "Suggest difficulty is disabled for this connection";
+pub(crate) const REJECT_INVALID_ADDR: &str = "Invalid Bitcoin address";
 
 /// Validation-failure messages — emitted when `parse_request` returns
 /// [`FrameParseError::Validation`].
-pub const VALIDATION_INVALID_SUBSCRIBE: &str = "Invalid subscription message";
-pub const VALIDATION_INVALID_CONFIGURE: &str = "Invalid configuration message";
-pub const VALIDATION_INVALID_AUTHORIZE: &str = "Invalid authorization message";
-pub const VALIDATION_INVALID_SUGGEST: &str = "Invalid suggest difficulty message";
-pub const VALIDATION_INVALID_SUBMIT: &str = "Invalid mining submit message";
+pub(crate) const VALIDATION_INVALID_SUBSCRIBE: &str = "Invalid subscription message";
+pub(crate) const VALIDATION_INVALID_CONFIGURE: &str = "Invalid configuration message";
+pub(crate) const VALIDATION_INVALID_AUTHORIZE: &str = "Invalid authorization message";
+pub(crate) const VALIDATION_INVALID_SUGGEST: &str = "Invalid suggest difficulty message";
+pub(crate) const VALIDATION_INVALID_SUBMIT: &str = "Invalid mining submit message";
 
 // ── RpcId — preserves the inbound id through to the response ─────────
 
@@ -415,12 +415,13 @@ impl<'de> Deserialize<'de> for SubmitParams<'de> {
     }
 }
 
-/// Parse one JSON-RPC line into a typed [`SV1Request`].
+/// Parse one JSON-RPC line into a typed `SV1Request`.
 ///
 /// The line should NOT include the trailing newline (the framing layer
 /// is the line splitter). Leading/trailing whitespace inside the line
-/// is tolerated — `bp_protocol_detect` already absorbed any pre-frame
-/// whitespace at the socket level.
+/// is tolerated: the first-byte router in `bin/blitzpool` sends a
+/// connection that leads with a space/CR/LF to SV1 but only peeks, so
+/// that whitespace arrives here and is trimmed.
 pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
     let trimmed = line.trim();
     // Parse only the JSON-RPC envelope — `serde_json::from_str` borrows the
@@ -520,7 +521,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             let raw_ua = arr.first().and_then(|v| v.as_str()).map(String::from);
             let user_agent = raw_ua
                 .as_deref()
-                .map(refine_user_agent)
+                .map(bp_common::normalize_user_agent)
                 .unwrap_or_else(|| "unknown".to_string());
             Ok(SV1Request::Subscribe(SubscribeRequest {
                 id,
@@ -559,28 +560,16 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 });
             }
             let raw_username = arr[0].as_str().unwrap().to_string();
-            // The shared split — one implementation across the protocol paths
-            // that read a `user_identity` (see
-            // `bp_common::split_identity_and_worker`). SV1's own default stays
-            // here rather than in the shared function, which is why that one
-            // returns `Option` instead of a defaulted string.
-            //
-            // A trailing dot ("addr.") gets the same default as no dot at all:
-            // an empty worker name is not a name. Letting "" through birthed the
-            // `client_entity` row under clientName "" while every share-path
-            // write targets a non-empty name — the touch UPDATE then matches 0
-            // rows, `updatedAt` freezes, and `kill_dead_clients` sweeps an
-            // actively-hashing session. The shared split returns `Some("")` for
-            // a trailing dot, so the emptiness check has to live at this call
-            // site; the SV2 reader in `bp_stratum_v2::extensions` makes the same
-            // check for the same reason.
-            let (address, worker) = bp_common::split_identity_and_worker(&raw_username);
-            let (address, worker) = (
-                address.to_string(),
-                worker
-                    .filter(|w| !w.is_empty())
-                    .map_or_else(|| "worker".to_string(), str::to_string),
-            );
+            // A trailing dot ("addr.") gets the same default as no dot at
+            // all: an empty worker name is not a name. Letting "" through
+            // birthed the `client_entity` row under clientName "" while
+            // every share-path write targets a non-empty name — the touch
+            // UPDATE then matches 0 rows, `updatedAt` freezes, and
+            // `kill_dead_clients` sweeps an actively-hashing session.
+            let (address, worker) = match bp_common::split_user_identity(&raw_username) {
+                (a, Some(w)) if !w.is_empty() => (a.to_string(), w.to_string()),
+                (a, _) => (a.to_string(), "worker".to_string()),
+            };
             let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
             Ok(SV1Request::Authorize(AuthorizeRequest {
                 id,
@@ -623,30 +612,6 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
     }
 }
 
-/// User-agent normalisation:
-/// take the first whitespace-/`/`-/`V`-bounded token, then collapse
-/// known firmware tags ("bosminer", "bOS" → "Braiins OS"; "cpuminer" → "cpuminer").
-pub fn refine_user_agent(raw: &str) -> String {
-    let first_token = raw
-        .split(' ')
-        .next()
-        .unwrap_or("")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split('V')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if first_token.contains("bosminer") || first_token.contains("bOS") {
-        "Braiins OS".to_string()
-    } else if first_token.contains("cpuminer") {
-        "cpuminer".to_string()
-    } else {
-        first_token
-    }
-}
-
 // ── Writers — byte-pinned via Serialize-derived structs ──────────────
 
 #[derive(Serialize)]
@@ -682,7 +647,7 @@ struct ConfigureResult<'a> {
 ///
 /// Wire shape:
 /// `{"id":<id>,"error":null,"result":[[["mining.notify","<sid>"]],"<en1>",<en2_size>]}`
-pub fn write_subscribe_response(
+pub(crate) fn write_subscribe_response(
     id: &RpcId,
     session_id: &str,
     extranonce1_hex: &str,
@@ -709,7 +674,7 @@ pub fn write_subscribe_response(
 /// The pool returns a fixed `{version-rolling: true, mask: <hex>}` map
 /// regardless of which extensions the client asked for. The mask is
 /// emitted as 8-hex-padded lowercase.
-pub fn write_configure_response(id: &RpcId, version_rolling_mask: u32) -> Vec<u8> {
+pub(crate) fn write_configure_response(id: &RpcId, version_rolling_mask: u32) -> Vec<u8> {
     let mask = format!("{:08x}", version_rolling_mask);
     let frame = SuccessFrame {
         id,
@@ -723,7 +688,7 @@ pub fn write_configure_response(id: &RpcId, version_rolling_mask: u32) -> Vec<u8
 }
 
 /// Emit a `mining.authorize` response: `{"id":<id>,"error":null,"result":true}`.
-pub fn write_authorize_response(id: &RpcId) -> Vec<u8> {
+pub(crate) fn write_authorize_response(id: &RpcId) -> Vec<u8> {
     let frame = SuccessFrame {
         id,
         error: (),
@@ -733,7 +698,7 @@ pub fn write_authorize_response(id: &RpcId) -> Vec<u8> {
 }
 
 /// Emit a `mining.submit` success response.
-pub fn write_submit_success(id: &RpcId) -> Vec<u8> {
+pub(crate) fn write_submit_success(id: &RpcId) -> Vec<u8> {
     let frame = SuccessFrame {
         id,
         error: (),
@@ -748,7 +713,7 @@ pub fn write_submit_success(id: &RpcId) -> Vec<u8> {
 /// emits as a bare integer (`[1024]`), whereas a fractional value emits
 /// as a float (`[0.1]`). JavaScript has no separate integer type, so
 /// `JSON.stringify` already does this — we replicate it explicitly.
-pub fn write_set_difficulty(difficulty: f64) -> Vec<u8> {
+pub(crate) fn write_set_difficulty(difficulty: f64) -> Vec<u8> {
     let frame = NotificationFrame {
         id: (),
         method: "mining.set_difficulty",
@@ -759,30 +724,14 @@ pub fn write_set_difficulty(difficulty: f64) -> Vec<u8> {
 
 /// Emit a `mining.extranonce.subscribe` response: `{"id":<id>,"error":null,"result":true}`.
 ///
-/// Sent when a client opts in to the dynamic-extranonce extension. The ack
-/// tells spec-compliant firmware the pool will honour `mining.set_extranonce`
-/// pushes; standard ASIC firmware that never subscribes simply never sees this.
-pub fn write_extranonce_subscribe_response(id: &RpcId) -> Vec<u8> {
+/// Sent when a client opts in to the dynamic-extranonce extension. It only
+/// confirms the request: the pool never follows up with
+/// `mining.set_extranonce`.
+pub(crate) fn write_extranonce_subscribe_response(id: &RpcId) -> Vec<u8> {
     let frame = SuccessFrame {
         id,
         error: (),
         result: true,
-    };
-    finalize(&frame)
-}
-
-/// Emit a server-initiated `mining.set_extranonce` notification (no id).
-///
-/// Wire shape: `{"id":null,"method":"mining.set_extranonce","params":["<en1>",<en2_size>]}`.
-/// Only valid to send to a session that opted in via
-/// `mining.extranonce.subscribe`: a client that never subscribed may ignore it
-/// and keep mining on its original extranonce-1, which would then disagree with
-/// the server's share validation.
-pub fn write_set_extranonce(extranonce1_hex: &str, extranonce2_size: u8) -> Vec<u8> {
-    let frame = NotificationFrame {
-        id: (),
-        method: "mining.set_extranonce",
-        params: (extranonce1_hex, extranonce2_size),
     };
     finalize(&frame)
 }
@@ -793,7 +742,7 @@ pub fn write_set_extranonce(extranonce1_hex: &str, extranonce2_size: u8) -> Vec<
 /// The third element is the empty string — validation errors are concatenated
 /// over an empty array, and we never collect validation details
 /// (`StratumV1Client::isValid*` returns bool, not details).
-pub fn write_error(id: &RpcId, code: i64, message: &str) -> Vec<u8> {
+pub(crate) fn write_error(id: &RpcId, code: i64, message: &str) -> Vec<u8> {
     let frame = ErrorFrame {
         id,
         result: (),
@@ -1271,8 +1220,8 @@ mod tests {
 
     #[test]
     fn parse_tolerates_leading_whitespace_inside_line() {
-        // Pre-frame whitespace is normally absorbed by bp_protocol_detect;
-        // some implementations still ship it through. Don't reject.
+        // Some implementations lead with whitespace; the first-byte router
+        // only peeks, so it reaches the parser. Don't reject.
         let req = parse_request("   {\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}")
             .expect("ok");
         assert!(matches!(req, SV1Request::Subscribe(_)));
@@ -1360,16 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn write_set_extranonce_byte_exact() {
-        // params = [extranonce1_hex, extranonce2_size]; no id (server push).
-        let bytes = write_set_extranonce("deadbeef", 8);
-        assert_eq!(
-            s(&bytes),
-            "{\"id\":null,\"method\":\"mining.set_extranonce\",\"params\":[\"deadbeef\",8]}\n"
-        );
-    }
-
-    #[test]
     fn write_error_byte_exact_with_empty_validation_detail() {
         // Concatenate validation errors with comma separator.
         // — over an empty array yields the empty string.
@@ -1404,26 +1343,6 @@ mod tests {
             s(&bytes),
             "{\"id\":null,\"result\":null,\"error\":[20,\"Invalid subscription message\",\"\"]}\n"
         );
-    }
-
-    // ─ User-agent refinement ──────────────────────────────────────────
-
-    #[test]
-    fn refine_user_agent_strips_after_separators() {
-        assert_eq!(refine_user_agent("cgminer/4.11.1"), "cgminer");
-        assert_eq!(refine_user_agent("bfgminer 5.5.0"), "bfgminer");
-        assert_eq!(refine_user_agent("antminerV1.2.3"), "antminer");
-    }
-
-    #[test]
-    fn refine_user_agent_collapses_braiins_firmware() {
-        assert_eq!(refine_user_agent("bosminer-plus/1.0"), "Braiins OS");
-        assert_eq!(refine_user_agent("S9-bOS+/9.0"), "Braiins OS");
-    }
-
-    #[test]
-    fn refine_user_agent_collapses_cpuminer() {
-        assert_eq!(refine_user_agent("cpuminer/2.5.0"), "cpuminer");
     }
 
     // ─ RpcId roundtrips ──────────────────────────────────────────────

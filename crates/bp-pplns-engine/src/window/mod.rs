@@ -412,7 +412,7 @@ pub struct WindowStore {
     /// the only constraint left.
     bucket_shares: u64,
     net_diff: NetworkDifficulty,
-    /// Age rule for [`TRIM_BATCH_LUA`], in ms. Always at least one day:
+    /// Age rule for [`TRIM_BATCH_LUA`], in days. Always at least one:
     /// `PplnsEngineConfig::validate` rejects `abandoned_balance_days == 0`
     /// outright, and the constructor floors it, so there is no "age rule off"
     /// state to guard against and no branch pretending otherwise.
@@ -421,7 +421,7 @@ pub struct WindowStore {
     /// the dust sweep uses: both answer "how long until a miner counts as
     /// gone", one for its share weight and one for its ledger claim. Split
     /// them only if a reason to tune them apart actually turns up.
-    max_age_ms: i64,
+    max_age_days: u32,
 }
 
 impl WindowStore {
@@ -446,7 +446,7 @@ impl WindowStore {
             // Floored, not validated-and-rejected, because the engine config
             // already refuses 0 — this only keeps a direct constructor (the
             // tests) from producing a cutoff that would age out everything.
-            max_age_ms: max_age_days.max(1) as i64 * 86_400_000,
+            max_age_days: max_age_days.max(1),
         }
     }
 
@@ -461,7 +461,7 @@ impl WindowStore {
     /// window ancient. That is the safe direction to fail in, and it is why
     /// the floor is a `>=` test rather than a plain comparison.
     fn age_cutoff_ms(&self) -> i64 {
-        bp_common::now_ms() - self.max_age_ms
+        crate::config::abandoned_cutoff_ms(bp_common::now_ms(), self.max_age_days)
     }
 
     /// One-shot conversion of a window written before [`KEY_BUCKETS`] carried

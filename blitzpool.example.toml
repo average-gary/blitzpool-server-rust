@@ -18,10 +18,6 @@ pool_identifier = "blitzpool"
 # assemble invitation + email-verification links). No trailing slash.
 # pool_base_url = "https://blitzpool.example.com"
 
-# `true` when the `/api` HTTP server is fronted by a TLS-terminating
-# proxy. Toggles HSTS + secure-cookie hints in responses.
-api_secure = false
-
 # ───────────────────────────────────────────────────────────────
 # Bitcoin Core
 # ───────────────────────────────────────────────────────────────
@@ -32,12 +28,6 @@ user = "bitcoin"
 password = "REPLACE-ME"
 port = 8332
 timeout_ms = 10000
-
-# Optional ZeroMQ feed for raw-block notifications. The Rust port
-# primarily uses TDP for templates; ZMQ stays here for operators
-# still wiring a ZMQ source during cut-over.
-# [bitcoin_zmq]
-# host = "tcp://127.0.0.1:28332"
 
 # ───────────────────────────────────────────────────────────────
 # Template-Distribution-Protocol (TDP) — bitcoin-core IPC socket
@@ -57,7 +47,6 @@ socket_path = "/var/run/bitcoind/bp-tdp.sock"
 # ───────────────────────────────────────────────────────────────
 
 [database]
-driver = "postgres"
 host = "127.0.0.1"
 port = 5432
 user = "postgres"
@@ -65,10 +54,8 @@ password = "REPLACE-ME"
 database = "blitzpool"
 ssl = false
 pool_size = 10
-max_query_time_ms = 30000
 acquire_timeout_ms = 60000
 idle_timeout_ms = 10000
-run_migrations = true
 
 # ───────────────────────────────────────────────────────────────
 # Redis
@@ -79,7 +66,6 @@ host = "127.0.0.1"
 port = 6379
 # password = "REPLACE-ME"
 db = 0
-ttl_secs = 600
 
 # ───────────────────────────────────────────────────────────────
 # HTTP API (axum)
@@ -148,7 +134,8 @@ solo_port = 3333
 solo_start_difficulty = 5000
 solo_high_diff_port = 3339
 high_diff_start_difficulty = 1000000
-job_retention_ms = 300000
+# How long a retired job is kept for late shares (SV1 and SV2).
+job_retention_ms = 600000
 target_shares_per_minute = 15
 high_diff_target_shares_per_minute = 10
 difficulty_check_interval_ms = 240000
@@ -208,8 +195,6 @@ vardiff_silence_easing_enabled = false
 # NX handshake — miners pin the public key. Absent ⇒ random per
 # startup (staging only).
 # authority_privkey_hex = "REPLACE-ME-32-byte-hex"
-# ed25519_authority_seed_hex = "REPLACE-ME-32-byte-hex"
-# cert_signed_part = 42
 jdp_enabled = false
 # jdp_port = 3335
 #
@@ -252,7 +237,6 @@ jdp_enabled = false
 [debug]
 stratum_wire_logs = false
 stratum_share_logs = false
-noise_debug = false
 submit_latency = false
 
 # ───────────────────────────────────────────────────────────────
@@ -268,7 +252,6 @@ submit_latency = false
 # fee_percent = 1.5
 # coinbase_weight_budget = 35000
 # min_difficulty = 500
-# warmup_shares = 5
 # min_payout_sats = 5000
 # Shares per count-bucket for the sliding window (default 10000). The window
 # is stored as per-address buckets of this many shares instead of one entry
@@ -387,13 +370,11 @@ submit_latency = false
 
 # [notifications.telegram]
 # bot_token = "REPLACE-ME"
-# diff_notifications = true
 
 # [notifications.ntfy]
 # server_url = "https://ntfy.example.com"
 # # access_token = "REPLACE-ME"
 # # topic_prefix = "blitzpool-"
-# diff_notifications = false
 
 # [notifications.web_push]
 # vapid_public_key = "REPLACE-ME"
@@ -436,19 +417,9 @@ submit_latency = false
 # pass = "REPLACE-ME"
 # from = "Blitz Pool <noreply@example.com>"
 
-# ───────────────────────────────────────────────────────────────
-# Background aggregation
-# ───────────────────────────────────────────────────────────────
-
-[aggregation]
-enabled = true
-pool_stats_interval_ms = 600000
-chart_data_interval_ms = 300000
-
 # Prometheus /metrics exporter. Default off — flip `enabled = true`
-# to bind the listener (default 0.0.0.0:9000). Recorder call-sites
-# across SV1/SV2/engines/crons are not yet wired; enabling here today
-# exposes an empty /metrics body but verifies the listener can bind.
+# to bind the listener (default 0.0.0.0:9000). Exposes stream-consumer
+# lag, parked-block depths, vardiff adjustments and lost accepted shares.
 [metrics]
 enabled = false
 # bind = "0.0.0.0:9000"

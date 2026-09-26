@@ -201,7 +201,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let Ok(addr) = crate::utils::normalized_address_id(&address) else {
+    let Ok(addr) = AddressId::normalized(&address) else {
         return Ok(Json(ByAddressResponse {
             verified: false,
             method: None,
@@ -245,7 +245,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let Ok(addr) = crate::utils::normalized_address_id(&address) else {
+    let Ok(addr) = AddressId::normalized(&address) else {
         return Ok(Json(VerifiedStatusResponse {
             verified: false,
             email_verified: false,
@@ -343,7 +343,7 @@ fn script_type_label(t: AddressType) -> &'static str {
 
 /// Parse + validate a mainnet BTC address into a **canonical** `AddressId`.
 /// Rejects testnet / malformed addresses at the API boundary, then normalises
-/// via the single source of truth [`bp_common::normalize_btc_address`]
+/// via the single source of truth [`AddressId::normalized`]
 /// (lowercase bech32, preserve case-sensitive Base58) so the ownership row is
 /// keyed identically to what every verification gate looks up — otherwise a
 /// mixed-case Base58 (or upper-case bech32) proof would never match.
@@ -353,7 +353,7 @@ pub(crate) fn parse_supported_address(raw: &str, network: Network) -> Result<Add
         .ok()
         .and_then(|a| a.require_network(network).ok())
         .ok_or_else(|| ownership_error("invalid-address", StatusCode::BAD_REQUEST))?;
-    crate::utils::normalized_address_id(trimmed)
+    AddressId::normalized(trimmed)
         .map_err(|_| ownership_error("invalid-address", StatusCode::BAD_REQUEST))
 }
 

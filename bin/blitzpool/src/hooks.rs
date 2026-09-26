@@ -2,7 +2,7 @@
 
 //! Production hook impls — Phase 7.3.
 //!
-//! Wires the four "Noop-by-default" trait surfaces that the bp-api +
+//! Wires the three "Noop-by-default" trait surfaces that the bp-api +
 //! group-mgmt-engine layers expose against real backends:
 //!
 //! 1. **`bp_api::EmailVerificationHooks`** — `/api/email/register` +
@@ -12,13 +12,7 @@
 //! 2. **`bp_group_mgmt_engine::EmailHooks`** — invitation send +
 //!    join-decision (approved / rejected) emails fired from the
 //!    `InvitationService` + `JoinRequestService` admin paths.
-//! 3. **`bp_api::PushHooks`** — `/api/push/{register,fcm/register}`
-//!    side-effects. Phase 7.3 keeps both methods best-effort no-ops
-//!    (registration doesn't probe the upstream service);
-//!    the FCM / Web-Push adapters live in the aggregate so Phase 7.7
-//!    can wire them into the `NotificationDispatcher` block-found /
-//!    best-diff / device-status event fan-out.
-//! 4. **`bp_group_mgmt_engine::GroupServiceHooks`** — last-active
+//! 3. **`bp_group_mgmt_engine::GroupServiceHooks`** — last-active
 //!    lookup, kick / dissolve cleanup against `GroupRoundStore`'s
 //!    Redis keys, min-payout floor lookup.
 //!
@@ -35,7 +29,6 @@ use bp_api::email_hooks::{
     BindingChangeContext as ApiBindingChangeContext, EmailVerificationHooks,
     VerificationContext as ApiVerificationContext,
 };
-use bp_api::push_hooks::{FcmRegisterContext, PushHooks, UnifiedPushRegisterContext};
 use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_db::Db;
@@ -74,13 +67,12 @@ use crate::engines::EngineHandles;
 /// `group_service` + `invitation_email` fields hold concrete impls
 /// (the `SmtpInvitationEmailHooks` wrapper internally holds an
 /// `Option<Arc<SmtpAdapter>>` so the type stays the same regardless
-/// of whether `[smtp]` was configured). The `email_verification` +
-/// `push` fields keep `Arc<dyn _>` because `AppState` already
-/// stores those as trait objects.
+/// of whether `[smtp]` was configured). The `email_verification`
+/// field keeps `Arc<dyn _>` because `AppState` already stores it as a
+/// trait object.
 pub(crate) struct ProductionHooks {
     pub(crate) email_verification: Arc<dyn EmailVerificationHooks>,
     pub(crate) invitation_email: Arc<SmtpInvitationEmailHooks>,
-    pub(crate) push: Arc<dyn PushHooks>,
     pub(crate) group_service: Arc<ProductionGroupServiceHooks>,
     /// Concrete FCM adapter, exposed so the Phase 7.5 cron-wiring
     /// (`bin/blitzpool::crons`) can hand it to
@@ -131,10 +123,6 @@ pub(crate) async fn spawn(
     let email_verification: Arc<dyn EmailVerificationHooks> =
         Arc::new(SmtpEmailVerificationHooks::new(smtp.clone()));
     let invitation_email = Arc::new(SmtpInvitationEmailHooks::new(smtp.clone()));
-    let push: Arc<dyn PushHooks> = Arc::new(MultiChannelPushHooks {
-        fcm: fcm.clone(),
-        web_push: web_push.clone(),
-    });
     let group_service = Arc::new(ProductionGroupServiceHooks {
         db: foundation.db.clone(),
         group_solo: engines.group_solo.clone(),
@@ -150,7 +138,6 @@ pub(crate) async fn spawn(
     Ok(ProductionHooks {
         email_verification,
         invitation_email,
-        push,
         group_service,
         fcm,
         web_push,
@@ -334,40 +321,6 @@ impl EmailHooks for SmtpInvitationEmailHooks {
                 "smtp: send_join_decision failed (best-effort)"
             );
         }
-    }
-}
-
-// ─── bp-api::PushHooks impl ──────────────────────────────────────
-
-/// Holds the FCM + Web-Push adapter handles. Phase 7.3 keeps both
-/// hook methods as best-effort no-ops — register doesn't validate the
-/// token upstream, on_unified_push_registered doesn't fire a welcome
-/// ping. The adapters live in the struct so Phase 7.7 can clone them
-/// into the `NotificationDispatcher` block-found / best-diff /
-/// device-status fan-out.
-pub(crate) struct MultiChannelPushHooks {
-    pub(crate) fcm: Option<Arc<FcmAdapter>>,
-    #[allow(dead_code)] // notifications fan-out — outside this scan's scope
-    pub(crate) web_push: Option<Arc<WebPushAdapter>>,
-}
-
-#[async_trait]
-impl PushHooks for MultiChannelPushHooks {
-    async fn validate_fcm_token(&self, ctx: FcmRegisterContext) {
-        // Token validation happens at first-send time, not
-        // registration. Log so an operator running with FCM
-        // misconfigured sees a per-registration trail.
-        if self.fcm.is_none() {
-            warn!(
-                address = %ctx.address,
-                "push.fcm/register received but FCM adapter not configured"
-            );
-        }
-    }
-
-    async fn on_unified_push_registered(&self, _ctx: UnifiedPushRegisterContext) {
-        // Registration is a pure DB upsert; no welcome ping. Leave the hook
-        // empty so a future deployment can add one without a trait change.
     }
 }
 
@@ -561,18 +514,5 @@ mod tests {
         // confirm it doesn't wrap to a sentinel.
         let dt = epoch_ms_to_utc(i64::MIN);
         assert!(dt.timestamp_millis() > 0);
-    }
-
-    #[test]
-    fn multi_channel_push_hooks_can_be_constructed_without_adapters() {
-        let hooks = MultiChannelPushHooks {
-            fcm: None,
-            web_push: None,
-        };
-        // Compile-check only — we can't drive PushHooks methods from a
-        // sync test without a runtime, and the methods are no-ops in
-        // the "no adapters configured" path anyway.
-        let _ = hooks.fcm.is_some();
-        let _ = hooks.web_push.is_some();
     }
 }

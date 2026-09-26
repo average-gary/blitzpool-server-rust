@@ -14,6 +14,10 @@
 use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 use tracing::warn;
 
+/// Redis key of the PPLNS live budget. The autoscaler writes it; the API
+/// reads it to report the ceiling the running coinbase actually has.
+pub const PPLNS_COINBASE_BUDGET_KEY: &str = "pplns:coinbase_budget";
+
 /// Persist the live budget. Overwrites any prior value; no expiry.
 pub async fn write_coinbase_budget(
     conn: &mut ConnectionManager,

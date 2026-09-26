@@ -8,7 +8,7 @@
 //! break it closes is older than xpubs. Every identity column was
 //! `character varying(62)` — exactly the width of a mainnet `bc1p…` taproot
 //! address, with zero spare — so a **regtest** taproot address, which is 64
-//! characters, could never be stored. `0017_widen_identity_columns.sql` took all
+//! characters, could never be stored. `0018_widen_identity_columns.sql` took all
 //! 32 of them to 90.
 //!
 //! Two claims live here, and neither can be checked from Rust alone:
@@ -23,7 +23,7 @@
 //!
 //! Per `CLAUDE.md`: Postgres-backed, so `connect_or_skip` makes these **pass**
 //! when the container is down. `docker start bp-test-pg`, run with
-//! `--nocapture`, and read the passed-count. Migration 0017 is NOT applied to
+//! `--nocapture`, and read the passed-count. Migration 0018 is NOT applied to
 //! that container automatically — without it test 1 names all 32 columns and
 //! test 2 fails on the write.
 
@@ -93,7 +93,7 @@ async fn every_identity_column_is_at_least_as_wide_as_the_rust_cap() {
     // predicate finding nothing would mean the schema was never loaded.
     assert!(
         rows.len() >= 32,
-        "precondition: expected the 32 identity columns 0017 widened, found {} \
+        "precondition: expected the 32 identity columns 0018 widened, found {} \
          — is this container's schema loaded at all?",
         rows.len()
     );
@@ -116,7 +116,7 @@ async fn every_identity_column_is_at_least_as_wide_as_the_rust_cap() {
         narrow.is_empty(),
         "{} identity column(s) cannot hold what bp_common accepts \
          (MAX_ADDRESS_LEN = {MAX_ADDRESS_LEN}); apply \
-         0017_widen_identity_columns.sql:\n  {}",
+         0018_widen_identity_columns.sql:\n  {}",
         narrow.len(),
         narrow.join("\n  ")
     );

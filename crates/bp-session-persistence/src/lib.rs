@@ -9,8 +9,8 @@
 //! write-through cache to diverge after an out-of-band reset. Decomposes
 //! into:
 //!
-//! - **[`hooks::SessionPersistenceHook`]** — `bp_stratum_v1::SessionPersistence`
-//!   trait impl. On `register_session` (miner authorize), pends the
+//! - **[`hooks::SessionPersistenceHook`]** — `bp_share_hook::SharedSessionPersistence`
+//!   impl. On `register_session` (miner authorize), pends the
 //!   session in the row-birth debounce — no statement; the row is born
 //!   by the engine's flush once the session survives the debounce
 //!   window. On `deregister_session` (disconnect), soft-deletes by

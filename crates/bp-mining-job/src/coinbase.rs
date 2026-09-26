@@ -220,43 +220,46 @@ impl MiningJob {
         enonce1: &[u8; 4],
         enonce2: &[u8; 8],
     ) -> Vec<u8> {
-        // Non-witness layout (what we have stored, split around the slot):
-        //   prefix = [version:4][input_count:1][prev_txid:32][prev_vout:4]
-        //            [scriptsig_len:varint][scriptsig: prefix_part]
-        //   slot    = [enonce1:4][enonce2:8]
-        //   suffix = [scriptsig: suffix_part][sequence:4][output_count:varint]
-        //            [outputs...][locktime:4]
-        //
-        // Witness layout differs only at two points:
-        //   - bytes 4..4: insert [marker=0x00][flag=0x01] (right after version)
-        //   - before the trailing locktime: insert
-        //     [witness_count=0x01][witness_len=0x20][32 zero bytes]
-        let prefix = &self.coinbase_prefix;
-        let suffix = &self.coinbase_suffix;
-        let locktime_at = suffix.len() - 4;
-
-        let total = prefix.len() + 2 + EXTRANONCE_SLOT_LEN + locktime_at + 1 + 1 + 32 + 4;
-        let mut buf = Vec::with_capacity(total);
-        // version
-        buf.extend_from_slice(&prefix[..4]);
-        // BIP-141 marker + flag
-        buf.push(0x00);
-        buf.push(0x01);
-        // rest of the non-witness prefix (input_count onwards)
-        buf.extend_from_slice(&prefix[4..]);
-        // extranonce slot
-        buf.extend_from_slice(enonce1);
-        buf.extend_from_slice(enonce2);
-        // non-witness suffix up to (not including) locktime
-        buf.extend_from_slice(&suffix[..locktime_at]);
-        // witness stack: 1 item of 32 bytes (the coinbase's mandatory reserved value)
-        buf.push(0x01);
-        buf.push(0x20);
-        buf.extend_from_slice(&[0u8; 32]);
-        // locktime
-        buf.extend_from_slice(&suffix[locktime_at..]);
-        buf
+        let mut stratum = Vec::with_capacity(
+            self.coinbase_prefix.len() + EXTRANONCE_SLOT_LEN + self.coinbase_suffix.len(),
+        );
+        stratum.extend_from_slice(&self.coinbase_prefix);
+        stratum.extend_from_slice(enonce1);
+        stratum.extend_from_slice(enonce2);
+        stratum.extend_from_slice(&self.coinbase_suffix);
+        assemble_witness_coinbase(&stratum)
     }
+}
+
+/// Convert a non-witness (stratum) coinbase into the witness form Bitcoin
+/// Core's `submitblock` expects: BIP-141 marker `0x00` + flag `0x01` right
+/// after `version`, and a single 32-zero-byte witness item (the coinbase
+/// input's mandatory reserved value) right before `locktime`.
+///
+/// The one implementation of that layout. SV1 reaches it through
+/// [`MiningJob::witness_coinbase_with_extranonce`]; SV2 and the JDP block
+/// path hold already-assembled stratum bytes and call it directly.
+pub fn assemble_witness_coinbase(stratum_coinbase: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        stratum_coinbase.len() >= 8,
+        "stratum coinbase smaller than version+locktime"
+    );
+    let locktime_at = stratum_coinbase.len() - 4;
+    let mut buf = Vec::with_capacity(stratum_coinbase.len() + 2 + 1 + 1 + 32);
+    // version
+    buf.extend_from_slice(&stratum_coinbase[..4]);
+    // BIP-141 marker + flag
+    buf.push(0x00);
+    buf.push(0x01);
+    // everything between version and locktime (input + outputs)
+    buf.extend_from_slice(&stratum_coinbase[4..locktime_at]);
+    // witness stack: 1 item of 32 zero bytes
+    buf.push(0x01);
+    buf.push(0x20);
+    buf.extend_from_slice(&[0u8; 32]);
+    // locktime
+    buf.extend_from_slice(&stratum_coinbase[locktime_at..]);
+    buf
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -366,7 +369,11 @@ pub fn build_mining_job(
     // materialized (spliced per-share), so there is no full-coinbase buffer to
     // build and slice. Version 2 is the RPC-path coinbase version.
     let locktime = template.block_height.saturating_sub(1);
-    let coinbase_prefix = serialize_coinbase_prefix(2, &script_sig, extranonce_slot_size);
+    let coinbase_prefix = serialize_coinbase_prefix(
+        2,
+        &script_sig[..script_sig.len() - extranonce_slot_size],
+        script_sig.len(),
+    );
     let coinbase_suffix = serialize_coinbase_suffix(
         COINBASE_NONFINAL_SEQUENCE,
         outputs.len() as u64,
@@ -567,8 +574,8 @@ pub(crate) fn assemble_tdp_job(
     // per-share), so there is no full-coinbase buffer to build and slice.
     let coinbase_prefix = serialize_coinbase_prefix(
         template.coinbase_tx_version,
-        &script_sig,
-        extranonce_slot_size,
+        &script_sig[..script_sig.len() - extranonce_slot_size],
+        script_sig.len(),
     );
     let coinbase_suffix = serialize_coinbase_suffix(
         template.coinbase_tx_input_sequence,
@@ -599,17 +606,23 @@ fn build_tdp_scriptsig(tdp_prefix: &[u8], identifier: &[u8], slot_len: usize) ->
 
 /// Serialize the coinbase **prefix**: everything up to (but not including) the
 /// extranonce slot — version, input count, null prev-outpoint, the scriptsig
-/// length varint, and the scriptsig bytes *before* the slot.
+/// length varint, and `scriptsig_head`, the scriptsig bytes *before* the slot.
 ///
-/// The scriptsig length varint encodes the **full** scriptsig length (the real
-/// coinbase carries the extranonce inside the scriptsig); only the trailing
-/// `slot_len` scriptsig bytes are omitted here — the per-share hot path splices
-/// the extranonce into exactly that gap. Building the prefix directly (rather
-/// than serializing the whole coinbase and slicing) avoids one full-buffer
-/// allocation + copy per job and never materializes the discarded slot bytes.
-fn serialize_coinbase_prefix(version: u32, scriptsig: &[u8], slot_len: usize) -> Vec<u8> {
-    let head = scriptsig.len() - slot_len;
-    let mut buf = Vec::with_capacity(4 + 1 + 32 + 4 + 9 + head);
+/// `scriptsig_len` is the **full** scriptsig length (the real coinbase carries
+/// the extranonce inside the scriptsig); the per-share hot path splices the
+/// extranonce into the gap after the head. Building the prefix directly
+/// (rather than serializing the whole coinbase and slicing) avoids one
+/// full-buffer allocation + copy per job and never materializes the slot.
+///
+/// The one implementation of this layout: the pool's own jobs build it here,
+/// and so does SV2's `SetCustomMiningJob`, whose head comes from the JDC.
+pub fn serialize_coinbase_prefix(
+    version: u32,
+    scriptsig_head: &[u8],
+    scriptsig_len: usize,
+) -> Vec<u8> {
+    debug_assert!(scriptsig_head.len() <= scriptsig_len);
+    let mut buf = Vec::with_capacity(4 + 1 + 32 + 4 + 9 + scriptsig_head.len());
     // version (LE u32 — consensus-equivalent to i32 for positive values)
     buf.extend_from_slice(&version.to_le_bytes());
     // input count = 1
@@ -618,8 +631,8 @@ fn serialize_coinbase_prefix(version: u32, scriptsig: &[u8], slot_len: usize) ->
     buf.extend_from_slice(&[0u8; 32]);
     buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
     // scriptsig length (FULL length, incl. the slot) + scriptsig up to the slot
-    encode_varint(&mut buf, scriptsig.len() as u64);
-    buf.extend_from_slice(&scriptsig[..head]);
+    encode_varint(&mut buf, scriptsig_len as u64);
+    buf.extend_from_slice(scriptsig_head);
     buf
 }
 
@@ -1015,6 +1028,36 @@ pub fn solo_payouts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the BIP-141 witness layout: marker `0x00` + flag `0x01`
+    /// right after the 4-byte `version`, then a 1-byte witness-stack
+    /// length (`0x01`) + 1-byte item length (`0x20`) + 32 zero bytes
+    /// inserted right before the trailing 4-byte `locktime`.
+    #[test]
+    fn assemble_witness_coinbase_pins_bip141_layout() {
+        // Minimal coinbase: 4B version + 4B body + 4B locktime = 12B.
+        let mut stratum = Vec::with_capacity(12);
+        stratum.extend_from_slice(&1u32.to_le_bytes()); // version=1
+        stratum.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // body
+        stratum.extend_from_slice(&[0xEE, 0xEE, 0xEE, 0xEE]); // locktime
+        let w = assemble_witness_coinbase(&stratum);
+        // 12 stratum bytes + 2 marker/flag + 1 stack-count + 1 item-len
+        // + 32 witness bytes = 48.
+        assert_eq!(w.len(), 12 + 2 + 1 + 1 + 32);
+        // Version intact.
+        assert_eq!(&w[..4], &1u32.to_le_bytes());
+        // Marker + flag.
+        assert_eq!(w[4], 0x00);
+        assert_eq!(w[5], 0x01);
+        // Body intact.
+        assert_eq!(&w[6..10], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        // Witness stack: count=1, len=0x20, 32 zero bytes.
+        assert_eq!(w[10], 0x01);
+        assert_eq!(w[11], 0x20);
+        assert!(w[12..44].iter().all(|b| *b == 0));
+        // Locktime intact.
+        assert_eq!(&w[44..], &[0xEE, 0xEE, 0xEE, 0xEE]);
+    }
     use bitcoin::consensus::Decodable;
 
     fn template_with_height(height: u32) -> CoinbaseTemplate {

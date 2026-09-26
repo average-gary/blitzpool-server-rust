@@ -35,13 +35,10 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+use bp_common::HASHES_PER_DIFFICULTY_1;
+
 use crate::live_store::LiveSessionStore;
 use crate::touch_buffer::{TouchKey, TouchKeyRef};
-
-/// Hashes per unit of difficulty-1 work (2^32). `Σdiff × this / seconds`
-/// yields H/s. Matches `bp_api::time_range::DIFFICULTY_1`; duplicated here
-/// so bp-session-persistence needn't depend on bp-api.
-const HASH_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
 
 /// Consecutive zero-share windows after which a faded session is dropped
 /// from the map. The fade itself reaches 0 after two empty windows
@@ -127,7 +124,7 @@ impl HashrateSampler {
         let mut guard = self.guard();
         let mut writes = Vec::with_capacity(guard.len());
         guard.retain(|key, s| {
-            let rate = s.diff_accum * HASH_PER_DIFFICULTY_1 / window;
+            let rate = s.diff_accum * HASHES_PER_DIFFICULTY_1 / window;
             let displayed = match s.prev_rate {
                 Some(prev) => (prev + rate) / 2.0,
                 None => rate,
@@ -242,7 +239,7 @@ mod tests {
     }
 
     fn rate_for(diff: f64, window_secs: f64) -> f64 {
-        diff * HASH_PER_DIFFICULTY_1 / window_secs
+        diff * HASHES_PER_DIFFICULTY_1 / window_secs
     }
 
     #[test]

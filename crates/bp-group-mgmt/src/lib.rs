@@ -28,9 +28,8 @@
 //!   `removeMember` / `transferCreator` / `dissolveGroup` / etc.) →
 //!   service-wiring crate (depends on `bp-db` write extension).
 //! - Email sending (`emailService.sendInvitation`) → `bp-notifications`.
-//! - Address-cache rebuild for `getGroupForAddress` → the
-//!   `GroupMembershipReader` impl in service-wiring (the trait itself
-//!   already lives in [`bp_mining_mode`](../../bp-mining-mode/index.html)).
+//! - Address-cache rebuild for `getGroupForAddress` → service-wiring
+//!   (`group_for_address` in the bin).
 //! - Cron schedules for invitation/join-request expiry → service-wiring.
 //! - IANA timezone validation → service-wiring (depends on OS + a
 //!   timezone crate; here we only enforce non-empty shape).

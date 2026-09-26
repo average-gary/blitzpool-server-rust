@@ -98,8 +98,8 @@ impl BlockpartyCache {
     /// `on_share_accepted`, `dissolve_group`) so the routing guards
     /// don't read stale status.
     ///
-    /// `status == Dissolved` removes both the admin entry and the
-    /// admin's own member entry (admin is also a member row).
+    /// `status == Dissolved` removes the admin entry and every member
+    /// entry of the group — the dissolve deletes those member rows.
     pub async fn set_admin_status(
         &self,
         admin_address: &AddressId,
@@ -109,9 +109,7 @@ impl BlockpartyCache {
         let mut guard = self.inner.write().await;
         if matches!(status, BlockpartyStatus::Dissolved) {
             guard.admin.remove(admin_address);
-            // Member row for the admin disappears too — dissolve cascades
-            // on the DB side, here we keep the cache in lockstep.
-            guard.member.remove(admin_address);
+            guard.member.retain(|_, g| *g != group_id);
         } else {
             guard
                 .admin
@@ -276,6 +274,34 @@ mod tests {
             .set_admin_status(&admin, gid, BlockpartyStatus::Dissolved)
             .await;
         assert!(cache.member_group_id(&admin).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dissolve_drops_every_member_of_that_group_only() {
+        let cache = BlockpartyCache::new();
+        let admin = addr("bc1qadmin4");
+        let bob = addr("bc1qbobyyy");
+        let gid = Uuid::new_v4();
+        let other_admin = addr("bc1qadmin5");
+        let carol = addr("bc1qcarol");
+        let other = Uuid::new_v4();
+        cache
+            .set_admin_status(&admin, gid, BlockpartyStatus::Ready)
+            .await;
+        cache.insert_member(&bob, gid).await;
+        cache
+            .set_admin_status(&other_admin, other, BlockpartyStatus::Ready)
+            .await;
+        cache.insert_member(&carol, other).await;
+
+        cache
+            .set_admin_status(&admin, gid, BlockpartyStatus::Dissolved)
+            .await;
+
+        assert!(cache.member_group_id(&bob).await.is_none());
+        assert!(cache.member_group_id(&admin).await.is_none());
+        assert_eq!(cache.member_group_id(&carol).await, Some(other));
+        assert_eq!(cache.member_group_id(&other_admin).await, Some(other));
     }
 
     #[tokio::test]

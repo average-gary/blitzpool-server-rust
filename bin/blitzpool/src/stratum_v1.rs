@@ -7,7 +7,7 @@
 //! optionally pplns + pplns-high-diff). The TCP-accept loop lives in
 //! `stratum.rs` because it's now protocol-detect-multiplexed (SV1 +
 //! SV2 share the same listening port and dispatch via
-//! [`bp_protocol_detect::detect`]). Each server has its own
+//! the first-byte router in `stratum.rs`). Each server has its own
 //! [`ServerHooks`] clone wired to:
 //!
 //! - **block_sink**: [`TdpBlockSubmissionSink`] (shared across all
@@ -45,16 +45,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bp_common::{AddressId, MiningMode, StreamKind};
-use bp_config::{AppConfig, Role};
+use bp_common::{AddressId, MiningMode};
+use bp_config::AppConfig;
 use bp_group_mgmt_engine::{GroupService, GroupServiceHooks};
 use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
-use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
-use bp_stratum_v1::{
-    PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
-    Sv1AcceptedShareAdapter, Sv1RejectedShareAdapter, Sv1SessionPersistenceAdapter,
-};
+use bp_stratum_v1::{PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
 use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
@@ -63,7 +59,6 @@ use crate::block_sink::TdpBlockSubmissionSink;
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::group_service::SharedGroupService;
-use crate::network::config_network_to_bitcoin;
 use crate::payout_identities::PayoutIdentityDirectory;
 
 /// Per-port SV1 server bundle. One entry per `[stratum]`/`[pplns]`
@@ -108,10 +103,7 @@ pub(crate) fn build_per_port_servers(
     // cannot depend on which port a miner connected to.
     rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
-    gate: Option<(
-        Arc<crate::device_status_gate::Gate>,
-        crate::device_status_gate::SubscribedAddresses,
-    )>,
+    device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
     settle: crate::settlement::SettlementSignal,
@@ -130,31 +122,15 @@ pub(crate) fn build_per_port_servers(
     // engine ledger (PPLNS / Group-Solo `on_block_found`) +
     // notification dispatcher, in addition to the existing TDP
     // submit_solution path.
-    let mut sink = TdpBlockSubmissionSink::new(tdp.clone())
-        .with_network(config_network_to_bitcoin(cfg.network))
-        .with_alt_streams(foundation.alt_tdp.clone())
-        .with_fanout(
-            engines.mode_gate.clone(),
-            engines.pplns.clone(),
-            engines.group_solo.clone(),
-            dispatcher.clone(),
-            foundation.bitcoin_rpc.clone(),
-        )
-        .with_blockparty(engines.blockparty.clone())
-        .with_pool(foundation.db.pool().clone())
-        .with_redis(foundation.redis.clone())
-        .with_settle_handle(settle);
-    // The front routes block-found events to the stream — the payout Satellite
-    // applies the ledger and the notify Satellite fans out the push. A front
-    // always produces (front + payout can't share a process; see the boot
-    // guard in main.rs), so this gates on the front role alone.
-    if cfg.has_role(Role::Front) {
-        sink = sink.with_block_found_producer(StreamProducer::new(
-            foundation.redis.clone(),
-            BLOCK_FOUND_STREAM_KEY,
-        ));
-    }
-    let block_sink = sink.into_sv1_arc();
+    let block_sink = TdpBlockSubmissionSink::wired(
+        tdp.clone(),
+        cfg,
+        foundation,
+        engines,
+        dispatcher.clone(),
+        settle,
+    )
+    .into_sv1_arc();
 
     let port_configs = build_port_configs(cfg);
     for pc in &port_configs {
@@ -166,20 +142,6 @@ pub(crate) fn build_per_port_servers(
     }
 
     let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
-    // Phase 7.7: device-status sink forwards Authorized/Disconnect events. With
-    // an in-process dispatcher (a front co-located with the `notify` role) it
-    // fires directly; without one the front publishes to the `device:status`
-    // stream so the Satellite can fan it out — never a silent drop. (Stratum
-    // only spawns on the front, so `None` here means "no co-located dispatcher",
-    // not "notifications off".)
-    let device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink> = match gate {
-        Some((g, subs)) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
-            g, subs,
-        )),
-        None => Arc::new(crate::device_status::ProducingDeviceStatusSink::new(
-            foundation.redis.clone(),
-        )),
-    };
     let mut out: Vec<Sv1PortServer> = Vec::with_capacity(port_configs.len());
 
     // One pool-wide extranonce1 allocator shared across every SV1 port, so
@@ -196,34 +158,16 @@ pub(crate) fn build_per_port_servers(
             rotating_intake.clone(),
             engines,
             lookup.clone(),
-            engines.mode_gate.clone(),
-            engines.payout_identities.clone(),
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
         );
 
-        // Subscribe BEFORE snapshotting — anything broadcast between the
-        // two ends up in both, the assembler dedupes on template_id.
-        // Snapshot covers the bitcoin-core bootstrap pair (NewTemplate +
-        // SetNewPrevHash) that bridge_out usually broadcasts BEFORE the
-        // per-port subscriber here exists; the broadcast misses it but
-        // TdpHandle's internal tap-task captures it into the snapshot.
-        // See `feedback-tdp-initial-template-drain` for the race.
-        let updates_rx = tdp.subscribe();
-        let initial_snapshot = tdp.current_snapshot();
-        // Every port carries ALL alt streams — mode is per-address, not
-        // per-port, so a Group-Solo / Blockparty member can connect on any
-        // port and must be routable onto its stream.
-        let alt_streams: Vec<(StreamKind, _, _)> = foundation
-            .alt_tdp
-            .iter()
-            .map(|(kind, handle)| (*kind, handle.subscribe(), handle.current_snapshot()))
-            .collect();
+        let templates = crate::stratum::PortTemplates::subscribe(tdp, foundation);
         let server = StratumV1Server::spawn(
             server_config.clone(),
-            updates_rx,
-            initial_snapshot,
-            alt_streams,
+            templates.updates_rx,
+            templates.initial_snapshot,
+            templates.alt_streams,
             hooks,
             extranonce.clone(),
             job_cache.clone(),
@@ -240,12 +184,12 @@ pub(crate) fn build_per_port_servers(
 // ─── ServerConfig + PortConfig builders ──────────────────────────
 
 pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
-    let network = config_network_to_bitcoin(cfg.network);
+    let network = crate::boot::bitcoin_network(cfg.network);
     let mut sc = ServerConfig::defaults_for(network);
     sc.pool_identifier = cfg.pool_identifier.clone();
     // Solo dev-fee is applied by `ProductionPayoutResolver` (reads
     // `cfg.solo` directly); `ServerConfig` carries no fee fields.
-    sc.job_retention_ms = cfg.stratum.job_retention_ms;
+    sc.lifecycle.retention_ms = cfg.stratum.job_retention_ms;
     sc.difficulty_check_interval_ms = cfg.stratum.difficulty_check_interval_ms;
     sc.vardiff_silence_easing = cfg.stratum.vardiff_silence_easing_enabled;
     sc.protocol_debug = cfg.debug.stratum_wire_logs;
@@ -290,7 +234,6 @@ pub(crate) fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
             payout_mode: MiningMode::Pplns,
             target_shares_per_minute: pplns.target_shares_per_minute as f64,
             minimum_difficulty: pplns.min_difficulty as f64,
-            ledger_warmup_shares: pplns.warmup_shares,
             ..PortConfig::new(pplns.port, pplns.start_difficulty as f64)
         });
 
@@ -302,7 +245,6 @@ pub(crate) fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
             payout_mode: MiningMode::Pplns,
             target_shares_per_minute: cfg.stratum.high_diff_target_shares_per_minute as f64,
             minimum_difficulty: pplns.min_difficulty as f64,
-            ledger_warmup_shares: pplns.warmup_shares,
             allow_suggested_difficulty: false,
             ..PortConfig::new(
                 pplns.high_diff_port,
@@ -324,46 +266,27 @@ fn build_port_hooks(
     rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
-    mode_gate: Arc<BlitzpoolModeGate>,
-    payout_identities: Arc<PayoutIdentityDirectory>,
-    device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink>,
+    device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> ServerHooks {
     // Front-only path: `build_per_port_servers` runs only when Stratum spawns
     // (the front), where `engines::spawn` always builds these.
-    let accepted = Sv1AcceptedShareAdapter::new(
-        engines
+    ServerHooks {
+        block_sink,
+        accepted_sink: engines
             .accepted_sink
             .clone()
             .expect("front mode builds the accepted composite"),
-    );
-    let rejected = Sv1RejectedShareAdapter::new(
-        engines
+        rejected_sink: engines
             .rejected_sink
             .clone()
             .expect("front mode builds the rejected composite"),
-    );
-
-    let blockparty_lookup: Option<Arc<dyn BlockpartyAdminLookup>> = engines
-        .blockparty
-        .clone()
-        .map(|bp| Arc::new(BlockpartyApiAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
-    let mode_gate_persistence: Arc<dyn SharedSessionPersistence> =
-        Arc::new(ModeGatePopulatingPersistence::new(
+        session_persistence: ModeGatePopulatingPersistence::for_port(
             port_payout_mode,
-            mode_gate,
-            payout_identities,
+            engines,
             group_lookup,
-            blockparty_lookup,
             live_sessions,
-        ));
-    let session = Sv1SessionPersistenceAdapter::new(mode_gate_persistence);
-
-    ServerHooks {
-        block_sink,
-        accepted_sink: Arc::new(accepted),
-        rejected_sink: Arc::new(rejected),
-        session_persistence: Arc::new(session),
+        ),
         payout_resolver,
         device_status_sink,
         rotating_intake: Some(rotating_intake),
@@ -426,8 +349,10 @@ impl BlockpartyAdminLookup for BlockpartyApiAdminLookup {
 /// `MiningModeResult` into the shared [`BlitzpoolModeGate`].
 ///
 /// **Per-port** — the `port_payout_mode` field captures the fallback
-/// mode for addresses that aren't in any active group. Each of the
-/// 4 SV1 ports gets its own instance.
+/// mode for addresses that aren't in any active group. Every port gets
+/// its own instance per protocol, built by [`Self::for_port`]: SV1 and
+/// SV2 must not share one, because `sessions` is keyed by session ids
+/// each protocol mints on its own.
 ///
 /// **session→address tracking**: the SV1
 /// `SessionPersistence::deregister_session` API only carries the
@@ -457,6 +382,29 @@ pub(crate) struct ModeGatePopulatingPersistence {
 }
 
 impl ModeGatePopulatingPersistence {
+    /// The instance a Stratum port registers its sessions through — the one
+    /// place the SV1 and SV2 port builders get it from, so the two cannot
+    /// resolve a connection's mode from different inputs.
+    pub(crate) fn for_port(
+        port_payout_mode: MiningMode,
+        engines: &EngineHandles,
+        group_lookup: Arc<dyn GroupLookup>,
+        live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
+    ) -> Arc<dyn SharedSessionPersistence> {
+        let blockparty: Option<Arc<dyn BlockpartyAdminLookup>> = engines
+            .blockparty
+            .clone()
+            .map(|bp| Arc::new(BlockpartyApiAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
+        Arc::new(Self::new(
+            port_payout_mode,
+            engines.mode_gate.clone(),
+            engines.payout_identities.clone(),
+            group_lookup,
+            blockparty,
+            live_sessions,
+        ))
+    }
+
     pub(crate) fn new(
         port_payout_mode: MiningMode,
         mode_gate: Arc<BlitzpoolModeGate>,
@@ -559,7 +507,6 @@ fn mode_from_port(m: MiningMode) -> MiningModeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::Network as BitcoinNetwork;
     use bp_config::{
         ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PayoutIdentityConfig, PplnsConfig,
         RedisConfig, StratumConfig, TdpConfig as TomlTdpConfig,
@@ -573,7 +520,6 @@ mod tests {
             network: Network::Regtest,
             pool_identifier: "Blitzpool-Test".into(),
             pool_base_url: None,
-            api_secure: false,
             roles: Vec::new(),
             // Default: rotating identities off, which is what these tests want —
             // they assert SV1's existing static-address behaviour.
@@ -585,7 +531,6 @@ mod tests {
                 port: 18443,
                 timeout_ms: 1000,
             },
-            bitcoin_zmq: None,
             tdp: TomlTdpConfig {
                 socket_path: PathBuf::from("/tmp/bp-tdp.sock"),
                 fee_threshold_sats: None,
@@ -594,7 +539,6 @@ mod tests {
                 staleness_threshold_secs: 120,
             },
             database: DatabaseConfig {
-                driver: "postgres".into(),
                 host: "h".into(),
                 port: 5432,
                 user: "u".into(),
@@ -602,17 +546,14 @@ mod tests {
                 database: "d".into(),
                 ssl: false,
                 pool_size: 1,
-                max_query_time_ms: 30_000,
                 acquire_timeout_ms: 1_000,
                 idle_timeout_ms: 1_000,
-                run_migrations: false,
             },
             redis: RedisConfig {
                 host: "h".into(),
                 port: 6379,
                 password: None,
                 db: 0,
-                ttl_secs: 60,
             },
             api: ApiConfig {
                 port: 3334,
@@ -637,7 +578,6 @@ mod tests {
             blockparty: None,
             notifications: Default::default(),
             smtp: None,
-            aggregation: Default::default(),
             metrics: Default::default(),
         }
     }
@@ -652,7 +592,6 @@ mod tests {
             fee_percent: 1.5,
             coinbase_weight_budget: 100_000,
             min_difficulty: 1024,
-            warmup_shares: 5,
             min_payout_sats: 100_000,
             dust_sweep_enabled: true,
             abandoned_balance_days: 90,
@@ -691,7 +630,6 @@ mod tests {
         assert_eq!(ports[2].port, 3340);
         assert_eq!(ports[3].port, 3349);
         assert_eq!(ports[2].minimum_difficulty, 1024.0);
-        assert_eq!(ports[2].ledger_warmup_shares, 5);
         // PPLNS high-diff mirrors high_diff_start_difficulty.
         assert_eq!(ports[3].initial_difficulty, 1_000_000.0);
         assert!(ports[0].allow_suggested_difficulty);
@@ -709,18 +647,14 @@ mod tests {
         assert_eq!(mode_from_port(MiningMode::GroupSolo).mode, MiningMode::Solo);
     }
 
-    // `config_network_maps_to_bitcoin_network` was here, pinning three of the
-    // four variants against this module's own copy of the mapping. Both the
-    // mapping and its pins now live in `crate::network`, over every variant.
-
     #[test]
     fn build_server_config_carries_pool_identifier() {
         let mut cfg = min_cfg(None);
         cfg.pool_identifier = "MyPool".into();
         let sc = build_server_config(&cfg);
         assert_eq!(sc.pool_identifier, "MyPool");
-        assert_eq!(sc.job_retention_ms, 600_000);
-        assert_eq!(sc.network, BitcoinNetwork::Regtest);
+        assert_eq!(sc.lifecycle.retention_ms, 600_000);
+        assert_eq!(sc.network, bitcoin::Network::Regtest);
     }
 
     // ── ModeGatePopulatingPersistence behaviour ───────────────────

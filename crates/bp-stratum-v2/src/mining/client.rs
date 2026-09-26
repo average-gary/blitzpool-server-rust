@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use bitcoin::Network;
 use bp_common::{parse_payout_identity_with, AddressId, PayoutIdentity, StreamKind};
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_mining_job::{
     address_to_script, merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError,
     PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
@@ -58,6 +59,7 @@ use bp_share::{
 use bp_stats::MAX_REASONABLE_DIFFICULTY;
 use bp_vardiff::{Clock, VarDiffEngine};
 
+use crate::codec_common::SetupConnectionInput;
 use crate::extensions::{
     RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS, SV2_EXTENSION_TYPE_WORKER_ID,
 };
@@ -73,7 +75,8 @@ use super::submit::{
     ShareAccept, ShareReject, ShareValidation, StandardJobContext, SubmitSharesExtendedInput,
     SubmitSharesStandardInput,
 };
-use super::translator::{TemplateBroadcast, TemplateChange};
+use super::translator::TemplateBroadcast;
+use bp_template_distribution::TemplateChange;
 
 // ── SetupConnection flags ──────────────────────────────────────────
 // (BIP-310 / SV2 Mining/SetupConnection Flags for Mining Protocol)
@@ -236,7 +239,7 @@ pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 ///
 /// It has to be REJECTED rather than merely served, because the pool derives
 /// the job's block-candidate threshold from it
-/// (`network_difficulty_from_n_bits`). Taken on trust, a JDC declaring a
+/// (`bp_mining_job::meets_network_target`). Taken on trust, a JDC declaring a
 /// trivial `n_bits` makes every ordinary share look like a found block — and
 /// since the mining side now records a block found on a custom job, that is a
 /// phantom `blocks_entity` row and a "block found" notification per share.
@@ -313,20 +316,6 @@ fn is_mining_extension_supported(ext: u16) -> bool {
 }
 
 // ── Inputs (typed wrappers over deserialized SV2 frames) ────────────
-
-/// Inputs from a deserialized `SetupConnection` frame, narrowed to
-/// what the handler actually reads.
-#[derive(Clone, Debug)]
-pub struct SetupConnectionInput {
-    pub protocol: u8,
-    pub min_version: u16,
-    pub max_version: u16,
-    pub flags: u32,
-    pub vendor: String,
-    pub firmware: String,
-    pub hardware_version: String,
-    pub device_id: String,
-}
 
 /// Inputs from a deserialized `OpenStandardMiningChannel` frame.
 #[derive(Clone, Debug)]
@@ -718,6 +707,8 @@ pub struct MiningSessionState<C: Clock> {
     /// quiet channel's difficulty down (see [`bp_vardiff`]'s module doc,
     /// "Silence easing"). Off by default.
     pub vardiff_silence_easing: bool,
+    /// Job lifecycle handed to every channel this connection opens.
+    pub job_lifecycle: LifecycleConfig,
     /// Clock reading of the last vardiff evaluation, timer or inline.
     /// Gates the post-share inline check so it cannot run more often than
     /// `vardiff_interval_ms` — see [`Self::vardiff_cooldown_elapsed`].
@@ -770,6 +761,9 @@ pub struct PortConfig {
     /// Whether vardiff may use elapsed silence as evidence and walk a
     /// quiet channel's difficulty down. Off by default.
     pub vardiff_silence_easing: bool,
+    /// Retire-not-clear job lifecycle every channel opened on this port
+    /// ages its jobs under (`retention_ms` from `[stratum] job_retention_ms`).
+    pub job_lifecycle: LifecycleConfig,
 }
 
 impl<C: Clock + Clone> MiningSessionState<C> {
@@ -811,6 +805,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             target_shares_per_minute: port.target_shares_per_minute,
             vardiff_interval_ms: port.vardiff_interval_ms,
             vardiff_silence_easing: port.vardiff_silence_easing,
+            job_lifecycle: port.job_lifecycle,
             last_difficulty_check_ms: 0,
             share_logs: false,
             uses_custom_extranonce: false,
@@ -1037,8 +1032,8 @@ pub fn handle_request_extensions<C: Clock>(
 // ── Handler: OpenStandardMiningChannel ──────────────────────────────
 
 /// Handle `OpenStandardMiningChannel`. The `extranonce_prefix` is
-/// allocated by the IO layer (via the global
-/// `ExtranonceAllocator`) and passed in; the handler doesn't own the
+/// allocated by the IO layer (via the pool-wide allocator behind
+/// `crate::extranonce::ConnectionExtranonce`) and passed in; the handler doesn't own the
 /// allocator because allocations are pool-global, not session-local.
 ///
 /// Flow:
@@ -1075,6 +1070,7 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
         extranonce_prefix.clone(),
         ctx.assigned_difficulty,
         input.max_target,
+        state.job_lifecycle,
     );
     state.channels.insert(channel_id, channel);
     let engine = state.new_channel_vardiff(ctx.assigned_difficulty);
@@ -1125,20 +1121,14 @@ fn assign_channel_to_group<C: Clock>(
     if state.requires_standard_jobs || state.is_tdp_client || state.work_selection {
         return 0;
     }
-    let gid = match state.groups.group_for_size(full_extranonce_size) {
-        Some(gid) => gid,
-        None => {
-            let gid = state.next_channel_id;
-            state.next_channel_id = state.next_channel_id.saturating_add(1);
-            state.groups.create(gid, full_extranonce_size);
-            gid
-        }
-    };
-    // Matches by construction (looked up / created for `full_extranonce_size`).
-    let _ = state
+    let next_channel_id = &mut state.next_channel_id;
+    state
         .groups
-        .add_channel(gid, channel_id, full_extranonce_size);
-    gid
+        .join_group_for_size(channel_id, full_extranonce_size, || {
+            let gid = *next_channel_id;
+            *next_channel_id = next_channel_id.saturating_add(1);
+            gid
+        })
 }
 
 // ── Handler: OpenExtendedMiningChannel ──────────────────────────────
@@ -1205,6 +1195,7 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
         rollable_size,
         ctx.assigned_difficulty,
         input.max_target,
+        state.job_lifecycle,
     );
     state.channels.insert(channel_id, channel);
     let engine = state.new_channel_vardiff(ctx.assigned_difficulty);
@@ -1241,66 +1232,16 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
 
 // ── Open-mining-channel shared helper ────────────────────────────────
 
-/// Floor a hashrate-derived worker difficulty to a whole integer.
-///
-/// `hash_rate_to_difficulty` yields fractional values (e.g. `931.31`).
-/// SV2-native miners take the 32-byte target verbatim, but SV1 rigs
-/// behind the translator receive `mining.set_difficulty(931.31)`,
-/// truncate the decimal to `931`, and then submit shares that meet
-/// integer diff `931` but not the fractional target `931.31` — which
-/// the pool rejects as difficulty-too-low. Flooring here makes the
-/// stored `session_difficulty` (used for share validation) and the
-/// target bytes on the wire agree on an integer the miner can hit.
-///
-/// Floor (not round-to-nearest) is deliberate: it never makes the
-/// target harder than the hashrate estimate, so a miner that meets the
-/// integer diff exactly always passes. Result is bounded below by
-/// `1.0` so a sub-1 computed diff can't round down to `0`.
-///
-/// This touches only the worker/share difficulty, which is a
-/// pool-internal share-accounting threshold fully decoupled from block
-/// validity (the block-candidate gate compares against the network
-/// target, not this value) — so flooring can never affect found blocks.
-/// Non-finite / non-positive inputs are returned unchanged for the
-/// caller's existing min/ceiling guards to handle.
-/// Round a difficulty we are about to ASSIGN to a downstream to a power of two.
-///
-/// Nothing in SV2 asks for this, and a miner handles a crooked target fine — the
-/// firmware filters in software against the exact value it was given. A
-/// translating proxy does not. The SRI translator rounds our target UP to a
-/// power of two when it lowers it into an SV1 `mining.set_difficulty`
-/// (`build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding`),
-/// so the miner then works against a HIGHER difficulty than the one we keep
-/// booking its shares at. Measured on a live pair: we assigned 2887, the miner
-/// was given 4096, and 29.5 % of its work was never credited. The size of the
-/// loss is just the distance to the next power of two — up to nearly half.
-///
-/// Assigning a power of two leaves such a proxy nothing to round, so both sides
-/// account for the same number.
-///
-/// **Always UP, never to the nearest rung.** Rounding to the nearest goes down
-/// as often as up, and a downstream that requested a difficulty via
-/// `UpdateChannel` rejects a lower one as a protocol error: the translator logs
-/// "SetTarget response has target which is higher than requested target …
-/// Ignoring this pending update" and the miner keeps its previous difficulty
-/// while we book against the new one. Rounding down therefore does not merely
-/// mis-size the target, it throws the assignment away — measured, and worse than
-/// the under-counting this function exists to fix. Rounding up is always
-/// accepted and costs at most a factor of two in share rate.
+/// Round a difficulty we are about to ASSIGN to a downstream to a power of two,
+/// always UP — [`bp_vardiff::round_up_to_power_of_two`] says why (a translating
+/// proxy rounds a crooked target itself and the pool then under-credits the
+/// miner). A deliberately sub-1 configured difficulty is left alone.
 fn power_of_two_difficulty(diff: Difficulty) -> Difficulty {
     let v = diff.as_f64();
     if !v.is_finite() || v < 1.0 {
-        // Leave a deliberately sub-1 configured difficulty alone.
         return diff;
     }
-    let lower = 2_f64.powf(v.log2().floor());
-    // The tolerance matters: a value that is a power of two apart from
-    // floating-point dust must stay on its rung rather than double.
-    if v <= lower * (1.0 + 1e-9) {
-        Difficulty(lower)
-    } else {
-        Difficulty(lower * 2.0)
-    }
+    Difficulty(bp_vardiff::round_up_to_power_of_two(v))
 }
 
 /// Captured context the kind-specific closure needs.
@@ -1530,7 +1471,6 @@ pub fn handle_submit_shares_standard<C: Clock>(
         template_version: entry.template_snapshot.version as i32,
         prev_hash: entry.template_snapshot.prev_hash,
         n_bits: entry.template_snapshot.n_bits,
-        network_difficulty: entry.template_snapshot.network_difficulty,
         classification,
         payouts_fingerprint: entry.payouts_fingerprint,
         template_id: entry.template_id,
@@ -1594,9 +1534,8 @@ pub use crate::mining::jobs::StandardTemplateSnapshot;
 /// Handle `SubmitSharesExtended`. Resolves the channel, extended-job
 /// and per-job difficulty (per-job if available, otherwise channel
 /// session difficulty) and delegates to
-/// [`validate_submit_extended`]. The `network_difficulty` argument and
-/// the `now_ms` clock-read are caller-provided so the handler stays
-/// pure.
+/// [`validate_submit_extended`]. The `now_ms` clock-read is
+/// caller-provided so the handler stays pure.
 pub fn handle_submit_shares_extended<C: Clock>(
     state: &mut MiningSessionState<C>,
     submission: &SubmitSharesExtendedInput,
@@ -1661,6 +1600,7 @@ pub fn handle_submit_shares_extended<C: Clock>(
         kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
+        job_lifecycle: *channel.standard_jobs.lifecycle(),
     };
 
     let validation = validate_submit_extended(
@@ -2229,7 +2169,11 @@ pub fn apply_template_broadcast<C: Clock>(
             channel.standard_jobs.retire(now_ms);
             channel.standard_jobs.cleanup_expired(now_ms);
             retire_extended_jobs(&mut channel.extended_jobs, now_ms);
-            cleanup_retired_extended_jobs(&mut channel.extended_jobs, now_ms);
+            cleanup_retired_extended_jobs(
+                &mut channel.extended_jobs,
+                now_ms,
+                channel.standard_jobs.lifecycle(),
+            );
             channel.clear_submission_cache();
             channel.latest_extended_prev_hash = Some(template.prev_hash);
             channel.latest_extended_n_bits = Some(template.n_bits);
@@ -2303,7 +2247,6 @@ pub fn apply_template_broadcast<C: Clock>(
                     version: template.version,
                     prev_hash: template.prev_hash,
                     n_bits: template.n_bits,
-                    network_difficulty: template.network_difficulty,
                     coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
                 };
                 channel.standard_jobs.record_send(
@@ -2399,7 +2342,6 @@ pub fn apply_template_broadcast<C: Clock>(
                     min_ntime: template.header_timestamp,
                     extranonce_prefix: channel.extranonce_prefix.clone(),
                     difficulty: channel.session_difficulty,
-                    network_difficulty: template.network_difficulty,
                     coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
                     template_id: Some(template.template_id),
                     jdp_claims_the_block: false,
@@ -2448,9 +2390,21 @@ pub fn apply_template_broadcast<C: Clock>(
     // Build the group's shared coinbase template (coinbase parts + header
     // fields) for `full_size`. The `difficulty` and `extranonce_prefix`
     // placeholders are overridden per member — members share the job but each
-    // holds its own prefix. `None` if the mining-job build fails.
-    let build_group_template = |full_size: usize| -> Option<GroupTemplateParts> {
-        let mining_job = mining_job_inputs.build(full_size).ok()?;
+    // holds its own prefix. `None` (logged here) if the mining-job build fails.
+    let session_id = state.session_id;
+    let build_group_template = |gid: u32, full_size: usize| -> Option<GroupTemplateParts> {
+        let mining_job = mining_job_inputs
+            .build(full_size)
+            .inspect_err(|err| {
+                tracing::warn!(
+                    ?err,
+                    session_id,
+                    gid,
+                    full_size,
+                    "skipping group: mining-job build failed"
+                );
+            })
+            .ok()?;
         let tx_prefix = mining_job.coinbase_prefix().to_vec();
         let tx_suffix = mining_job.coinbase_suffix().to_vec();
         let merkle_path = template.merkle_path.clone();
@@ -2465,7 +2419,6 @@ pub fn apply_template_broadcast<C: Clock>(
             min_ntime: template.header_timestamp,
             extranonce_prefix: Vec::new(),
             difficulty: Difficulty(0.0),
-            network_difficulty: template.network_difficulty,
             coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
             template_id: Some(template.template_id),
             jdp_claims_the_block: false,
@@ -2507,7 +2460,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     match (current_job_id, current_job_template) {
                         (Some(jid), Some(tmpl)) => Some((jid, tmpl)),
                         _ => match (
-                            build_group_template(full_size),
+                            build_group_template(gid, full_size),
                             state.groups.alloc_job_id(gid),
                         ) {
                             (Some((tmpl, _, _, _)), Some(jid)) => {
@@ -2568,9 +2521,8 @@ pub fn apply_template_broadcast<C: Clock>(
 
         // ── TEMPLATE broadcast (only_channel == None): ONE group job. ──
         let Some((group_template, tx_prefix, tx_suffix, merkle_path)) =
-            build_group_template(full_size)
+            build_group_template(gid, full_size)
         else {
-            tracing::warn!(gid, full_size, "skipping group: mining-job build failed");
             continue;
         };
         let group_job_id = match state.groups.alloc_job_id(gid) {
@@ -2586,7 +2538,11 @@ pub fn apply_template_broadcast<C: Clock>(
                 channel.standard_jobs.retire(now_ms);
                 channel.standard_jobs.cleanup_expired(now_ms);
                 retire_extended_jobs(&mut channel.extended_jobs, now_ms);
-                cleanup_retired_extended_jobs(&mut channel.extended_jobs, now_ms);
+                cleanup_retired_extended_jobs(
+                    &mut channel.extended_jobs,
+                    now_ms,
+                    channel.standard_jobs.lifecycle(),
+                );
                 channel.clear_submission_cache();
                 channel.latest_extended_prev_hash = Some(template.prev_hash);
                 channel.latest_extended_n_bits = Some(template.n_bits);
@@ -2791,7 +2747,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // The job's `n_bits` must be the one the pool is working on. This is NOT
     // a per-regime rule and must not move into one of the blocks below: the
     // pool derives this job's block-candidate threshold from the number
-    // (`network_difficulty_from_n_bits`, further down), so on trust a JDC
+    // (`meets_network_target` at submit time), so on trust a JDC
     // declaring a trivial `n_bits` turns every ordinary share into a "block
     // found" — a phantom `blocks_entity` row and a notification per share,
     // now that the mining side records blocks found on custom jobs.
@@ -3207,10 +3163,10 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 };
             if crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
                 &declared,
-                &entry.pool_payout,
-                &entry.payouts,
-                &entry.dust_limits,
-                &entry.additional_outputs,
+                &entry.built.pool_payout,
+                &entry.built.payouts,
+                &entry.built.dust_limits,
+                &entry.built.additional_outputs,
             )
             .is_err()
             {
@@ -3219,7 +3175,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // Only now, past ext 0x0003/Output Verification — a fingerprint
             // stamped before the recompute would name a distribution this
             // coinbase was never proven to pay.
-            entry.payouts_fingerprint
+            entry.built.payouts_fingerprint
         }
     };
 
@@ -3235,18 +3191,13 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // + the full extranonce slot (pool prefix + miner-rollable).
     let full_extranonce_size = channel.full_extranonce_size();
     let script_sig_len = input.coinbase_prefix.len() + full_extranonce_size;
-    let script_sig_len_varint = encode_varint(script_sig_len as u64);
 
     // Assemble the non-witness coinbase prefix.
-    let mut coinbase_tx_prefix =
-        Vec::with_capacity(4 + 1 + 36 + script_sig_len_varint.len() + input.coinbase_prefix.len());
-    coinbase_tx_prefix.extend_from_slice(&input.coinbase_tx_version.to_le_bytes());
-    coinbase_tx_prefix.push(0x01); // input_count varint = 1
-                                   // null outpoint: 32 zero bytes (hash) + 0xFFFFFFFF (index, LE).
-    coinbase_tx_prefix.extend_from_slice(&[0u8; 32]);
-    coinbase_tx_prefix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    coinbase_tx_prefix.extend_from_slice(&script_sig_len_varint);
-    coinbase_tx_prefix.extend_from_slice(&input.coinbase_prefix);
+    let coinbase_tx_prefix = bp_mining_job::serialize_coinbase_prefix(
+        input.coinbase_tx_version,
+        &input.coinbase_prefix,
+        script_sig_len,
+    );
 
     // Assemble the non-witness coinbase suffix.
     let mut coinbase_tx_suffix = Vec::with_capacity(4 + input.coinbase_tx_outputs.len() + 4);
@@ -3280,11 +3231,6 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             min_ntime: input.min_ntime,
             extranonce_prefix: channel.extranonce_prefix.clone(),
             difficulty: channel.session_difficulty,
-            // Custom (JDC-declared) job: derive the block-found gate's network
-            // difficulty from the declared job's own n_bits (no pool template).
-            network_difficulty: crate::mining::translator::network_difficulty_from_n_bits(
-                input.n_bits,
-            ),
             // No pool template → no reward to thread; the JDC builds and
             // propagates the block itself.
             coinbase_tx_value_remaining: 0,
@@ -3335,30 +3281,6 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     })
 }
 
-/// Encode a `u64` as a Bitcoin varint (1 / 3 / 5 / 9 bytes). Pure
-/// helper — kept private to this module since the only consumer is
-/// [`handle_set_custom_mining_job`]'s scriptSig length encoding.
-fn encode_varint(n: u64) -> Vec<u8> {
-    if n < 0xFD {
-        vec![n as u8]
-    } else if n <= 0xFFFF {
-        let mut buf = Vec::with_capacity(3);
-        buf.push(0xFD);
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
-        buf
-    } else if n <= 0xFFFF_FFFF {
-        let mut buf = Vec::with_capacity(5);
-        buf.push(0xFE);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-        buf
-    } else {
-        let mut buf = Vec::with_capacity(9);
-        buf.push(0xFF);
-        buf.extend_from_slice(&n.to_le_bytes());
-        buf
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -3384,6 +3306,7 @@ pub(crate) mod tests {
             kind: ch.kind,
             extranonce_size: ch.extranonce_size,
             job_target,
+            job_lifecycle: *ch.standard_jobs.lifecycle(),
         };
         validate_submit_extended(
             &mut ch.submission_cache,
@@ -3405,6 +3328,7 @@ pub(crate) mod tests {
             target_shares_per_minute: 6.0,
             vardiff_interval_ms: 60_000,
             vardiff_silence_easing: false,
+            job_lifecycle: LifecycleConfig::DEFAULT,
         }
     }
 
@@ -3967,7 +3891,6 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
-            network_difficulty: Difficulty(1e15),
             coinbase_tx_value_remaining: 5_000_000_000,
         }
     }
@@ -4080,7 +4003,7 @@ pub(crate) mod tests {
         let easy = Difficulty(1.0 / 4_294_967_296.0);
         {
             let ch = s.channels.get_mut(&channel_id).unwrap();
-            // Default snapshot() pins network_difficulty=1e15 → unreachable.
+            // Default snapshot() pins n_bits = difficulty 1 → unreachable.
             ch.standard_jobs
                 .record_send_for_test(7, easy, [0xDD; 32], snapshot(), 0);
         }
@@ -4105,9 +4028,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Companion to the gating test: a share whose submission-difficulty
-    /// meets the configured network-difficulty emits `ShareAccepted`
-    /// with `is_block_candidate = true`. IO-layer reads this flag to
+    /// Companion to the gating test: a share whose hash meets the job's
+    /// network target emits `ShareAccepted` with
+    /// `is_block_candidate = true`. IO-layer reads this flag to
     /// fire the `BlockSubmissionSink` (which submits block candidates
     /// for upstream processing).
     #[test]
@@ -4123,10 +4046,10 @@ pub(crate) mod tests {
         let easy = Difficulty(1.0 / 4_294_967_296.0);
         {
             let ch = s.channels.get_mut(&channel_id).unwrap();
-            // Snapshot with trivially-reachable network_difficulty so
-            // any accepted share is also a block candidate.
+            // Snapshot with a trivially-reachable target (`0xffff·2^240`)
+            // so any accepted share is also a block candidate.
             let mut snap = snapshot();
-            snap.network_difficulty = easy;
+            snap.n_bits = 0x2100_ffff;
             ch.standard_jobs
                 .record_send_for_test(7, easy, [0xDD; 32], snap, 0);
         }
@@ -4143,8 +4066,8 @@ pub(crate) mod tests {
             SessionEvent::ShareAccepted { accept, .. } => {
                 assert!(
                     accept.is_block_candidate,
-                    "submission ≥ network must flag block-candidate so \
-                     IO-layer fires BlockSubmissionSink"
+                    "a hash meeting the network target must flag block-candidate \
+                     so IO-layer fires BlockSubmissionSink"
                 );
             }
             ev => panic!("expected ShareAccepted, got {ev:?}"),
@@ -4308,7 +4231,7 @@ pub(crate) mod tests {
             version: 0,
             ntime: 0,
             extranonce: ExtranonceBytes::from_slice(&[0; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         };
         let out = handle_submit_shares_extended(&mut s, &sub, 0);
         match &out.outbound[0] {
@@ -4343,7 +4266,6 @@ pub(crate) mod tests {
             n_bits: 0x1d00_ffff,
             min_ntime: 0,
             difficulty: easy,
-            network_difficulty: Difficulty(1e15),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
             jdp_claims_the_block: false,
@@ -4362,7 +4284,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             ntime: 0x6500_0001,
             extranonce: ExtranonceBytes::from_slice(&[0x11; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         };
         let out = handle_submit_shares_extended(&mut s, &sub, 0);
         assert!(matches!(
@@ -4416,7 +4338,6 @@ pub(crate) mod tests {
                 n_bits: 0x1d00_ffff,
                 min_ntime: 0,
                 difficulty: Difficulty(1.0 / 4_294_967_296.0),
-                network_difficulty: Difficulty(1e15),
                 coinbase_tx_value_remaining: 5_000_000_000,
                 template_id: None,
                 created_at: 0,
@@ -4440,7 +4361,7 @@ pub(crate) mod tests {
                 version: 0x2000_0000,
                 ntime: 0x6500_0001,
                 extranonce: ExtranonceBytes::from_slice(&[0x11; 8]),
-                tail_tlvs: Vec::new(),
+                tlvs: Vec::new(),
             };
             let out = handle_submit_shares_extended(&mut s, &sub, 0);
             match out.events.first() {
@@ -4951,8 +4872,9 @@ pub(crate) mod tests {
 
     // ── apply_template_broadcast ───────────────────────────────────
 
-    use crate::mining::translator::{ActiveSV2Template, TemplateBroadcast, TemplateChange};
+    use crate::mining::translator::TemplateBroadcast;
     use bp_mining_job::PayoutEntry;
+    use bp_template_distribution::{ActiveTemplate, TemplateChange};
 
     fn payouts() -> Vec<PayoutEntry> {
         vec![PayoutEntry::static_address(
@@ -4997,15 +4919,13 @@ pub(crate) mod tests {
         }
     }
 
-    fn active_template(template_id: u64, prev: [u8; 32]) -> ActiveSV2Template {
-        ActiveSV2Template {
+    fn active_template(template_id: u64, prev: [u8; 32]) -> ActiveTemplate {
+        ActiveTemplate {
             template_id,
             version: 0x2000_0000,
             prev_hash: prev,
             n_bits: 0x1d00_ffff,
             header_timestamp: 0x6500_0001,
-            network_target: [0xFF; 32],
-            network_difficulty: Difficulty(1.0),
             coinbase_prefix: vec![0x03, 0xC8, 0x00, 0x00],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -5990,7 +5910,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             ntime: 0x6500_0001,
             extranonce: ExtranonceBytes::from_slice(&[0x11u8; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         };
         let member_ch = s.channels.get_mut(&member).unwrap();
         let res = validate_ext(
@@ -6125,7 +6045,7 @@ pub(crate) mod tests {
             version: 0x2000_0000,
             ntime: 0x6500_0001,
             extranonce: ExtranonceBytes::from_slice(&[0x11u8; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         };
         let res = validate_ext(
             s.channels.get_mut(&ch1).unwrap(),
@@ -6327,7 +6247,6 @@ pub(crate) mod tests {
                     n_bits: 0,
                     min_ntime: 0,
                     difficulty: Difficulty(1.0),
-                    network_difficulty: Difficulty(1e15),
                     coinbase_tx_value_remaining: 5_000_000_000,
                     template_id: None,
                     jdp_claims_the_block: false,
@@ -6362,6 +6281,73 @@ pub(crate) mod tests {
             ch.standard_jobs.classify(7, 1_000),
             Some(bp_jobs_lifecycle::JobClassification::StaleCreditable),
             "pre-existing standard entry must be retired (not deleted)"
+        );
+    }
+
+    /// `[stratum] job_retention_ms` reaches SV2: a port configured with a
+    /// 60 s retention ages out an extended job retired 120 s ago on the next
+    /// block change, while the 600 s default keeps it. Four retired jobs so
+    /// the 3-entry floor leaves exactly the oldest one GC-eligible.
+    #[test]
+    fn template_broadcast_ages_extended_jobs_under_configured_retention() {
+        fn retired_job_survives(retention_ms: u64) -> bool {
+            let mut s = MiningSessionState::new(
+                Arc::new(TestClock::new(0)),
+                1,
+                PortConfig {
+                    job_lifecycle: LifecycleConfig {
+                        retention_ms,
+                        ..LifecycleConfig::DEFAULT
+                    },
+                    ..port_cfg()
+                },
+            );
+            handle_setup_connection(&mut s, &good_setup());
+            let _ = handle_open_extended_mining_channel(
+                &mut s,
+                &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
+                vec![0xAA, 0xBB, 0xCC, 0xDD],
+            );
+            let cid = s.primary_channel.unwrap();
+            let ch = s.channels.get_mut(&cid).unwrap();
+            for (job_id, created_at) in [(90u32, 500u64), (91, 501), (92, 502), (93, 503)] {
+                ch.extended_jobs.insert(
+                    job_id,
+                    ExtendedJob {
+                        payouts_fingerprint: [0u8; 32],
+                        coinbase_prefix: vec![],
+                        coinbase_suffix: vec![],
+                        merkle_path: vec![],
+                        extranonce_prefix: vec![],
+                        version: 0,
+                        prev_hash: [0; 32],
+                        n_bits: 0,
+                        min_ntime: 0,
+                        difficulty: Difficulty(1.0),
+                        coinbase_tx_value_remaining: 5_000_000_000,
+                        template_id: None,
+                        jdp_claims_the_block: false,
+                        created_at,
+                        retired_at: Some(1_000),
+                    },
+                );
+            }
+            let _ = apply_template_broadcast(
+                &mut s,
+                &broadcast(TemplateChange::NewBlock, [0xCC; 32]),
+                &synthetic_mining_job_inputs(),
+                1_000 + 120_000,
+                None,
+            );
+            s.channels[&cid].extended_jobs.contains_key(&90)
+        }
+        assert!(
+            !retired_job_survives(60_000),
+            "retired 120 s ago under a 60 s retention: must be aged out"
+        );
+        assert!(
+            retired_job_survives(LifecycleConfig::DEFAULT.retention_ms),
+            "retired 120 s ago under the 600 s default: must still be stored"
         );
     }
 
@@ -6499,13 +6485,7 @@ pub(crate) mod tests {
         outputs_blob: &[u8],
     ) -> (Vec<u8>, Vec<u8>) {
         let script_sig_len = script_sig_prefix.len() + FIXTURE_DECLARED_SLOT;
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(&2u32.to_le_bytes()); // coinbase_tx_version
-        prefix.push(0x01); // input count
-        prefix.extend_from_slice(&[0u8; 32]); // null outpoint hash
-        prefix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // outpoint index
-        prefix.extend_from_slice(&encode_varint(script_sig_len as u64));
-        prefix.extend_from_slice(script_sig_prefix);
+        let prefix = bp_mining_job::serialize_coinbase_prefix(2, script_sig_prefix, script_sig_len);
 
         let mut suffix = Vec::new();
         suffix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nSequence
@@ -6991,7 +6971,7 @@ pub(crate) mod tests {
     /// threshold from it.
     ///
     /// Taken on trust, a JDC declaring a trivial `n_bits` makes every
-    /// ordinary share clear `network_difficulty` and arrive at the block
+    /// ordinary share meet the network target and arrive at the block
     /// sink as a find. Since the mining side now records a block found on a
     /// custom job, that is a phantom `blocks_entity` row plus a "block found"
     /// notification for every share the JDC submits.
@@ -7309,19 +7289,21 @@ pub(crate) mod tests {
     ) -> crate::bridge::PayoutDistributionEntry {
         crate::bridge::PayoutDistributionEntry {
             distribution_id: 9,
-            pool_payout: WeightedOutput {
-                script_pubkey: vec![0x51],
-                weight: 1,
+            built: crate::bridge::BuiltPayoutDistribution {
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 9,
+                }],
+                dust_limits: vec![1],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([0x5A; 32]),
+                bookable: true,
             },
-            payouts: vec![WeightedOutput {
-                script_pubkey: vec![0x00, 0x14, 0xAA],
-                weight: 9,
-            }],
-            dust_limits: vec![1],
-            additional_outputs: vec![],
-            reference_reward_sats: 312_500_000,
-            payouts_fingerprint: Some([0x5A; 32]),
-            bookable: true,
             accounting,
             jdp_session_id: None,
             published_at_ms: 1_000,
@@ -7332,10 +7314,10 @@ pub(crate) mod tests {
     /// `entry` at revenue `t`.
     fn conformant_outputs(entry: &crate::bridge::PayoutDistributionEntry, t: u64) -> Vec<u8> {
         let outputs = compute_payout_vector(
-            &entry.pool_payout,
-            &entry.payouts,
-            &entry.dust_limits,
-            &entry.additional_outputs,
+            &entry.built.pool_payout,
+            &entry.built.payouts,
+            &entry.built.dust_limits,
+            &entry.built.additional_outputs,
             t,
         )
         .unwrap();
@@ -7400,7 +7382,10 @@ pub(crate) mod tests {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
-        let fingerprint = entry.payouts_fingerprint.expect("fixture must carry one");
+        let fingerprint = entry
+            .built
+            .payouts_fingerprint
+            .expect("fixture must carry one");
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -8854,10 +8839,10 @@ pub(crate) mod tests {
             assert!(
                 crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
                     &outputs,
-                    &entry.pool_payout,
-                    &entry.payouts,
-                    &entry.dust_limits,
-                    &entry.additional_outputs,
+                    &entry.built.pool_payout,
+                    &entry.built.payouts,
+                    &entry.built.dust_limits,
+                    &entry.built.additional_outputs,
                 )
                 .is_ok(),
                 "the {label} coinbase must be ext 0x0003/Output Verification-conformant, or this test \

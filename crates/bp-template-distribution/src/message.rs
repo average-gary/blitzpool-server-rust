@@ -105,49 +105,6 @@ pub fn apply_to_snapshot(snapshot: &mut TemplateSnapshot, update: &TemplateUpdat
     }
 }
 
-/// Extension trait that both per-protocol template assemblers
-/// (SV1 in `bp-stratum-v1::notify`, SV2 in `bp-stratum-v2::mining::translator`)
-/// implement so the bootstrap-from-snapshot logic can live in one
-/// place. See [`bootstrap_assembler_from_snapshot`].
-pub trait TemplateAssembler {
-    /// Implementation-specific change description (TemplateChange::NewBlock /
-    /// Refresh in both crates today; kept generic so neither protocol
-    /// crate has to depend on the other's enum).
-    type Change;
-    /// Implementation-specific active template (ActiveSV1Template /
-    /// ActiveSV2Template) — `Clone` so the caller can both stash a
-    /// snapshot AND broadcast.
-    type Active: Clone;
-
-    fn apply(&mut self, update: &TemplateUpdate) -> Option<Self::Change>;
-    fn current(&self) -> Option<&Self::Active>;
-}
-
-/// Replay a [`TemplateSnapshot`] through an assembler so a late
-/// subscriber recovers the bootstrap state the broadcast missed.
-/// Returns `Some((active, change))` when both halves of the pair are
-/// present in the snapshot and apply cleanly; `None` otherwise.
-///
-/// The caller is responsible for the side-effects (updating its
-/// own current_template mutex, broadcasting on its outbound
-/// template_tx) since the shape of those varies per protocol.
-pub fn bootstrap_assembler_from_snapshot<A: TemplateAssembler>(
-    assembler: &mut A,
-    snapshot: TemplateSnapshot,
-) -> Option<(A::Active, A::Change)> {
-    if let Some(t) = snapshot.new_template {
-        let _ = assembler.apply(&TemplateUpdate::NewTemplate(t));
-    }
-    if let Some(p) = snapshot.set_new_prev_hash {
-        if let Some(change) = assembler.apply(&TemplateUpdate::SetNewPrevHash(p)) {
-            if let Some(active) = assembler.current().cloned() {
-                return Some((active, change));
-            }
-        }
-    }
-    None
-}
-
 /// Mirror of `template_distribution_sv2::RequestTransactionDataSuccess`.
 ///
 /// `transaction_list` is the ordered list of raw, witness-serialised

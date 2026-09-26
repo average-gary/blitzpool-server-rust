@@ -123,12 +123,16 @@ fn build_app_state(
     let bitcoin_rpc_arc = Some(Arc::new(foundation.bitcoin_rpc.clone()));
     let tdp_clone = foundation.tdp.clone();
     let geoip_arc = foundation.geoip.clone();
-    let metrics_clone = foundation.metrics.clone();
 
     let state = AppState {
         pool,
         redis: Some(foundation.redis.clone()),
         pplns: pplns_arc,
+        pplns_budget_autoscaled: cfg
+            .pplns
+            .as_ref()
+            .and_then(|p| p.coinbase_autoscale.as_ref())
+            .is_some_and(|a| a.enabled),
         group_solo: group_solo_arc,
         group_service: Some(group_service),
         invitation_service: Some(invitation_service),
@@ -138,14 +142,12 @@ fn build_app_state(
         tdp_staleness_threshold_ms: (cfg.tdp.staleness_threshold_secs as i64) * 1000,
         bitcoin_rpc: bitcoin_rpc_arc,
         geoip: geoip_arc,
-        metrics: metrics_clone,
         pool_version: env!("CARGO_PKG_VERSION"),
         email_verification_hooks: production_hooks.email_verification.clone(),
         pool_base_url: cfg.pool_base_url.clone(),
         email_enabled: cfg.smtp.is_some(),
-        push_hooks: production_hooks.push.clone(),
         start_time: chrono::Utc::now(),
-        network: crate::network::config_network_to_bitcoin(cfg.network),
+        network: crate::boot::bitcoin_network(cfg.network),
         pool_identifier: cfg.pool_identifier.clone(),
         // Same values the payout resolver is built with, so the preview
         // and the real coinbase cannot disagree.

@@ -37,14 +37,6 @@
 //! The JDP sub-protocol has its own codec of the same shape,
 //! [`crate::jdp_server_codec`].
 
-use stratum_core::common_messages_sv2::{
-    SetupConnection as Sv2SetupConnection, SetupConnectionErrorOwned as Sv2SetupConnError,
-    SetupConnectionSuccessOwned as Sv2SetupConnSuccess,
-};
-use stratum_core::extensions_sv2::extensions_negotiation::{
-    RequestExtensions as Sv2RequestExtensions, RequestExtensionsErrorOwned as Sv2ReqExtError,
-    RequestExtensionsSuccessOwned as Sv2ReqExtSuccess,
-};
 use stratum_core::mining_sv2::{
     CloseChannel as Sv2CloseChannel, NewExtendedMiningJobOwned as Sv2NewExtMiningJob,
     NewMiningJobOwned as Sv2NewMiningJob, OpenExtendedMiningChannel as Sv2OpenExtChannel,
@@ -64,15 +56,19 @@ use stratum_core::mining_sv2::{
     UpdateChannelErrorOwned as Sv2UpdateChannelError,
 };
 use stratum_core::parsers_sv2::{
-    AnyMessage, AnyMessageOwned, CommonMessages, CommonMessagesOwned, Extensions,
-    ExtensionsNegotiation, ExtensionsNegotiationOwned, ExtensionsOwned, Mining, MiningOwned,
+    AnyMessage, AnyMessageOwned, CommonMessages, Extensions, ExtensionsNegotiation, Mining,
+    MiningOwned,
 };
 
-use crate::codec_common::{bytes_to_32, str0255, token_from_bytes, utf8_from_bytes, CodecError};
+use crate::codec_common::{
+    bytes_to_32, decode_request_extensions, decode_setup_connection, request_extensions_error,
+    request_extensions_success, setup_connection_error, setup_connection_success, str0255,
+    token_from_bytes, utf8_from_bytes, CodecError, SetupConnectionInput,
+};
 use crate::extensions::RequestExtensions as LocalRequestExtensions;
 use crate::mining::client::{
     CloseChannelInput, OpenExtendedMiningChannelInput, OpenStandardMiningChannelInput,
-    OutboundFrame, SetCustomMiningJobInput, SetupConnectionInput, UpdateChannelInput,
+    OutboundFrame, SetCustomMiningJobInput, UpdateChannelInput,
 };
 use crate::mining::submit::{SubmitSharesExtendedInput, SubmitSharesStandardInput};
 
@@ -115,7 +111,7 @@ pub fn decode_mining_inbound(
         AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
             ExtensionsNegotiation::RequestExtensions(m),
         )) => Ok(Some(InboundMiningFrame::RequestExtensions(
-            decode_request_extensions(m)?,
+            decode_request_extensions(m),
         ))),
         AnyMessage::Mining(m) => decode_mining_message(m).map(Some),
         _ => Ok(None),
@@ -178,28 +174,6 @@ fn mining_variant_name(m: &Mining<'_>) -> &'static str {
 }
 
 // ── Per-variant decoders ────────────────────────────────────────────
-
-fn decode_setup_connection(m: Sv2SetupConnection<'_>) -> Result<SetupConnectionInput, CodecError> {
-    Ok(SetupConnectionInput {
-        protocol: m.protocol as u8,
-        min_version: m.min_version,
-        max_version: m.max_version,
-        flags: m.flags,
-        vendor: utf8_from_bytes(m.vendor.as_bytes())?,
-        firmware: utf8_from_bytes(m.firmware.as_bytes())?,
-        hardware_version: utf8_from_bytes(m.hardware_version.as_bytes())?,
-        device_id: utf8_from_bytes(m.device_id.as_bytes())?,
-    })
-}
-
-fn decode_request_extensions(
-    m: Sv2RequestExtensions<'_>,
-) -> Result<LocalRequestExtensions, CodecError> {
-    Ok(LocalRequestExtensions {
-        request_id: m.request_id,
-        requested_extensions: m.requested_extensions.into_inner(),
-    })
-}
 
 fn decode_open_std_channel(
     m: Sv2OpenStdChannel<'_>,
@@ -275,7 +249,7 @@ fn decode_submit_shares_extended(
         // layer extracts the TLV-tail via `parse_message_frame_with_tlvs`
         // and attaches it post-decode (`server.rs` sets this field
         // before passing to `handle_submit_shares_extended`).
-        tail_tlvs: Vec::new(),
+        tlvs: Vec::new(),
     })
 }
 
@@ -313,48 +287,19 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessageOwned, C
         OutboundFrame::SetupConnectionSuccess {
             used_version,
             flags,
-        } => Ok(AnyMessageOwned::Common(
-            CommonMessagesOwned::SetupConnectionSuccess(Sv2SetupConnSuccess {
-                used_version,
-                flags,
-            }),
-        )),
-        OutboundFrame::SetupConnectionError { flags, error_code } => Ok(AnyMessageOwned::Common(
-            CommonMessagesOwned::SetupConnectionError(Sv2SetupConnError {
-                flags,
-                error_code: str0255(error_code)?,
-            }),
-        )),
+        } => Ok(setup_connection_success(used_version, flags)),
+        OutboundFrame::SetupConnectionError { flags, error_code } => {
+            setup_connection_error(flags, error_code)
+        }
         OutboundFrame::RequestExtensionsSuccess {
             request_id,
             supported_extensions,
-        } => Ok(AnyMessageOwned::Extensions(
-            ExtensionsOwned::ExtensionsNegotiation(
-                ExtensionsNegotiationOwned::RequestExtensionsSuccess(Sv2ReqExtSuccess {
-                    request_id,
-                    supported_extensions: supported_extensions
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                }),
-            ),
-        )),
+        } => request_extensions_success(request_id, supported_extensions),
         OutboundFrame::RequestExtensionsError {
             request_id,
             unsupported_extensions,
             required_extensions,
-        } => Ok(AnyMessageOwned::Extensions(
-            ExtensionsOwned::ExtensionsNegotiation(
-                ExtensionsNegotiationOwned::RequestExtensionsError(Sv2ReqExtError {
-                    request_id,
-                    unsupported_extensions: unsupported_extensions
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                    required_extensions: required_extensions
-                        .try_into()
-                        .map_err(CodecError::from_conv)?,
-                }),
-            ),
-        )),
+        } => request_extensions_error(request_id, unsupported_extensions, required_extensions),
         OutboundFrame::OpenStandardMiningChannelSuccess {
             request_id,
             channel_id,
@@ -564,6 +509,11 @@ mod tests {
     use super::*;
     use stratum_core::binary_sv2::Seq064K;
     use stratum_core::common_messages_sv2::Protocol;
+    use stratum_core::common_messages_sv2::SetupConnection as Sv2SetupConnection;
+    use stratum_core::extensions_sv2::extensions_negotiation::RequestExtensions as Sv2RequestExtensions;
+    use stratum_core::parsers_sv2::{
+        CommonMessagesOwned, ExtensionsNegotiationOwned, ExtensionsOwned,
+    };
 
     // ── decode_setup_connection ────────────────────────────────────
 

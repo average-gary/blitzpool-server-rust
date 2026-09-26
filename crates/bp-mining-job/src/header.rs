@@ -83,9 +83,73 @@ pub fn build_block_header(
     h
 }
 
+/// Whether a share hash is proof of work for a block — the one block-found
+/// gate SV1 and SV2 both run.
+///
+/// Exact: `n_bits` decodes through `bitcoin::Target::from_compact`, the
+/// consensus decoding, and the hash is compared as a little-endian U256, so
+/// the verdict is the one bitcoin-core will reach. The difficulty-vs-difficulty
+/// comparison it replaces went through `f64` and called a hash just above the
+/// target a block.
+///
+/// `hash_le` is the header's sha256d as it comes out of the hasher (internal,
+/// little-endian order). Reversing it to display order does not bring the
+/// test close to right, it inverts it.
+pub fn meets_network_target(hash_le: &[u8; 32], n_bits: u32) -> bool {
+    let target =
+        bitcoin::pow::Target::from_compact(bitcoin::pow::CompactTarget::from_consensus(n_bits));
+    bp_share::Target::from_le_bytes(target.to_le_bytes()).is_met_by_le(hash_le)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The boundary is inclusive and exact: the target itself is a block,
+    /// one above it is not. The `f64` gate this replaces called
+    /// `target + 1` a block on every `n_bits` tried.
+    #[test]
+    fn the_network_target_boundary_is_exact() {
+        for n_bits in [0x1d00_ffff_u32, 0x1703_4e33, 0x207f_ffff] {
+            let target = bitcoin::pow::Target::from_compact(
+                bitcoin::pow::CompactTarget::from_consensus(n_bits),
+            )
+            .to_le_bytes();
+            assert!(
+                meets_network_target(&target, n_bits),
+                "{n_bits:#x}: target itself"
+            );
+
+            let mut above = target;
+            for byte in above.iter_mut() {
+                let (v, carry) = byte.overflowing_add(1);
+                *byte = v;
+                if !carry {
+                    break;
+                }
+            }
+            assert!(
+                !meets_network_target(&above, n_bits),
+                "{n_bits:#x}: target + 1"
+            );
+        }
+    }
+
+    /// Byte order: the genesis target is `0x00000000ffff0000…` in display
+    /// order. A hash with its only set bits just under that must pass, and one
+    /// with a set bit in the top four bytes must not — read in the wrong order
+    /// both verdicts flip.
+    #[test]
+    fn the_network_target_reads_the_hash_little_endian() {
+        let mut below = [0u8; 32];
+        below[27] = 0xff;
+        below[26] = 0xfe;
+        assert!(meets_network_target(&below, 0x1d00_ffff));
+
+        let mut above = [0u8; 32];
+        above[28] = 0x01;
+        assert!(!meets_network_target(&above, 0x1d00_ffff));
+    }
 
     #[test]
     fn genesis_header_matches_known_bytes() {

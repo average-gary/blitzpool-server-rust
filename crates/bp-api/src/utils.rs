@@ -4,15 +4,6 @@
 //! share the same wire-shape transforms (email masking, etc.) without
 //! drifting per-file.
 
-/// The "normalize (trim + lowercase bech32) → validate shape" step every
-/// address-taking endpoint runs.
-///
-/// A re-export, not a wrapper: this was a fourth spelling of the composition
-/// (`AddressId::new(normalize_btc_address(x))`) beside the rule's
-/// three copies. Re-exporting keeps the `crate::utils::normalized_address_id`
-/// call sites while leaving exactly one implementation.
-pub use bp_common::normalized_address_id;
-
 /// Mask an email for over-the-wire exposure.
 ///
 /// Format: `<first-char-local>***@<first-char-SLD>***<tld-and-below>`.
@@ -48,6 +39,55 @@ pub fn mask_email(email: &str) -> String {
         .expect("dot_idx > 0 ensures non-empty");
     let tld_and_below = &domain[dot_idx..]; // includes the leading dot
     format!("{local_head}***@{domain_head}***{tld_and_below}")
+}
+
+// ─── Member pseudonymisation ───────────────────────────────────────
+//
+// The Group-Solo and Blockparty detail endpoints are anonymous (a group id alone opens them), so
+// they must never hand out a member's full payout address — the id would then
+// be a scraper key for every member's on-chain address. Instead each member is
+// exposed as an opaque `memberId` (the stable join key the UI uses across the
+// detail endpoints) plus a masked `addressLabel` for display. The full address
+// never leaves the server; the viewer's own row is flagged via `?viewer=`, and
+// the UI already knows its own address (from the route) for the self-link.
+
+/// Opaque, stable per-(group, member) id. Deterministic so every detail
+/// endpoint produces the same id for the same member (the UI joins on it), and
+/// one-way + group-scoped so it reveals neither the address nor cross-group
+/// membership.
+pub(crate) fn member_id(group_id: uuid::Uuid, address: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(group_id.as_bytes());
+    h.update([0u8]); // domain-separate the two fields
+    h.update(address.as_bytes());
+    hex::encode(&h.finalize()[..8]) // 64-bit → collision-free within a group
+}
+
+/// Masked labels for a group's members, guaranteed unique within the group.
+/// Base = last-5 (like the UI); if two members would collapse to the same
+/// label, both are widened to last-9, which makes an intra-group visual
+/// collision astronomically unlikely. (The `memberId` join is collision-free
+/// regardless — this only keeps two rows from *looking* identical.)
+pub(crate) fn build_member_labels(
+    addresses: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut base_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for a in addresses {
+        *base_counts.entry(bp_common::short_address(a)).or_insert(0) += 1;
+    }
+    let mut out = std::collections::HashMap::with_capacity(addresses.len());
+    for a in addresses {
+        let base = bp_common::short_address(a);
+        let label = if base_counts.get(&base).copied().unwrap_or(0) > 1 {
+            bp_common::short_address_with_tail(a, 9)
+        } else {
+            base
+        };
+        out.insert(a.clone(), label);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -93,14 +133,37 @@ mod tests {
     }
 
     #[test]
-    fn normalized_address_id_trims_and_lowercases_bech32() {
-        let a = normalized_address_id("  BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4  ")
-            .expect("valid bech32");
-        assert_eq!(a.as_str(), "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+    fn member_id_is_stable_group_scoped_and_opaque() {
+        let g1 = uuid::Uuid::from_u128(1);
+        let g2 = uuid::Uuid::from_u128(2);
+        let a = "bc1qsomeaddressaaaa";
+        // Deterministic.
+        assert_eq!(member_id(g1, a), member_id(g1, a));
+        // Group-scoped: same address, different group → different id.
+        assert_ne!(member_id(g1, a), member_id(g2, a));
+        // Different address → different id.
+        assert_ne!(member_id(g1, a), member_id(g1, "bc1qsomeaddressbbbb"));
+        // Opaque: doesn't leak the address, fixed 16-hex width.
+        let id = member_id(g1, a);
+        assert_eq!(id.len(), 16);
+        // Pinned: the blitzpool-ui sidecar recomputes this id, so a change of
+        // the algorithm must not pass silently.
+        assert_eq!(id, "0fffe6b3af2a8384");
+        assert!(!id.contains("address"));
     }
 
     #[test]
-    fn normalized_address_id_rejects_empty() {
-        assert!(normalized_address_id("   ").is_err());
+    fn build_member_labels_disambiguates_collisions() {
+        // Same first-4 ("bc1q") AND same last-5 ("12345") → base labels collide
+        // → both widened so two rows never render identically.
+        let a = "bc1qAAAAAAAAA12345".to_string();
+        let b = "bc1qBBBBBBBBB12345".to_string();
+        let labels = build_member_labels(&[a.clone(), b.clone()]);
+        assert_eq!(bp_common::short_address(&a), bp_common::short_address(&b)); // base collides
+        assert_ne!(labels[&a], labels[&b], "colliding labels must be widened");
+        // A non-colliding address keeps the short last-5 label.
+        let c = "bc1qCCCCCCCCCC99999".to_string();
+        let labels2 = build_member_labels(&[a, c.clone()]);
+        assert_eq!(labels2[&c], bp_common::short_address(&c));
     }
 }

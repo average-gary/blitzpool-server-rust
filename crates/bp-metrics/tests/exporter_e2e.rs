@@ -2,8 +2,8 @@
 
 #![allow(clippy::print_stderr)]
 
-//! End-to-end test: spawn the Prometheus exporter, emit a few metrics
-//! via the recorder helpers, scrape `/metrics`, verify the
+//! End-to-end test: spawn the Prometheus exporter, emit through the
+//! recorder helpers, scrape `/metrics`, verify the
 //! Prometheus-text-format output contains the expected lines.
 //!
 //! **Single test only**: `metrics::set_global_recorder` is
@@ -12,12 +12,10 @@
 //! end-to-end assertion in this one test.
 
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
 
 use bp_metrics::{
-    record_aggregation_job, record_api_request, record_pool_stats, record_share_submission,
-    record_stratum_difficulty_adjustment, record_stratum_job_sent, set_stratum_clients_connected,
-    AggregationStatus, MetricsService, PrometheusConfig, ShareStatus,
+    record_stratum_difficulty_adjustment, set_parked_block_counts, set_stream_consumer_lag,
+    MetricsService, PrometheusConfig,
 };
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(29_000);
@@ -38,32 +36,13 @@ async fn spawn_emit_scrape_roundtrip() {
         }
     };
 
-    // Emit one of each metric kind. The recorder helpers must not
-    // panic; the exporter must accept the labels + ranges.
-    record_share_submission(ShareStatus::Valid, 1024.0, Some(Duration::from_millis(5)));
-    record_share_submission(ShareStatus::Invalid, 0.5, None);
-    record_share_submission(ShareStatus::Stale, 2048.0, Some(Duration::from_millis(2)));
-    set_stratum_clients_connected("sv1", 42);
-    set_stratum_clients_connected("sv2", 7);
+    // Emit through every recorder helper the pool calls.
     record_stratum_difficulty_adjustment();
-    record_stratum_job_sent();
-    record_stratum_job_sent();
-    record_api_request("GET", "/api/info", 200, Duration::from_millis(15));
-    record_api_request("POST", "/api/groups", 201, Duration::from_millis(80));
-    record_pool_stats(1.234e15, 600);
-    record_aggregation_job(
-        "stats_sink_flush",
-        AggregationStatus::Success,
-        Duration::from_millis(120),
-    );
+    set_stream_consumer_lag("shares:accepted", "money", Some(12), 3);
+    set_stream_consumer_lag("blocks:found", "notify", None, 0);
+    set_parked_block_counts(2, 0);
 
-    // Tiny wait so the exporter has a moment to schedule the histogram
-    // observations through its internal channel (the exporter is
-    // single-task; counters/gauges are sync, histograms can be slightly
-    // delayed under pressure).
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let url = handle.metrics_url();
+    let url = format!("http://{}/metrics", handle.bind_addr);
     let body = reqwest::get(&url)
         .await
         .expect("GET /metrics")
@@ -73,58 +52,21 @@ async fn spawn_emit_scrape_roundtrip() {
         .await
         .expect("read body");
 
-    // Spot-check the expected metric names + label permutations.
+    // Labels are emitted sorted, so each line has a fixed shape.
+    for line in [
+        "stratum_difficulty_adjustments_total 1",
+        r#"stream_consumer_pending{stream="shares:accepted",group="money"} 3"#,
+        r#"stream_consumer_lag{stream="shares:accepted",group="money"} 12"#,
+        r#"stream_consumer_lag_computable{stream="shares:accepted",group="money"} 1"#,
+        r#"stream_consumer_lag_computable{stream="blocks:found",group="notify"} 0"#,
+        "pool_blocks_pending_apply 2",
+        "pool_blocks_unbookable 0",
+    ] {
+        assert!(body.contains(line), "`{line}` missing — body:\n{body}");
+    }
+    // A lag Redis cannot compute is not emitted as a (misleading) 0.
     assert!(
-        body.contains(r#"stratum_shares_total{status="valid"} 1"#),
-        "stratum_shares_total{{status=valid}} missing — body:\n{body}"
-    );
-    assert!(body.contains(r#"stratum_shares_total{status="invalid"} 1"#));
-    assert!(body.contains(r#"stratum_shares_total{status="stale"} 1"#));
-    assert!(body.contains(r#"stratum_clients_connected{protocol="sv1"} 42"#));
-    assert!(body.contains(r#"stratum_clients_connected{protocol="sv2"} 7"#));
-    assert!(body.contains("stratum_difficulty_adjustments_total 1"));
-    assert!(body.contains("stratum_jobs_sent_total 2"));
-    // api_requests_total emits label-sorted (Prometheus convention).
-    // We assert the bare metric name + the labels exist somewhere on
-    // the same line rather than a fixed concatenation order.
-    let api_lines: Vec<&str> = body
-        .lines()
-        .filter(|l| l.starts_with("api_requests_total{") && l.contains("/api/info"))
-        .collect();
-    assert!(
-        !api_lines.is_empty(),
-        "api_requests_total for /api/info missing — body:\n{body}"
-    );
-    let api_lines: Vec<&str> = body
-        .lines()
-        .filter(|l| l.starts_with("api_requests_total{") && l.contains("/api/groups"))
-        .collect();
-    assert!(
-        !api_lines.is_empty(),
-        "api_requests_total for /api/groups missing"
-    );
-    assert!(body.contains("pool_hashrate_hashes_per_second 1234"));
-    assert!(body.contains("pool_miners_active 600"));
-    assert!(
-        body.contains(r#"aggregation_jobs_total{job_name="stats_sink_flush",status="success"} 1"#)
-    );
-
-    // Histogram buckets show up as `_bucket{le="..."}` lines. Verify at
-    // least one bucket landed for each histogram metric.
-    assert!(
-        body.contains("stratum_share_validation_duration_seconds_bucket"),
-        "share validation histogram missing"
-    );
-    assert!(
-        body.contains("api_request_duration_seconds_bucket"),
-        "api request histogram missing"
-    );
-    assert!(
-        body.contains("pool_share_difficulty_bucket"),
-        "share-difficulty histogram missing"
-    );
-    assert!(
-        body.contains("aggregation_job_duration_seconds_bucket"),
-        "aggregation histogram missing"
+        !body.contains(r#"stream_consumer_lag{stream="blocks:found""#),
+        "uncomputable lag must not be emitted — body:\n{body}"
     );
 }

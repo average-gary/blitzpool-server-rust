@@ -377,11 +377,11 @@ struct PayoutInfoEntry {
 #[serde(rename_all = "camelCase")]
 struct ClientBlockTemplateResponse {
     block_template: serde_json::Value,
-    /// `solo` / `pplns` / `group-solo` — drives the UI's
+    /// `solo` / `pplns` / `group-solo` / `blockparty` — drives the UI's
     /// distribution-preview labelling.
     mode: &'static str,
     payout_information: Vec<PayoutInfoEntry>,
-    /// Set only when `mode == "group-solo"`.
+    /// Set for the two group modes, `group-solo` and `blockparty`.
     #[serde(skip_serializing_if = "Option::is_none")]
     group_id: Option<String>,
     /// Full block hex (header + per-address coinbase + template txs)
@@ -393,6 +393,12 @@ struct ClientBlockTemplateResponse {
     /// Per-address coinbase tx hex (witness form, zero extranonces).
     /// Same fallback behaviour as `blockHex`.
     coinbase_tx_hex: String,
+    /// Group-Solo only: the member the preview names as finder, the one its
+    /// finder bonus is paid to. The asking address when it has shares in
+    /// the window, otherwise the member with the largest window share
+    /// (see `preview_finder`). Absent for the modes without a finder bonus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_finder: Option<String>,
 }
 
 async fn client_block_template<H, M>(
@@ -405,7 +411,7 @@ where
 {
     use bp_common::AddressId;
 
-    let addr = AddressId::new(address.clone()).map_err(|_| ApiError::InvalidAddress)?;
+    let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     let key = format!("CLIENT_BLOCK_TEMPLATE_{}", addr.as_str());
     let s = state.clone();
     let bytes = state
@@ -429,36 +435,27 @@ where
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
 
-                // Mode resolution: group membership wins, then
-                // Blockparty admin routing, then PPLNS window presence,
-                // else solo (matches /api/pplns/mode/:address).
-                let mut mode: &'static str = "solo";
-                let mut group_id: Option<uuid::Uuid> = None;
-                if let Some(member) = bp_db::find_group_member_by_address(&s.pool, &addr).await? {
-                    mode = "group-solo";
-                    group_id = Some(member.group_id);
-                } else if let Some(bp) = s.blockparty.as_ref() {
-                    if let Some(gid) = bp.routable_group_id_for_admin(&addr).await {
-                        mode = "blockparty";
-                        group_id = Some(gid);
-                    }
-                }
-                if mode == "solo" {
-                    if let Some(engine) = s.pplns.as_ref() {
-                        if let Ok(Some(status)) = engine.reader().address_status(&address).await {
-                            if status.current_window_shares > 0.0 {
-                                mode = "pplns";
-                            }
-                        }
-                    }
-                }
+                // The same resolution `/api/pplns/mode/:address` reports, so
+                // the preview shows the mode the pool is actually using.
+                let resolved = crate::mode::resolve_address_mode(&s, &addr).await?;
 
-                let payouts: Vec<PayoutInfoEntry> = match mode {
-                    "group-solo" => {
-                        let gid = group_id.expect("set when mode == group-solo");
+                let mut previewed_finder: Option<String> = None;
+                let payouts: Vec<PayoutInfoEntry> = match resolved.mode {
+                    MiningMode::GroupSolo => {
+                        let gid = resolved
+                            .group_id
+                            .expect("group-solo resolves with its group");
                         match s.group_solo.as_ref() {
                             Some(engine) => {
-                                match engine.build_distribution(gid, reward_sats, &addr).await {
+                                let window = engine
+                                    .reader()
+                                    .round_stats(gid)
+                                    .await
+                                    .map(|stats| stats.per_address)
+                                    .unwrap_or_default();
+                                let finder = preview_finder(&addr, &window);
+                                previewed_finder = Some(finder.as_str().to_string());
+                                match engine.build_distribution(gid, reward_sats, &finder).await {
                                     // The §4 evaluation at this template's
                                     // revenue — what the real coinbase pays.
                                     Ok(dist) => dist
@@ -485,8 +482,10 @@ where
                             None => Vec::new(),
                         }
                     }
-                    "blockparty" => {
-                        let gid = group_id.expect("set when mode == blockparty");
+                    MiningMode::Blockparty => {
+                        let gid = resolved
+                            .group_id
+                            .expect("blockparty resolves with its group");
                         match s.blockparty.as_ref() {
                             Some(bp) => match bp
                                 .build_payouts(gid, bp_common::Sats(reward_sats as i64))
@@ -506,7 +505,7 @@ where
                             None => Vec::new(),
                         }
                     }
-                    "pplns" => match s.pplns.as_ref() {
+                    MiningMode::Pplns => match s.pplns.as_ref() {
                         Some(engine) => match engine.build_distribution(reward_sats).await {
                             // The §4 evaluation at this template's revenue —
                             // exactly what the real coinbase build runs.
@@ -532,7 +531,7 @@ where
                         },
                         None => Vec::new(),
                     },
-                    _ => {
+                    MiningMode::Solo => {
                         // Solo: exactly what the payout resolver would build.
                         // This used to be a second implementation reading the
                         // PPLNS fee config, so a solo miner saw a fee output
@@ -578,11 +577,12 @@ where
                 };
                 Ok(ClientBlockTemplateResponse {
                     block_template: template,
-                    mode,
+                    mode: resolved.mode.as_str(),
                     payout_information: payouts,
-                    group_id: group_id.map(|g| g.to_string()),
+                    group_id: resolved.group_id.map(|g| g.to_string()),
                     block_hex,
                     coinbase_tx_hex,
+                    preview_finder: previewed_finder,
                 })
             },
         )
@@ -596,6 +596,35 @@ where
 /// is byte-stable across renders. The block carries every tx the
 /// template proposed plus the just-built coinbase, with a zero nonce
 /// in the header (preview, never submitted).
+/// Who the Group-Solo preview names as the block's finder.
+///
+/// A member's miner mines a job that names that member as finder, so for an
+/// address with shares in the current window the preview is its own job.
+/// An address with no shares there cannot find the block; naming it would
+/// pay it a finder bonus no real coinbase will pay. The preview then shows
+/// the most likely block instead: the member with the largest window share
+/// as finder. With no shares in the window at all, the asking address
+/// stays the finder (that is how the first block of an empty window is
+/// built).
+fn preview_finder(
+    requester: &bp_common::AddressId,
+    window: &std::collections::HashMap<String, f64>,
+) -> bp_common::AddressId {
+    if window
+        .get(requester.as_str())
+        .is_some_and(|shares| *shares > 0.0)
+    {
+        return requester.clone();
+    }
+    window
+        .iter()
+        .filter(|(_, shares)| **shares > 0.0)
+        // Ties resolve by address so the preview does not flip between polls.
+        .max_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| b.cmp(a)))
+        .and_then(|(address, _)| bp_common::AddressId::new(address.clone()).ok())
+        .unwrap_or_else(|| requester.clone())
+}
+
 fn assemble_block_preview(
     template: &serde_json::Value,
     payouts: &[PayoutInfoEntry],
@@ -963,10 +992,12 @@ fn format_uptime(ms: u64) -> String {
 // (the in-progress slot) are excluded so the tail of the chart never
 // shows a half-filled bucket.
 
-use crate::time_range::{chart_slot_boundaries, ChartPoint, Range, SlotCounts, SlotDataResponse};
+use crate::time_range::{
+    accepted_slot_data, chart_slot_boundaries, fold_into_slots, ChartPoint, Range, SlotDataResponse,
+};
 use axum::extract::Query;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -974,7 +1005,8 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-use crate::time_range::{DIFFICULTY_1, SLOT_SECONDS};
+use crate::time_range::SLOT_SECONDS;
+use bp_common::HASHES_PER_DIFFICULTY_1;
 
 async fn chart<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -1000,8 +1032,8 @@ where
                 .into_iter()
                 .filter(|r| r.time < cutoff)
                 .map(|r| ChartPoint {
-                    label: crate::time_range::format_slot_label(r.time),
-                    data: (r.accepted as f64 * DIFFICULTY_1 / SLOT_SECONDS).round(),
+                    label: crate::time_range::format_iso_ms(r.time),
+                    data: (r.accepted as f64 * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
                 })
                 .collect())
         })
@@ -1027,27 +1059,10 @@ where
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Accepted, async move {
             let since = bp_common::now_ms() - range.window_ms();
             let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut buckets: BTreeMap<i64, f64> = boundaries.iter().map(|&b| (b, 0.0)).collect();
-            for r in rows {
-                let k = crate::time_range::bucket_key(r.time, range.slot_size_ms());
-                if let Some(v) = buckets.get_mut(&k) {
-                    *v += r.accepted as f64;
-                }
-            }
-            Ok(SlotDataResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts = BTreeMap::new();
-                        counts.insert("accepted".into(), buckets.get(&b).copied().unwrap_or(0.0));
-                        SlotCounts {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
+            Ok(accepted_slot_data(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.accepted as f64)),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
@@ -1080,45 +1095,36 @@ where
             // distinct counting stays in-process; we just avoid shipping the
             // full 17-column stats row for every session in the window.
             let rows = bp_db::find_pool_worker_rows_since(&s.pool, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut addresses_by_slot: BTreeMap<i64, std::collections::HashSet<String>> =
-                BTreeMap::new();
-            let mut workers_by_slot: BTreeMap<i64, std::collections::HashSet<(String, String)>> =
-                BTreeMap::new();
-            for r in &rows {
-                let k = crate::time_range::bucket_key(r.time, range.slot_size_ms());
-                addresses_by_slot
-                    .entry(k)
-                    .or_default()
-                    .insert(r.address.clone());
-                workers_by_slot
-                    .entry(k)
-                    .or_default()
-                    .insert((r.address.clone(), r.client_name.clone()));
-            }
-            Ok(SlotDataResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts = BTreeMap::new();
-                        counts.insert(
-                            "addresses".into(),
-                            addresses_by_slot.get(&b).map(|s| s.len()).unwrap_or(0) as f64,
-                        );
-                        counts.insert(
-                            "workers".into(),
-                            workers_by_slot.get(&b).map(|s| s.len()).unwrap_or(0) as f64,
-                        );
-                        SlotCounts {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
+            Ok(worker_slots(
+                &chart_slot_boundaries(since),
+                rows.iter()
+                    .map(|r| (r.time, (r.address.as_str(), r.client_name.as_str()))),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// `(time, (address, worker))` samples → distinct addresses + workers per slot.
+fn worker_slots<'a>(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, (&'a str, &'a str))>,
+) -> SlotDataResponse {
+    type Seen = (HashSet<String>, HashSet<(String, String)>);
+    let slots = fold_into_slots(
+        boundaries,
+        samples,
+        |(addresses, workers): &mut Seen, (address, worker)| {
+            addresses.insert(address.to_string());
+            workers.insert((address.to_string(), worker.to_string()));
+        },
+    );
+    SlotDataResponse::from_slots(slots, |(addresses, workers)| {
+        BTreeMap::from([
+            ("addresses".to_string(), addresses.len() as f64),
+            ("workers".to_string(), workers.len() as f64),
+        ])
+    })
 }
 
 // ─── /api/info/rejected ───────────────────────────────────────────
@@ -1180,36 +1186,95 @@ where
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Rejected, async move {
             let since = bp_common::now_ms() - range.window_ms();
             let rows = bp_db::find_pool_rejected_statistics_since(&s.pool, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut buckets: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
-            for r in rows {
-                let k = crate::time_range::bucket_key(r.time, range.slot_size_ms());
-                let key = normalise_reject_reason(&r.reason).to_string();
-                *buckets.entry(k).or_default().entry(key).or_default() += r.count as f64;
-            }
-            Ok(SlotDataResponse {
-                slot_data: boundaries
-                    .iter()
-                    .map(|&b| {
-                        let mut counts: BTreeMap<String, f64> = REJECT_REASON_KEYS
-                            .iter()
-                            .map(|&k| (k.to_string(), 0.0))
-                            .collect();
-                        if let Some(seen) = buckets.remove(&b) {
-                            for (k, v) in seen {
-                                counts.insert(k, v);
-                            }
-                        }
-                        SlotCounts {
-                            time: crate::time_range::format_slot_label(b),
-                            counts,
-                        }
-                    })
-                    .collect(),
-            })
+            Ok(rejected_slots(
+                &chart_slot_boundaries(since),
+                rows.iter()
+                    .map(|r| (r.time, (r.reason.as_str(), r.count as f64))),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+/// `(time, (reason, count))` samples → per-reason counts per slot.
+fn rejected_slots<'a>(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, (&'a str, f64))>,
+) -> SlotDataResponse {
+    let slots = fold_into_slots(
+        boundaries,
+        samples,
+        |seen: &mut BTreeMap<String, f64>, (reason, count)| {
+            *seen
+                .entry(normalise_reject_reason(reason).to_string())
+                .or_default() += count;
+        },
+    );
+    SlotDataResponse::from_slots(slots, with_all_reasons)
+}
+
+/// Every key of [`REJECT_REASON_KEYS`], holding what `seen` recorded for
+/// it or the default, plus anything else `seen` recorded.
+fn with_all_reasons<X: Default>(seen: BTreeMap<String, X>) -> BTreeMap<String, X> {
+    let mut counts: BTreeMap<String, X> = REJECT_REASON_KEYS
+        .iter()
+        .map(|&k| (k.to_string(), X::default()))
+        .collect();
+    counts.extend(seen);
+    counts
+}
+
+/// Per-reason rejected-share bucket of the per-address and per-group
+/// `/rejected` endpoints — `count` is the raw rejection count,
+/// `diffMinusOne` is the share-difficulty sum at the moment of rejection.
+#[derive(Serialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RejectCounts {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    count: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
+    diff_minus_one: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RejectedSlot {
+    time: String,
+    counts: BTreeMap<String, RejectCounts>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RejectSlotsResponse {
+    slot_data: Vec<RejectedSlot>,
+}
+
+/// `(time, (reason, count, diff1))` samples → per-reason counts and
+/// diff-1 sums per slot, every known reason present.
+pub(crate) fn rejected_by_reason_slots<'a>(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, (&'a str, f64, f64))>,
+) -> RejectSlotsResponse {
+    let slots = fold_into_slots(
+        boundaries,
+        samples,
+        |seen: &mut BTreeMap<String, RejectCounts>, (reason, count, diff1)| {
+            let entry = seen
+                .entry(normalise_reject_reason(reason).to_string())
+                .or_default();
+            entry.count += count;
+            entry.diff_minus_one += diff1;
+        },
+    );
+    RejectSlotsResponse {
+        slot_data: slots
+            .into_iter()
+            .map(|(b, seen)| RejectedSlot {
+                time: crate::time_range::format_iso_ms(b),
+                counts: with_all_reasons(seen),
+            })
+            .collect(),
+    }
 }
 
 // ─── /api/info/shares ─────────────────────────────────────────────
@@ -1432,7 +1497,7 @@ where
 //   - 10-min slots
 //   - hide both the in-progress and just-ended slot (via the same
 //     visibility-cutoff helper the writer uses)
-//   - hashrate = ROUND(diff * DIFFICULTY_1 / 600)
+//   - hashrate = ROUND(diff * HASHES_PER_DIFFICULTY_1 / 600)
 
 async fn chart_mode<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -1464,14 +1529,121 @@ where
                 label: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(r.time)
                     .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
                     .unwrap_or_default(),
-                data: ((r.diff as f64) * DIFFICULTY_1 / SLOT_SECONDS).round(),
+                data: ((r.diff as f64) * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
             })
             .collect(),
     ))
 }
 
 #[cfg(test)]
+mod slot_json_tests {
+    use super::*;
+
+    const S: i64 = 600_000;
+    const T0: i64 = 1_700_000_400_000;
+    const BOUNDARIES: [i64; 3] = [T0, T0 + S, T0 + 2 * S];
+
+    fn json<T: serde::Serialize>(v: &T) -> String {
+        serde_json::to_string(v).unwrap()
+    }
+
+    /// `/api/info/accepted`.
+    #[test]
+    fn accepted_json_is_unchanged() {
+        let samples = vec![
+            (T0, 1.5),
+            (T0, 0.1_f32 as f64),
+            (T0 + S + 123, 2.0),
+            (T0 - S, 99.0),
+            (T0 + 3 * S, 77.0),
+        ];
+        assert_eq!(
+            json(&accepted_slot_data(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"accepted":1.6000000014901161}},{"time":"2023-11-14T22:30:00.000Z","counts":{"accepted":2}},{"time":"2023-11-14T22:40:00.000Z","counts":{"accepted":0}}]}"#
+        );
+    }
+
+    /// `/api/info/workers` — distinct addresses and (address, worker) pairs.
+    #[test]
+    fn workers_json_is_unchanged() {
+        let samples = vec![
+            (T0, ("a1", "w1")),
+            (T0, ("a1", "w2")),
+            (T0, ("a2", "w1")),
+            (T0, ("a1", "w1")),
+            (T0 + S + 9, ("a3", "w1")),
+            (T0 + 3 * S, ("a9", "w9")),
+        ];
+        assert_eq!(
+            json(&worker_slots(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"addresses":2,"workers":3}},{"time":"2023-11-14T22:30:00.000Z","counts":{"addresses":1,"workers":1}},{"time":"2023-11-14T22:40:00.000Z","counts":{"addresses":0,"workers":0}}]}"#
+        );
+    }
+
+    /// `/api/info/rejected` — counts only, every known reason pre-filled.
+    #[test]
+    fn rejected_json_is_unchanged() {
+        let samples = vec![
+            (T0, ("job-not-found", 2.0)),
+            (T0, ("JobNotFound", 1.0)),
+            (T0, ("low-difficulty", 0.1_f32 as f64)),
+            (T0, ("something-new", 3.0)),
+            (T0 + S + 7, ("Stale", 4.0)),
+            (T0 + 3 * S, ("Stale", 50.0)),
+        ];
+        assert_eq!(
+            json(&rejected_slots(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":3,"LowDifficultyShare":0.10000000149011612,"NotSubscribed":0,"OtherUnknown":3,"Stale":0,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}},{"time":"2023-11-14T22:30:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":0,"LowDifficultyShare":0,"NotSubscribed":0,"OtherUnknown":0,"Stale":4,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}},{"time":"2023-11-14T22:40:00.000Z","counts":{"DuplicateShare":0,"JobNotFound":0,"LowDifficultyShare":0,"NotSubscribed":0,"OtherUnknown":0,"Stale":0,"UnauthorizedWorker":0,"VersionRollingNotAllowed":0}}]}"#
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    /// `previewFinder` is present for Group-Solo only; every other mode's
+    /// JSON stays exactly as it was (no null, no key).
+    #[test]
+    fn preview_finder_field_is_absent_unless_set() {
+        let response = |finder: Option<&str>| ClientBlockTemplateResponse {
+            block_template: serde_json::json!({}),
+            mode: "pplns",
+            payout_information: Vec::new(),
+            group_id: None,
+            block_hex: String::new(),
+            coinbase_tx_hex: String::new(),
+            preview_finder: finder.map(str::to_string),
+        };
+        let without = serde_json::to_value(response(None)).unwrap();
+        assert!(without.get("previewFinder").is_none());
+        let with = serde_json::to_value(response(Some("bc1qfinder"))).unwrap();
+        assert_eq!(with["previewFinder"], "bc1qfinder");
+    }
+
+    #[test]
+    fn preview_finder_is_the_asker_only_when_it_has_window_shares() {
+        use bp_common::AddressId;
+        use std::collections::HashMap;
+        let asker =
+            AddressId::new("bc1qs84n0jqe6qdu4dzk4vjjfnnk9n8ulz5v72tts8".to_string()).unwrap();
+        let top = "bc1qxd6lw5eeuv82sjl6qelac6er98grz5cnjc53v8".to_string();
+        let small = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string();
+
+        // Mining: the preview is the asker's own job.
+        let mining = HashMap::from([(asker.as_str().to_string(), 5.0), (top.clone(), 3_000.0)]);
+        assert_eq!(preview_finder(&asker, &mining), asker);
+
+        // Not mining: the largest window share is the finder, not the asker.
+        let idle = HashMap::from([(top.clone(), 3_673_618_500.0), (small, 1_172.0)]);
+        assert_eq!(preview_finder(&asker, &idle).as_str(), top);
+
+        // A zero entry is no share either.
+        let zero = HashMap::from([(asker.as_str().to_string(), 0.0), (top.clone(), 10.0)]);
+        assert_eq!(preview_finder(&asker, &zero).as_str(), top);
+
+        // Empty window: nobody else to name, the asker bootstraps it.
+        assert_eq!(preview_finder(&asker, &HashMap::new()), asker);
+    }
+
     use super::*;
 
     #[test]

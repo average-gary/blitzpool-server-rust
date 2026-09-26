@@ -14,13 +14,11 @@
 //! debounces flapping connections and collapses bursts, before they
 //! reach the fan-out.
 
-mod config;
 mod device_gate;
 mod orchestrator;
 
-pub use config::DispatcherConfig;
 pub use device_gate::{
     DeviceAggregate, DeviceGateConfig, DeviceKey, DeviceLiveness, DeviceLivenessLookup,
-    DeviceNotice, DeviceStatusGate, NoReportedStateStore, Notified, ReportedStateStore,
+    DeviceNotice, DeviceStatusGate, ReportedStateStore,
 };
 pub use orchestrator::{DeviceStatusEvent, NotificationDispatcher};

@@ -36,22 +36,18 @@
 
 use std::sync::{Arc, RwLock};
 
-use bp_common::{MiningMode, StreamKind};
-use bp_config::{AppConfig, Role};
+use bp_common::MiningMode;
+use bp_config::AppConfig;
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_share::Difficulty;
-use bp_share_hook::SharedSessionPersistence;
-use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
+use bp_stratum_v2::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
 use bp_stratum_v2::hooks::{
-    AcceptedShareSink as Sv2AcceptedSink, BlockSubmissionSink as Sv2BlockSink, MiningServerHooks,
-    PayoutResolver, RejectedShareSink as Sv2RejectedSink, SessionPersistence as Sv2SessionPersist,
+    BlockSubmissionSink as Sv2BlockSink, MiningServerHooks, PayoutResolver,
 };
 use bp_stratum_v2::mining::client::PortConfig as Sv2PortConfig;
-use bp_stratum_v2::noise::{NoiseConfig, NoiseConfigError, DEFAULT_CERT_VALIDITY};
+use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::server::{ServerConfig as Sv2ServerConfig, StratumV2MiningServer};
-use bp_stratum_v2::shared_adapter::{
-    Sv2AcceptedShareAdapter, Sv2RejectedShareAdapter, Sv2SessionPersistenceAdapter,
-};
 use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -63,14 +59,9 @@ use tracing::{info, warn};
 // canonical wire-format `Secp256k1SecretKey::FromStr` parses).
 
 use crate::boot::FoundationHandles;
-use crate::engines::{BlitzpoolModeGate, EngineHandles};
+use crate::engines::EngineHandles;
 use crate::group_service::SharedGroupService;
-use crate::network::config_network_to_bitcoin;
-use crate::payout_identities::PayoutIdentityDirectory;
-use crate::stratum_v1::{
-    self, BlockpartyAdminLookup, BlockpartyApiAdminLookup, GroupLookup,
-    ModeGatePopulatingPersistence,
-};
+use crate::stratum_v1::{self, GroupLookup, ModeGatePopulatingPersistence};
 
 /// Per-port SV2 mining server bundle. One entry per port (mirrors
 /// [`crate::stratum_v1::Sv1PortServer`]). Carries the SV2 `PortConfig`
@@ -84,16 +75,14 @@ pub(crate) struct Sv2PortServer {
 
 #[derive(Debug, Error)]
 pub(crate) enum StratumV2SpawnError {
-    #[error("sv2 noise config invalid: {0}")]
-    Noise(#[from] NoiseConfigError),
     #[error("sv2 authority private key hex must be exactly 64 hex chars (32 bytes): got {0}")]
-    AuthorityPrivkeyHexLen(usize),
+    PrivkeyHexLen(usize),
     #[error("sv2 authority private key hex didn't decode: {0}")]
-    AuthorityPrivkeyHex(String),
+    PrivkeyHex(String),
     #[error("sv2 authority private key bytes didn't parse: {0}")]
-    AuthorityPrivkey(String),
+    InvalidPrivkey(String),
     #[error("sv2 needs [sv2].authority_privkey_hex (32-byte hex) — none configured")]
-    AuthorityKeyMissing,
+    PrivkeyMissing,
 }
 
 /// Construct the shared [`JdpDeclaredJobRegistry`] used by every SV2
@@ -107,40 +96,34 @@ pub(crate) fn build_bridge() -> Arc<RwLock<JdpDeclaredJobRegistry>> {
 
 /// Build the pool-wide [`NoiseConfig`] from `[sv2]`. Decodes
 /// `authority_privkey_hex` (raw 32-byte secp256k1 secret in hex),
-/// derives the matching x-only public key, and stamps the default
-/// 12-hour cert validity.
+/// and derives the matching x-only public key.
 pub(crate) fn build_noise_config(cfg: &AppConfig) -> Result<NoiseConfig, StratumV2SpawnError> {
     let hex_str = cfg
         .sv2
         .authority_privkey_hex
         .as_deref()
-        .ok_or(StratumV2SpawnError::AuthorityKeyMissing)?;
+        .ok_or(StratumV2SpawnError::PrivkeyMissing)?;
     if hex_str.len() != 64 {
-        return Err(StratumV2SpawnError::AuthorityPrivkeyHexLen(hex_str.len()));
+        return Err(StratumV2SpawnError::PrivkeyHexLen(hex_str.len()));
     }
-    let raw_bytes: Vec<u8> = (0..hex_str.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex_str[i..i + 2], 16)
-                .map_err(|e| StratumV2SpawnError::AuthorityPrivkeyHex(e.to_string()))
-        })
-        .collect::<Result<_, _>>()?;
+    let raw_bytes =
+        hex::decode(hex_str).map_err(|e| StratumV2SpawnError::PrivkeyHex(e.to_string()))?;
     // Round-trip via base58check — stratum-apps's `FromStr` parses
     // that form, which avoids depending on a specific `secp256k1`
     // version (stratum-apps pins 0.28; the workspace uses 0.29).
     let b58 = bs58::encode(&raw_bytes).with_check().into_string();
     let authority_prv: Secp256k1SecretKey =
         b58.parse().map_err(|e: stratum_apps::key_utils::Error| {
-            StratumV2SpawnError::AuthorityPrivkey(format!("{e:?}"))
+            StratumV2SpawnError::InvalidPrivkey(format!("{e:?}"))
         })?;
     let authority_pub: Secp256k1PublicKey = authority_prv.into();
-    NoiseConfig::new(authority_pub, authority_prv, DEFAULT_CERT_VALIDITY).map_err(Into::into)
+    Ok(NoiseConfig::new(authority_pub, authority_prv))
 }
 
 /// Build the SV2 [`ServerConfig`](Sv2ServerConfig) from the network +
 /// pool identifier in the toplevel `AppConfig`.
 pub(crate) fn build_server_config(cfg: &AppConfig) -> Sv2ServerConfig {
-    let network = config_network_to_bitcoin(cfg.network);
+    let network = crate::boot::bitcoin_network(cfg.network);
     let mut sc = Sv2ServerConfig::defaults_for(network);
     sc.pool_identifier = cfg.pool_identifier.clone();
     sc.debug_messages = cfg.debug.stratum_wire_logs;
@@ -169,10 +152,7 @@ pub(crate) fn build_per_port_servers(
     // in `crate::stratum`. See SV1's `build_per_port_servers`.
     rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
-    gate: Option<(
-        Arc<crate::device_status_gate::Gate>,
-        crate::device_status_gate::SubscribedAddresses,
-    )>,
+    device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
     settle: crate::settlement::SettlementSignal,
@@ -183,59 +163,33 @@ pub(crate) fn build_per_port_servers(
     };
 
     let server_config = build_server_config(cfg);
-    let network = config_network_to_bitcoin(cfg.network);
+    let network = crate::boot::bitcoin_network(cfg.network);
     // Use SV1's port enumeration as the canonical port list (same TCP
     // listener serves SV1 + SV2 — protocol-detect dispatches in
     // `crate::stratum`).
     let sv1_port_configs = stratum_v1::build_port_configs(cfg);
     let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
-    let mode_gate = engines.mode_gate.clone();
     // TDP submit + (engine ledger + dispatcher notification)
     // fan-out. The SV2 ShareAccept now carries the per-job pinned
     // `coinbase_tx_value_remaining`, so the engine ledger-write fires for
     // SV2-found blocks just like SV1; the dispatcher notification fires too.
-    let mut sink = crate::block_sink::TdpBlockSubmissionSink::new(tdp.clone())
-        .with_network(network)
-        .with_alt_streams(foundation.alt_tdp.clone())
-        .with_fanout(
-            mode_gate.clone(),
-            engines.pplns.clone(),
-            engines.group_solo.clone(),
-            dispatcher.clone(),
-            foundation.bitcoin_rpc.clone(),
-        )
-        .with_blockparty(engines.blockparty.clone())
-        .with_pool(foundation.db.pool().clone())
-        .with_redis(foundation.redis.clone())
-        .with_settle_handle(settle);
-    // The front routes block-found events to the stream — the payout Satellite
-    // applies the ledger and the notify Satellite fans out the push. A front
-    // always produces (front + payout can't share a process; see the boot
-    // guard in main.rs), so this gates on the front role alone.
-    if cfg.has_role(Role::Front) {
-        sink = sink.with_block_found_producer(StreamProducer::new(
-            foundation.redis.clone(),
-            BLOCK_FOUND_STREAM_KEY,
-        ));
-    }
-    let block_sink: Arc<dyn Sv2BlockSink> = sink.into_sv2_arc();
-
-    // Device-status sink. Forwards ChannelOpened / ChannelClosed.
-    // With an in-process dispatcher (a front co-located with the `notify` role)
-    // it fires directly; without one the front publishes to the `device:status`
-    // stream so the Satellite fans it out — never a silent drop. (Stratum only
-    // spawns on the front, so `None` here means "no co-located dispatcher", not
-    // "notifications off".)
-    let device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink> = match gate {
-        Some((g, subs)) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
-            g, subs,
-        )),
-        None => Arc::new(crate::device_status::ProducingDeviceStatusSink::new(
-            foundation.redis.clone(),
-        )),
-    };
+    let block_sink: Arc<dyn Sv2BlockSink> = crate::block_sink::TdpBlockSubmissionSink::wired(
+        tdp.clone(),
+        cfg,
+        foundation,
+        engines,
+        dispatcher.clone(),
+        settle,
+    )
+    .into_sv2_arc();
 
     let mut out: Vec<Sv2PortServer> = Vec::with_capacity(sv1_port_configs.len());
+
+    // One extranonce allocator shared across every SV2 port, as SV1 does —
+    // a separate one per port starts each at the same prefix, and two PPLNS
+    // ports hash the same coinbase.
+    let extranonce = SharedExtranonceAllocator::new_default_on_worker(SV2_WORKER_ID);
+
     for sv1_port_config in sv1_port_configs {
         let hooks = build_port_hooks(
             sv1_port_config.payout_mode,
@@ -244,35 +198,21 @@ pub(crate) fn build_per_port_servers(
             block_sink.clone(),
             engines,
             lookup.clone(),
-            mode_gate.clone(),
-            engines.payout_identities.clone(),
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
             custom_extranonce.clone(),
         );
 
-        // Subscribe + snapshot — broadcast catches future updates,
-        // snapshot covers the bitcoin-core bootstrap pair the broadcast
-        // typically misses (sent before this subscriber installs). See
-        // memory `feedback-tdp-initial-template-drain`.
-        let updates_rx = tdp.subscribe();
-        let initial_snapshot = tdp.current_snapshot();
-        // Every port carries ALL alt streams — mode is per-address, not
-        // per-port, so a Group-Solo / Blockparty member can connect on any
-        // port and must be routable onto its stream.
-        let alt_streams: Vec<(StreamKind, _, _)> = foundation
-            .alt_tdp
-            .iter()
-            .map(|(kind, handle)| (*kind, handle.subscribe(), handle.current_snapshot()))
-            .collect();
+        let templates = crate::stratum::PortTemplates::subscribe(tdp, foundation);
         let server = StratumV2MiningServer::spawn(
             server_config.clone(),
             noise_config.clone(),
-            updates_rx,
-            initial_snapshot,
-            alt_streams,
+            templates.updates_rx,
+            templates.initial_snapshot,
+            templates.alt_streams,
             hooks,
             bridge.clone(),
+            extranonce.clone(),
             job_cache.clone(),
         );
         // Same per-port toml block drives both SV1 + SV2. start_difficulty
@@ -297,6 +237,10 @@ pub(crate) fn build_per_port_servers(
             target_shares_per_minute: sv1_port_config.target_shares_per_minute,
             vardiff_interval_ms: cfg.stratum.difficulty_check_interval_ms,
             vardiff_silence_easing: cfg.stratum.vardiff_silence_easing_enabled,
+            job_lifecycle: LifecycleConfig {
+                retention_ms: cfg.stratum.job_retention_ms,
+                ..LifecycleConfig::DEFAULT
+            },
         };
         info!(
             port = sv1_port_config.port,
@@ -324,49 +268,29 @@ fn build_port_hooks(
     block_sink: Arc<dyn Sv2BlockSink>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
-    mode_gate: Arc<BlitzpoolModeGate>,
-    payout_identities: Arc<PayoutIdentityDirectory>,
-    device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
+    device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
 ) -> MiningServerHooks {
     // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
-    let accepted: Arc<dyn Sv2AcceptedSink> = Arc::new(Sv2AcceptedShareAdapter::new(
-        engines
-            .accepted_sink
-            .clone()
-            .expect("front mode builds the accepted composite"),
-    ));
-    let rejected: Arc<dyn Sv2RejectedSink> = Arc::new(Sv2RejectedShareAdapter::new(
-        engines
-            .rejected_sink
-            .clone()
-            .expect("front mode builds the rejected composite"),
-    ));
-
-    let blockparty_lookup: Option<Arc<dyn BlockpartyAdminLookup>> = engines
-        .blockparty
-        .clone()
-        .map(|bp| Arc::new(BlockpartyApiAdminLookup(bp)) as Arc<dyn BlockpartyAdminLookup>);
-    let mode_gate_persistence: Arc<dyn SharedSessionPersistence> =
-        Arc::new(ModeGatePopulatingPersistence::new(
-            port_payout_mode,
-            mode_gate,
-            payout_identities,
-            group_lookup,
-            blockparty_lookup,
-            live_sessions,
-        ));
-    let session: Arc<dyn Sv2SessionPersist> =
-        Arc::new(Sv2SessionPersistenceAdapter::new(mode_gate_persistence));
-
     MiningServerHooks {
         payout_resolver,
         block_sink,
-        accepted_sink: accepted,
-        rejected_sink: rejected,
-        session_persistence: session,
+        accepted_sink: engines
+            .accepted_sink
+            .clone()
+            .expect("front mode builds the accepted composite"),
+        rejected_sink: engines
+            .rejected_sink
+            .clone()
+            .expect("front mode builds the rejected composite"),
+        session_persistence: ModeGatePopulatingPersistence::for_port(
+            port_payout_mode,
+            engines,
+            group_lookup,
+            live_sessions,
+        ),
         device_status_sink,
         custom_extranonce,
         rotating_intake: Some(rotating_intake),
@@ -387,7 +311,6 @@ mod tests {
             network: Network::Regtest,
             pool_identifier: "Blitzpool-Test".into(),
             pool_base_url: None,
-            api_secure: false,
             roles: Vec::new(),
             // Default: rotating identities off — these tests assert SV2's
             // existing static-address behaviour.
@@ -399,7 +322,6 @@ mod tests {
                 port: 18443,
                 timeout_ms: 1000,
             },
-            bitcoin_zmq: None,
             tdp: TomlTdpConfig {
                 socket_path: PathBuf::from("/tmp/bp-tdp.sock"),
                 fee_threshold_sats: None,
@@ -408,7 +330,6 @@ mod tests {
                 staleness_threshold_secs: 120,
             },
             database: DatabaseConfig {
-                driver: "postgres".into(),
                 host: "h".into(),
                 port: 5432,
                 user: "u".into(),
@@ -416,17 +337,14 @@ mod tests {
                 database: "d".into(),
                 ssl: false,
                 pool_size: 1,
-                max_query_time_ms: 30_000,
                 acquire_timeout_ms: 1_000,
                 idle_timeout_ms: 1_000,
-                run_migrations: false,
             },
             redis: RedisConfig {
                 host: "h".into(),
                 port: 6379,
                 password: None,
                 db: 0,
-                ttl_secs: 60,
             },
             api: ApiConfig {
                 port: 3334,
@@ -446,8 +364,6 @@ mod tests {
             sv2: Sv2Config {
                 jdp_validation_socket_path: None,
                 authority_privkey_hex: privkey,
-                ed25519_authority_seed_hex: None,
-                cert_signed_part: None,
                 jdp_enabled: false,
                 jdp_port: None,
                 jdp_orphan_submitblock: false,
@@ -463,7 +379,6 @@ mod tests {
                 fee_percent: 1.5,
                 coinbase_weight_budget: 100_000,
                 min_difficulty: 1024,
-                warmup_shares: 5,
                 min_payout_sats: 100_000,
                 dust_sweep_enabled: true,
                 abandoned_balance_days: 90,
@@ -476,7 +391,6 @@ mod tests {
             blockparty: None,
             notifications: Default::default(),
             smtp: None,
-            aggregation: Default::default(),
             metrics: Default::default(),
         }
     }
@@ -492,7 +406,6 @@ mod tests {
     fn build_noise_config_decodes_hex_secret() {
         let cfg = min_cfg_with_sv2(Some(TEST_PRIVKEY_HEX.to_string()));
         let noise = build_noise_config(&cfg).expect("must parse");
-        assert_eq!(noise.cert_validity(), DEFAULT_CERT_VALIDITY);
         // Public key derived from secret must be non-zero.
         assert_ne!((*noise.authority_pub()).into_bytes(), [0u8; 32]);
     }
@@ -502,7 +415,7 @@ mod tests {
         let cfg = min_cfg_with_sv2(None);
         assert!(matches!(
             build_noise_config(&cfg),
-            Err(StratumV2SpawnError::AuthorityKeyMissing)
+            Err(StratumV2SpawnError::PrivkeyMissing)
         ));
     }
 
@@ -511,7 +424,7 @@ mod tests {
         let cfg = min_cfg_with_sv2(Some("aa".to_string()));
         assert!(matches!(
             build_noise_config(&cfg),
-            Err(StratumV2SpawnError::AuthorityPrivkeyHexLen(2))
+            Err(StratumV2SpawnError::PrivkeyHexLen(2))
         ));
     }
 
@@ -520,7 +433,18 @@ mod tests {
         let cfg = min_cfg_with_sv2(Some("g".repeat(64)));
         assert!(matches!(
             build_noise_config(&cfg),
-            Err(StratumV2SpawnError::AuthorityPrivkeyHex(_))
+            Err(StratumV2SpawnError::PrivkeyHex(_))
+        ));
+    }
+
+    /// 64 bytes that are not 64 ASCII characters: a multi-byte character
+    /// straddling a two-character hex pair is a decode error, not a panic.
+    #[test]
+    fn build_noise_config_rejects_non_ascii() {
+        let cfg = min_cfg_with_sv2(Some(format!("€{}", "a".repeat(61))));
+        assert!(matches!(
+            build_noise_config(&cfg),
+            Err(StratumV2SpawnError::PrivkeyHex(_))
         ));
     }
 

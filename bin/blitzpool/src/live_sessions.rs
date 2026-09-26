@@ -1015,9 +1015,7 @@ mod tests {
         let device = (MINER_ADDR.to_string(), worker.to_string());
 
         let mut hooks = bp_stratum_v1::ServerHooks::no_op();
-        hooks.session_persistence = Arc::new(bp_stratum_v1::Sv1SessionPersistenceAdapter::new(
-            Arc::clone(&reg),
-        ));
+        hooks.session_persistence = Arc::clone(&reg) as _;
 
         // The template broadcast is deliberately never fed. Authorize does
         // not need a template — `apply_outcome` skips the post-authorize

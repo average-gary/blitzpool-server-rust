@@ -8,81 +8,31 @@
 //! here are the byte-level helpers both the base-protocol allocate path and
 //! the declare-time validator need:
 //!
-//! - [`encode_coinbase_outputs`] — `(address, sats)` list → consensus
-//!   `Vec<TxOut>` bytes (`AllocateMiningJobToken.Success.coinbase_tx_outputs`
-//!   on the non-negotiated base path).
-//! - [`designated_payout_script`] / [`pays_designated_output`] — the two
-//!   halves of the SV2 JDP/AllocateMiningJobToken.Success base-protocol
-//!   convention: which script the pool designated, and whether a coinbase
-//!   honours it.
+//! - [`designated_output_blob`] / [`designated_payout_script`] /
+//!   [`pays_designated_output`] — the SV2 JDP/AllocateMiningJobToken.Success
+//!   base-protocol convention: the blob that designates the pool's payout
+//!   script, reading that script back, and whether a coinbase honours it.
 //! - [`declared_coinbase_tx`] — the declared prefix/suffix pair → the
 //!   rebuilt transaction, its extranonce slot width and its committed
 //!   scriptSig prefix, fail-closed.
 //! - [`PayoutBooking`] — the accounting identity a proven declaration
 //!   carries to the block-found path.
 
-use bitcoin::consensus::Encodable;
-use bitcoin::{Amount, Network, TxOut};
-use bp_common::{AddressId, Sats};
-use bp_mining_job::address_to_script;
-
-// ── DynamicOutput ────────────────────────────────────────────────────
-
-/// One entry in a concrete coinbase output list (base-path allocate).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DynamicOutput {
-    pub address: AddressId,
-    pub sats: Sats,
-}
-
-// ── Errors ───────────────────────────────────────────────────────────
-
-#[derive(Debug, thiserror::Error)]
-pub enum EncodeError {
-    /// Address didn't parse or didn't match the configured network
-    /// (delegated to `bp_mining_job::address_to_script`).
-    #[error("address-to-script failed: {0}")]
-    InvalidAddress(String),
-}
-
-/// Serialise `outputs` as a consensus-encoded `Vec<TxOut>`.
-///
-/// Layout (per Bitcoin consensus):
-/// - `VarInt(outputs.len())`
-/// - Per output: `u64-LE value` + `VarInt(script_len)` + `script_pubkey`
-///
-/// Empty `outputs` returns `[0x00]` (single varint zero) — the
-/// consensus encoding of an empty vector.
-pub fn encode_coinbase_outputs(
-    network: Network,
-    outputs: &[DynamicOutput],
-) -> Result<Vec<u8>, EncodeError> {
-    if outputs.is_empty() {
-        return Ok(vec![0x00]);
-    }
-    // Build TxOuts, then consensus-encode the whole vector.
-    let mut txouts = Vec::with_capacity(outputs.len());
-    for out in outputs {
-        let script = address_to_script(network, out.address.as_str())
-            .map_err(|e| EncodeError::InvalidAddress(format!("{e}")))?;
-        let value_sats = out.sats.to_i64().max(0) as u64;
-        txouts.push(TxOut {
-            value: Amount::from_sat(value_sats),
-            script_pubkey: script,
-        });
-    }
-    let mut buf = Vec::with_capacity(64 + outputs.len() * 40);
-    // Same answer as everywhere else in this crate that consensus-encodes
-    // into a `Vec<u8>` (`WeightedOutput::to_wire_txout`, the declared-job
-    // fixtures): the writer has no failure mode, so an error variant for it
-    // would be one the caller can never see.
-    txouts
-        .consensus_encode(&mut buf)
-        .expect("Vec<u8> writer cannot fail");
-    Ok(buf)
-}
+use bitcoin::{Amount, Script, TxOut};
 
 // ── SV2 JDP/AllocateMiningJobToken.Success base-protocol payout output ───
+
+/// The `AllocateMiningJobToken.Success.coinbase_tx_outputs` blob on the
+/// base path: ONE output paying `script`, at 0 sats — SV2
+/// JDP/AllocateMiningJobToken.Success leaves the amount to the JDC and
+/// designates the first output's script as the pool payout output. Read back
+/// by [`designated_payout_script`].
+pub fn designated_output_blob(script: &Script) -> Vec<u8> {
+    bitcoin::consensus::serialize(&vec![TxOut {
+        value: Amount::ZERO,
+        script_pubkey: script.to_owned(),
+    }])
+}
 
 /// The script the pool designated as its payout output, read back out of
 /// the blob it sent as `AllocateMiningJobToken.Success.coinbase_tx_outputs`.
@@ -378,17 +328,11 @@ impl CandidateBacking {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::consensus::Decodable;
+    use bitcoin::consensus::Encodable;
+    use bitcoin::hex::DisplayHex;
+    use bitcoin::Network;
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
-
-    #[test]
-    fn encode_empty_is_varint_zero() {
-        assert_eq!(
-            encode_coinbase_outputs(Network::Regtest, &[]).unwrap(),
-            vec![0x00]
-        );
-    }
 
     // ── SV2 JDP/AllocateMiningJobToken.Success designated payout output ───
 
@@ -399,25 +343,29 @@ mod tests {
         }
     }
 
-    /// The round trip the allocate path actually performs: encode one
-    /// 0-value output for the miner, then read its script back out. The
-    /// script is what the mining side holds a custom job to, so it has to
-    /// be the miner's, not merely non-empty.
+    /// The round trip the allocate path actually performs: build the blob
+    /// for the miner's script, then read the script back out. The script is
+    /// what the mining side holds a custom job to, so it has to be the
+    /// miner's, not merely non-empty.
+    ///
+    /// Also pinned byte-for-byte: this is what a JDC receives, and it must
+    /// stay what the former general `(address, sats)` encoder produced —
+    /// output count 1, value 0, `OP_0 <20-byte program>` for the BIP-173
+    /// P2WPKH test vector.
     #[test]
     fn the_designated_script_round_trips_through_the_allocate_blob() {
-        let addr = AddressId::new(ADDR.to_string()).unwrap();
-        let blob = encode_coinbase_outputs(
-            Network::Regtest,
-            &[DynamicOutput {
-                address: addr.clone(),
-                sats: Sats(0),
-            }],
-        )
-        .unwrap();
-        let expected = bp_mining_job::address_to_script(Network::Regtest, ADDR).unwrap();
+        let script = bp_mining_job::address_to_script(Network::Regtest, ADDR).unwrap();
+        let blob = designated_output_blob(&script);
+        assert_eq!(
+            blob.to_lower_hex_string(),
+            "01\
+             0000000000000000\
+             16\
+             0014751e76e8199196d454941c45d1b3a323f1433bd6",
+        );
         assert_eq!(
             designated_payout_script(&blob).as_deref(),
-            Some(expected.as_bytes())
+            Some(script.as_bytes())
         );
     }
 
@@ -468,41 +416,6 @@ mod tests {
         assert!(!pays_designated_output(&[], &pool));
     }
 
-    #[test]
-    fn encode_roundtrips_via_consensus_decode() {
-        let outputs = vec![DynamicOutput {
-            address: AddressId::new(ADDR).unwrap(),
-            sats: Sats(312_500_000),
-        }];
-        let bytes = encode_coinbase_outputs(Network::Regtest, &outputs).unwrap();
-        let decoded = <Vec<TxOut>>::consensus_decode(&mut bytes.as_slice()).unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].value.to_sat(), 312_500_000);
-    }
-
-    #[test]
-    fn encode_rejects_invalid_address() {
-        let outputs = vec![DynamicOutput {
-            address: AddressId::new("notanaddress").unwrap(),
-            sats: Sats(1_000),
-        }];
-        assert!(matches!(
-            encode_coinbase_outputs(Network::Regtest, &outputs),
-            Err(EncodeError::InvalidAddress(_))
-        ));
-    }
-
-    #[test]
-    fn encode_clamps_negative_sats_to_zero() {
-        let outputs = vec![DynamicOutput {
-            address: AddressId::new(ADDR).unwrap(),
-            sats: Sats(-5),
-        }];
-        let bytes = encode_coinbase_outputs(Network::Regtest, &outputs).unwrap();
-        let decoded = <Vec<TxOut>>::consensus_decode(&mut bytes.as_slice()).unwrap();
-        assert_eq!(decoded[0].value.to_sat(), 0);
-    }
-
     /// The outputs of a rebuilt declaration — what the removed
     /// `declared_coinbase_outputs` wrapper used to return. Kept as a test
     /// helper only: production reads the whole [`DeclaredCoinbase`], so a
@@ -536,15 +449,9 @@ mod tests {
         p
     }
 
-    fn one_output_bytes(sats: i64) -> Vec<u8> {
-        encode_coinbase_outputs(
-            Network::Regtest,
-            &[DynamicOutput {
-                address: AddressId::new(ADDR).unwrap(),
-                sats: Sats(sats),
-            }],
-        )
-        .unwrap()
+    fn one_output_bytes(sats: u64) -> Vec<u8> {
+        let script = bp_mining_job::address_to_script(Network::Regtest, ADDR).unwrap();
+        bitcoin::consensus::serialize(&vec![txout(sats, script.into_bytes())])
     }
 
     #[test]

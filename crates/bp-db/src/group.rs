@@ -462,9 +462,9 @@ pub async fn find_group_join_request(
 // Consumed by `bp-group-mgmt-engine`'s GroupService /
 // PplnsGroupInvitationService / PplnsGroupJoinRequestService.
 
-/// INSERT a freshly-built `pplns_group` row. `active = false` and
-/// `isPublic = false` are set by the caller — a new group always starts
-/// inactive (member count of 1 = creator alone) and private.
+/// INSERT a freshly-built `pplns_group` row. `active` and `isPublic` are
+/// set by the caller: a new group starts private, and active whenever its
+/// creator alone meets `MIN_MEMBERS_ACTIVE`.
 /// Returns the full row read back (so the caller can attach it to the
 /// API response without a follow-up SELECT).
 #[allow(clippy::too_many_arguments)]

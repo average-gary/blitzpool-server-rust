@@ -17,18 +17,20 @@
 //!   `is_block_candidate = true`. Hands the assembled-block bytes off
 //!   to `bp_template_distribution::TdpHandle::submit_solution` in
 //!   production wiring; tests use [`NoOpHooks`].
-//! - **`AcceptedShareSink`** / **`RejectedShareSink`** — share fan-out
-//!   for PPLNS / group-solo accumulators + reject counters.
-//! - **`SessionPersistence`** — register / deregister the per-channel
-//!   session in the live-clients registry on `ChannelOpened` /
-//!   connection close.
+//! - **`CustomExtranonceSource`** — customer extranonce overrides.
 //!
-//! ## Why 5 traits, not 8
+//! Accepted / rejected shares, session lifecycle and device status go to
+//! the protocol-agnostic `bp_share_hook` traits, which SV1 shares — the
+//! server projects its own types into them at the call site
+//! (`crate::shared_adapter`).
+//!
+//! ## Why not 8
 //!
 //! The earlier skeleton listed 8 hooks (block submission, accepted /
 //! rejected sinks, session persistence, block-found notification,
-//! mempool validator, miner lookup, coinbase distributor). The 5
-//! above cover the **mining-server** per-connection task. None of the
+//! mempool validator, miner lookup, coinbase distributor). The hooks
+//! above plus the shared sinks cover the **mining-server** per-connection
+//! task. None of the
 //! other three is owed here:
 //!
 //! - `BlockFoundNotificationSink` lives in `bp_notifications`
@@ -48,9 +50,12 @@ use std::sync::Arc;
 
 use bp_common::{AddressId, StreamKind};
 use bp_mining_job::{PayoutEntry, ResolvedPayouts};
-use bp_share::Difficulty;
+use bp_share_hook::{
+    DeviceStatusSink, NoOpSink, SharedAcceptedShareSink, SharedRejectedShareSink,
+    SharedSessionPersistence,
+};
 
-use crate::mining::submit::{RejectReason, ShareAccept};
+use crate::mining::submit::ShareAccept;
 
 // ── PayoutResolver ──────────────────────────────────────────────────
 
@@ -60,8 +65,8 @@ use crate::mining::submit::{RejectReason, ShareAccept};
 /// produce the `MiningJob` consumed by
 /// [`crate::mining::client::apply_template_broadcast`].
 ///
-/// Production impl runs the service-layer mode-resolver
-/// ([`bp_mining_mode::ModeResolver`]) + evaluates the per-mode distribution
+/// Production impl looks the address up in the bin's mode gate
+/// (`BlitzpoolModeGate`) + evaluates the per-mode distribution
 /// (PPLNS/Group-Solo: the SV2 ext 0x0003/Payout Computation weight formula at
 /// this reward; Blockparty / single-output solo: their own exact allocators).
 /// Tests use [`NoOpHooks`] returning a single 100%-to-self entry.
@@ -123,89 +128,6 @@ pub trait BlockSubmissionSink: Send + Sync {
     );
 }
 
-// ── AcceptedShareSink ───────────────────────────────────────────────
-
-/// Records an accepted share for PPLNS / group-solo / per-mode
-/// accumulators + the share-totals cache.
-#[async_trait::async_trait]
-pub trait AcceptedShareSink: Send + Sync {
-    /// `hash_rate` is the session-wide H/s snapshot the vardiff
-    /// engine reports right after consuming this share — written to
-    /// client_entity.hashRate by the persistence sink. `user_agent` is
-    /// the vendor-derived firmware string (same source as the
-    /// register / device-status path), used to stamp the all-time
-    /// best-difficulty row. `channel_count` is how many mining channels
-    /// the connection holds (`1` for a direct miner, `> 1` when a rental
-    /// proxy bundles several same-rig devices onto one connection) —
-    /// persisted to client_entity.channelCount so the UI can flag the
-    /// session's difficulty as aggregated.
-    #[allow(clippy::too_many_arguments)]
-    async fn record_accepted(
-        &self,
-        address: &str,
-        worker: &str,
-        session_id_hex: &str,
-        user_agent: Option<&str>,
-        accept: &ShareAccept,
-        hash_rate: f64,
-        channel_count: u32,
-    );
-}
-
-// ── RejectedShareSink ───────────────────────────────────────────────
-
-/// Records a rejected share. `reason` is the typed reject; `wire_code`
-/// is its serialized form (`stale-share`, `invalid-job-id`,
-/// `difficulty-too-low`, `bad-extranonce-size`, ...).
-#[async_trait::async_trait]
-pub trait RejectedShareSink: Send + Sync {
-    async fn record_rejected(
-        &self,
-        address: Option<&str>,
-        worker: Option<&str>,
-        session_id_hex: &str,
-        reason: RejectReason,
-        difficulty: Difficulty,
-    );
-}
-
-// ── SessionPersistence ──────────────────────────────────────────────
-
-/// Per-channel session registration. Production wiring updates the
-/// `client` DB table + the live-clients in-process registry; on
-/// disconnect it fires the device-offline notification.
-#[async_trait::async_trait]
-pub trait SessionPersistence: Send + Sync {
-    async fn register_session(
-        &self,
-        session_id_hex: &str,
-        address: &str,
-        worker: &str,
-        channel_id: u32,
-        user_agent: Option<&str>,
-    );
-
-    async fn deregister_session(&self, session_id_hex: &str);
-}
-
-// ── DeviceStatusSink ────────────────────────────────────────────────
-
-/// Fired on per-channel ChannelOpened (online) + ChannelClosed (offline)
-/// transitions. Production wiring forwards to
-/// `bp_notifications::dispatcher::NotificationDispatcher::notify_device_status`
-/// so subscribers receive per-worker connect / disconnect pushes.
-#[async_trait::async_trait]
-pub trait DeviceStatusSink: Send + Sync {
-    async fn on_device_event(
-        &self,
-        address: &str,
-        worker: &str,
-        session_id_hex: &str,
-        user_agent: Option<&str>,
-        is_online: bool,
-    );
-}
-
 // ── CustomExtranonceSource ──────────────────────────────────────────
 
 /// Look up a customer-set extranonce prefix for a `(address, worker)`.
@@ -233,9 +155,9 @@ pub trait CustomExtranonceSource: Send + Sync {
 pub struct MiningServerHooks {
     pub payout_resolver: Arc<dyn PayoutResolver>,
     pub block_sink: Arc<dyn BlockSubmissionSink>,
-    pub accepted_sink: Arc<dyn AcceptedShareSink>,
-    pub rejected_sink: Arc<dyn RejectedShareSink>,
-    pub session_persistence: Arc<dyn SessionPersistence>,
+    pub accepted_sink: Arc<dyn SharedAcceptedShareSink>,
+    pub rejected_sink: Arc<dyn SharedRejectedShareSink>,
+    pub session_persistence: Arc<dyn SharedSessionPersistence>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
     /// Customer extranonce overrides. [`NoOpHooks`] returns `None` for every
     /// worker, so a deployment without the feature behaves exactly as before.
@@ -260,13 +182,14 @@ impl MiningServerHooks {
     /// its concrete impl.
     pub fn no_op() -> Self {
         let no_op: Arc<NoOpHooks> = Arc::new(NoOpHooks);
+        let shared: Arc<NoOpSink> = Arc::new(NoOpSink);
         Self {
             payout_resolver: no_op.clone(),
             block_sink: no_op.clone(),
-            accepted_sink: no_op.clone(),
-            rejected_sink: no_op.clone(),
-            session_persistence: no_op.clone(),
-            device_status_sink: no_op.clone(),
+            accepted_sink: shared.clone(),
+            rejected_sink: shared.clone(),
+            session_persistence: shared.clone(),
+            device_status_sink: shared,
             custom_extranonce: no_op,
             // See SV1's `no_op`: no intake means the static path, unchanged,
             // and `NoOpHooks` gets no stub impl of the trait.
@@ -302,45 +225,6 @@ impl BlockSubmissionSink for NoOpHooks {
     async fn submit_block(&self, _: &ShareAccept, _: &str, _: &str, _: &str, _: StreamKind) {}
 }
 
-#[async_trait::async_trait]
-impl AcceptedShareSink for NoOpHooks {
-    async fn record_accepted(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: &ShareAccept,
-        _: f64,
-        _: u32,
-    ) {
-    }
-}
-
-#[async_trait::async_trait]
-impl RejectedShareSink for NoOpHooks {
-    async fn record_rejected(
-        &self,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: &str,
-        _: RejectReason,
-        _: Difficulty,
-    ) {
-    }
-}
-
-#[async_trait::async_trait]
-impl DeviceStatusSink for NoOpHooks {
-    async fn on_device_event(&self, _: &str, _: &str, _: &str, _: Option<&str>, _: bool) {}
-}
-
-#[async_trait::async_trait]
-impl SessionPersistence for NoOpHooks {
-    async fn register_session(&self, _: &str, _: &str, _: &str, _: u32, _: Option<&str>) {}
-    async fn deregister_session(&self, _: &str) {}
-}
-
 impl CustomExtranonceSource for NoOpHooks {
     fn lookup(&self, _: &str, _: &str) -> Option<[u8; 4]> {
         None
@@ -357,6 +241,7 @@ impl CustomExtranonceSource for NoOpHooks {
 /// this crate can use it, mirroring the SV1 pattern.
 pub mod test_support {
     use super::*;
+    use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
     use std::sync::Mutex;
 
     #[derive(Clone, Debug, PartialEq)]
@@ -374,7 +259,7 @@ pub mod test_support {
         pub address: Option<String>,
         pub worker: Option<String>,
         pub session_id_hex: String,
-        pub reason: RejectReason,
+        pub reason: RejectedReason,
         pub difficulty: f64,
     }
 
@@ -383,7 +268,6 @@ pub mod test_support {
         pub session_id_hex: String,
         pub address: String,
         pub worker: String,
-        pub channel_id: u32,
     }
 
     /// Records every hook call. Cheap to clone (`Arc<...>` internal
@@ -478,62 +362,45 @@ pub mod test_support {
     }
 
     #[async_trait::async_trait]
-    impl AcceptedShareSink for RecordingHooks {
-        async fn record_accepted(
-            &self,
-            address: &str,
-            worker: &str,
-            session_id_hex: &str,
-            _user_agent: Option<&str>,
-            accept: &ShareAccept,
-            _hash_rate: f64,
-            channel_count: u32,
-        ) {
+    impl SharedAcceptedShareSink for RecordingHooks {
+        async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
             self.accepted
                 .lock()
                 .expect("poisoned")
                 .push(AcceptedRecord {
-                    address: address.to_string(),
-                    worker: worker.to_string(),
-                    session_id_hex: session_id_hex.to_string(),
-                    effective_difficulty: accept.effective_difficulty.as_f64(),
-                    is_block_candidate: accept.is_block_candidate,
-                    channel_count,
+                    address: share.address.to_string(),
+                    worker: share.worker.to_string(),
+                    session_id_hex: share.session_id.to_string(),
+                    effective_difficulty: share.effective_difficulty,
+                    is_block_candidate: share.is_block_candidate,
+                    channel_count: share.channel_count,
                 });
         }
     }
 
     #[async_trait::async_trait]
-    impl RejectedShareSink for RecordingHooks {
-        async fn record_rejected(
-            &self,
-            address: Option<&str>,
-            worker: Option<&str>,
-            session_id_hex: &str,
-            reason: RejectReason,
-            difficulty: Difficulty,
-        ) {
+    impl SharedRejectedShareSink for RecordingHooks {
+        async fn record_rejected(&self, share: SharedRejectedShare<'_>) {
             self.rejected
                 .lock()
                 .expect("poisoned")
                 .push(RejectedRecord {
-                    address: address.map(|a| a.to_string()),
-                    worker: worker.map(|w| w.to_string()),
-                    session_id_hex: session_id_hex.to_string(),
-                    reason,
-                    difficulty: difficulty.as_f64(),
+                    address: share.address.map(|a| a.to_string()),
+                    worker: share.worker.map(|w| w.to_string()),
+                    session_id_hex: share.session_id.to_string(),
+                    reason: share.reason,
+                    difficulty: share.difficulty,
                 });
         }
     }
 
     #[async_trait::async_trait]
-    impl SessionPersistence for RecordingHooks {
+    impl SharedSessionPersistence for RecordingHooks {
         async fn register_session(
             &self,
             session_id_hex: &str,
             address: &str,
             worker: &str,
-            channel_id: u32,
             _user_agent: Option<&str>,
         ) {
             self.registered
@@ -543,7 +410,6 @@ pub mod test_support {
                     session_id_hex: session_id_hex.to_string(),
                     address: address.to_string(),
                     worker: worker.to_string(),
-                    channel_id,
                 });
         }
 
@@ -580,6 +446,7 @@ mod tests {
     use super::*;
     use crate::mining::submit::RejectReason;
     use bp_jobs_lifecycle::JobClassification;
+    use bp_share::Difficulty;
 
     fn make_addr() -> AddressId {
         AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string()).unwrap()
@@ -617,7 +484,15 @@ mod tests {
         let server_hooks = hooks.clone().into_server_hooks();
         server_hooks
             .accepted_sink
-            .record_accepted("addr1", "wrk", "sess-1", None, &make_accept(), 0.0, 1)
+            .record_accepted(crate::shared_adapter::shared_accepted(
+                "addr1",
+                "wrk",
+                "sess-1",
+                None,
+                &make_accept(),
+                0.0,
+                1,
+            ))
             .await;
         let records = hooks.accepted.lock().unwrap();
         assert_eq!(records.len(), 1);
@@ -629,19 +504,21 @@ mod tests {
     async fn recording_hooks_capture_rejected_share() {
         let hooks = RecordingHooks::new();
         let server_hooks = hooks.clone().into_server_hooks();
-        server_hooks
-            .rejected_sink
-            .record_rejected(
-                Some("addr1"),
-                Some("worker1"),
-                "sess-1",
-                RejectReason::StaleShare,
-                Difficulty(1024.0),
-            )
-            .await;
+        let share = crate::shared_adapter::shared_rejected(
+            Some("addr1"),
+            Some("worker1"),
+            "sess-1",
+            RejectReason::StaleShare,
+            Difficulty(1024.0),
+        )
+        .expect("a stale share counts toward the reject stats");
+        server_hooks.rejected_sink.record_rejected(share).await;
         let records = hooks.rejected.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].reason, RejectReason::StaleShare);
+        assert_eq!(
+            records[0].reason,
+            bp_share_hook::RejectedReason::JobNotFound
+        );
     }
 
     #[tokio::test]
@@ -669,14 +546,13 @@ mod tests {
         let server_hooks = hooks.clone().into_server_hooks();
         server_hooks
             .session_persistence
-            .register_session("sess-1", "addr1", "wrk", 7, Some("ua"))
+            .register_session("sess-1", "addr1", "wrk", Some("ua"))
             .await;
         server_hooks
             .session_persistence
             .deregister_session("sess-1")
             .await;
         assert_eq!(hooks.registered.lock().unwrap().len(), 1);
-        assert_eq!(hooks.registered.lock().unwrap()[0].channel_id, 7);
         assert_eq!(hooks.deregistered.lock().unwrap()[0], "sess-1");
     }
 

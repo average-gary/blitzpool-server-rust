@@ -32,7 +32,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bp_share::{difficulty_to_target, Difficulty, Target};
+use bp_jobs_lifecycle::LifecycleConfig;
+use bp_share::{Difficulty, Target, TargetMemo};
 
 use super::jobs::{ExtendedJob, StandardJobMaps};
 use super::submit::ExtranonceBytes;
@@ -54,7 +55,7 @@ pub struct ChannelState {
 
     /// Pool-assigned extranonce prefix. 4 bytes typical for Standard
     /// (the entire prefix); 4–8 bytes for Extended (variable, allocated
-    /// by [`crate::extranonce::ExtranonceAllocator`]).
+    /// by [`crate::extranonce::ConnectionExtranonce`]).
     pub extranonce_prefix: Vec<u8>,
     /// Miner-controlled bytes after the prefix. `0` for Standard;
     /// `(12 - prefix.len)`-clamped for Extended (BitAxe/NerdQAxe quirk
@@ -132,14 +133,9 @@ pub struct ChannelState {
     /// `false` until the first share is processed.
     pub first_share_logged: bool,
 
-    /// Memo for `difficulty_to_target` on the per-share accept check.
-    /// Per-job difficulty changes only on a vardiff ratchet, so within a
-    /// channel nearly every share validates at the same difficulty — a
-    /// single `(difficulty bits → target)` slot serves them all and a
-    /// miss just recomputes. Keyed on the exact f64 bit pattern, so the
-    /// cached target is bit-identical to recomputing: purely a
-    /// per-share BigUint-divide saving, no behaviour change.
-    target_memo: Option<(u64, Target)>,
+    /// Target memo for the per-share accept check. Per-job difficulty
+    /// changes only on a vardiff ratchet.
+    target_memo: TargetMemo,
 }
 
 impl ChannelState {
@@ -149,6 +145,7 @@ impl ChannelState {
         extranonce_prefix: Vec<u8>,
         session_difficulty: Difficulty,
         declared_max_target: [u8; 32],
+        job_lifecycle: LifecycleConfig,
     ) -> Self {
         Self {
             channel_id,
@@ -158,7 +155,7 @@ impl ChannelState {
             session_difficulty,
             declared_max_target,
             last_declared_hash_rate: None,
-            standard_jobs: StandardJobMaps::new(),
+            standard_jobs: StandardJobMaps::new(job_lifecycle),
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
@@ -169,7 +166,7 @@ impl ChannelState {
             submission_cache: SubmissionCache::Standard(HashSet::new()),
             last_sent_job_signature: None,
             first_share_logged: false,
-            target_memo: None,
+            target_memo: TargetMemo::default(),
         }
     }
 
@@ -180,6 +177,7 @@ impl ChannelState {
         extranonce_size: u8,
         session_difficulty: Difficulty,
         declared_max_target: [u8; 32],
+        job_lifecycle: LifecycleConfig,
     ) -> Self {
         Self {
             channel_id,
@@ -189,7 +187,7 @@ impl ChannelState {
             session_difficulty,
             declared_max_target,
             last_declared_hash_rate: None,
-            standard_jobs: StandardJobMaps::new(),
+            standard_jobs: StandardJobMaps::new(job_lifecycle),
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
@@ -200,7 +198,7 @@ impl ChannelState {
             submission_cache: SubmissionCache::Extended(HashSet::new()),
             last_sent_job_signature: None,
             first_share_logged: false,
-            target_memo: None,
+            target_memo: TargetMemo::default(),
         }
     }
 
@@ -212,23 +210,10 @@ impl ChannelState {
         self.accepted_share_difficulty_sum += share_difficulty.as_f64();
     }
 
-    /// Target for `job_difficulty`, memoized per channel. Returns the
-    /// cached target when the difficulty matches the last computed one
-    /// (the common case — per-job difficulty only moves on a vardiff
-    /// ratchet), otherwise computes it via `difficulty_to_target` and
-    /// caches the result. Keyed on the exact f64 bit pattern, so the
-    /// returned target is identical to an uncached
-    /// `difficulty_to_target(job_difficulty)`.
+    /// Target for `job_difficulty`, memoized per channel (see
+    /// [`TargetMemo`]).
     pub fn target_for(&mut self, job_difficulty: Difficulty) -> Target {
-        let key = job_difficulty.as_f64().to_bits();
-        if let Some((cached_key, cached_target)) = self.target_memo {
-            if cached_key == key {
-                return cached_target;
-            }
-        }
-        let target = difficulty_to_target(job_difficulty);
-        self.target_memo = Some((key, target));
-        target
+        self.target_memo.target_for(job_difficulty)
     }
 
     /// Reset the submission-dedup cache. Called on `SetNewPrevHash`
@@ -245,7 +230,7 @@ impl ChannelState {
 
     /// Total bytes the miner sees as the "coinbase extranonce slot"
     /// (`prefix + miner-rollable`). Always 12 by design; the constant is
-    /// implicit in the [`crate::extranonce::ExtranonceAllocator`] default.
+    /// set by [`bp_mining_job::EXTRANONCE_SLOT_LEN`].
     pub fn full_extranonce_size(&self) -> usize {
         self.extranonce_prefix.len() + self.extranonce_size as usize
     }
@@ -354,42 +339,16 @@ mod tests {
 
     // ── Construction ───────────────────────────────────────────────
 
-    /// The per-channel target memo returns bit-identical results to an
-    /// uncached `difficulty_to_target` and recomputes on a difficulty
-    /// change — so it's a pure performance shim, no behaviour change.
-    #[test]
-    fn target_memo_matches_uncached_and_recomputes_on_change() {
-        let mut ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1024.0), max_target());
-        for d in [1.0, 1024.0, 65535.0, 0.5, 1e9, 1234.5678] {
-            let direct = difficulty_to_target(Difficulty(d));
-            assert_eq!(
-                ch.target_for(Difficulty(d)),
-                direct,
-                "diff {d}: memo != uncached"
-            );
-            // Immediate repeat is served from the slot — still equal.
-            assert_eq!(
-                ch.target_for(Difficulty(d)),
-                direct,
-                "diff {d}: repeat mismatch"
-            );
-        }
-        // Switching difficulty recomputes (no stale slot); switching back
-        // still yields the correct target.
-        let a = ch.target_for(Difficulty(1024.0));
-        let b = ch.target_for(Difficulty(2048.0));
-        assert_ne!(a, b, "distinct difficulties must map to distinct targets");
-        assert_eq!(
-            ch.target_for(Difficulty(1024.0)),
-            difficulty_to_target(Difficulty(1024.0)),
-            "re-selecting a prior difficulty must recompute correctly"
-        );
-    }
-
     /// Fresh Standard channel: zero extranonce_size, empty maps.
     #[test]
     fn standard_channel_starts_clean() {
-        let ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1024.0), max_target());
+        let ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1024.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.kind, ChannelKind::Standard);
         assert_eq!(ch.extranonce_size, 0);
         assert!(ch.standard_jobs.is_empty());
@@ -403,7 +362,14 @@ mod tests {
     /// Fresh Extended channel: extranonce_size > 0, Extended-cache.
     #[test]
     fn extended_channel_starts_clean() {
-        let ch = ChannelState::new_extended(2, vec![0; 4], 8, Difficulty(1024.0), max_target());
+        let ch = ChannelState::new_extended(
+            2,
+            vec![0; 4],
+            8,
+            Difficulty(1024.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.kind, ChannelKind::Extended);
         assert_eq!(ch.extranonce_size, 8);
         assert!(matches!(ch.submission_cache, SubmissionCache::Extended(_)));
@@ -418,7 +384,13 @@ mod tests {
         let mut tgt = [0u8; 32];
         tgt[0] = 0x01;
         tgt[31] = 0xFF;
-        let ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), tgt);
+        let ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            tgt,
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.declared_max_target, tgt);
     }
 
@@ -427,7 +399,13 @@ mod tests {
     /// Counters increment together; difficulty sum accumulates as f64.
     #[test]
     fn record_accepted_share_bumps_counters() {
-        let mut ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.record_accepted_share(Difficulty(1024.0));
         ch.record_accepted_share(Difficulty(2048.5));
         assert_eq!(ch.accepted_share_count, 2);
@@ -481,7 +459,13 @@ mod tests {
     /// trigger).
     #[test]
     fn clear_submission_cache_empties_dedup() {
-        let mut ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.submission_cache.insert_standard(StandardDedupKey {
             job_id: 1,
             nonce: 1,
@@ -498,11 +482,24 @@ mod tests {
     /// cache.
     #[test]
     fn cache_kind_is_preserved_after_clear() {
-        let mut ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.clear_submission_cache();
         assert!(matches!(ch.submission_cache, SubmissionCache::Standard(_)));
 
-        let mut ch = ChannelState::new_extended(2, vec![0; 4], 8, Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_extended(
+            2,
+            vec![0; 4],
+            8,
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.clear_submission_cache();
         assert!(matches!(ch.submission_cache, SubmissionCache::Extended(_)));
     }
@@ -512,7 +509,14 @@ mod tests {
     /// The diagnostic flag is mutable (callers flip it on first-share-log).
     #[test]
     fn diagnostic_flags_can_be_toggled() {
-        let mut ch = ChannelState::new_extended(1, vec![0; 4], 8, Difficulty(1.0), max_target());
+        let mut ch = ChannelState::new_extended(
+            1,
+            vec![0; 4],
+            8,
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         ch.first_share_logged = true;
         assert!(ch.first_share_logged);
     }
@@ -526,9 +530,22 @@ mod tests {
     /// `handle_open_extended_mining_channel`.
     #[test]
     fn full_extranonce_size_is_sum_of_prefix_and_rollable() {
-        let ch = ChannelState::new_standard(1, vec![0; 4], Difficulty(1.0), max_target());
+        let ch = ChannelState::new_standard(
+            1,
+            vec![0; 4],
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.full_extranonce_size(), 4);
-        let ch = ChannelState::new_extended(2, vec![0; 6], 6, Difficulty(1.0), max_target());
+        let ch = ChannelState::new_extended(
+            2,
+            vec![0; 6],
+            6,
+            Difficulty(1.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        );
         assert_eq!(ch.full_extranonce_size(), 12);
     }
 }

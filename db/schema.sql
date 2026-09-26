@@ -1581,8 +1581,6 @@ ALTER TABLE ONLY public.blockparty_group
     ADD CONSTRAINT "PK_blockparty_group" PRIMARY KEY (id);
 ALTER TABLE ONLY public.blockparty_group
     ADD CONSTRAINT "UQ_blockparty_group_name" UNIQUE (name);
-ALTER TABLE ONLY public.blockparty_group
-    ADD CONSTRAINT "UQ_blockparty_group_admin_address" UNIQUE ("adminAddress");
 
 ALTER TABLE ONLY public.blockparty_member
     ADD CONSTRAINT "PK_blockparty_member" PRIMARY KEY (id);
@@ -1606,6 +1604,8 @@ ALTER TABLE ONLY public.blockparty_block_history
     ADD CONSTRAINT "FK_blockparty_block_history_group" FOREIGN KEY ("groupId") REFERENCES public.blockparty_group(id) ON DELETE CASCADE;
 
 CREATE INDEX "IDX_blockparty_group_status" ON public.blockparty_group(status);
+CREATE UNIQUE INDEX "UQ_blockparty_group_admin_address_live"
+    ON public.blockparty_group("adminAddress") WHERE status <> 'dissolved';
 CREATE INDEX "IDX_blockparty_member_group" ON public.blockparty_member("groupId");
 CREATE INDEX "IDX_blockparty_invitation_group" ON public.blockparty_invitation("groupId");
 CREATE INDEX "IDX_blockparty_invitation_address" ON public.blockparty_invitation(address);
@@ -1694,12 +1694,12 @@ CREATE INDEX IF NOT EXISTS "IDX_pplns_extranonce_challenge_expiresAt"
 --
 -- Payout identity: one row per miner, either a fixed address ('static') or a
 -- rotating xpub-derived descriptor ('rotating'). The database half of
--- `bp_common::PayoutIdentity`. See crates/bp-db/migrations/0016_add_miner_identity.sql
+-- `bp_common::PayoutIdentity`. See crates/bp-db/migrations/0017_add_miner_identity.sql
 -- for the full reasoning, including why there is no `addr(<address>)` sentinel.
 -- The ledger key is base58: hex would not have fit the varchar(62) these columns
 -- were when 0010 was written, and it is frozen there now for a better reason —
 -- a payout_id is content-addressed, so changing the encoding orphans every
--- balance already keyed by it. 0017_widen_identity_columns.sql took every
+-- balance already keyed by it. 0018_widen_identity_columns.sql took every
 -- identity column to varchar(90); see it for why 90.
 --
 

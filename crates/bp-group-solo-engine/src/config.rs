@@ -104,45 +104,12 @@ impl GroupSoloEngineConfig {
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ConfigError {
-    #[error(
-        "no fee_address configured — the pool output is structural under the \
-         weight model (SV2 ext 0x0003 §4). Without it every block of this mode \
-         falls back to a solo coinbase paying 100 % to one miner"
-    )]
-    MissingFeeAddress,
-    #[error(
-        "fee_address {value:?} is not a usable payout address — same effect as \
-         none at all: every block falls back to a solo coinbase"
-    )]
-    InvalidFeeAddress { value: String },
-    #[error("fee_percent must be in [0.0, 100.0] and finite, got {value}")]
-    InvalidFeePercent { value: f64 },
-    #[error("min_payout_sats must be ≥ DUST_LIMIT_SATS ({dust}), got {value}")]
-    MinPayoutBelowDustLimit { value: i64, dust: u64 },
-    #[error("coinbase_weight_budget must be > {min} (base + safety margin), got {value}")]
-    WeightBudgetTooLow { value: u32, min: u32 },
+    /// The fee / min-payout / coinbase-budget checks shared with the other
+    /// payout engine; see [`FeePayoutBudgetError`].
+    #[error(transparent)]
+    FeePayoutBudget(#[from] FeePayoutBudgetError),
     #[error("{field} must be > 0, got 0")]
     ZeroUnsignedField { field: &'static str },
-}
-
-impl From<FeePayoutBudgetError> for ConfigError {
-    fn from(e: FeePayoutBudgetError) -> Self {
-        match e {
-            FeePayoutBudgetError::MissingFeeAddress => ConfigError::MissingFeeAddress,
-            FeePayoutBudgetError::InvalidFeeAddress { value } => {
-                ConfigError::InvalidFeeAddress { value }
-            }
-            FeePayoutBudgetError::InvalidFeePercent { value } => {
-                ConfigError::InvalidFeePercent { value }
-            }
-            FeePayoutBudgetError::MinPayoutBelowDust { value, dust } => {
-                ConfigError::MinPayoutBelowDustLimit { value, dust }
-            }
-            FeePayoutBudgetError::WeightBudgetTooLow { value, min } => {
-                ConfigError::WeightBudgetTooLow { value, min }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -169,7 +136,7 @@ mod tests {
     fn the_default_config_is_refused_because_it_has_no_fee_address() {
         assert_eq!(
             GroupSoloEngineConfig::default().try_new().unwrap_err(),
-            ConfigError::MissingFeeAddress
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::MissingFeeAddress)
         );
     }
 
@@ -184,9 +151,9 @@ mod tests {
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
-            ConfigError::InvalidFeeAddress {
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeeAddress {
                 value: typo.to_string()
-            }
+            })
         );
     }
 
@@ -203,7 +170,7 @@ mod tests {
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
-            ConfigError::InvalidFeePercent { value: -0.1 }
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeePercent { value: -0.1 })
         );
     }
 
@@ -215,7 +182,7 @@ mod tests {
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
-            ConfigError::InvalidFeePercent { value: 105.0 }
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeePercent { value: 105.0 })
         );
     }
 
@@ -226,7 +193,9 @@ mod tests {
             ..valid()
         };
         match cfg.try_new().unwrap_err() {
-            ConfigError::InvalidFeePercent { value } => assert!(value.is_nan()),
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeePercent { value }) => {
+                assert!(value.is_nan())
+            }
             other => panic!("expected InvalidFeePercent, got {other:?}"),
         }
     }
@@ -239,7 +208,7 @@ mod tests {
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
-            ConfigError::MinPayoutBelowDustLimit { .. }
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::MinPayoutBelowDust { .. })
         ));
     }
 
@@ -260,7 +229,7 @@ mod tests {
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
-            ConfigError::WeightBudgetTooLow { .. }
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::WeightBudgetTooLow { .. })
         ));
     }
 

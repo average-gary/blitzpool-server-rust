@@ -9,9 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::config::{BitcoinRpcConfig, RpcAuth};
 use crate::error::{RpcError, RpcErrorDetail};
-use crate::types::{
-    BlockHeaderInfo, BlockTxids, DecodedTransaction, MiningInfo, NetworkInfo, PeerInfo,
-};
+use crate::types::{BlockHeaderInfo, BlockTxids, DecodedTransaction, MiningInfo, NetworkInfo};
 
 /// Async JSON-RPC client to a Bitcoin Core node. Cheap to clone — shares
 /// an underlying `reqwest::Client` connection pool.
@@ -62,10 +60,6 @@ impl BitcoinRpc {
     /// Returns the raw `getmininginfo` result bytes exactly as Core sent them.
     pub async fn get_mining_info_raw(&self) -> Result<Box<serde_json::value::RawValue>, RpcError> {
         self.call("getmininginfo", serde_json::json!([])).await
-    }
-
-    pub async fn get_peer_info(&self) -> Result<Vec<PeerInfo>, RpcError> {
-        self.call("getpeerinfo", serde_json::json!([])).await
     }
 
     /// Current chain-tip height. Used on the block-found hot path to

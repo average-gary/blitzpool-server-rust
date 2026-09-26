@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use bp_common::AddressId;
+use bp_common::{short_address, AddressId};
 use bp_db::{
     delete_push_subscription_by_endpoint, find_ntfy_subscription_by_address,
     find_push_subscriptions_by_address, find_telegram_subscriptions_by_address,
@@ -16,7 +16,6 @@ use tracing::{debug, warn};
 
 use crate::command::ChatLanguageMap;
 
-use super::config::DispatcherConfig;
 use crate::adapter::{
     AdapterError, FcmAdapter, NtfyAdapter, PushKind, PushPayload, TelegramAdapter, WebPushAdapter,
 };
@@ -32,6 +31,9 @@ use super::device_gate::{DeviceAggregate, DeviceNotice, DevicePartial};
 // case-insensitive so any historical casing still routes.
 const PUSH_TYPE_UNIFIED: &str = "unified_push";
 const PUSH_TYPE_FCM: &str = "fcm";
+
+/// Timezone device-status timestamps are rendered in.
+const DEVICE_TIMEZONE: chrono_tz::Tz = chrono_tz::Europe::Zurich;
 
 /// Engine-side description of a worker connect / disconnect event. The
 /// dispatcher converts this to per-language text and routes to whichever
@@ -52,7 +54,6 @@ pub struct DeviceStatusEvent {
 /// Telegram bot token).
 pub struct NotificationDispatcher {
     pool: PgPool,
-    config: DispatcherConfig,
     telegram: Option<Arc<TelegramAdapter>>,
     ntfy: Option<Arc<NtfyAdapter>>,
     fcm: Option<Arc<FcmAdapter>>,
@@ -63,7 +64,6 @@ pub struct NotificationDispatcher {
 impl NotificationDispatcher {
     pub fn new(
         pool: PgPool,
-        config: DispatcherConfig,
         telegram: Option<Arc<TelegramAdapter>>,
         ntfy: Option<Arc<NtfyAdapter>>,
         fcm: Option<Arc<FcmAdapter>>,
@@ -72,7 +72,6 @@ impl NotificationDispatcher {
     ) -> Self {
         Self {
             pool,
-            config,
             telegram,
             ntfy,
             fcm,
@@ -132,9 +131,6 @@ impl NotificationDispatcher {
     /// responsible for deciding this actually IS a new best (engines
     /// keep that state — dispatcher just sends).
     pub async fn notify_best_diff(&self, address: &AddressId, difficulty: f64) {
-        if !self.config.best_diff_enabled {
-            return;
-        }
         let (telegram_subs, ntfy_sub, push_subs) = self.load_subs(address).await;
         let formatted = format_number_suffix(difficulty);
 
@@ -221,7 +217,6 @@ impl NotificationDispatcher {
                     self.chat_languages.clone(),
                     partial.clone(),
                     telegram_dev,
-                    self.config.timezone,
                 )) as TaskFuture);
             }
         }
@@ -283,7 +278,6 @@ impl NotificationDispatcher {
                     self.chat_languages.clone(),
                     agg.clone(),
                     telegram_dev,
-                    self.config.timezone,
                 )) as TaskFuture);
             }
         }
@@ -351,7 +345,6 @@ impl NotificationDispatcher {
                     self.chat_languages.clone(),
                     event.clone(),
                     telegram_dev,
-                    self.config.timezone,
                 )) as TaskFuture);
             }
         }
@@ -372,7 +365,6 @@ impl NotificationDispatcher {
                     self.pool.clone(),
                     event.clone(),
                     fcm_dev,
-                    self.config.timezone,
                 )) as TaskFuture);
             }
         }
@@ -495,7 +487,7 @@ async fn send_telegram_best_diff(
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
             let include_address = chat_count > 1;
-            let fmt_addr = format_address_short(address.as_str());
+            let fmt_addr = short_address(address.as_str());
             let text = match (lang, include_address) {
                 (Language::De, true) => format!(
                     "\u{1f3c6} Neue beste Difficulty für Adresse {fmt_addr}!\nWert: {formatted}"
@@ -525,9 +517,8 @@ async fn send_telegram_device_status(
     chat_languages: ChatLanguageMap,
     event: DeviceStatusEvent,
     subs: Vec<TelegramSubscriptionRow>,
-    tz: chrono_tz::Tz,
 ) {
-    let fmt_addr = format_address_short(event.address.as_str());
+    let fmt_addr = short_address(event.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
         let adapter = Arc::clone(&adapter);
         let pool = pool.clone();
@@ -538,7 +529,7 @@ async fn send_telegram_device_status(
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
             let include_address = chat_count > 1;
-            let time_str = format_device_time(tz, event.timestamp, lang);
+            let time_str = format_device_time(DEVICE_TIMEZONE, event.timestamp, lang);
             let address_suffix_de = if include_address {
                 Some(format!(" – Adresse {fmt_addr}"))
             } else {
@@ -579,9 +570,8 @@ async fn send_telegram_device_partial(
     chat_languages: ChatLanguageMap,
     partial: DevicePartial,
     subs: Vec<TelegramSubscriptionRow>,
-    tz: chrono_tz::Tz,
 ) {
-    let fmt_addr = format_address_short(partial.address.as_str());
+    let fmt_addr = short_address(partial.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
         let adapter = Arc::clone(&adapter);
         let pool = pool.clone();
@@ -591,7 +581,7 @@ async fn send_telegram_device_partial(
         async move {
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
-            let time_str = format_device_time(tz, partial.timestamp, lang);
+            let time_str = format_device_time(DEVICE_TIMEZONE, partial.timestamp, lang);
             let suffix = (chat_count > 1).then(|| match lang {
                 Language::De => format!(" – Adresse {fmt_addr}"),
                 Language::En => format!(" – address {fmt_addr}"),
@@ -688,9 +678,8 @@ async fn send_telegram_device_aggregate(
     chat_languages: ChatLanguageMap,
     agg: DeviceAggregate,
     subs: Vec<TelegramSubscriptionRow>,
-    tz: chrono_tz::Tz,
 ) {
-    let fmt_addr = format_address_short(agg.address.as_str());
+    let fmt_addr = short_address(agg.address.as_str());
     let tasks = subs.into_iter().map(|sub| {
         let adapter = Arc::clone(&adapter);
         let pool = pool.clone();
@@ -700,7 +689,7 @@ async fn send_telegram_device_aggregate(
         async move {
             let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
             let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
-            let time_str = format_device_time(tz, agg.timestamp, lang);
+            let time_str = format_device_time(DEVICE_TIMEZONE, agg.timestamp, lang);
             let suffix = (chat_count > 1).then(|| match lang {
                 Language::De => format!(" – Adresse {fmt_addr}"),
                 Language::En => format!(" – address {fmt_addr}"),
@@ -875,11 +864,9 @@ async fn send_fcm_device_status(
     pool: PgPool,
     event: DeviceStatusEvent,
     subs: Vec<PushSubscriptionRow>,
-    tz: chrono_tz::Tz,
 ) {
-    // FCM device-status payload uses UTC + plain locale ("en-US").
-    // Timezone is for telegram + ntfy paths.
-    let _ = tz;
+    // FCM device-status payload uses UTC + plain locale ("en-US");
+    // `DEVICE_TIMEZONE` is for the telegram + ntfy paths.
     let worker = event
         .worker_name
         .clone()
@@ -1072,24 +1059,6 @@ async fn count_chat_subscriptions(pool: &PgPool, chat_id: i64) -> usize {
     }
 }
 
-fn format_address_short(address: &str) -> String {
-    // First 4 chars + "..." + last 5 chars. For addresses ≤ 9 chars
-    // return the full string.
-    if address.len() <= 9 {
-        return address.to_string();
-    }
-    let head: String = address.chars().take(4).collect();
-    let tail: String = address
-        .chars()
-        .rev()
-        .take(5)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}...{tail}")
-}
-
 fn extract_difficulty_tag(message: &str) -> String {
     // The BlockSubmitted hook formats its result message as `valid (158T)`
     // etc. Pull the bracketed token out for the data.difficulty field.
@@ -1136,20 +1105,6 @@ fn log_adapter_send(kind: &'static str, result: Result<(), AdapterError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn short_address_keeps_prefix_dots_suffix() {
-        assert_eq!(
-            format_address_short("bc1q1234567890abcdefxyz"),
-            "bc1q...efxyz".to_string()
-        );
-    }
-
-    #[test]
-    fn short_address_passthrough_for_tiny_input() {
-        assert_eq!(format_address_short("abc"), "abc");
-        assert_eq!(format_address_short("123456789"), "123456789");
-    }
 
     #[test]
     fn extract_difficulty_picks_bracketed_token() {

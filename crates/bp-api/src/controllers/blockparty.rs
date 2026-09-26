@@ -6,7 +6,7 @@
 //! because the UI reads `response.ok === true` after parsing.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{delete, get, patch, post},
@@ -23,12 +23,16 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::middleware::rate_limit;
 use crate::state::SharedState;
+use crate::utils::{build_member_labels, member_id};
 use bp_group_mgmt_engine::OpenInviteTtl;
 
 // ─── DTOs (camelCase JSON, ms-epoch i64 timestamps) ───────────────
 
 /// Canonical public-facing group shape.
 /// No `updatedAt`, no admin-token hash; `dissolvedAt` stays null until dissolve.
+/// `adminAddress` stays public on purpose: the party mines on it and members
+/// point rented hashrate at it, so it is shared anyway. Member payout
+/// addresses are what the roster pseudonymises.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GroupPublicView {
@@ -62,13 +66,24 @@ impl GroupPublicView {
     }
 }
 
-/// Member shape emitted by `GET /:id` (public detail). Email is masked.
-/// `confirmed: bool` is the only confirmation-state surface — `confirmedAt`
-/// is never returned (UI binds on the bool).
+/// Member shape of `GET /:id` and `member-view`. Same pseudonymisation as the
+/// Group-Solo roster (`crate::utils::member_id`): an opaque `memberId` plus a
+/// masked `addressLabel`; the full payout address only for an admin-token
+/// caller, who needs it to edit the splits. A BTC address is public on-chain,
+/// so one known member address would otherwise open the whole roster via
+/// `by-address`. `confirmed: bool` is the only confirmation-state surface —
+/// `confirmedAt` is never returned (UI binds on the bool).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MemberPublicView {
-    address: String,
+    member_id: String,
+    address_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
+    /// True only for the viewer's own row (`?viewer=` or the member-view
+    /// address).
+    is_self: bool,
+    /// Masked, except the viewer's own in `member-view` (token-proven).
     email: String,
     percent_bp: i32,
     role: String,
@@ -80,39 +95,52 @@ struct MemberPublicView {
     verified_via: Option<&'static str>,
 }
 
-impl MemberPublicView {
-    fn from_row_masked(r: &BlockpartyMemberRow, verified_via: Option<&'static str>) -> Self {
-        Self {
-            address: r.address.as_str().to_owned(),
-            email: mask_email(&r.email),
-            percent_bp: r.percent_bp,
-            role: r.role.clone(),
-            confirmed: r.confirmed_at.is_some(),
-            verified_via,
-        }
-    }
+/// Who is looking at a roster, and what that lets them see.
+struct RosterViewer<'a> {
+    /// Flags this member's row `isSelf`.
+    address: Option<&'a AddressId>,
+    /// Admin-token caller: full addresses.
+    is_admin: bool,
+    /// Member-token caller: their own email unmasked.
+    own_email: bool,
+}
 
-    /// `member-view` variant: members see their own email unmasked but
-    /// other members' emails masked.
-    fn from_row_for_viewer(
-        r: &BlockpartyMemberRow,
-        viewer: &AddressId,
-        verified_via: Option<&'static str>,
-    ) -> Self {
-        let own = r.address == *viewer;
-        Self {
-            address: r.address.as_str().to_owned(),
-            email: if own {
-                r.email.clone()
-            } else {
-                mask_email(&r.email)
-            },
-            percent_bp: r.percent_bp,
-            role: r.role.clone(),
-            confirmed: r.confirmed_at.is_some(),
-            verified_via,
-        }
-    }
+fn member_views(
+    group_id: Uuid,
+    members: &[BlockpartyMemberRow],
+    owned: &std::collections::HashSet<String>,
+    viewer: &RosterViewer<'_>,
+) -> Vec<MemberPublicView> {
+    let addrs: Vec<String> = members
+        .iter()
+        .map(|m| m.address.as_str().to_owned())
+        .collect();
+    let labels = build_member_labels(&addrs);
+    members
+        .iter()
+        .map(|m| {
+            let addr = m.address.as_str();
+            let is_self = viewer.address == Some(&m.address);
+            MemberPublicView {
+                member_id: member_id(group_id, addr),
+                address_label: labels
+                    .get(addr)
+                    .cloned()
+                    .unwrap_or_else(|| bp_common::short_address(addr)),
+                address: viewer.is_admin.then(|| addr.to_owned()),
+                is_self,
+                email: if is_self && viewer.own_email {
+                    m.email.clone()
+                } else {
+                    mask_email(&m.email)
+                },
+                percent_bp: m.percent_bp,
+                role: m.role.clone(),
+                confirmed: m.confirmed_at.is_some(),
+                verified_via: verified_via_for(m, owned),
+            }
+        })
+        .collect()
 }
 
 /// Batch the signature-ownership lookup for a roster into a single query: the
@@ -242,6 +270,7 @@ where
         )
         .route("/api/blockparty/:id", get(detail::<H, M>))
         .route("/api/blockparty/:id/history", get(history::<H, M>))
+        .route("/api/blockparty/:id/admin-check", get(admin_check::<H, M>))
         .route(
             "/api/blockparty/:id/member-view/:address",
             get(member_view::<H, M>),
@@ -341,6 +370,13 @@ where
     }))
 }
 
+#[derive(Deserialize)]
+struct ViewerQuery {
+    /// The viewer's own address (already in the UI route). Only flags that
+    /// member's row `isSelf` — never echoed back for other members.
+    viewer: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DetailResponse {
@@ -352,23 +388,59 @@ struct DetailResponse {
 async fn detail<H, M>(
     State(state): State<SharedState<H, M>>,
     Path(id): Path<Uuid>,
+    Query(q): Query<ViewerQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<DetailResponse>, ApiError>
 where
     H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
     M: bp_group_mgmt_engine::EmailHooks + 'static,
 {
     let svc = require_blockparty(&state)?;
+    let token = admin_token(&headers);
+    let is_admin = match token.as_deref() {
+        None => false,
+        Some(t) => {
+            svc.verify_admin_token(id, Some(t)).await?;
+            true
+        }
+    };
+    let viewer = q
+        .viewer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize)
+        .transpose()?;
     let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
     let members = svc.list_members(id).await?;
     let owned = ownership_set_for_members(&state, &members).await?;
-    let member_views = members
-        .iter()
-        .map(|m| MemberPublicView::from_row_masked(m, verified_via_for(m, &owned)))
-        .collect();
+    let viewer = RosterViewer {
+        address: viewer.as_ref(),
+        is_admin,
+        own_email: false,
+    };
     Ok(Json(DetailResponse {
         group: GroupPublicView::from_row(&group),
-        members: member_views,
+        members: member_views(id, &members, &owned, &viewer),
     }))
+}
+
+/// 204 when `x-blockparty-admin-token` is this party's admin token; 401 when
+/// missing or wrong, 404 for an unknown or dissolved party. Same contract as
+/// `GET /api/pplns/groups/:id/admin-check`.
+async fn admin_check<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    require_blockparty(&state)?
+        .verify_admin_token(id, admin_token(&headers).as_deref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn history<H, M>(
@@ -400,13 +472,14 @@ where
     let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
     let members = svc.list_members(id).await?;
     let owned = ownership_set_for_members(&state, &members).await?;
-    let member_views = members
-        .iter()
-        .map(|m| MemberPublicView::from_row_for_viewer(m, &viewer, verified_via_for(m, &owned)))
-        .collect();
+    let roster_viewer = RosterViewer {
+        address: Some(&viewer),
+        is_admin: false,
+        own_email: true,
+    };
     Ok(Json(DetailResponse {
         group: GroupPublicView::from_row(&group),
-        members: member_views,
+        members: member_views(id, &members, &owned, &roster_viewer),
     }))
 }
 
@@ -809,34 +882,87 @@ mod tests {
         assert_eq!(json, expected);
     }
 
-    #[test]
-    fn member_public_view_json_shape_masked() {
-        let row = BlockpartyMemberRow {
+    fn member_row(address: &str, email: &str) -> BlockpartyMemberRow {
+        BlockpartyMemberRow {
             id: 42,
             group_id: Uuid::parse_str("219eba31-19ac-4f3c-b97a-f50ee3f02b96").unwrap(),
-            address: AddressId::new("bc1q307hujcervvdfr73ntlam2f7w65j6gs9zcnf39").unwrap(),
-            email: "mvogel@yahoo.ch".to_owned(),
+            address: AddressId::new(address).unwrap(),
+            email: email.to_owned(),
             percent_bp: 2500,
             role: "member".to_owned(),
             confirmed_at: Some(1_779_464_900_000),
             member_token_hash: Some("internal".to_owned()),
             created_at: 0,
             updated_at: 0,
-        };
-        let dto = MemberPublicView::from_row_masked(&row, Some("email"));
-        let json = serde_json::to_value(&dto).unwrap();
-        let expected: serde_json::Value = serde_json::from_str(
-            r#"{
-                "address": "bc1q307hujcervvdfr73ntlam2f7w65j6gs9zcnf39",
-                "email": "m***@y***.ch",
-                "percentBp": 2500,
-                "role": "member",
-                "confirmed": true,
-                "verifiedVia": "email"
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(json, expected);
+        }
+    }
+
+    const ALICE: &str = "bc1q307hujcervvdfr73ntlam2f7w65j6gs9zcnf39";
+    const BOB: &str = "bc1qywnf55acqpxr0lekg2gmy2s46pzxqze99j0u9y";
+
+    fn roster(viewer: &RosterViewer<'_>) -> Vec<serde_json::Value> {
+        let gid = Uuid::parse_str("219eba31-19ac-4f3c-b97a-f50ee3f02b96").unwrap();
+        let members = [
+            member_row(ALICE, "mvogel@yahoo.ch"),
+            member_row(BOB, "bob@example.com"),
+        ];
+        member_views(gid, &members, &Default::default(), viewer)
+            .iter()
+            .map(|v| serde_json::to_value(v).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn anonymous_roster_carries_no_full_address() {
+        let alice = AddressId::new(ALICE).unwrap();
+        let rows = roster(&RosterViewer {
+            address: Some(&alice),
+            is_admin: false,
+            own_email: false,
+        });
+        let gid = Uuid::parse_str("219eba31-19ac-4f3c-b97a-f50ee3f02b96").unwrap();
+        let expected: serde_json::Value = serde_json::json!({
+            "memberId": member_id(gid, ALICE),
+            "addressLabel": bp_common::short_address(ALICE),
+            "isSelf": true,
+            "email": "m***@y***.ch",
+            "percentBp": 2500,
+            "role": "member",
+            "confirmed": true,
+            "verifiedVia": "email"
+        });
+        assert_eq!(rows[0], expected);
+        assert_eq!(rows[1]["isSelf"], false);
+        for row in &rows {
+            assert!(row.get("address").is_none(), "leaked: {row}");
+            assert!(!row.to_string().contains(&ALICE[8..]), "leaked: {row}");
+            assert!(!row.to_string().contains(&BOB[8..]), "leaked: {row}");
+        }
+    }
+
+    #[test]
+    fn member_view_unmasks_only_the_viewers_own_email() {
+        let alice = AddressId::new(ALICE).unwrap();
+        let rows = roster(&RosterViewer {
+            address: Some(&alice),
+            is_admin: false,
+            own_email: true,
+        });
+        assert_eq!(rows[0]["email"], "mvogel@yahoo.ch");
+        assert_eq!(rows[1]["email"], "b***@e***.com");
+        assert!(rows.iter().all(|r| r.get("address").is_none()));
+    }
+
+    #[test]
+    fn admin_roster_carries_full_addresses() {
+        let rows = roster(&RosterViewer {
+            address: None,
+            is_admin: true,
+            own_email: false,
+        });
+        assert_eq!(rows[0]["address"], ALICE);
+        assert_eq!(rows[1]["address"], BOB);
+        assert!(rows.iter().all(|r| r["isSelf"] == false));
     }
 
     #[test]

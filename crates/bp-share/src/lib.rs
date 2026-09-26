@@ -98,30 +98,11 @@ impl Target {
     /// Numerically largest target — trivially easy.
     pub const MAX: Target = Target([0xff; 32]);
 
-    /// Difficulty-1 target.
-    /// BE: `00 00 00 00 FF FF 00 00 ... 00`, LE: zeros with 0xFF at indices 26–27.
-    pub const DIFF_ONE: Target = {
-        let mut t = [0u8; 32];
-        t[26] = 0xff;
-        t[27] = 0xff;
-        Target(t)
-    };
-
     pub fn from_le_bytes(bytes: [u8; 32]) -> Self {
         Target(bytes)
     }
 
-    pub fn from_be_bytes(mut bytes: [u8; 32]) -> Self {
-        bytes.reverse();
-        Target(bytes)
-    }
-
     pub fn to_le_bytes(self) -> [u8; 32] {
-        self.0
-    }
-
-    pub fn to_be_bytes(mut self) -> [u8; 32] {
-        self.0.reverse();
         self.0
     }
 
@@ -728,13 +709,38 @@ pub fn difficulty_to_target(diff: Difficulty) -> Target {
     Target(biguint_to_le_bytes_32(&target_big))
 }
 
+/// One-slot memo for [`difficulty_to_target`] on the per-share accept
+/// check. A session validates nearly every share at the same difficulty
+/// (it moves only on a vardiff ratchet), so one `(difficulty bits →
+/// target)` slot serves them all and a miss just recomputes. Keyed on the
+/// exact f64 bit pattern, so the cached target is bit-identical to
+/// recomputing: purely a per-share BigUint-divide saving.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TargetMemo(Option<(u64, Target)>);
+
+impl TargetMemo {
+    /// Target for `diff`: the cached one when `diff` matches the last
+    /// computed difficulty, otherwise `difficulty_to_target(diff)`, cached.
+    pub fn target_for(&mut self, diff: Difficulty) -> Target {
+        let key = diff.0.to_bits();
+        if let Some((cached_key, cached_target)) = self.0 {
+            if cached_key == key {
+                return cached_target;
+            }
+        }
+        let target = difficulty_to_target(diff);
+        self.0 = Some((key, target));
+        target
+    }
+}
+
 // ============================================================================
 // SV2 hashrate-to-target
 // ============================================================================
 
 /// SV2-spec target = (2^256 − h·s) / (h·s + 1)
 /// where h = hashrate (H/s), s = 60 / sharesPerMinute.
-pub fn hash_rate_to_target(hash_rate: f64, shares_per_minute: f64) -> Target {
+fn hash_rate_to_target(hash_rate: f64, shares_per_minute: f64) -> Target {
     if !hash_rate.is_finite()
         || hash_rate <= 0.0
         || !shares_per_minute.is_finite()
@@ -849,30 +855,12 @@ mod tests {
     // ---- Target byte-order ----
 
     #[test]
-    fn target_diff_one_le_layout() {
-        let t = Target::DIFF_ONE;
-        // BE: 00 00 00 00 FF FF 00 ... 00
-        let be = t.to_be_bytes();
-        assert_eq!(be[0..4], [0, 0, 0, 0]);
-        assert_eq!(be[4..6], [0xff, 0xff]);
-        assert_eq!(be[6..32], [0u8; 26]);
-    }
-
-    #[test]
-    fn target_le_be_round_trip() {
-        let be = [
-            0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-        ];
-        let t = Target::from_be_bytes(be);
-        assert_eq!(t, Target::DIFF_ONE);
-        assert_eq!(t.to_be_bytes(), be);
-    }
-
-    #[test]
     fn target_display_is_be_hex() {
-        let s = Target::DIFF_ONE.to_string();
+        // Difficulty-1 target: LE storage has 0xFF at indices 26–27.
+        let mut le = [0u8; 32];
+        le[26] = 0xff;
+        le[27] = 0xff;
+        let s = Target(le).to_string();
         assert_eq!(
             s,
             "00000000ffff0000000000000000000000000000000000000000000000000000"
@@ -1002,6 +990,42 @@ mod tests {
     fn target_zero_returns_max_difficulty() {
         let zero = Target([0u8; 32]);
         assert_eq!(target_to_difficulty(&zero).0, f64::MAX);
+    }
+
+    // ---- TargetMemo ----
+
+    /// The memo returns bit-identical results to an uncached
+    /// `difficulty_to_target` and recomputes on a difficulty change — a
+    /// pure performance shim, no behaviour change.
+    #[test]
+    fn target_memo_matches_uncached_and_recomputes_on_change() {
+        let mut memo = TargetMemo::default();
+        // Across a spread of difficulties (integer, fractional, extreme)
+        // the memoized target must be bit-identical to the uncached path.
+        for d in [1.0, 1024.0, 65535.0, 0.5, 1e9, 1234.5678] {
+            let direct = difficulty_to_target(Difficulty(d));
+            assert_eq!(
+                memo.target_for(Difficulty(d)),
+                direct,
+                "diff {d}: memo != uncached"
+            );
+            // Immediate repeat is served from the slot — still equal.
+            assert_eq!(
+                memo.target_for(Difficulty(d)),
+                direct,
+                "diff {d}: repeat mismatch"
+            );
+        }
+        // Switching difficulty must recompute (no stale slot), and
+        // switching back must still yield the correct target.
+        let a = memo.target_for(Difficulty(1024.0));
+        let b = memo.target_for(Difficulty(2048.0));
+        assert_ne!(a, b, "distinct difficulties must map to distinct targets");
+        assert_eq!(
+            memo.target_for(Difficulty(1024.0)),
+            difficulty_to_target(Difficulty(1024.0)),
+            "re-selecting a prior difficulty must recompute correctly"
+        );
     }
 
     // ---- SV2 hashrate-to-target ----

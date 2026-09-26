@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Response types for `getnetworkinfo`, `getmininginfo`, `getpeerinfo`.
+//! Response types for `getnetworkinfo`, `getmininginfo`, `getblockheader`,
+//! `getblock`, `getrawtransaction`.
 //!
 //! Fields mirror the JSON output of bitcoin-core v29+. Fields that may be
 //! absent in older / newer versions are wrapped in `Option`. Unknown
@@ -102,58 +103,6 @@ pub struct BlockHeaderInfo {
     /// Block height. Present for blocks on the active chain.
     #[serde(default)]
     pub height: Option<u64>,
-}
-
-// ---------------------------------------------------------------------------
-// getpeerinfo (single-peer entry)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub id: u64,
-    /// IP:port of the peer.
-    pub addr: String,
-    /// Local network address that peer connected to / from.
-    #[serde(default)]
-    pub addrbind: Option<String>,
-    #[serde(default)]
-    pub addrlocal: Option<String>,
-    /// Symbolic service names (NETWORK, WITNESS, …).
-    #[serde(default)]
-    pub servicesnames: Vec<String>,
-    #[serde(default)]
-    pub services: Option<String>,
-    pub relaytxes: bool,
-    pub lastsend: i64,
-    pub lastrecv: i64,
-    pub bytessent: u64,
-    pub bytesrecv: u64,
-    pub conntime: i64,
-    pub timeoffset: i64,
-    #[serde(default)]
-    pub pingtime: Option<f64>,
-    #[serde(default)]
-    pub minping: Option<f64>,
-    /// Network discriminator the peer connects over —
-    /// `"ipv4"` / `"ipv6"` / `"onion"` / `"i2p"` / `"cjdns"` /
-    /// `"not_publicly_routable"`. Optional because some older
-    /// bitcoin-core versions omit it. Used by `/api/info/peers`.
-    #[serde(default)]
-    pub network: Option<String>,
-
-    /// Reported subversion string of the peer, e.g. `/Satoshi:29.0.0/`.
-    pub subver: String,
-    pub inbound: bool,
-    /// `"inbound"` / `"manual"` / `"feeler"` / `"outbound-full-relay"` /
-    /// `"block-relay-only"` / `"addr-fetch"`.
-    #[serde(default)]
-    pub connection_type: Option<String>,
-    pub startingheight: i64,
-    #[serde(default)]
-    pub synced_headers: Option<i64>,
-    #[serde(default)]
-    pub synced_blocks: Option<i64>,
-    pub version: u64,
 }
 
 #[cfg(test)]
@@ -268,65 +217,6 @@ mod tests {
         assert_eq!(info.blocks, 851234);
         assert_eq!(info.currentblockweight, None);
         assert!(info.warnings.is_null());
-    }
-
-    #[test]
-    fn peer_info_parses_array() {
-        let json = r#"[
-            {
-                "id": 0,
-                "addr": "1.2.3.4:8333",
-                "services": "0000000000000409",
-                "servicesnames": ["NETWORK", "WITNESS"],
-                "relaytxes": true,
-                "lastsend": 1700000000,
-                "lastrecv": 1700000001,
-                "bytessent": 123,
-                "bytesrecv": 456,
-                "conntime": 1699999000,
-                "timeoffset": -1,
-                "pingtime": 0.123,
-                "minping": 0.100,
-                "subver": "/Satoshi:29.0.0/",
-                "inbound": false,
-                "connection_type": "outbound-full-relay",
-                "startingheight": 851000,
-                "synced_headers": 851234,
-                "synced_blocks": 851234,
-                "version": 70016
-            }
-        ]"#;
-        let peers: Vec<PeerInfo> = serde_json::from_str(json).unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].addr, "1.2.3.4:8333");
-        assert_eq!(
-            peers[0].connection_type.as_deref(),
-            Some("outbound-full-relay")
-        );
-        assert!(!peers[0].inbound);
-    }
-
-    #[test]
-    fn peer_info_tolerates_missing_optional_fields() {
-        // Minimal subset older builds may emit.
-        let json = r#"[{
-            "id": 1,
-            "addr": "5.6.7.8:8333",
-            "relaytxes": false,
-            "lastsend": 0,
-            "lastrecv": 0,
-            "bytessent": 0,
-            "bytesrecv": 0,
-            "conntime": 0,
-            "timeoffset": 0,
-            "subver": "/older:1.0/",
-            "inbound": true,
-            "startingheight": 0,
-            "version": 70015
-        }]"#;
-        let peers: Vec<PeerInfo> = serde_json::from_str(json).unwrap();
-        assert_eq!(peers[0].id, 1);
-        assert_eq!(peers[0].connection_type, None);
     }
 }
 

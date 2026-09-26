@@ -4,7 +4,7 @@
 //!
 //! Owns one TCP listener per configured port (solo + solo-high-diff +
 //! optionally pplns + pplns-high-diff). For each connection: peek the
-//! first byte, classify via [`bp_protocol_detect::detect`], dispatch
+//! first byte, classify via [`detect`], dispatch
 //! to either the SV1 server's `accept_connection` (existing SV1
 //! handshake) or the SV2 server's `accept_connection` (Noise XK
 //! handshake). HTTP requests on a stratum port get closed with a
@@ -38,7 +38,6 @@ use std::sync::{Arc, RwLock};
 
 use bp_config::AppConfig;
 use bp_notifications::dispatcher::NotificationDispatcher;
-use bp_protocol_detect::{detect, Detected};
 use bp_stratum_v1::{PortConfig as Sv1PortConfig, StratumV1Server};
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::server::StratumV2MiningServer;
@@ -162,7 +161,7 @@ pub(crate) async fn spawn(
         engines.payout_identities.clone(),
         // The renderer's network, so the resolver can ask the renderer's own
         // payability question before it hands a coinbase a key it cannot pay.
-        crate::network::config_network_to_bitcoin(cfg.network),
+        crate::boot::bitcoin_network(cfg.network),
     ));
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();
     let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = production_resolver;
@@ -201,6 +200,8 @@ pub(crate) async fn spawn(
     ));
     let live_publisher = crate::live_sessions::spawn_publisher(Arc::clone(&live_sessions));
 
+    let device_status = crate::device_status::stratum_sinks(gate, foundation.redis.clone());
+
     let sv1_servers = stratum_v1::build_per_port_servers(
         cfg,
         foundation,
@@ -209,7 +210,7 @@ pub(crate) async fn spawn(
         sv1_resolver,
         rotating_intake.clone(),
         dispatcher.clone(),
-        gate.clone(),
+        Arc::clone(&device_status),
         Arc::clone(&live_sessions),
         job_cache.clone(),
         settle.clone(),
@@ -230,7 +231,7 @@ pub(crate) async fn spawn(
         custom_extranonce,
         rotating_intake,
         dispatcher,
-        gate,
+        device_status,
         Arc::clone(&live_sessions),
         job_cache,
         settle,
@@ -404,6 +405,41 @@ async fn dispatch_connection(
     }
 }
 
+/// What the first byte of an accepted connection says it speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Detected {
+    /// SV1 JSON-RPC: `'{'`, or one of the pre-JSON whitespace bytes
+    /// `' '` / `'\n'` / `'\r'` some SV1 implementations lead with.
+    Sv1,
+    /// SV2 binary protocol (Noise handshake). Every byte the other
+    /// variants don't claim lands here.
+    Sv2,
+    /// HTTP request: `'G'` (GET) or `'P'` (POST/PUT/PATCH). Not served on
+    /// a stratum port — [`dispatch_connection`] logs a warning and closes.
+    Http,
+    /// TLS ClientHello (`0x16`). Closed right away, so a TLS probe never
+    /// reaches the SV2 handshake machinery.
+    Tls,
+}
+
+/// Classify a connection by its first byte.
+///
+/// Pre-JSON whitespace (`' '`, `'\n'`, `'\r'`) counts as SV1: the SV1
+/// spec opens with `{`, but some implementations lead with whitespace.
+/// The byte is only peeked, so the SV1 parser still sees it and trims it.
+fn detect(first_byte: u8) -> Detected {
+    match first_byte {
+        // HTTP — GET (0x47) or POST/PUT/PATCH (0x50).
+        b'G' | b'P' => Detected::Http,
+        // SV1 — '{' (0x7B) or leading whitespace before the JSON body.
+        b'{' | b' ' | b'\n' | b'\r' => Detected::Sv1,
+        // TLS ClientHello — not a stratum protocol.
+        0x16 => Detected::Tls,
+        // Anything else: assume SV2 binary (Noise handshake).
+        _ => Detected::Sv2,
+    }
+}
+
 /// Peek the first byte from `socket` without consuming it. Returns
 /// `Ok(None)` when the peer closed the connection before sending
 /// anything; `Err(_)` for any I/O error.
@@ -418,30 +454,86 @@ async fn peek_first_byte(socket: &TcpStream) -> std::io::Result<Option<u8>> {
     }
 }
 
-// Silence the `Arc` import warning when no other module needs it.
-fn _silence_arc<T>(_: Arc<T>) {}
+/// One Stratum port's template subscriptions: the default stream plus every
+/// alt stream, each with the snapshot that covers what the broadcast missed.
+/// SV1 and SV2 build their per-port servers from the same set.
+pub(crate) struct PortTemplates {
+    pub(crate) updates_rx:
+        tokio::sync::broadcast::Receiver<bp_template_distribution::TemplateUpdate>,
+    pub(crate) initial_snapshot: bp_template_distribution::TemplateSnapshot,
+    pub(crate) alt_streams: Vec<(
+        bp_common::StreamKind,
+        tokio::sync::broadcast::Receiver<bp_template_distribution::TemplateUpdate>,
+        bp_template_distribution::TemplateSnapshot,
+    )>,
+}
+
+impl PortTemplates {
+    /// Subscribe BEFORE snapshotting: anything broadcast between the two ends
+    /// up in both, and the assembler dedupes on template_id. The snapshot
+    /// covers the bitcoin-core bootstrap pair (NewTemplate + SetNewPrevHash)
+    /// the broadcast usually sends before a per-port subscriber exists; see
+    /// `feedback-tdp-initial-template-drain` for the race.
+    ///
+    /// Every port carries ALL alt streams — mode is per-address, not per-port,
+    /// so a Group-Solo / Blockparty member can connect on any port and must be
+    /// routable onto its stream.
+    pub(crate) fn subscribe(
+        tdp: &bp_template_distribution::TdpHandle,
+        foundation: &FoundationHandles,
+    ) -> Self {
+        let updates_rx = tdp.subscribe();
+        let initial_snapshot = tdp.current_snapshot();
+        let alt_streams = foundation
+            .alt_tdp
+            .iter()
+            .map(|(kind, handle)| (*kind, handle.subscribe(), handle.current_snapshot()))
+            .collect();
+        Self {
+            updates_rx,
+            initial_snapshot,
+            alt_streams,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Detection routing is exercised end-to-end against the actual
-    // `bp_protocol_detect::detect` table; the pure-classification
-    // logic itself is tested inside that crate. Here we just confirm
-    // the mapping we rely on in `dispatch_connection` hasn't shifted.
+    // ── first-byte detection ─────────────────────────────────────────
 
     #[test]
-    fn detect_table_pins_expected_mappings() {
-        assert_eq!(detect(b'{'), Detected::Sv1);
-        assert_eq!(detect(b' '), Detected::Sv1);
-        assert_eq!(detect(b'\n'), Detected::Sv1);
-        assert_eq!(detect(b'\r'), Detected::Sv1);
+    fn http_method_initials_route_to_http() {
+        // GET (0x47); POST / PUT / PATCH all start with 0x50.
         assert_eq!(detect(b'G'), Detected::Http);
         assert_eq!(detect(b'P'), Detected::Http);
+    }
+
+    #[test]
+    fn open_brace_and_leading_whitespace_are_sv1() {
+        // Some non-strict SV1 implementations lead with whitespace.
+        for b in [b'{', b' ', b'\n', b'\r'] {
+            assert_eq!(detect(b), Detected::Sv1, "byte 0x{b:02x}");
+        }
+    }
+
+    #[test]
+    fn tls_client_hello_is_its_own_variant() {
+        // TLS ClientHello typically starts 0x16 0x03 0x01 (handshake, TLS 1.0).
         assert_eq!(detect(0x16), Detected::Tls);
-        // SV2's Noise handshake first byte is typically 0x00..0x40 but
-        // any non-classified byte falls into SV2.
-        assert_eq!(detect(0x00), Detected::Sv2);
-        assert_eq!(detect(0xFF), Detected::Sv2);
+    }
+
+    #[test]
+    fn unclaimed_bytes_fall_through_to_sv2() {
+        // A Noise XK first message starts with the ephemeral public key, so
+        // the leading byte is whatever the curve produced.
+        for b in [0x00, 0x01, 0x42, 0x80, 0xab, 0xfe, 0xff] {
+            assert_eq!(detect(b), Detected::Sv2, "byte 0x{b:02x}");
+        }
+        // Letters other than the HTTP method initials are not HTTP.
+        for b in [b'A', b'B', b'H', b'O', b'T', b'X', b'Z'] {
+            assert_eq!(detect(b), Detected::Sv2, "letter '{}'", b as char);
+        }
     }
 }

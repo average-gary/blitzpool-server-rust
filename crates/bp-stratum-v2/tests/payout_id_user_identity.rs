@@ -19,7 +19,7 @@ use bp_share::Difficulty;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::hooks::MiningServerHooks;
 use bp_stratum_v2::mining::client::{PortConfig, FLAG_REQUIRES_VERSION_ROLLING};
-use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
@@ -130,13 +130,13 @@ async fn a_payout_id_user_identity_is_admitted_because_the_server_warms_first() 
     };
     let server = StratumV2MiningServer::spawn(
         ServerConfig::defaults_for(Network::Regtest),
-        NoiseConfig::parse_strings(SRI_TEST_PUB, SRI_TEST_PRV, DEFAULT_CERT_VALIDITY)
-            .expect("noise config"),
+        NoiseConfig::new(SRI_TEST_PUB.parse().unwrap(), SRI_TEST_PRV.parse().unwrap()),
         updates_rx,
         bp_template_distribution::TemplateSnapshot::default(),
         Vec::new(),
         hooks,
         Arc::new(RwLock::new(JdpDeclaredJobRegistry::new())),
+        common::sv2_extranonce(),
         Arc::new(bp_mining_job::MiningJobCache::new()),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -148,6 +148,7 @@ async fn a_payout_id_user_identity_is_admitted_because_the_server_warms_first() 
         target_shares_per_minute: 6.0,
         vardiff_interval_ms: 200,
         vardiff_silence_easing: false,
+        job_lifecycle: bp_jobs_lifecycle::LifecycleConfig::DEFAULT,
     };
     let server_clone = server.clone();
     tokio::spawn(async move {

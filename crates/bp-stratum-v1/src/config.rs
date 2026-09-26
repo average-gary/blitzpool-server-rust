@@ -5,9 +5,9 @@
 //! Two layers:
 //!
 //! - [`ServerConfig`]: process-wide defaults (network, pool identifier,
-//!   dev-fee, lifecycle constants). Built once at startup.
+//!   job lifecycle). Built once at startup.
 //! - [`PortConfig`]: per-listener overrides (initial difficulty, payout
-//!   mode, vardiff floor, warmup gate). One per TCP port the operator
+//!   mode, vardiff floor). One per TCP port the operator
 //!   exposes.
 //!
 //! Default values are tuned for production deployments and require no
@@ -16,6 +16,7 @@
 
 use bitcoin::Network;
 use bp_common::MiningMode;
+use bp_jobs_lifecycle::LifecycleConfig;
 
 use crate::error::StratumV1Error;
 
@@ -23,53 +24,34 @@ use crate::error::StratumV1Error;
 /// bytes. Combined with the 4-byte extranonce-1 from the session id, total
 /// extranonce slot is 12 bytes. Matches ckpool's `nonce2length` default
 /// and is required by the Braiins Hashpower marketplace (≥ 7).
-pub const EXTRANONCE2_SIZE: u8 = 8;
+pub(crate) const EXTRANONCE2_SIZE: u8 = 8;
 
 /// SV1 `mining.configure` response advertises BIP-310 version-rolling with
 /// this mask. Standard value compatible with most ASIC firmwares.
-pub const DEFAULT_VERSION_ROLLING_MASK: u32 = 0x1fffe000;
-
-/// Default ckpool-style stale-grace window. Shares against a job retired
-/// within this many milliseconds are still credited at the issued
-/// difficulty (network jitter absorption).
-pub const DEFAULT_STALE_GRACE_MS: u64 = 5_000;
-
-/// Default ckpool-style job retention. Retired entries remain queryable
-/// for this long after retirement before aging out (10 minutes).
-pub const DEFAULT_JOB_RETENTION_MS: u64 = 600_000;
-
-/// Minimum number of jobs/templates kept in the registry regardless of
-/// age — defends against startup races where aging would prematurely
-/// drop entries.
-pub const DEFAULT_MIN_RETAINED_JOBS: usize = 3;
+pub(crate) const VERSION_ROLLING_MASK: u32 = 0x1fffe000;
 
 /// Default vardiff sample-window evaluation interval (60 s). The
 /// per-connection difficulty-check timer fires this often.
-pub const DEFAULT_DIFFICULTY_CHECK_INTERVAL_MS: u64 = 60_000;
+pub(crate) const DEFAULT_DIFFICULTY_CHECK_INTERVAL_MS: u64 = 60_000;
 
-/// Default cpuminer fallback difficulty. When `userAgent == "cpuminer"`
-/// and the initial difficulty is below `cpuminer_high_diff_threshold`,
-/// the session difficulty is pinned to this value.
-pub const DEFAULT_CPUMINER_FALLBACK_DIFFICULTY: f64 = 0.1;
+/// cpuminer fallback difficulty. When `userAgent == "cpuminer"` and the
+/// initial difficulty is below [`CPUMINER_HIGH_DIFF_THRESHOLD`], the
+/// session difficulty is pinned to this value.
+pub(crate) const CPUMINER_FALLBACK_DIFFICULTY: f64 = 0.1;
 
 /// Above this initial difficulty, the cpuminer fallback is skipped (the
 /// session was deliberately started at high diff — typically a stress
 /// test, not a real CPU miner).
-pub const DEFAULT_CPUMINER_HIGH_DIFF_THRESHOLD: f64 = 1_000_000.0;
-
-/// External-share-submission minimum difficulty. When external sharing
-/// is enabled, only shares meeting at least this difficulty are forwarded
-/// (typically 1T to match real block-finder hash work).
-pub const DEFAULT_EXTERNAL_SHARE_MIN_DIFFICULTY: f64 = 1.0e12;
+pub(crate) const CPUMINER_HIGH_DIFF_THRESHOLD: f64 = 1_000_000.0;
 
 /// Default vardiff target submission rate per minute. Used when the
 /// port doesn't override it.
-pub const DEFAULT_TARGET_SHARES_PER_MINUTE: f64 = 6.0;
+pub(crate) const DEFAULT_TARGET_SHARES_PER_MINUTE: f64 = 6.0;
 
 /// Default initial session difficulty fallback when a port doesn't supply
 /// one and the miner doesn't successfully negotiate via
 /// `mining.suggest_difficulty`.
-pub const DEFAULT_INITIAL_DIFFICULTY: f64 = 16_384.0;
+pub(crate) const DEFAULT_INITIAL_DIFFICULTY: f64 = 16_384.0;
 
 /// Default pool identifier embedded in the coinbase scriptsig (after the
 /// BIP-34 height push, before the extranonce slot). Dropped at coinbase-
@@ -84,16 +66,10 @@ pub struct ServerConfig {
     /// Embedded in the coinbase scriptsig. Dropped if the resulting
     /// scriptsig would exceed the 100-byte consensus limit.
     pub pool_identifier: String,
-    /// Window during which a share against a retired job is still
-    /// credited as if the job were active (ckpool-style jitter
-    /// absorption). Beyond this, shares are rejected as `stale`.
-    pub stale_grace_ms: u64,
-    /// How long after retirement a job/template stays in the registry
-    /// for classification before aging out.
-    pub job_retention_ms: u64,
-    /// MIN_RETAINED — never delete below this many entries regardless of
-    /// age. Defends against startup races.
-    pub min_retained_jobs: usize,
+    /// Job/template retire-and-age-out parameters for the registry.
+    /// Starts at [`LifecycleConfig::DEFAULT`]; production overrides only
+    /// `retention_ms` (`[stratum] job_retention_ms`).
+    pub lifecycle: LifecycleConfig,
     /// How often each connection re-evaluates its vardiff target.
     pub difficulty_check_interval_ms: u64,
     /// Whether vardiff may use elapsed silence as evidence and walk a
@@ -101,20 +77,6 @@ pub struct ServerConfig {
     /// "Silence easing"). Off by default — it changes retarget behaviour
     /// for every session, so operators switch it on per deployment.
     pub vardiff_silence_easing: bool,
-    /// cpuminer fallback target when the initial difficulty is below
-    /// `cpuminer_high_diff_threshold`.
-    pub cpuminer_fallback_difficulty: f64,
-    /// Above this, the cpuminer fallback is bypassed.
-    pub cpuminer_high_diff_threshold: f64,
-    /// BIP-310 version-rolling mask advertised in `mining.configure`.
-    pub version_rolling_mask: u32,
-    /// Extranonce-2 size announced in `mining.subscribe` response.
-    pub extranonce2_size: u8,
-    /// Whether to forward high-difficulty shares to an external pool/API.
-    pub external_share_submission_enabled: bool,
-    /// Minimum share difficulty for external submission (only meaningful
-    /// when `external_share_submission_enabled` is `true`).
-    pub external_share_min_difficulty: f64,
     /// When `true`, every inbound JSON-RPC line and every outbound
     /// frame the per-connection task writes is logged at DEBUG with
     /// `📨 RX:` / `📤 TX:` prefixes. Heavy — only enable in staging.
@@ -138,17 +100,9 @@ impl ServerConfig {
         Self {
             network,
             pool_identifier: DEFAULT_POOL_IDENTIFIER.to_string(),
-            stale_grace_ms: DEFAULT_STALE_GRACE_MS,
-            job_retention_ms: DEFAULT_JOB_RETENTION_MS,
-            min_retained_jobs: DEFAULT_MIN_RETAINED_JOBS,
+            lifecycle: LifecycleConfig::DEFAULT,
             difficulty_check_interval_ms: DEFAULT_DIFFICULTY_CHECK_INTERVAL_MS,
             vardiff_silence_easing: false,
-            cpuminer_fallback_difficulty: DEFAULT_CPUMINER_FALLBACK_DIFFICULTY,
-            cpuminer_high_diff_threshold: DEFAULT_CPUMINER_HIGH_DIFF_THRESHOLD,
-            version_rolling_mask: DEFAULT_VERSION_ROLLING_MASK,
-            extranonce2_size: EXTRANONCE2_SIZE,
-            external_share_submission_enabled: false,
-            external_share_min_difficulty: DEFAULT_EXTERNAL_SHARE_MIN_DIFFICULTY,
             protocol_debug: false,
             share_logs: false,
             log_submit_latency: false,
@@ -158,56 +112,16 @@ impl ServerConfig {
     /// Validate cross-field invariants. Called by the server before any
     /// connection is accepted.
     pub fn validate(&self) -> Result<(), StratumV1Error> {
-        if self.min_retained_jobs == 0 {
-            return Err(StratumV1Error::InvalidConfig(
-                "min_retained_jobs must be ≥ 1".into(),
-            ));
-        }
-        if self.stale_grace_ms == 0 {
-            return Err(StratumV1Error::InvalidConfig(
-                "stale_grace_ms must be > 0 (set to a small value to disable)".into(),
-            ));
-        }
-        if self.job_retention_ms < self.stale_grace_ms {
+        if self.lifecycle.retention_ms < self.lifecycle.grace_ms {
             return Err(StratumV1Error::InvalidConfig(format!(
-                "job_retention_ms {} must be ≥ stale_grace_ms {}",
-                self.job_retention_ms, self.stale_grace_ms
+                "job_retention_ms {} must be ≥ the {} ms stale-grace window",
+                self.lifecycle.retention_ms, self.lifecycle.grace_ms
             )));
         }
         if self.difficulty_check_interval_ms == 0 {
             return Err(StratumV1Error::InvalidConfig(
                 "difficulty_check_interval_ms must be > 0".into(),
             ));
-        }
-        if !(self.cpuminer_fallback_difficulty > 0.0
-            && self.cpuminer_fallback_difficulty.is_finite())
-        {
-            return Err(StratumV1Error::InvalidConfig(format!(
-                "cpuminer_fallback_difficulty {} must be > 0 and finite",
-                self.cpuminer_fallback_difficulty
-            )));
-        }
-        if !(self.cpuminer_high_diff_threshold > 0.0
-            && self.cpuminer_high_diff_threshold.is_finite())
-        {
-            return Err(StratumV1Error::InvalidConfig(format!(
-                "cpuminer_high_diff_threshold {} must be > 0 and finite",
-                self.cpuminer_high_diff_threshold
-            )));
-        }
-        if self.extranonce2_size == 0 {
-            return Err(StratumV1Error::InvalidConfig(
-                "extranonce2_size must be > 0".into(),
-            ));
-        }
-        if self.external_share_submission_enabled
-            && !(self.external_share_min_difficulty > 0.0
-                && self.external_share_min_difficulty.is_finite())
-        {
-            return Err(StratumV1Error::InvalidConfig(format!(
-                "external_share_min_difficulty {} must be > 0 and finite when external_share_submission_enabled",
-                self.external_share_min_difficulty
-            )));
         }
         Ok(())
     }
@@ -239,12 +153,6 @@ pub struct PortConfig {
     /// to at least this. Used on payout-mode ports to keep sub-dust
     /// devices off the ledger.
     pub minimum_difficulty: f64,
-    /// Payout-mode warmup gate. The first `N` accepted shares of a fresh
-    /// session are still validated and counted in per-session statistics,
-    /// but skip the PPLNS / group-solo ledger write. Filters short-lived
-    /// CPU/low-hashrate miners that briefly clear the minimum difficulty.
-    /// `0` disables (every share counts from the first).
-    pub ledger_warmup_shares: u32,
 }
 
 impl PortConfig {
@@ -259,13 +167,12 @@ impl PortConfig {
             target_shares_per_minute: DEFAULT_TARGET_SHARES_PER_MINUTE,
             payout_mode: MiningMode::Solo,
             minimum_difficulty: 0.0,
-            ledger_warmup_shares: 0,
         }
     }
 
     /// Apply the `rawInitial`-style clamping semantics:
     /// constructor does: if `initial_difficulty` is non-finite or
-    /// non-positive, fall back to [`DEFAULT_INITIAL_DIFFICULTY`]; if the
+    /// non-positive, fall back to `DEFAULT_INITIAL_DIFFICULTY`; if the
     /// minimum-difficulty floor is set, raise the initial to meet it.
     ///
     /// Returns the effective starting difficulty that the connection's
@@ -337,16 +244,8 @@ mod tests {
         let c = cfg();
         assert_eq!(c.network, Network::Bitcoin);
         assert_eq!(c.pool_identifier, "Public-Pool");
-        assert_eq!(c.stale_grace_ms, 5_000);
-        assert_eq!(c.job_retention_ms, 600_000);
-        assert_eq!(c.min_retained_jobs, 3);
+        assert_eq!(c.lifecycle, LifecycleConfig::DEFAULT);
         assert_eq!(c.difficulty_check_interval_ms, 60_000);
-        assert_eq!(c.cpuminer_fallback_difficulty, 0.1);
-        assert_eq!(c.cpuminer_high_diff_threshold, 1_000_000.0);
-        assert_eq!(c.version_rolling_mask, 0x1fffe000);
-        assert_eq!(c.extranonce2_size, 8);
-        assert!(!c.external_share_submission_enabled);
-        assert_eq!(c.external_share_min_difficulty, 1.0e12);
     }
 
     #[test]
@@ -357,56 +256,12 @@ mod tests {
     // ── ServerConfig validation ───────────────────────────────────────
 
     #[test]
-    fn rejects_zero_min_retained_jobs() {
-        let mut c = cfg();
-        c.min_retained_jobs = 0;
-        assert!(matches!(
-            c.validate(),
-            Err(StratumV1Error::InvalidConfig(_))
-        ));
-    }
-
-    #[test]
     fn rejects_retention_below_grace() {
         // job_retention_ms must be ≥ stale_grace_ms — a job has to survive
         // at least the grace window to be classifiable.
         let mut c = cfg();
-        c.job_retention_ms = 1_000;
-        c.stale_grace_ms = 5_000;
-        assert!(matches!(
-            c.validate(),
-            Err(StratumV1Error::InvalidConfig(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_zero_extranonce2_size() {
-        let mut c = cfg();
-        c.extranonce2_size = 0;
-        assert!(matches!(
-            c.validate(),
-            Err(StratumV1Error::InvalidConfig(_))
-        ));
-    }
-
-    #[test]
-    fn external_share_min_diff_only_required_when_enabled() {
-        let mut c = cfg();
-        c.external_share_submission_enabled = false;
-        c.external_share_min_difficulty = 0.0; // ignored
-        c.validate().expect("disabled path ignores min diff");
-
-        c.external_share_submission_enabled = true;
-        assert!(matches!(
-            c.validate(),
-            Err(StratumV1Error::InvalidConfig(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_nonfinite_cpuminer_constants() {
-        let mut c = cfg();
-        c.cpuminer_fallback_difficulty = f64::NAN;
+        c.lifecycle.retention_ms = 1_000;
+        c.lifecycle.grace_ms = 5_000;
         assert!(matches!(
             c.validate(),
             Err(StratumV1Error::InvalidConfig(_))
@@ -424,7 +279,6 @@ mod tests {
         assert_eq!(p.target_shares_per_minute, 6.0);
         assert_eq!(p.payout_mode, MiningMode::Solo);
         assert_eq!(p.minimum_difficulty, 0.0);
-        assert_eq!(p.ledger_warmup_shares, 0);
     }
 
     #[test]

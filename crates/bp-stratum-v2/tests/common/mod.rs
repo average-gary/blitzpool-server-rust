@@ -19,6 +19,13 @@ use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWrit
 /// The regtest miner address every SV2 regtest mines to.
 pub(crate) const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
+/// A fresh SV2 extranonce allocator, as the binary builds one for all ports.
+pub(crate) fn sv2_extranonce() -> bp_stratum_v2::extranonce::SharedExtranonceAllocator {
+    bp_stratum_v2::extranonce::SharedExtranonceAllocator::new_default_on_worker(
+        bp_stratum_v2::extranonce::SV2_WORKER_ID,
+    )
+}
+
 /// Put `msg` into its SV2 frame and write it over the Noise stream.
 pub(crate) async fn write_any_message(writer: &mut NoiseTcpWriteHalf, msg: AnyMessageOwned) {
     let sv2_frame: MessageFrame<AnyMessageOwned> =

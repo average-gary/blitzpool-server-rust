@@ -161,7 +161,7 @@ Rust workspace of **37 crates** (`bp-*` + the `blitzpool` binary). Async on **to
 
 ## UI
 
-The frontend lives in its own repo: **[blitzpool-ui](https://github.com/warioishere/blitzpool-ui)** (Angular). It talks to the `api` role's HTTP endpoints and exposes the per-miner dashboard, payout-group + Blockparty admin flows, public group directory, and a mining-modes explainer.
+The official Blitzpool web UI is not open source. The server is, and so is the HTTP API the UI is built on: the `api` role serves everything a frontend needs, from the per-miner dashboard data to the payout-group and Blockparty admin flows and the public group directory. The endpoints live in [`crates/bp-api`](crates/bp-api). Anyone is free to build their own frontend on top of it.
 
 ---
 

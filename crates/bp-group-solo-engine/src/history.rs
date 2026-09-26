@@ -17,7 +17,6 @@
 
 use bp_common::{AddressId, Sats};
 use bp_db::{bulk_insert_pplns_group_block_history, GroupPayoutHistoryInsert};
-use bp_pplns::CoinbaseDistributionEntry;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -40,22 +39,6 @@ pub struct AuditRow {
     pub shares_in_round: i64,
     pub total_shares_in_round: i64,
     pub row_type: GroupPayoutRowType,
-}
-
-/// Convenience constructor: a coinbase output.
-pub fn coinbase_row(
-    entry: &CoinbaseDistributionEntry,
-    shares_in_round: i64,
-    total_shares_in_round: i64,
-) -> AuditRow {
-    AuditRow {
-        address: entry.address.clone(),
-        paid_sats: entry.sats,
-        percent: entry.percent as f32,
-        shares_in_round,
-        total_shares_in_round,
-        row_type: GroupPayoutRowType::Coinbase,
-    }
 }
 
 /// Write one block's payout history for one group inside a single PG
@@ -104,21 +87,5 @@ mod tests {
         assert_eq!(GroupPayoutRowType::Coinbase.as_wire(), "coinbase");
         assert_eq!(GroupPayoutRowType::Pending.as_wire(), "pending");
         assert_eq!(GroupPayoutRowType::DustSweep.as_wire(), "dust-sweep");
-    }
-
-    #[test]
-    fn coinbase_row_carries_entry_fields_and_share_counts() {
-        let entry = CoinbaseDistributionEntry {
-            address: AddressId::new("bc1qfoo").unwrap(),
-            percent: 33.33,
-            sats: Sats(1_000_000),
-        };
-        let row = coinbase_row(&entry, 333, 1_000);
-        assert_eq!(row.address.as_str(), "bc1qfoo");
-        assert!((row.percent - 33.33).abs() < 1e-3);
-        assert_eq!(row.paid_sats.0, 1_000_000);
-        assert_eq!(row.shares_in_round, 333);
-        assert_eq!(row.total_shares_in_round, 1_000);
-        assert_eq!(row.row_type, GroupPayoutRowType::Coinbase);
     }
 }

@@ -225,7 +225,6 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
         .await
         .expect("pending-fee-route must be Some for CONFIRMING admin");
     assert_eq!(route.fee_address, fee_addr_id);
-    assert_eq!(route.percent, 100);
     assert!(svc.routable_group_id_for_admin(&admin_id).await.is_none());
 
     // ── Mine the fee-route coinbase and make core validate it ────

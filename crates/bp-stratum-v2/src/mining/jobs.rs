@@ -34,11 +34,12 @@
 //!
 //! ## Lifecycle constants
 //!
-//! [`bp_jobs_lifecycle::LifecycleConfig::DEFAULT`] holds the standard
-//! defaults (5 s grace, 10 min retention, 3-entry floor). Production
-//! wiring passes `[stratum] job_retention_ms` as the retention override
-//! (the grace window is not configurable); both helpers
-//! below pin against `LifecycleConfig::DEFAULT`.
+//! Each channel carries one [`LifecycleConfig`], stored in its
+//! [`StandardJobMaps`] and read back via [`StandardJobMaps::lifecycle`]
+//! for the Extended-side helpers. The binary builds it from
+//! [`LifecycleConfig::DEFAULT`] (5 s grace, 3-entry floor) with
+//! `retention_ms` taken from `[stratum] job_retention_ms`; the grace
+//! window is not configurable.
 
 use std::collections::HashMap;
 
@@ -71,6 +72,10 @@ pub struct ExtendedJob {
     pub merkle_path: Vec<[u8; 32]>,
     pub version: u32,
     pub prev_hash: [u8; 32],
+    /// Pinned at send-time (SV2 Mining/SubmitShares.Error). The block-found
+    /// gate reads the network target from THIS, not the current template's —
+    /// a block change between job-send and share-submit must not
+    /// retroactively reclassify an in-flight share's block-candidacy.
     pub n_bits: u32,
     pub min_ntime: u32,
     /// The channel's extranonce prefix **as of send-time**. Extended jobs
@@ -84,8 +89,8 @@ pub struct ExtendedJob {
     /// keeps using the old one. Validating those in-flight shares against
     /// the channel's new prefix would diverge the reconstructed coinbase
     /// and reject every one of them as diff-too-low. Same send-time-pinning
-    /// rationale as [`Self::difficulty`] and [`Self::network_difficulty`],
-    /// applied to the one input those two don't cover.
+    /// rationale as [`Self::difficulty`] and [`Self::n_bits`], applied to
+    /// the one input those two don't cover.
     pub extranonce_prefix: Vec<u8>,
     /// Per-job session difficulty stored at send-time.
     /// SV2 Mining/SubmitShares.Error requires share validation against the
@@ -96,14 +101,6 @@ pub struct ExtendedJob {
     /// the Extended submit-handler read directly from the job record instead
     /// of cross-referencing the Standard-side map.
     pub difficulty: Difficulty,
-    /// Per-job **network** difficulty pinned at send-time
-    /// (SV2 Mining/SubmitShares.Error). The block-found gate compares the
-    /// share's solved difficulty against THIS, not the current template's — a
-    /// block-change between job-send and share-submit must not retroactively
-    /// reclassify an in-flight share's block-candidacy. Mirrors the Standard
-    /// side, which pins it on
-    /// [`StandardTemplateSnapshot::network_difficulty`].
-    pub network_difficulty: Difficulty,
     /// Block-reward portion the coinbase claims (= the template's
     /// `coinbase_tx_value_remaining` at send-time). Threaded onto
     /// [`crate::mining::submit::ShareAccept`] so the block-found fan-out can
@@ -162,12 +159,14 @@ pub struct ExtendedJob {
 }
 
 /// Classify a previously-stored extended job for share validation.
-/// Thin wrapper around [`bp_jobs_lifecycle::classify`] that pins the
-/// SV2 default config — the SV2 callsite always wants
-/// [`LifecycleConfig::DEFAULT`] (env-overrides come from the consumer
-/// crate when wiring lands).
-pub fn classify_extended_job(ej: &ExtendedJob, now_ms: u64) -> JobClassification {
-    classify(ej.retired_at, now_ms, &LifecycleConfig::DEFAULT)
+/// Thin wrapper around [`bp_jobs_lifecycle::classify`] with the
+/// channel's lifecycle config.
+pub fn classify_extended_job(
+    ej: &ExtendedJob,
+    now_ms: u64,
+    config: &LifecycleConfig,
+) -> JobClassification {
+    classify(ej.retired_at, now_ms, config)
 }
 
 /// Stamp `retired_at = Some(now_ms)` on every entry that doesn't
@@ -188,19 +187,16 @@ pub fn retire_extended_jobs<K>(map: &mut HashMap<K, ExtendedJob>, now_ms: u64) {
 
 /// Per-channel extended-jobs aging — thin wrapper around
 /// [`bp_jobs_lifecycle::age_entries`] threading the SV2-specific field
-/// accessors (`created_at`, `retired_at`) and pinning
-/// [`LifecycleConfig::DEFAULT`].
-pub fn cleanup_retired_extended_jobs<K>(map: &mut HashMap<K, ExtendedJob>, now_ms: u64)
-where
+/// accessors (`created_at`, `retired_at`) with the channel's lifecycle
+/// config.
+pub fn cleanup_retired_extended_jobs<K>(
+    map: &mut HashMap<K, ExtendedJob>,
+    now_ms: u64,
+    config: &LifecycleConfig,
+) where
     K: Eq + std::hash::Hash + Clone,
 {
-    age_entries(
-        map,
-        now_ms,
-        &LifecycleConfig::DEFAULT,
-        |ej| ej.created_at,
-        |ej| ej.retired_at,
-    );
+    age_entries(map, now_ms, config, |ej| ej.created_at, |ej| ej.retired_at);
 }
 
 // ── StandardTemplateSnapshot ─────────────────────────────────────────
@@ -217,7 +213,6 @@ pub struct StandardTemplateSnapshot {
     pub version: u32,
     pub prev_hash: [u8; 32],
     pub n_bits: u32,
-    pub network_difficulty: Difficulty,
     /// Block-reward portion the coinbase claims (= the template's
     /// `coinbase_tx_value_remaining` at send-time). Threaded onto
     /// [`crate::mining::submit::ShareAccept`] so the block-found fan-out can
@@ -265,7 +260,7 @@ pub struct StandardJobEntry {
     /// Full non-witness coinbase bytes (= `mining_job.coinbase_prefix() +
     /// channel.extranonce_prefix + [0u8; 8] + mining_job.coinbase_suffix()`
     /// for Standard pool-built jobs). Convertible to the
-    /// witness-form by [`crate::mining::submit::assemble_witness_coinbase`]
+    /// witness-form by [`bp_mining_job::assemble_witness_coinbase`]
     /// at submit time. Empty for `SetCustomMiningJob`-derived jobs.
     pub coinbase_stratum: Vec<u8>,
     /// Identity of the payout list this job's coinbase pays — copied off
@@ -311,34 +306,26 @@ pub struct StandardJobMaps {
     config: LifecycleConfig,
 }
 
-impl Default for StandardJobMaps {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            config: LifecycleConfig::DEFAULT,
-        }
-    }
-}
-
 impl StandardJobMaps {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Build with a custom [`LifecycleConfig`]. Useful for tests that
-    /// want tight grace/retention windows; production uses
-    /// [`Self::new`] which pins [`LifecycleConfig::DEFAULT`].
-    pub fn with_config(config: LifecycleConfig) -> Self {
+    /// Empty maps aging under `config` — the channel's lifecycle config.
+    pub fn new(config: LifecycleConfig) -> Self {
         Self {
             entries: HashMap::new(),
             config,
         }
     }
 
+    /// The channel's lifecycle config. The Extended-side helpers
+    /// ([`classify_extended_job`], [`cleanup_retired_extended_jobs`]) read
+    /// it from here so a channel has exactly one.
+    pub fn lifecycle(&self) -> &LifecycleConfig {
+        &self.config
+    }
+
     /// Record a fresh `NewMiningJob` send. `now_ms` stamps
     /// `created_at_ms` for the aging algorithm. `template_snapshot`
-    /// freezes the template context (version / prev_hash / n_bits /
-    /// network_difficulty) at send-time so submit-validation can
+    /// freezes the template context (version / prev_hash / n_bits) at
+    /// send-time so submit-validation can
     /// reconstruct the exact 80-byte header the miner hashed against
     /// — SV2 Mining/SubmitShares.Error strict-conform.
     ///
@@ -486,7 +473,6 @@ mod tests {
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
-            network_difficulty: Difficulty(1.0),
             coinbase_tx_value_remaining: 5_000_000_000,
         }
     }
@@ -503,7 +489,6 @@ mod tests {
             n_bits: 0x1d00_ffff,
             min_ntime: 0,
             difficulty: Difficulty(1.0),
-            network_difficulty: Difficulty(1.0),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
             jdp_claims_the_block: false,
@@ -518,7 +503,7 @@ mod tests {
     #[test]
     fn classify_active_for_fresh_job() {
         assert_eq!(
-            classify_extended_job(&ej(1_000), 1_500),
+            classify_extended_job(&ej(1_000), 1_500, &LifecycleConfig::DEFAULT),
             JobClassification::Active
         );
     }
@@ -528,7 +513,11 @@ mod tests {
         let mut job = ej(1_000);
         job.retired_at = Some(10_000);
         assert_eq!(
-            classify_extended_job(&job, 10_000 + LifecycleConfig::DEFAULT.grace_ms),
+            classify_extended_job(
+                &job,
+                10_000 + LifecycleConfig::DEFAULT.grace_ms,
+                &LifecycleConfig::DEFAULT
+            ),
             JobClassification::StaleCreditable
         );
     }
@@ -538,7 +527,11 @@ mod tests {
         let mut job = ej(1_000);
         job.retired_at = Some(10_000);
         assert_eq!(
-            classify_extended_job(&job, 10_000 + LifecycleConfig::DEFAULT.grace_ms + 1),
+            classify_extended_job(
+                &job,
+                10_000 + LifecycleConfig::DEFAULT.grace_ms + 1,
+                &LifecycleConfig::DEFAULT
+            ),
             JobClassification::StaleRejected
         );
     }
@@ -575,7 +568,11 @@ mod tests {
             j.retired_at = Some(6_000);
             map.insert(i, j);
         }
-        cleanup_retired_extended_jobs(&mut map, 6_000 + LifecycleConfig::DEFAULT.retention_ms * 5);
+        cleanup_retired_extended_jobs(
+            &mut map,
+            6_000 + LifecycleConfig::DEFAULT.retention_ms * 5,
+            &LifecycleConfig::DEFAULT,
+        );
         assert_eq!(map.len(), LifecycleConfig::DEFAULT.min_retained);
     }
 
@@ -587,22 +584,26 @@ mod tests {
         let mut map: HashMap<u32, ExtendedJob> = HashMap::new();
         map.insert(1, ej(t0 - 10_000));
         assert_eq!(
-            classify_extended_job(&map[&1], t0),
+            classify_extended_job(&map[&1], t0, &LifecycleConfig::DEFAULT),
             JobClassification::Active
         );
         retire_extended_jobs(&mut map, t0);
         assert_eq!(
-            classify_extended_job(&map[&1], t0 + 1_000),
+            classify_extended_job(&map[&1], t0 + 1_000, &LifecycleConfig::DEFAULT),
             JobClassification::StaleCreditable
         );
         assert_eq!(
-            classify_extended_job(&map[&1], t0 + 30_000),
+            classify_extended_job(&map[&1], t0 + 30_000, &LifecycleConfig::DEFAULT),
             JobClassification::StaleRejected
         );
         for i in 0..3u32 {
             map.insert(100 + i, ej(t0 + 100 + u64::from(i)));
         }
-        cleanup_retired_extended_jobs(&mut map, t0 + LifecycleConfig::DEFAULT.retention_ms + 1);
+        cleanup_retired_extended_jobs(
+            &mut map,
+            t0 + LifecycleConfig::DEFAULT.retention_ms + 1,
+            &LifecycleConfig::DEFAULT,
+        );
         assert!(!map.contains_key(&1));
     }
 
@@ -610,7 +611,7 @@ mod tests {
 
     #[test]
     fn standard_job_maps_record_and_lookup_in_lockstep() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         let mr = [0x42u8; 32];
         maps.record_send_for_test(7, Difficulty(1024.0), mr, snap(), 1_000);
         let (d, r) = maps.lookup(7).expect("must find");
@@ -620,13 +621,13 @@ mod tests {
 
     #[test]
     fn standard_job_maps_lookup_returns_none_for_unknown() {
-        let maps = StandardJobMaps::new();
+        let maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         assert_eq!(maps.lookup(42), None);
     }
 
     #[test]
     fn standard_job_maps_pin_per_job_difficulty() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(100.0), [0u8; 32], snap(), 1_000);
         maps.record_send_for_test(2, Difficulty(200.0), [0u8; 32], snap(), 2_000);
         assert_eq!(maps.difficulty_of(1), Some(Difficulty(100.0)));
@@ -641,19 +642,17 @@ mod tests {
     /// the current template's).
     #[test]
     fn standard_per_job_snapshot_pins_template_context_at_send_time() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         let snap_old = StandardTemplateSnapshot {
             version: 0x2000_0000,
             prev_hash: [0xAA; 32],
             n_bits: 0x1d00_ffff,
-            network_difficulty: Difficulty(100.0),
             coinbase_tx_value_remaining: 5_000_000_000,
         };
         let snap_new = StandardTemplateSnapshot {
             version: 0x2000_0001,
             prev_hash: [0xBB; 32],
             n_bits: 0x1d01_ffff,
-            network_difficulty: Difficulty(200.0),
             coinbase_tx_value_remaining: 4_900_000_000,
         };
         maps.record_send_for_test(1, Difficulty(1.0), [0x11; 32], snap_old, 1_000);
@@ -670,12 +669,16 @@ mod tests {
             e1_after.template_snapshot.prev_hash, [0xAA; 32],
             "retired entry must keep its send-time snapshot"
         );
+        assert_eq!(
+            e1_after.template_snapshot.n_bits, 0x1d00_ffff,
+            "the block-found gate reads the send-time n_bits, not the new tip's"
+        );
         assert_eq!(e1_after.retired_at_ms, Some(3_000));
     }
 
     #[test]
     fn standard_job_maps_forget_drops_entry() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(100.0), [0u8; 32], snap(), 0);
         maps.forget(1);
         assert!(maps.is_empty());
@@ -684,7 +687,7 @@ mod tests {
 
     #[test]
     fn standard_record_send_stamps_created_at_and_clears_retired_at() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(1.0), [0u8; 32], snap(), 1_000);
         maps.retire(2_000);
         // Re-send same id (shouldn't happen with next_job_id but pin
@@ -701,20 +704,20 @@ mod tests {
 
     #[test]
     fn standard_classify_unknown_job_returns_none() {
-        let maps = StandardJobMaps::new();
+        let maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         assert_eq!(maps.classify(42, 1_000), None);
     }
 
     #[test]
     fn standard_classify_active_for_fresh_job() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(1.0), [0u8; 32], snap(), 1_000);
         assert_eq!(maps.classify(1, 1_500), Some(JobClassification::Active));
     }
 
     #[test]
     fn standard_classify_stale_creditable_at_grace_boundary() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(1.0), [0u8; 32], snap(), 1_000);
         maps.retire(10_000);
         assert_eq!(
@@ -725,7 +728,7 @@ mod tests {
 
     #[test]
     fn standard_classify_stale_rejected_one_ms_past_grace() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(1.0), [0u8; 32], snap(), 1_000);
         maps.retire(10_000);
         assert_eq!(
@@ -736,7 +739,7 @@ mod tests {
 
     #[test]
     fn standard_retire_is_idempotent_keeps_original_timestamp() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(1.0), [0u8; 32], snap(), 1_000);
         maps.retire(10_000);
         maps.retire(20_000);
@@ -753,7 +756,7 @@ mod tests {
 
     #[test]
     fn standard_cleanup_expired_respects_min_retained_floor() {
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         for i in 0..5u32 {
             maps.record_send_for_test(
                 i,
@@ -773,7 +776,7 @@ mod tests {
     #[test]
     fn standard_end_to_end_lifecycle() {
         let t0 = 1_000_000_000u64;
-        let mut maps = StandardJobMaps::new();
+        let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(1.0), [0u8; 32], snap(), t0 - 10_000);
         assert_eq!(maps.classify(1, t0), Some(JobClassification::Active));
         maps.retire(t0);
@@ -807,7 +810,7 @@ mod tests {
     /// kicks in earlier.
     #[test]
     fn standard_with_config_honours_custom_retention() {
-        let mut maps = StandardJobMaps::with_config(LifecycleConfig {
+        let mut maps = StandardJobMaps::new(LifecycleConfig {
             grace_ms: 100,
             retention_ms: 500,
             min_retained: 1,

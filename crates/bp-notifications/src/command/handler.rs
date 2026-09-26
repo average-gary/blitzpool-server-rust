@@ -39,11 +39,11 @@ use super::parser::{
     parse_address_callback, parse_bestdiff_callback, parse_hourly_callback, AddressCallback,
     Command, FlagToggle, HourlyTarget, LanguageSwitch,
 };
-use super::read::format_address_short;
 use crate::adapter::{
     AdapterError, AdapterResult, InlineButton, InlineKeyboard, NtfyAdapter, TelegramAdapter,
 };
 use crate::format::Language;
+use bp_common::short_address;
 
 /// Shared, process-lifetime map of Telegram `chat_id` → chosen
 /// [`Language`]. Owned by [`CommandHandler`] and handed to the
@@ -56,14 +56,6 @@ pub type ChatLanguageMap = Arc<Mutex<HashMap<i64, Language>>>;
 pub enum Transport {
     Telegram { chat_id: i64 },
     Ntfy { address: AddressId },
-}
-
-/// Marker for callers that want to provide their own response sink
-/// instead of going through the built-in [`Transport`] dispatch (e.g.
-/// tests, or a future bp-bot-commands crate that owns its own
-/// adapter handles).
-pub trait ResponseSink: Send + Sync {
-    fn transport_kind(&self) -> &'static str;
 }
 
 /// A `/bestdiff_reset` confirmation awaiting the user's yes/no tap,
@@ -284,7 +276,7 @@ impl CommandHandler {
                 let star = if s.is_default { "⭐ " } else { "" };
                 vec![
                     InlineButton::new(
-                        format!("{star}{}", format_address_short(s.address.as_str())),
+                        format!("{star}{}", short_address(s.address.as_str())),
                         format!("addr:set:{}", s.id),
                     ),
                     InlineButton::new("🗑", format!("addr:rm:{}", s.id)),
@@ -405,7 +397,7 @@ impl CommandHandler {
                 .await;
             return;
         };
-        let trimmed = format_address_short(target.address.as_str());
+        let trimmed = short_address(target.address.as_str());
         match cb {
             AddressCallback::SetDefault(_) => {
                 if target.is_default {
@@ -635,7 +627,7 @@ impl CommandHandler {
             },
         };
         let de = matches!(lang, Language::De);
-        let trimmed = format_address_short(address.as_str());
+        let trimmed = short_address(address.as_str());
         let text = if de {
             format!("Best Difficulty für {trimmed} wirklich zurücksetzen?")
         } else {
@@ -691,7 +683,7 @@ impl CommandHandler {
                 return;
             }
         };
-        let trimmed = format_address_short(pending.address.as_str());
+        let trimmed = short_address(pending.address.as_str());
 
         if !confirm {
             let _ = adapter
@@ -1298,7 +1290,7 @@ mod tests {
         // "Oversized" is whatever `AddressId` says it is, read from the cap
         // rather than written as a literal. This line said `repeat(70)` until
         // 2026-08-12, when `MAX_ADDRESS_LEN` moved from 62 to 90
-        // (`0017_widen_identity_columns.sql`) and 70 became a *valid* length —
+        // (`0018_widen_identity_columns.sql`) and 70 became a *valid* length —
         // the test then failed, which is how it was found.
         assert!(parse_address(&"a".repeat(bp_common::MAX_ADDRESS_LEN + 1)).is_none());
         assert!(

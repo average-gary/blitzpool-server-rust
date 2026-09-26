@@ -41,7 +41,6 @@ mod blockparty;
 mod client;
 mod custom_extranonce;
 mod email;
-mod external;
 mod group;
 mod miner_identity;
 mod notification;
@@ -51,7 +50,7 @@ mod pplns;
 mod redis_backup;
 mod stats_writes;
 
-pub use pool::{Db, DbConfig, DbError};
+pub use pool::{with_boot_policy, Db, DbConfig, DbError};
 
 pub use redis_backup::{
     fetch_redis_backup, insert_redis_backup, latest_redis_backup_captured_at,
@@ -76,8 +75,8 @@ pub use block::{
     FoundBlockRow, RpcBlockRow,
 };
 pub use blockparty::{
-    delete_blockparty_join_link, delete_blockparty_member, find_blockparty_group,
-    find_blockparty_group_by_admin_address, find_blockparty_group_by_name,
+    delete_blockparty_join_link, delete_blockparty_member, delete_blockparty_members_for_group,
+    find_blockparty_group, find_blockparty_group_by_admin_address, find_blockparty_group_by_name,
     find_blockparty_join_link_by_token, find_blockparty_join_link_for_group,
     find_blockparty_member_by_address, find_blockparty_member_in_group,
     insert_blockparty_block_history, insert_blockparty_group, insert_blockparty_member,
@@ -114,10 +113,6 @@ pub use email::{
     insert_email_verification, upsert_address_email_verified, AddressEmailRow,
     EmailVerificationRow,
 };
-pub use external::{
-    find_external_share, find_external_share_top_difficulties, insert_external_share,
-    ExternalShareTopDifficulty, ExternalSharesRow,
-};
 pub use group::{
     bulk_insert_pplns_group_block_history, count_pplns_group_join_requests_pending_for_address,
     count_pplns_group_members_for_group, delete_pplns_group_block_history_for_group,
@@ -153,8 +148,8 @@ pub use notification::{
     delete_push_subscription_by_endpoint_and_type, delete_push_subscriptions_by_address,
     delete_push_subscriptions_by_address_and_type, delete_stale_push_subscriptions,
     delete_telegram_subscription_by_chat_address, find_addresses_for_ntfy_listener,
-    find_addresses_with_push_subscription, find_device_notification_addresses,
-    find_ntfy_subscription, find_ntfy_subscription_by_address,
+    find_addresses_with_push_subscription, find_best_difficulty_scan_addresses,
+    find_device_notification_addresses, find_ntfy_subscription, find_ntfy_subscription_by_address,
     find_ntfy_subscriptions_with_hourly_enabled, find_push_subscription,
     find_push_subscriptions_by_address, find_telegram_subscription,
     find_telegram_subscriptions_by_address, find_telegram_subscriptions_by_chat,

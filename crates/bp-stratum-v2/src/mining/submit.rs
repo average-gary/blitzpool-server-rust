@@ -29,7 +29,8 @@
 //! effective difficulty (for accounting), the classification
 //! (`Active` vs `StaleCreditable` — both credit, see
 //! [`bp_jobs_lifecycle::JobClassification`]), and the `is_block_candidate`
-//! flag indicating that `submission_difficulty >= network_difficulty`.
+//! flag: the hash meets the job's network target
+//! ([`bp_mining_job::meets_network_target`]).
 //! Or [`ShareValidation::Rejected`] carrying one of four SV2 wire
 //! codes: `invalid-channel-id`, `invalid-job-id`, `stale-share`,
 //! `difficulty-too-low`.
@@ -39,7 +40,9 @@
 //! caller serializes the chosen literal directly without paraphrasing.
 
 use bp_jobs_lifecycle::JobClassification;
-use bp_mining_job::{build_block_header, merkle_root_from_coinbase};
+use bp_mining_job::{
+    assemble_witness_coinbase, build_block_header, meets_network_target, merkle_root_from_coinbase,
+};
 use bp_share::{calculate_difficulty, sha256d_from_parts, Difficulty, Target};
 use smallvec::SmallVec;
 
@@ -54,6 +57,7 @@ use super::channel::{
     ChannelKind, ChannelState, ExtendedDedupKey, StandardDedupKey, SubmissionCache,
 };
 use super::jobs::{classify_extended_job, ExtendedJob};
+use bp_jobs_lifecycle::LifecycleConfig;
 
 // ── Wire codes (SV2 mining-protocol error strings) ───────────────────
 
@@ -158,8 +162,8 @@ pub struct ShareAccept {
     /// header hash. Drives the block-found gate and the personal-best
     /// tracker.
     pub submission_difficulty: Difficulty,
-    /// 80-byte block header that produced the hash. Forwarded to the
-    /// external-share-submitter (when enabled).
+    /// 80-byte block header that produced the hash. The block-submit path
+    /// assembles a found block from it.
     pub header: [u8; 80],
     /// `sha256d(header)` in LE byte order — the share's identity, the
     /// PoW result.
@@ -270,18 +274,17 @@ pub struct SubmitSharesExtendedInput {
     pub version: u32,
     pub ntime: u32,
     pub extranonce: ExtranonceBytes,
-    /// Trailing TLV bytes from the frame's tail (after the
-    /// `SubmitSharesExtended` base payload). Carries ext 0x0002
-    /// `[ext_type 0x0002 BE][field_type 0x01][len BE16][user_identity]`
-    /// when the miner has negotiated 0x0002 (Worker-Specific Hashrate
-    /// Tracking). Empty when no TLVs are present.
+    /// The TLVs the frame carried after the `SubmitSharesExtended` base
+    /// payload, as the frame parser decoded them. Carries the ext 0x0002
+    /// Worker-ID TLV when the miner uses Worker-Specific Hashrate Tracking;
+    /// empty when there are none.
     ///
     /// Resolved into [`ShareAccept::effective_worker_name`] by
     /// [`validate_submit_extended`] via
     /// [`crate::extensions::resolve_share_worker_name_from_tlv`] —
     /// ext 0x0002/Behavior Based on Negotiation: scan-for-known-TLV semantics,
     /// TLV-order-irrelevant.
-    pub tail_tlvs: Vec<u8>,
+    pub tlvs: Vec<stratum_core::parsers_sv2::Tlv>,
 }
 
 // ── Standard-channel job context ─────────────────────────────────────
@@ -298,11 +301,8 @@ pub struct StandardJobContext<'a> {
     /// 32-byte previous-block hash from the template.
     pub prev_hash: [u8; 32],
     /// `n_bits` (`block.bits`) from the template — encodes the network
-    /// target.
+    /// target the block-found gate checks.
     pub n_bits: u32,
-    /// Network difficulty derived from `n_bits`. Cached on the template
-    /// so we don't recompute per-share.
-    pub network_difficulty: Difficulty,
     /// Job classification from the central registry (`JobNotFound` /
     /// `Active` / `StaleCreditable` / `StaleRejected`). `None` for
     /// genuinely missing jobs.
@@ -360,7 +360,7 @@ pub struct StandardJobContext<'a> {
 /// 6. Compare against `difficulty_to_target(job_difficulty)`. Miss →
 ///    [`RejectReason::DifficultyTooLow`].
 /// 7. Otherwise build [`ShareAccept`] with `is_block_candidate =
-///    submission_difficulty >= job_ctx.network_difficulty`.
+///    meets_network_target(hash, job_ctx.n_bits)`.
 ///
 /// The dedup-cache **write** is the caller's responsibility — it
 /// happens INSIDE this function only when the share validates (so a
@@ -420,7 +420,7 @@ pub fn validate_submit_standard(
     // bad share doesn't get logged as duplicate.
     channel.submission_cache.insert_standard(dedup_key);
 
-    let is_block_candidate = pow.submission_difficulty >= job_ctx.network_difficulty;
+    let is_block_candidate = meets_network_target(&pow.submission_hash, job_ctx.n_bits);
     // Witness-form coinbase for the block-found path.
     // Built only for block-candidates; per-share allocation cost is
     // negligible on the rare candidate path.
@@ -472,6 +472,9 @@ pub struct ExtendedChannelView {
     /// `channel.target_for(job_difficulty)` — precomputed by the caller
     /// so the validator needs no `&mut` access to the channel's memo.
     pub job_target: Target,
+    /// The channel's lifecycle config (`channel.standard_jobs.lifecycle()`),
+    /// which the stale-share classification runs against.
+    pub job_lifecycle: LifecycleConfig,
 }
 
 /// Validate a `SubmitSharesExtended` frame. Pure function with the
@@ -482,7 +485,7 @@ pub struct ExtendedChannelView {
 ///
 /// **Caller's prep work**: channel lookup only (`None` → emit
 /// [`RejectReason::InvalidChannelId`] directly). Everything else —
-/// extended-job lookup, classification, network-difficulty lookup —
+/// extended-job lookup, classification, the block-found gate —
 /// happens inside.
 ///
 /// **Extranonce-size mismatch is a HARD reject** with wire-code
@@ -495,11 +498,10 @@ pub struct ExtendedChannelView {
 /// `job_difficulty` is the per-job target the share validates against
 /// (SV2 Mining/SubmitShares.Error). Caller resolves it from
 /// `channel.standard_jobs.job_id_to_difficulty` if present, else falls back to
-/// `channel.session_difficulty`. The **network** difficulty for the
-/// block-found gate is read from `ext_job.network_difficulty` (pinned at
-/// send-time, SV2 Mining/SubmitShares.Error strict) — NOT the current
-/// template, so a block-change between job-send and submit can't reclassify
-/// the share.
+/// `channel.session_difficulty`. The **network** target for the
+/// block-found gate is read from `ext_job.n_bits` (pinned at send-time, SV2
+/// Mining/SubmitShares.Error strict) — NOT the current template, so a
+/// block-change between job-send and submit can't reclassify the share.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_submit_extended(
     submission_cache: &mut SubmissionCache,
@@ -536,7 +538,7 @@ pub fn validate_submit_extended(
         return ShareValidation::Rejected(RejectReason::DuplicateShare.into());
     }
 
-    let classification = classify_extended_job(ext_job, now_ms);
+    let classification = classify_extended_job(ext_job, now_ms, &view.job_lifecycle);
     if classification == JobClassification::StaleRejected {
         let retired_ago_ms = ext_job
             .retired_at
@@ -683,10 +685,10 @@ pub fn validate_submit_extended(
 
     submission_cache.insert_extended(dedup_key);
 
-    // Per-job pinned network difficulty (SV2 Mining/SubmitShares.Error strict)
-    // — the gate uses the template the miner hashed against, not the latest
+    // The job's own n_bits — the header the miner hashed commits to it, so
+    // the gate uses the template the miner hashed against, not the latest
     // one.
-    let is_block_candidate = pow.submission_difficulty >= ext_job.network_difficulty;
+    let is_block_candidate = meets_network_target(&pow.submission_hash, ext_job.n_bits);
     // Witness-form coinbase for the block-found path. Built only for
     // block-candidates to keep the per-share allocation off the hot
     // path (every non-candidate share goes through the validator,
@@ -697,33 +699,13 @@ pub fn validate_submit_extended(
         Vec::new()
     };
     // ext 0x0002 Worker-ID TLV resolution
-    // (ext 0x0002/Behavior Based on Negotiation). The validator operates at
-    // the channel layer and doesn't know the session-level `address` or
-    // `channel_worker` — those are session-state. We pass empty channel
-    // defaults so the resolver either returns a non-empty TLV-derived worker
-    // name (TLV present
-    // + valid + spec-compliant) or the empty channel default. The
-    // empty string is collapsed to `None` so consumers can rely on
-    // `Some(_) ⇒ TLV was present and the caller should override
-    // attribution`.
-    //
-    // The IO layer applies the cross-account-attribution security
-    // check (TLV-address must match the channel's session address)
-    // before applying `effective_worker_name` to share-stats, because
-    // it has the session context.
-    let resolved = crate::extensions::resolve_share_worker_name_from_tlv(
-        &crate::extensions::ResolveWorkerNameInput {
-            tail: &submission.tail_tlvs,
-            channel_address: None,
-            channel_worker: "",
-            ext_0x0002_negotiated,
-        },
+    // (ext 0x0002/Behavior Based on Negotiation). `Some(_)` means the TLV
+    // names a worker and the caller attributes the share to it instead of
+    // the channel's worker.
+    let effective_worker_name = crate::extensions::resolve_share_worker_name_from_tlv(
+        &submission.tlvs,
+        ext_0x0002_negotiated,
     );
-    let effective_worker_name = if resolved.is_empty() {
-        None
-    } else {
-        Some(resolved)
-    };
 
     ShareValidation::Accepted(Box::new(ShareAccept {
         classification,
@@ -739,48 +721,6 @@ pub fn validate_submit_extended(
         effective_worker_name,
         coinbase_tx_value_remaining: ext_job.coinbase_tx_value_remaining,
     }))
-}
-
-/// Convert the non-witness (stratum) coinbase bytes into the
-/// witness-form serialisation Bitcoin Core's `submitblock` expects:
-/// inserts BIP-141 marker `0x00` + flag `0x01` right after `version`,
-/// then a single witness item of 32 zero bytes (the coinbase input's
-/// mandatory reserved value) right before `locktime`.
-///
-/// Mirrors the algebra in
-/// [`bp_mining_job::MiningJob::witness_coinbase_with_extranonce`] but
-/// operates on already-assembled stratum-coinbase bytes — the SV2
-/// extended-validator path reconstructs them from
-/// `ext_job.coinbase_prefix + ext_job.extranonce_prefix +
-/// submission.extranonce + ext_job.coinbase_suffix` and has no
-/// `MiningJob` handle. Output is byte-identical to the SV1 path.
-///
-/// `pub` so the bin's JDP-block-submission
-/// sink (`bin/blitzpool/src/jdp_hooks.rs`) can reuse it: a JDP-declared
-/// job's coinbase arrives in stratum (non-witness) form via
-/// `DeclareMiningJob`, but block submission to bitcoin-core needs the
-/// witness form. Single source of truth for the BIP-141 layout.
-pub fn assemble_witness_coinbase(stratum_coinbase: &[u8]) -> Vec<u8> {
-    debug_assert!(
-        stratum_coinbase.len() >= 8,
-        "stratum coinbase smaller than version+locktime"
-    );
-    let locktime_at = stratum_coinbase.len() - 4;
-    let mut buf = Vec::with_capacity(stratum_coinbase.len() + 2 + 1 + 1 + 32);
-    // version
-    buf.extend_from_slice(&stratum_coinbase[..4]);
-    // BIP-141 marker + flag
-    buf.push(0x00);
-    buf.push(0x01);
-    // everything between version and locktime (input + outputs)
-    buf.extend_from_slice(&stratum_coinbase[4..locktime_at]);
-    // witness stack: 1 item of 32 zero bytes
-    buf.push(0x01);
-    buf.push(0x20);
-    buf.extend_from_slice(&[0u8; 32]);
-    // locktime
-    buf.extend_from_slice(&stratum_coinbase[locktime_at..]);
-    buf
 }
 
 #[cfg(test)]
@@ -799,11 +739,24 @@ mod tests {
     }
 
     fn std_channel() -> ChannelState {
-        ChannelState::new_standard(1, vec![0u8; 4], Difficulty(1024.0), max_target())
+        ChannelState::new_standard(
+            1,
+            vec![0u8; 4],
+            Difficulty(1024.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        )
     }
 
     fn ext_channel() -> ChannelState {
-        ChannelState::new_extended(2, vec![0u8; 4], 8, Difficulty(1024.0), max_target())
+        ChannelState::new_extended(
+            2,
+            vec![0u8; 4],
+            8,
+            Difficulty(1024.0),
+            max_target(),
+            LifecycleConfig::DEFAULT,
+        )
     }
 
     fn ext_job(prev: [u8; 32], n_bits: u32) -> ExtendedJob {
@@ -820,10 +773,6 @@ mod tests {
             // the validator now reconstructs the coinbase from the JOB's prefix.
             extranonce_prefix: vec![0u8; 4],
             difficulty: Difficulty(1.0 / 4_294_967_296.0),
-            // Unreasonably hard pinned network difficulty → not a block
-            // candidate. Tests that exercise the candidate gate set this
-            // field explicitly on the returned job.
-            network_difficulty: Difficulty(1e15),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
             jdp_claims_the_block: false,
@@ -838,7 +787,6 @@ mod tests {
             template_version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
-            network_difficulty: Difficulty(1e15), // unreasonably hard → not a block
             classification: class,
             template_id: None,
             coinbase_stratum: &[],
@@ -866,7 +814,7 @@ mod tests {
             version: 0x2000_0000,
             ntime: 0x6500_0001,
             extranonce: SmallVec::from_slice(&[0x11; 8]),
-            tail_tlvs: Vec::new(),
+            tlvs: Vec::new(),
         }
     }
 
@@ -888,6 +836,7 @@ mod tests {
             kind: ch.kind,
             extranonce_size: ch.extranonce_size,
             job_target,
+            job_lifecycle: *ch.standard_jobs.lifecycle(),
         };
         validate_submit_extended(
             &mut ch.submission_cache,
@@ -1124,13 +1073,17 @@ mod tests {
         );
     }
 
-    /// `is_block_candidate` flips to true when submission ≥ network.
+    /// Target `0xffff·2^240`: met by every hash except the top 2^-16.
+    const TRIVIAL_N_BITS: u32 = 0x2100_ffff;
+
+    /// `is_block_candidate` flips to true when the hash meets the job's
+    /// network target.
     #[test]
-    fn standard_marks_block_candidate_when_submission_meets_network() {
+    fn standard_marks_block_candidate_when_the_hash_meets_the_network_target() {
         let mut ch = std_channel();
         let merkle = [0xDD; 32];
         let mut ctx = std_ctx(JobClassification::Active);
-        ctx.network_difficulty = Difficulty(0.0); // trivially meetable
+        ctx.n_bits = TRIVIAL_N_BITS;
         let out = validate_submit_standard(&mut ch, &std_submission(), easy_diff(), &merkle, &ctx);
         match out {
             ShareValidation::Accepted(a) => assert!(a.is_block_candidate),
@@ -1170,18 +1123,16 @@ mod tests {
     }
 
     /// 5b (SV2 Mining/SubmitShares.Error strict): the block-candidate gate
-    /// reads the network difficulty **pinned on the job at send-time**, not
-    /// any current/latest template. A job pinned with a trivial network
-    /// difficulty yields a block-candidate for the same easy share that the
-    /// default (1e15) job classifies as non-candidate — proving the gate is
-    /// per-job, so a block-change between send and submit can't reclassify an
-    /// in-flight share.
+    /// reads the `n_bits` **pinned on the job at send-time**, not any
+    /// current/latest template. A job pinned with a trivial target yields a
+    /// block-candidate for the same easy share that a difficulty-1 job
+    /// (`extended_accepts_easy_share`) classifies as non-candidate — proving
+    /// the gate is per-job, so a block-change between send and submit can't
+    /// reclassify an in-flight share.
     #[test]
-    fn extended_block_candidate_uses_per_job_pinned_network_difficulty() {
+    fn extended_block_candidate_uses_per_job_pinned_n_bits() {
         let mut ch = ext_channel();
-        let mut job = ext_job([0xCC; 32], 0x1d00_ffff);
-        // Trivial pinned network difficulty → any valid share is a candidate.
-        job.network_difficulty = Difficulty(1.0e-18);
+        let job = ext_job([0xCC; 32], TRIVIAL_N_BITS);
         let out = validate_ext(
             &mut ch,
             &ext_submission(),
@@ -1195,7 +1146,7 @@ mod tests {
             ShareValidation::Accepted(a) => {
                 assert!(
                     a.is_block_candidate,
-                    "trivial per-job network difficulty must yield a block candidate"
+                    "a trivial per-job target must yield a block candidate"
                 );
                 // Witness coinbase is assembled only for candidates.
                 assert!(!a.witness_coinbase.is_empty());
@@ -1316,103 +1267,14 @@ mod tests {
         ));
     }
 
-    // ── assemble_witness_coinbase — byte-identical to SV1's path ──────
-
-    /// Pin the BIP-141 witness layout: marker `0x00` + flag `0x01`
-    /// right after the 4-byte `version`, then a 1-byte witness-stack
-    /// length (`0x01`) + 1-byte item length (`0x20`) + 32 zero bytes
-    /// inserted right before the trailing 4-byte `locktime`.
-    #[test]
-    fn assemble_witness_coinbase_pins_bip141_layout() {
-        // Minimal coinbase: 4B version + 4B body + 4B locktime = 12B.
-        let mut stratum = Vec::with_capacity(12);
-        stratum.extend_from_slice(&1u32.to_le_bytes()); // version=1
-        stratum.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // body
-        stratum.extend_from_slice(&[0xEE, 0xEE, 0xEE, 0xEE]); // locktime
-        let w = assemble_witness_coinbase(&stratum);
-        // 12 stratum bytes + 2 marker/flag + 1 stack-count + 1 item-len
-        // + 32 witness bytes = 48.
-        assert_eq!(w.len(), 12 + 2 + 1 + 1 + 32);
-        // Version intact.
-        assert_eq!(&w[..4], &1u32.to_le_bytes());
-        // Marker + flag.
-        assert_eq!(w[4], 0x00);
-        assert_eq!(w[5], 0x01);
-        // Body intact.
-        assert_eq!(&w[6..10], &[0xAA, 0xBB, 0xCC, 0xDD]);
-        // Witness stack: count=1, len=0x20, 32 zero bytes.
-        assert_eq!(w[10], 0x01);
-        assert_eq!(w[11], 0x20);
-        assert!(w[12..44].iter().all(|b| *b == 0));
-        // Locktime intact.
-        assert_eq!(&w[44..], &[0xEE, 0xEE, 0xEE, 0xEE]);
-    }
-
-    #[test]
-    fn assemble_witness_coinbase_matches_mining_job_for_segwit_round_trip() {
-        // Build a real MiningJob (SV1's coinbase shape) + a synthetic
-        // 12-byte extranonce, then compare the witness-form output of
-        // both the MiningJob helper and our SV2-side assembler over
-        // the same stratum-coinbase bytes.
-        use bitcoin::Network;
-        use bp_mining_job::{build_mining_job, CoinbaseTemplate, PayoutEntry, EXTRANONCE_SLOT_LEN};
-
-        let payouts = [PayoutEntry::static_address(
-            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            5_000_000_000,
-        )];
-        let template = CoinbaseTemplate {
-            block_height: 42,
-            coinbase_value_sats: 5_000_000_000,
-            witness_commitment: [0x77; 32],
-        };
-        let job = build_mining_job(
-            Network::Regtest,
-            &payouts,
-            &template,
-            "BP",
-            EXTRANONCE_SLOT_LEN,
-            [0u8; 32],
-        )
-        .expect("ok");
-        let enonce1 = [0xAA; 4];
-        let enonce2 = [0xBB; 8];
-
-        // SV1's path: build witness coinbase from the MiningJob helpers.
-        let sv1_witness = job.witness_coinbase_with_extranonce(&enonce1, &enonce2);
-
-        // SV2's path: reconstruct the stratum coinbase the same way
-        // `validate_submit_extended` does (prefix + extranonce slot
-        // + suffix), then run the witness assembler.
-        let mut stratum = Vec::new();
-        stratum.extend_from_slice(job.coinbase_prefix());
-        stratum.extend_from_slice(&enonce1);
-        stratum.extend_from_slice(&enonce2);
-        stratum.extend_from_slice(job.coinbase_suffix());
-        let sv2_witness = assemble_witness_coinbase(&stratum);
-
-        assert_eq!(
-            sv1_witness, sv2_witness,
-            "SV1's MiningJob::witness_coinbase_with_extranonce and SV2's \
-             assemble_witness_coinbase MUST produce byte-identical output \
-             over the same stratum-coinbase input"
-        );
-    }
-
     // ── ext 0x0002 Worker-ID TLV resolution in validate_submit_extended ──
 
-    fn worker_id_tlv_bytes(user_identity: &str) -> Vec<u8> {
-        // Hand-built wire-form TLV: [ext_type 0x0002 LE][field_type 0x01]
-        // [length LE16][value bytes]. Mirrors ext 0x0002/TLV Format for user_identity with the
-        // SV2 U16 little-endian convention
-        // (SV2 Overview/Stratum V2 TLV Encoding Model).
-        let value = user_identity.as_bytes();
-        let mut tlv = Vec::with_capacity(5 + value.len());
-        tlv.extend_from_slice(&0x0002u16.to_le_bytes());
-        tlv.push(0x01);
-        tlv.extend_from_slice(&(value.len() as u16).to_le_bytes());
-        tlv.extend_from_slice(value);
-        tlv
+    fn worker_id_tlvs(user_identity: &str) -> Vec<stratum_core::parsers_sv2::Tlv> {
+        vec![stratum_core::parsers_sv2::Tlv::new(
+            crate::extensions::SV2_EXTENSION_TYPE_WORKER_ID,
+            crate::extensions::SV2_FIELD_TYPE_USER_IDENTITY,
+            user_identity.as_bytes().to_vec(),
+        )]
     }
 
     /// ext 0x0002 negotiated + valid TLV → `ShareAccept.effective_worker_name`
@@ -1422,7 +1284,7 @@ mod tests {
         let mut ch = ext_channel();
         let job = ext_job([0xCC; 32], 0x1d00_ffff);
         let mut sub = ext_submission();
-        sub.tail_tlvs = worker_id_tlv_bytes("Worker_001");
+        sub.tlvs = worker_id_tlvs("Worker_001");
 
         let out = validate_ext(
             &mut ch,
@@ -1454,7 +1316,7 @@ mod tests {
         let mut ch = ext_channel();
         let job = ext_job([0xCC; 32], 0x1d00_ffff);
         let mut sub = ext_submission();
-        sub.tail_tlvs = worker_id_tlv_bytes("Worker_001");
+        sub.tlvs = worker_id_tlvs("Worker_001");
 
         let out = validate_ext(
             &mut ch,
@@ -1482,7 +1344,7 @@ mod tests {
     fn ext_0x0002_negotiated_no_tlv_falls_back_to_channel_default() {
         let mut ch = ext_channel();
         let job = ext_job([0xCC; 32], 0x1d00_ffff);
-        let sub = ext_submission(); // tail_tlvs is empty.
+        let sub = ext_submission(); // tlvs is empty.
 
         let out = validate_ext(
             &mut ch,

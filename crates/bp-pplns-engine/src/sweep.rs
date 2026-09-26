@@ -111,10 +111,9 @@ impl<C: Clock> DustSweepRunner<C> {
         }
     }
 
-    /// Epoch-ms before which a balance row's owner counts as abandoned. The
-    /// one place that turns `abandoned_days` into a boundary.
+    /// Epoch-ms before which a balance row's owner counts as abandoned.
     fn cutoff_ms(&self, now_ms: i64) -> i64 {
-        now_ms - (self.abandoned_days as i64) * 86_400_000
+        crate::config::abandoned_cutoff_ms(now_ms, self.abandoned_days)
     }
 
     /// Run one sweep. Public so tests + admin endpoints can trigger

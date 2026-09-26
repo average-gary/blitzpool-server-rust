@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `DistributionBuilder` — production-side wrapper around
-//! `bp_pplns::build_coinbase_distribution`.
+//! `DistributionBuilder` — production-side wrapper around the weight
+//! build both payout engines share, `bp_coinbase_snapshot::build_and_snapshot`.
 //!
 //! Reads the current window from Redis (per-address aggregate hash),
-//! loads the open-balance ledger rows from Postgres, calls the
-//! pure-math distribution builder, then persists a snapshot into
-//! `pplns:snapshot` so [`crate::ledger::apply_distribution`] can
-//! replay the same distribution deterministically when the block is
-//! found.
+//! loads the open-balance ledger rows from Postgres, builds the weight
+//! distribution, then persists its settlement inputs under
+//! `pplns:snapshot:<fingerprint>` so the block-found path can settle the
+//! block's own coinbase against them.
 //!
 //! Two layers of `bp_inflight_cache::InflightResultCache` (30s TTL by
 //! default):

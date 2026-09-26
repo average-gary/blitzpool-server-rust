@@ -17,15 +17,16 @@
 //!
 //! `bp-share-hook` introduces a **protocol-agnostic view** —
 //! [`SharedAcceptedShare`] — and the trait engines implement against it,
-//! [`SharedAcceptedShareSink`]. Each Stratum server crate provides a
-//! thin adapter that projects its native `ShareAccept` into the shared
-//! view and delegates to `SharedAcceptedShareSink`.
+//! [`SharedAcceptedShareSink`]. Each Stratum server projects its native
+//! `ShareAccept` into the shared view at the call site (its
+//! `shared_adapter` module) and calls the shared sink directly — the
+//! servers hold these traits, not protocol-specific copies of them.
 //!
 //! ```text
 //!  bp-stratum-v1::ShareAccept ──┐
-//!                               ├── Sv1->Shared adapter ──┐
-//!  bp-stratum-v2::ShareAccept ──┘                         │
-//!                                                         ▼
+//!                               ├── per-server projection ──┐
+//!  bp-stratum-v2::ShareAccept ──┘                           │
+//!                                                           ▼
 //!                                  bp-pplns-engine, bp-group-solo-engine,
 //!                                  bp-share-stats-sink, bp-session-persistence,
 //!                                  ... all impl SharedAcceptedShareSink
@@ -34,17 +35,17 @@
 //! # Lifecycle outlook
 //!
 //! When SV1 is eventually retired (SV2 is the future protocol), the
-//! `bp-stratum-v1` crate + its adapter just go away. Engines stay
+//! `bp-stratum-v1` crate + its projection just go away. Engines stay
 //! unchanged.
 //!
 //! # Scope
 //!
-//! Covers the three per-share hook surfaces that ALL engines need
-//! protocol-agnostically:
+//! Covers the hook surfaces both servers fire with the same payload:
 //!
 //! - **`SharedAcceptedShareSink`** — every accepted share
 //! - **`SharedRejectedShareSink`** — every rejected share
 //! - **`SharedSessionPersistence`** — authorize / disconnect lifecycle
+//! - **`DeviceStatusSink`** — per-device online / offline transitions
 //!
 //! **`BlockSubmissionSink` stays per-protocol** because it carries the
 //! full native `ShareAccept` (header / hash / mining-job snapshot)
@@ -85,8 +86,8 @@ pub struct SharedAcceptedShare<'a> {
     pub effective_difficulty: f64,
 
     /// Difficulty the share actually **solved** (derived from the
-    /// hash). Drives best-difficulty tracking + the block-found
-    /// threshold (`>= network_difficulty`).
+    /// hash). Drives best-difficulty tracking. The block-found gate
+    /// compares the hash itself against the network target.
     pub submission_difficulty: f64,
 
     /// Miner firmware / vendor string for this session (SV1
@@ -122,7 +123,7 @@ pub struct SharedAcceptedShare<'a> {
 
     /// Core wall-clock time (epoch milliseconds) at which this share was
     /// accepted, stamped **once** at the protocol-agnostic projection
-    /// boundary (the SV1/SV2 adapters) via [`bp_common::now_ms`]. Every
+    /// boundary (the SV1/SV2 `shared_adapter` projections) via [`bp_common::now_ms`]. Every
     /// downstream sink MUST window / time-bucket on this value and never
     /// re-stamp
     /// `now()` at the sink. In a single process the two are microseconds
@@ -137,15 +138,15 @@ pub struct SharedAcceptedShare<'a> {
     /// Group-Solo windows) keys its dedup marker on this so a redelivered
     /// share is a no-op. Assigned once at the single fan-out point (the
     /// in-process composite today, the stream producer under the split);
-    /// **empty (`""`) until the producer stamps it** — the protocol adapters
-    /// leave it blank because they have no global sequence.
+    /// **empty (`""`) until the producer stamps it** — the protocol side
+    /// leaves it blank because they have no global sequence.
     pub share_id: &'a str,
 
     /// Resolved payout mode for this share's address, stamped by the
     /// producer at the single fan-out point. Sinks read this instead of
     /// querying a mode-gate per share: under the split the producer (Core)
     /// resolves it once from the authoritative gate, so the consumer sinks
-    /// need no gate. `Solo` until the producer stamps it (the adapters have
+    /// need no gate. `Solo` until the producer stamps it (the protocol side has
     /// no gate).
     pub mode: MiningMode,
     /// Group id (UUID string) for `GroupSolo` / `Blockparty` modes, else
@@ -186,8 +187,8 @@ impl ShareSequencer {
     }
 }
 
-/// Hook for accepted shares. Engines implement this once and the
-/// Stratum-server adapters dispatch every accepted share through it.
+/// Hook for accepted shares. Engines implement this once and both
+/// Stratum servers dispatch every accepted share through it.
 /// Mode-blind by design — a mode-specific engine gates on the
 /// producer-stamped [`SharedAcceptedShare::mode`] internally.
 ///
@@ -298,7 +299,7 @@ impl SharedAcceptedShare<'_> {
 /// `reason` is the canonical 3-variant [`bp_stats::RejectedReason`]
 /// (JobNotFound / DuplicateShare / LowDifficulty). Both Stratum
 /// servers map their richer per-protocol reject enums into this
-/// stable shape inside their adapters (SV1's `Stale` collapses into
+/// stable shape in their `shared_adapter` projections (SV1's `Stale` collapses into
 /// `JobNotFound`; SV2's `BadExtranonceSize` doesn't surface to this
 /// trait — it's pre-share-validation so the share never reaches a
 /// counter).
@@ -313,7 +314,7 @@ pub struct SharedRejectedShare<'a> {
     /// Group UUID string for a Group-Solo address, else `None`. Stamped by
     /// the producer at the fan-out point (the only side with the mode gate)
     /// so the Group-Solo reject sink needs no gate of its own — it reads this
-    /// instead. The protocol adapters leave it `None`.
+    /// instead. The protocol side leaves it `None`.
     pub group_id: Option<&'a str>,
 }
 
@@ -387,6 +388,47 @@ pub trait SharedSessionPersistence: Send + Sync {
     );
     /// Called when the connection closes (clean FIN or RST or timeout).
     async fn deregister_session(&self, session_id: &str);
+}
+
+/// Protocol-agnostic per-device online/offline transition. SV1 fires it on
+/// authorize and disconnect, SV2 on channel open and close, with the same
+/// payload, so both servers take this one trait. Production wiring forwards
+/// to the device-status gate (in-process) or the `device:status` stream.
+#[async_trait]
+pub trait DeviceStatusSink: Send + Sync {
+    async fn on_device_event(
+        &self,
+        address: &str,
+        worker: &str,
+        session_id: &str,
+        user_agent: Option<&str>,
+        is_online: bool,
+    );
+}
+
+/// Does nothing. What a server gets for every shared hook when it runs
+/// without production sinks — tests and standalone runs.
+pub struct NoOpSink;
+
+#[async_trait]
+impl SharedAcceptedShareSink for NoOpSink {
+    async fn record_accepted(&self, _: SharedAcceptedShare<'_>) {}
+}
+
+#[async_trait]
+impl SharedRejectedShareSink for NoOpSink {
+    async fn record_rejected(&self, _: SharedRejectedShare<'_>) {}
+}
+
+#[async_trait]
+impl SharedSessionPersistence for NoOpSink {
+    async fn register_session(&self, _: &str, _: &str, _: &str, _: Option<&str>) {}
+    async fn deregister_session(&self, _: &str) {}
+}
+
+#[async_trait]
+impl DeviceStatusSink for NoOpSink {
+    async fn on_device_event(&self, _: &str, _: &str, _: &str, _: Option<&str>, _: bool) {}
 }
 
 #[cfg(test)]

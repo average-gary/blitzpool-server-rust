@@ -74,7 +74,6 @@ use crate::jdp::client::{
     JdpSessionState, SolutionHeader,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
-use crate::jdp::payout_distribution::WeightedOutput;
 use crate::jdp::tx_validation::{merge_provided_with_known, partition_against_template};
 use crate::jdp_server_codec::{
     decode_jdp_inbound, encode_jdp_outbound, InboundJdpFrame, JdpWireFrame,
@@ -85,16 +84,11 @@ use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
 
 /// Resolve `(miner_address, encoded_coinbase_outputs)` for an
 /// inbound `AllocateMiningJobToken`. Production wiring parses
-/// `user_identifier` as a BTC address (or falls back to an IP-based
-/// lookup), then computes the pool's payout outputs via
-/// [`crate::hooks::PayoutResolver`] + [`crate::jdp::dynamic_outputs::encode_coinbase_outputs`].
+/// `user_identifier` as a BTC address, then computes the pool's payout outputs via
+/// [`crate::hooks::PayoutResolver`] + [`crate::jdp::dynamic_outputs::designated_output_blob`].
 /// Tests use a no-op + a custom fixture.
 #[async_trait]
 pub trait JdpAllocateResolver: Send + Sync {
-    /// `remote_addr` is the connection's remote IP (string form, e.g.
-    /// `"127.0.0.1:48292"`). Caller provides it so IP-based miner
-    /// lookup is possible without leaking sockets into the handler.
-    ///
     /// `payout_distribution_negotiated` — ext 0x0003 is active on this
     /// connection. ext 0x0003/Negotiation then REQUIRES `coinbase_tx_outputs`
     /// to be empty (the distribution replaces the base
@@ -103,7 +97,6 @@ pub trait JdpAllocateResolver: Send + Sync {
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
-        remote_addr: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome;
 }
@@ -147,28 +140,7 @@ pub trait CurrentPrevHashProvider: Send + Sync {
     async fn current_prev_hash(&self) -> Option<[u8; 32]>;
 }
 
-/// A freshly-built payout distribution, ready to publish as
-/// `SetPayoutDistribution` (ext 0x0003/SetPayoutDistribution) and to register
-/// in the bridge for ext 0x0003/Output Verification validation.
-#[derive(Clone, Debug)]
-pub struct BuiltPayoutDistribution {
-    /// The pool output (`weight_P` in the amount field).
-    pub pool_payout: WeightedOutput,
-    /// Miner payout slots in ext 0x0003/Payout Computation coinbase order.
-    pub payouts: Vec<WeightedOutput>,
-    /// Parallel to `payouts` (ext 0x0003/SetPayoutDistribution).
-    pub dust_limits: Vec<u32>,
-    /// Consensus-serialized 0-value TxOuts the pool appends.
-    pub additional_outputs: Vec<Vec<u8>>,
-    /// Revenue the weight boosts were projected against.
-    pub reference_reward_sats: u64,
-    /// Settlement-snapshot identity. `None` = the owning mode books
-    /// without a snapshot (Solo).
-    pub payouts_fingerprint: Option<[u8; 32]>,
-    /// Whether a found block on this distribution may be booked
-    /// (`false` when the snapshot write failed).
-    pub bookable: bool,
-}
+use crate::bridge::BuiltPayoutDistribution;
 
 /// Floor the publish interval at 1s.
 ///
@@ -398,10 +370,9 @@ impl JdpAllocateResolver for NoOpJdpHooks {
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
-        _remote_addr: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome {
-        // Pure parse — no IP fallback. Production wiring overrides.
+        // Pure parse. Production wiring overrides.
         let Some(addr) = parse_user_identifier_as_address(user_identifier) else {
             return AllocateOutcome::Ignored;
         };
@@ -424,13 +395,11 @@ impl JdpAllocateResolver for NoOpJdpHooks {
         let Ok(parsed) = addr.as_str().parse::<bitcoin::Address<_>>() else {
             return AllocateOutcome::Ignored;
         };
-        let txout = bitcoin::TxOut {
-            value: bitcoin::Amount::ZERO,
-            script_pubkey: parsed.assume_checked().script_pubkey(),
-        };
         AllocateOutcome::Granted(AllocateTokenContext {
             miner_address: addr,
-            coinbase_outputs: bitcoin::consensus::serialize(&vec![txout]),
+            coinbase_outputs: crate::jdp::dynamic_outputs::designated_output_blob(
+                &parsed.assume_checked().script_pubkey(),
+            ),
         })
     }
 }
@@ -607,13 +576,13 @@ impl StratumV2JdpServer {
                     continue;
                 };
                 last_fingerprint = built.payouts_fingerprint;
-                let entry = entry_from_built(
+                let entry = PayoutDistributionEntry {
                     distribution_id,
                     built,
-                    DistributionAccounting::PoolWide,
-                    None,
-                    SystemClock.now_ms(),
-                );
+                    accounting: DistributionAccounting::PoolWide,
+                    jdp_session_id: None,
+                    published_at_ms: SystemClock.now_ms(),
+                };
                 inner
                     .bridge
                     .write()
@@ -630,9 +599,9 @@ impl StratumV2JdpServer {
         });
     }
 
-    /// Per-connection task. The TCP-accept loop calls this for
-    /// each socket identified as JDP by `bp_protocol_detect`.
-    pub fn accept_connection(&self, socket: TcpStream, remote_addr: String) -> JoinHandle<()> {
+    /// Per-connection task. The accept loop on the dedicated JDP port
+    /// calls this for every accepted socket.
+    pub fn accept_connection(&self, socket: TcpStream) -> JoinHandle<()> {
         let noise_config = self.inner.noise_config.clone();
         let hooks = self.inner.hooks.clone();
         let bridge = self.inner.bridge.clone();
@@ -646,7 +615,6 @@ impl StratumV2JdpServer {
                 hooks,
                 bridge,
                 socket,
-                remote_addr,
                 cancel,
                 dist_rx,
             )
@@ -930,7 +898,8 @@ async fn republish_tailored(
 
 /// Build and push a fresh tailored distribution for `miner` on this session.
 ///
-/// Three callers, one implementation: the first allocate; a
+/// Reached only through [`republish_tailored`], whose three callers share
+/// this one implementation: the first allocate; a
 /// ext 0x0003/Implementation Notes settlement, which invalidates a tailored
 /// slot exactly like the pool-wide one while the publisher only ever
 /// republishes the latter; and the session's own frames, which retry an
@@ -1083,13 +1052,13 @@ async fn rebuild_tailored_plan(
             .deny_pool_wide(session_id);
         return SessionDistribution::Denied;
     };
-    let entry = entry_from_built(
+    let entry = PayoutDistributionEntry {
         distribution_id,
         built,
-        accounting.clone(),
-        Some(session_id),
-        SystemClock.now_ms(),
-    );
+        accounting: accounting.clone(),
+        jdp_session_id: Some(session_id),
+        published_at_ms: SystemClock.now_ms(),
+    };
     let wire = wire_from_entry(&entry);
     {
         let mut guard = bridge.write().expect("bridge RwLock poisoned");
@@ -1134,7 +1103,6 @@ async fn run_jdp_connection(
     hooks: JdpServerHooks,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     socket: TcpStream,
-    remote_addr: String,
     cancel: CancellationToken,
     mut dist_rx: tokio::sync::watch::Receiver<u64>,
 ) -> std::io::Result<()> {
@@ -1335,7 +1303,6 @@ async fn run_jdp_connection(
                     &hooks,
                     &bridge,
                     session_id,
-                    &remote_addr,
                     SystemClock.now_ms(),
                 )
                 .await;
@@ -1554,7 +1521,6 @@ async fn dispatch_jdp_inbound(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     session_id: u32,
-    remote_addr: &str,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
     match inbound {
@@ -1576,7 +1542,7 @@ async fn dispatch_jdp_inbound(
                 .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
             match hooks
                 .allocate_resolver
-                .resolve_allocate_context(&input.user_identifier, remote_addr, negotiated)
+                .resolve_allocate_context(&input.user_identifier, negotiated)
                 .await
             {
                 AllocateOutcome::Granted(ctx) => handle_allocate_token(state, &input, ctx, now_ms),
@@ -1837,52 +1803,19 @@ fn resolve_distribution_acceptance(
     })
 }
 
-/// Lower a [`BuiltPayoutDistribution`] into the bridge's registry entry.
-fn entry_from_built(
-    distribution_id: u64,
-    built: BuiltPayoutDistribution,
-    accounting: DistributionAccounting,
-    jdp_session_id: Option<u32>,
-    published_at_ms: u64,
-) -> PayoutDistributionEntry {
-    // Destructured rather than read field by field, so a field added to
-    // `BuiltPayoutDistribution` fails to compile HERE instead of being dropped
-    // on the way into the registry. The compiler only forces the producers to
-    // fill a new field in; nothing would have said it never arrives, and what
-    // the registry holds is what the declare-time payout check and the
-    // block-found booking read.
-    let BuiltPayoutDistribution {
-        pool_payout,
-        payouts,
-        dust_limits,
-        additional_outputs,
-        reference_reward_sats,
-        payouts_fingerprint,
-        bookable,
-    } = built;
-    PayoutDistributionEntry {
-        distribution_id,
-        pool_payout,
-        payouts,
-        dust_limits,
-        additional_outputs,
-        reference_reward_sats,
-        payouts_fingerprint,
-        bookable,
-        accounting,
-        jdp_session_id,
-        published_at_ms,
-    }
-}
-
 /// The ext 0x0003/SetPayoutDistribution wire form of a registry entry.
 fn wire_from_entry(entry: &PayoutDistributionEntry) -> SetPayoutDistribution {
     SetPayoutDistribution {
         distribution_id: entry.distribution_id,
-        pool_payout: entry.pool_payout.to_wire_txout(),
-        payouts: entry.payouts.iter().map(|p| p.to_wire_txout()).collect(),
-        dust_limits: entry.dust_limits.clone(),
-        additional_outputs: entry.additional_outputs.clone(),
+        pool_payout: entry.built.pool_payout.to_wire_txout(),
+        payouts: entry
+            .built
+            .payouts
+            .iter()
+            .map(|p| p.to_wire_txout())
+            .collect(),
+        dust_limits: entry.built.dust_limits.clone(),
+        additional_outputs: entry.built.additional_outputs.clone(),
     }
 }
 
@@ -2111,17 +2044,20 @@ pub(crate) fn register_bridge_entries(
 mod tests {
     use super::*;
     use crate::jdp::client::AllocateMiningJobTokenInput;
+    use crate::jdp::payout_distribution::WeightedOutput;
     use crate::tokens::Token;
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
     fn noise_cfg() -> NoiseConfig {
-        NoiseConfig::parse_strings(
-            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72",
-            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n",
-            crate::noise::DEFAULT_CERT_VALIDITY,
+        NoiseConfig::new(
+            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+                .parse()
+                .unwrap(),
+            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+                .parse()
+                .unwrap(),
         )
-        .unwrap()
     }
 
     fn fresh_bridge() -> Arc<RwLock<JdpDeclaredJobRegistry>> {
@@ -2140,8 +2076,8 @@ mod tests {
         s
     }
 
-    fn jdp_setup() -> crate::jdp::client::SetupConnectionInput {
-        crate::jdp::client::SetupConnectionInput {
+    fn jdp_setup() -> crate::codec_common::SetupConnectionInput {
+        crate::codec_common::SetupConnectionInput {
             protocol: crate::jdp::client::PROTOCOL_JOB_DECLARATION,
             min_version: 2,
             max_version: 2,
@@ -2158,19 +2094,21 @@ mod tests {
     fn test_distribution(id: u64) -> PayoutDistributionEntry {
         PayoutDistributionEntry {
             distribution_id: id,
-            pool_payout: WeightedOutput {
-                script_pubkey: vec![0x51],
-                weight: 1,
+            built: crate::bridge::BuiltPayoutDistribution {
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 9,
+                }],
+                dust_limits: vec![546],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([id as u8; 32]),
+                bookable: true,
             },
-            payouts: vec![WeightedOutput {
-                script_pubkey: vec![0x00, 0x14, 0xAA],
-                weight: 9,
-            }],
-            dust_limits: vec![546],
-            additional_outputs: vec![],
-            reference_reward_sats: 312_500_000,
-            payouts_fingerprint: Some([id as u8; 32]),
-            bookable: true,
             accounting: DistributionAccounting::PoolWide,
             jdp_session_id: None,
             published_at_ms: 1_000,
@@ -2222,11 +2160,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_op_allocate_resolver_designates_the_miners_own_output() {
         let hooks = NoOpJdpHooks;
-        let ctx = granted(
-            hooks
-                .resolve_allocate_context(ADDR, "1.2.3.4:1234", false)
-                .await,
-        );
+        let ctx = granted(hooks.resolve_allocate_context(ADDR, false).await);
         assert_eq!(ctx.miner_address.as_str(), ADDR);
         let outputs: Vec<bitcoin::TxOut> =
             bitcoin::consensus::deserialize(&ctx.coinbase_outputs).expect("outputs decode");
@@ -2250,11 +2184,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_op_allocate_resolver_empty_outputs_when_0x0003_negotiated() {
         let hooks = NoOpJdpHooks;
-        let ctx = granted(
-            hooks
-                .resolve_allocate_context(ADDR, "1.2.3.4:1234", true)
-                .await,
-        );
+        let ctx = granted(hooks.resolve_allocate_context(ADDR, true).await);
         assert_eq!(ctx.miner_address.as_str(), ADDR);
         assert!(ctx.coinbase_outputs.is_empty());
     }
@@ -2263,7 +2193,7 @@ mod tests {
     async fn no_op_allocate_resolver_rejects_garbage_user_identifier() {
         let hooks = NoOpJdpHooks;
         let outcome = hooks
-            .resolve_allocate_context(&"x".repeat(200), "1.2.3.4:1234", false)
+            .resolve_allocate_context(&"x".repeat(200), false)
             .await;
         assert!(
             matches!(outcome, AllocateOutcome::Ignored),
@@ -2287,7 +2217,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             1_000,
         )
         .await;
@@ -2405,7 +2334,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             1_000,
         )
         .await;
@@ -2447,7 +2375,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             1_000,
         )
         .await;
@@ -2478,7 +2405,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             1_000,
         )
         .await;
@@ -2521,7 +2447,6 @@ mod tests {
             hooks,
             bridge,
             1,
-            "1.2.3.4:5555",
             now_ms,
         )
         .await
@@ -2629,16 +2554,7 @@ mod tests {
         // Wrong request_id, right position count: no node call, no frame,
         // and the round-trip is still in flight afterwards — which is exactly
         // what let this repeat.
-        let out = dispatch_jdp_inbound(
-            &mut state,
-            answer(9_999),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            1_200,
-        )
-        .await;
+        let out = dispatch_jdp_inbound(&mut state, answer(9_999), &hooks, &bridge, 1, 1_200).await;
         assert!(out.outbound.is_empty(), "got {:?}", out.outbound);
         assert_eq!(
             validator.calls(),
@@ -2651,16 +2567,7 @@ mod tests {
         );
 
         // The real answer still goes through.
-        let _ = dispatch_jdp_inbound(
-            &mut state,
-            answer(11),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            1_300,
-        )
-        .await;
+        let _ = dispatch_jdp_inbound(&mut state, answer(11), &hooks, &bridge, 1, 1_300).await;
         assert_eq!(
             validator.calls(),
             2,
@@ -2737,7 +2644,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             0,
         )
         .await;
@@ -2765,16 +2671,7 @@ mod tests {
         };
 
         // No distribution published yet → the extension is not offered.
-        let outcome = dispatch_jdp_inbound(
-            &mut state,
-            request(1),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            1_000,
-        )
-        .await;
+        let outcome = dispatch_jdp_inbound(&mut state, request(1), &hooks, &bridge, 1, 1_000).await;
         match &outcome.outbound[0] {
             JdpOutboundFrame::RequestExtensionsError {
                 unsupported_extensions,
@@ -2793,16 +2690,7 @@ mod tests {
             .write()
             .unwrap()
             .publish_pool_wide(test_distribution(1));
-        let outcome = dispatch_jdp_inbound(
-            &mut state,
-            request(2),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            2_000,
-        )
-        .await;
+        let outcome = dispatch_jdp_inbound(&mut state, request(2), &hooks, &bridge, 1, 2_000).await;
         match &outcome.outbound[0] {
             JdpOutboundFrame::RequestExtensionsSuccess {
                 supported_extensions,
@@ -2969,7 +2857,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             3_000,
         )
         .await;
@@ -2988,7 +2875,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             3_000,
         )
         .await;
@@ -3006,7 +2892,6 @@ mod tests {
             &hooks,
             &bridge,
             1,
-            "1.2.3.4:5555",
             3_000,
         )
         .await;
@@ -3145,9 +3030,9 @@ mod tests {
         let entry = test_distribution(7);
         let wire = wire_from_entry(&entry);
         assert_eq!(wire.distribution_id, 7);
-        assert_eq!(wire.pool_payout, entry.pool_payout.to_wire_txout());
+        assert_eq!(wire.pool_payout, entry.built.pool_payout.to_wire_txout());
         assert_eq!(wire.payouts.len(), 1);
-        assert_eq!(wire.payouts[0], entry.payouts[0].to_wire_txout());
+        assert_eq!(wire.payouts[0], entry.built.payouts[0].to_wire_txout());
         assert_eq!(wire.dust_limits, vec![546]);
         assert!(wire.additional_outputs.is_empty());
     }

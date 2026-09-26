@@ -489,10 +489,13 @@ mod tests {
         let Ok(home) = std::env::var("HOME") else {
             return;
         };
+        // A LEADING `~` is the unexpanded form. One inside a name is an
+        // ordinary character — `$PATH` can carry `…/plugin~g2/bin`, which
+        // exists and must be probed as it is.
         for c in candidates() {
             let s = c.to_string_lossy();
             assert!(
-                !s.contains('~'),
+                !s.starts_with('~'),
                 "a literal `~` directory can never exist, so this candidate is \
                  dead weight: {s}"
             );

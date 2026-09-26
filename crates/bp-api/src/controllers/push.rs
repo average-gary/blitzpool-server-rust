@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::push_hooks::{FcmRegisterContext, UnifiedPushRegisterContext};
 use crate::state::SharedState;
+use crate::time_range::format_iso_ms;
 
 const UNIFIED_PUSH: &str = "unified_push";
 const FCM: &str = "fcm";
@@ -238,14 +238,6 @@ where
     )
     .await
     .map_err(|_| push_error("registration-failed", StatusCode::BAD_REQUEST))?;
-    state
-        .push_hooks
-        .on_unified_push_registered(UnifiedPushRegisterContext {
-            address: address.as_str().to_string(),
-            endpoint: endpoint.clone(),
-            platform: platform.clone(),
-        })
-        .await;
     Ok(Json(RegisterResponse {
         success: true,
         subscription: subscription_summary(&row),
@@ -437,14 +429,6 @@ where
     )
     .await
     .map_err(|_| push_error("registration-failed", StatusCode::BAD_REQUEST))?;
-    state
-        .push_hooks
-        .validate_fcm_token(FcmRegisterContext {
-            address: address.as_str().to_string(),
-            token: token.clone(),
-            platform: platform.clone(),
-        })
-        .await;
     Ok(Json(FcmRegisterResponse {
         success: true,
         subscription_type: "fcm",
@@ -550,13 +534,4 @@ where
 
 fn push_error(code: &'static str, status: StatusCode) -> ApiError {
     ApiError::GroupService { code, status }
-}
-
-fn format_iso_ms(ms: i64) -> String {
-    use chrono::TimeZone;
-    chrono::Utc
-        .timestamp_millis_opt(ms)
-        .single()
-        .unwrap_or_else(chrono::Utc::now)
-        .to_rfc3339()
 }

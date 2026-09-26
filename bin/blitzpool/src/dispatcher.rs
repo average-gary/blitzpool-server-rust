@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bp_notifications::command::ChatLanguageMap;
-use bp_notifications::dispatcher::{DispatcherConfig, NotificationDispatcher};
+use bp_notifications::dispatcher::NotificationDispatcher;
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -61,7 +61,6 @@ pub(crate) fn build(
         .chat_languages()
         .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
 
-    let config = DispatcherConfig::default_zurich();
     info!(
         fcm = fcm.is_some(),
         web_push = web_push.is_some(),
@@ -71,7 +70,6 @@ pub(crate) fn build(
     );
     Some(Arc::new(NotificationDispatcher::new(
         foundation.db.pool().clone(),
-        config,
         telegram,
         ntfy,
         fcm,

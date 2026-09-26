@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! PPLNS pure math — the weight-native distribution builder (SV2 ext
-//! 0x0003 §4 model) plus the shared record types and weight constants.
+//! 0x0003 §4 model) plus its telemetry and weight constants.
 //!
 //! No I/O. Window aggregation, Redis snapshots, DB writes, and dust-sweep
 //! cron belong to a higher-level service crate that consumes this one.
@@ -15,7 +15,7 @@ mod distribution;
 mod weight;
 mod weights;
 
-pub use distribution::{BudgetTelemetry, CoinbaseDistributionEntry};
+pub use distribution::BudgetTelemetry;
 pub use weight::{
     is_payable_payout_key, is_valid_payout_address, max_coinbase_outputs,
     output_weight_for_address, output_weight_for_payout_key, resolve_min_payout_sats,

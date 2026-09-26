@@ -2,9 +2,9 @@
 
 //! `BlockSubmissionSink` implementations.
 //!
-//! When a Stratum share's submission difficulty meets / exceeds the
-//! network difficulty derived from the template's `n_bits`, the
-//! per-protocol server fires the block-submission hook. The Rust port
+//! When a Stratum share's hash meets the network target the template's
+//! `n_bits` encodes, the per-protocol server fires the block-submission
+//! hook. The Rust port
 //! routes those through [`TdpBlockSubmissionSink`] which assembles the
 //! witness-form coinbase from the share's owned `MiningJob` snapshot
 //! plus the parsed extranonces, then calls
@@ -30,13 +30,10 @@
 //! by the time this hook fires; failing to forward to core only
 //! means we lose the block reward, not the share count).
 //!
-//! ## SV2 wiring
-//!
-//! SV2's `ShareAccept` doesn't yet carry the `MiningJob` snapshot +
-//! extranonce bytes the same way SV1 does (the Standard-channel job
-//! state lives in the channel's send-time bookkeeping, not the
-//! per-share `ShareAccept`). That extension lands alongside the SV2
-//! TCP binding in 7.4c.
+//! SV1 and SV2 differ only in where the coinbase bytes come from (SV1
+//! reassembles them from the job + extranonces, SV2 hands them over); the
+//! submit and the block-found emission are one path,
+//! [`TdpBlockSubmissionSink::submit_and_emit`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,10 +42,11 @@ use async_trait::async_trait;
 use bp_bitcoin::BitcoinRpc;
 use bp_coinbase_snapshot::ActualCoinbase;
 use bp_common::{AddressId, MiningMode, StreamKind};
+use bp_config::{AppConfig, Role};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_notifications::dispatcher::NotificationDispatcher;
 use bp_pplns_engine::engine::PplnsEngine;
-use bp_share_stream::StreamProducer;
+use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
 use bp_stratum_v1::{BlockSubmissionSink as Sv1BlockSubmissionSink, ShareAccept as Sv1ShareAccept};
 use bp_stratum_v2::hooks::BlockSubmissionSink as Sv2BlockSubmissionSink;
 use bp_stratum_v2::mining::submit::ShareAccept as Sv2ShareAccept;
@@ -57,8 +55,10 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
-use crate::engines::BlitzpoolModeGate;
-use crate::pending_blocks::{put_pending_block, PendingBlock, PendingGroup};
+use crate::block_confirmation::{settle_block, SettleFailure};
+use crate::boot::FoundationHandles;
+use crate::engines::{BlitzpoolModeGate, EngineHandles};
+use crate::pending_blocks::{put_pending_block, PendingBlock, PendingGroup, SettlementMode};
 
 /// Accounting inputs for a found block, bundled so the block-found fan-out
 /// (per-mode engine ledger + notifications) runs from one value.
@@ -74,9 +74,11 @@ pub(crate) struct BlockFoundEvent {
     pub address: String,
     pub worker: String,
     pub session_id: String,
-    /// Block-reward portion this coinbase claims (subsidy + fees after any
-    /// JDC coinbase outputs). `None` only signals a caller regression — a
-    /// non-Solo block-found always carries `Some`.
+    /// Wire form of [`Booking`]: `Some(reward)` = book, `None` = record
+    /// only. Read it through [`Self::booking`]. The field stays an `Option`
+    /// because the event rides a stream that other processes replay, and a
+    /// rolling deploy has old and new producers and consumers in flight at
+    /// once.
     pub reward_sats: Option<u64>,
     /// Big-endian block-hash hex — the idempotent history-row key + the
     /// PPLNS confirmation-gating key.
@@ -129,10 +131,46 @@ pub(crate) struct BlockFoundEvent {
     /// submitted coinbase transaction on the Core. The weight-model
     /// settlement books `claim − paid` from this — the event carries it
     /// so a Satellite never has to re-derive it from chain data.
-    /// `None` on events produced before this field existed; those can
-    /// only book through the legacy exact-match path.
+    /// `None` when the submitted coinbase did not decode, or on a
+    /// [`Booking::RecordOnly`] event; PPLNS and Group-Solo then book
+    /// nothing (see `BlockFoundApplier::gate_or_apply`).
     #[serde(default)]
     pub actual_coinbase: Option<ActualCoinbase>,
+}
+
+impl BlockFoundEvent {
+    /// What this event asks the apply side to do with the ledger.
+    pub(crate) fn booking(&self) -> Booking {
+        match self.reward_sats {
+            Some(reward_sats) => Booking::Book { reward_sats },
+            None => Booking::RecordOnly,
+        }
+    }
+}
+
+/// Whether a found block goes into its mode's ledger, or is only recorded
+/// (`blocks_entity` row + notification).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Booking {
+    /// Book it. `reward_sats` is the block-reward portion the coinbase
+    /// claims (subsidy + fees after any JDC coinbase outputs). PPLNS and
+    /// Group-Solo only log it: they settle from the block's own coinbase.
+    /// Blockparty builds its history row from it.
+    Book { reward_sats: u64 },
+    /// Record the block without any ledger write. For a block whose
+    /// distribution was never bookable, and for a pool-built SV2 custom-job
+    /// coinbase that did not decode.
+    RecordOnly,
+}
+
+impl Booking {
+    /// The event's wire form, see [`BlockFoundEvent::reward_sats`].
+    fn wire_reward_sats(self) -> Option<u64> {
+        match self {
+            Self::Book { reward_sats } => Some(reward_sats),
+            Self::RecordOnly => None,
+        }
+    }
 }
 
 /// What identifies a JDC-found block in `blocks_entity`.
@@ -184,7 +222,7 @@ struct BlockFoundInputs {
     /// ⚠️ Lands in `blocks_entity."sessionId"`, which is `varchar(8)`.
     /// Postgres does not truncate on INSERT, it errors.
     session_id: String,
-    reward_sats: Option<u64>,
+    booking: Booking,
     /// Big-endian block-hash hex. Not an `Option` here even though
     /// [`BlockFoundEvent::block_hash`] is one: every caller has the hash. The
     /// event keeps its `Option` because it is deserialized off a stream that
@@ -202,9 +240,10 @@ struct BlockFoundInputs {
 /// (`PplnsEngine::on_block_found` / `GroupSoloEngine::on_block_found`)
 /// plus the [`NotificationDispatcher`] for subscriber notifications.
 ///
-/// All fan-out hooks except the TDP submit are optional: when the
-/// mode-gate, engines, or dispatcher are absent, the corresponding
-/// step logs at INFO and continues. The TDP submit is the
+/// The mode gate, the RPC (for the height) and Postgres (for the
+/// `blocks_entity` row) are required: a block-found cannot be emitted
+/// without them. The engines and the dispatcher are optional: when one is
+/// absent, the corresponding step logs and continues. The TDP submit is the
 /// authoritative block-propagation path; engine + dispatcher are
 /// observability + accounting.
 pub(crate) struct TdpBlockSubmissionSink {
@@ -216,10 +255,10 @@ pub(crate) struct TdpBlockSubmissionSink {
     /// produced when boot wired both the template stream and this handle, so
     /// routing stays consistent (the handle knows the job's template_id).
     alt: HashMap<StreamKind, TdpHandle>,
-    mode_gate: Option<Arc<BlitzpoolModeGate>>,
-    bitcoin_rpc: Option<BitcoinRpc>,
+    mode_gate: Arc<BlitzpoolModeGate>,
+    bitcoin_rpc: BitcoinRpc,
     /// Postgres pool for writing to `blocks_entity` on block-found.
-    pool: Option<PgPool>,
+    pool: PgPool,
     /// The relocatable block-found apply deps (engine ledger + dispatcher +
     /// PPLNS pending store). Bundled in [`BlockFoundApplier`] so the exact
     /// same apply runs on the Core (in-process) or on a Satellite consuming
@@ -269,16 +308,67 @@ pub(crate) struct BlockFoundApplier {
 }
 
 impl TdpBlockSubmissionSink {
-    pub(crate) fn new(tdp: TdpHandle) -> Self {
+    pub(crate) fn new(
+        tdp: TdpHandle,
+        mode_gate: Arc<BlitzpoolModeGate>,
+        bitcoin_rpc: BitcoinRpc,
+        pool: PgPool,
+    ) -> Self {
         Self {
             tdp,
             alt: HashMap::new(),
-            mode_gate: None,
-            bitcoin_rpc: None,
-            pool: None,
+            mode_gate,
+            bitcoin_rpc,
+            pool,
             applier: BlockFoundApplier::default(),
             block_found_producer: None,
             network: bitcoin::Network::Bitcoin,
+        }
+    }
+
+    /// The sink as the binary wires it: the ONE way SV1, SV2 and the JDP
+    /// ledger booker build theirs, so a block books the same way whichever of
+    /// them found it. They used to be three hand-copied builder chains, and
+    /// the JDP copy had lost `with_settle_handle` — a block it booked on the
+    /// immediate path (parking failed) never invalidated the published
+    /// distributions.
+    ///
+    /// On the front the sink also produces onto the block-found stream: the
+    /// payout satellite applies the ledger and the notify satellite fans out
+    /// the push. A front always produces (front + payout can't share a
+    /// process; see the boot guard in main.rs), so this gates on the front
+    /// role alone.
+    pub(crate) fn wired(
+        tdp: TdpHandle,
+        cfg: &AppConfig,
+        foundation: &FoundationHandles,
+        engines: &EngineHandles,
+        dispatcher: Option<Arc<NotificationDispatcher>>,
+        settle: crate::settlement::SettlementSignal,
+    ) -> Self {
+        let sink = Self::new(
+            tdp,
+            engines.mode_gate.clone(),
+            foundation.bitcoin_rpc.clone(),
+            foundation.db.pool().clone(),
+        )
+        .with_network(crate::boot::bitcoin_network(cfg.network))
+        .with_alt_streams(foundation.alt_tdp.clone())
+        .with_fanout(
+            engines.pplns.clone(),
+            engines.group_solo.clone(),
+            dispatcher,
+        )
+        .with_blockparty(engines.blockparty.clone())
+        .with_redis(foundation.redis.clone())
+        .with_settle_handle(settle);
+        if cfg.has_role(Role::Front) {
+            sink.with_block_found_producer(StreamProducer::new(
+                foundation.redis.clone(),
+                BLOCK_FOUND_STREAM_KEY,
+            ))
+        } else {
+            sink
         }
     }
 
@@ -307,11 +397,6 @@ impl TdpBlockSubmissionSink {
         producer: StreamProducer<BlockFoundEvent>,
     ) -> Self {
         self.block_found_producer = Some(producer);
-        self
-    }
-
-    pub(crate) fn with_pool(mut self, pool: PgPool) -> Self {
-        self.pool = Some(pool);
         self
     }
 
@@ -368,21 +453,16 @@ impl TdpBlockSubmissionSink {
     /// the caller can chain at construction. Passing `None` for the
     /// dispatcher (no transport adapters wired) keeps the engine
     /// ledger-write live but skips notifications; passing `None` for
-    /// either engine collapses the per-mode `on_block_found` call to
-    /// a logged no-op.
+    /// PPLNS collapses its `on_block_found` call to a logged no-op.
     pub(crate) fn with_fanout(
         mut self,
-        mode_gate: Arc<BlitzpoolModeGate>,
         pplns: Option<PplnsEngine>,
         group_solo: GroupSoloEngine,
         dispatcher: Option<Arc<NotificationDispatcher>>,
-        bitcoin_rpc: BitcoinRpc,
     ) -> Self {
-        self.mode_gate = Some(mode_gate);
         self.applier.pplns = pplns;
         self.applier.group_solo = Some(group_solo);
         self.applier.dispatcher = dispatcher;
-        self.bitcoin_rpc = Some(bitcoin_rpc);
         self
     }
 
@@ -404,7 +484,7 @@ impl TdpBlockSubmissionSink {
             address: record.miner_address,
             worker: "jdp".to_string(),
             session_id: record.session_id,
-            reward_sats: Some(reward_sats),
+            booking: Booking::Book { reward_sats },
             block_hash: record.block_hash,
             block_data: record.block_data,
             pplns_payouts_fingerprint: Some(payouts_fingerprint),
@@ -421,11 +501,9 @@ impl TdpBlockSubmissionSink {
     /// block is still the pool's, and a block that exists in nobody's history
     /// is a block the operator has to find in a log.
     ///
-    /// `reward_sats: None` is what holds the ledger off, and it is the
-    /// existing, documented lever rather than a new branch: `apply_block_found`
-    /// skips the engine write for every non-Solo mode without a reward. The
-    /// fingerprint and the coinbase go as `None` for the same reason — there
-    /// is no distribution to resolve and nothing may be settled from a guess.
+    /// [`Booking::RecordOnly`] is what holds the ledger off. The fingerprint
+    /// and the coinbase go as `None` for the same reason — there is no
+    /// distribution to resolve and nothing may be settled from a guess.
     pub(crate) async fn record_declared_block_without_booking(
         &self,
         record: FoundBlockRecord,
@@ -434,7 +512,7 @@ impl TdpBlockSubmissionSink {
             address: record.miner_address,
             worker: "jdp".to_string(),
             session_id: record.session_id,
-            reward_sats: None,
+            booking: Booking::RecordOnly,
             block_hash: record.block_hash,
             block_data: record.block_data,
             pplns_payouts_fingerprint: None,
@@ -513,7 +591,7 @@ impl TdpBlockSubmissionSink {
             address,
             worker,
             session_id,
-            reward_sats,
+            booking,
             block_hash,
             block_data,
             pplns_payouts_fingerprint,
@@ -521,51 +599,33 @@ impl TdpBlockSubmissionSink {
         } = found;
         // Resolve the payout mode on the Core (the only side with the gate)
         // and stamp it onto the event so the apply side needs no gate.
-        let Some(mode_gate) = self.mode_gate.as_ref() else {
-            info!(
+        let resolved = self.mode_gate.lookup_mode(&address);
+
+        let Some(height) = self
+            .derive_block_height(&self.bitcoin_rpc, &block_data)
+            .await
+        else {
+            warn!(
                 address = %address,
-                "block-found: SKIPPED (no mode-gate wired)"
+                "block-found: could not derive block height — skipping fan-out"
             );
             return false;
-        };
-        let resolved = mode_gate.lookup_mode(&address);
-
-        let height = match self.bitcoin_rpc.as_ref() {
-            Some(rpc) => match self.derive_block_height(rpc, &block_data).await {
-                Some(h) => h,
-                None => {
-                    warn!(
-                        address = %address,
-                        "block-found: could not derive block height — skipping fan-out"
-                    );
-                    return false;
-                }
-            },
-            None => {
-                warn!(
-                    address = %address,
-                    "block-found: no BitcoinRpc — skipping (engines need block_height)"
-                );
-                return false;
-            }
         };
 
         // Persist the durable Core record (the Redis-independent safety net
         // the ledger can be reconciled against). Stays on the Core. Best-
         // effort: failure is logged but does not abort the apply below.
-        if let Some(pool) = self.pool.as_ref() {
-            if let Err(err) = bp_db::insert_found_block(
-                pool,
-                height as i64,
-                &address,
-                &worker,
-                &session_id,
-                &block_data,
-            )
-            .await
-            {
-                warn!(%err, address = %address, height, "block-found: blocks_entity insert failed");
-            }
+        if let Err(err) = bp_db::insert_found_block(
+            &self.pool,
+            height as i64,
+            &address,
+            &worker,
+            &session_id,
+            &block_data,
+        )
+        .await
+        {
+            warn!(%err, address = %address, height, "block-found: blocks_entity insert failed");
         }
 
         // Stamp the distribution the winning job's coinbase pays into the
@@ -589,7 +649,7 @@ impl TdpBlockSubmissionSink {
             worker,
             session_id,
             pplns_payouts_fingerprint,
-            reward_sats,
+            reward_sats: booking.wire_reward_sats(),
             block_hash: Some(block_hash),
             block_data,
             mode: resolved.mode,
@@ -769,12 +829,17 @@ impl BlockFoundApplier {
     /// Build an applier from the back-office engines + dispatcher + Redis —
     /// the Satellite's block-found stream consumer uses this to run the same
     /// apply the front runs in-process on a publish-failure fallback.
+    ///
+    /// `settle` is an argument, not a builder step: the payout satellite's
+    /// applier was built without it, so a block it booked on the immediate
+    /// path never invalidated the published distributions.
     pub(crate) fn new(
         pplns: Option<PplnsEngine>,
         group_solo: Option<GroupSoloEngine>,
         blockparty: Option<Arc<dyn bp_blockparty_engine::BlockpartyApi>>,
         dispatcher: Option<Arc<NotificationDispatcher>>,
         redis: Option<ConnectionManager>,
+        settle: Option<crate::settlement::SettlementSignal>,
     ) -> Self {
         Self {
             pplns,
@@ -782,7 +847,7 @@ impl BlockFoundApplier {
             blockparty,
             dispatcher,
             redis,
-            settle: None,
+            settle,
         }
     }
 
@@ -826,11 +891,7 @@ impl BlockFoundApplier {
         payouts_fingerprint: Option<[u8; 32]>,
         group: Option<PendingGroup>,
     ) {
-        let mode = if group.is_some() {
-            "group-solo"
-        } else {
-            "pplns"
-        };
+        let mode = SettlementMode::of(group.as_ref()).label();
         // Settlement is `claim − paid` against the block's OWN coinbase,
         // so its payments are not optional: without them there is
         // nothing to settle against.
@@ -910,59 +971,43 @@ impl BlockFoundApplier {
         payouts_fingerprint: Option<[u8; 32]>,
         group: Option<PendingGroup>,
     ) {
-        let applied = match (&group, self.pplns.as_ref(), self.group_solo.as_ref()) {
-            (Some(g), _, Some(engine)) => {
-                let (Ok(group_uuid), Ok(finder)) = (
-                    uuid::Uuid::parse_str(&g.group_id),
-                    AddressId::new(g.finder.clone()),
-                ) else {
-                    warn!(
-                        address = address_str,
-                        group_id = %g.group_id,
-                        height,
-                        "block-found: Group-Solo group id or finder unusable — NOT booked"
-                    );
-                    return;
-                };
-                engine
-                    .on_block_found(
-                        group_uuid,
-                        height,
-                        actual,
-                        &finder,
-                        weight_snapshot,
-                        payouts_fingerprint,
-                    )
-                    .await
-                    .map(|o| (o.history_inserted, "group-solo"))
-                    .map_err(|e| e.to_string())
-            }
-            (None, Some(engine), _) => engine
-                .on_block_found(height, actual, weight_snapshot, payouts_fingerprint)
-                .await
-                .map(|o| (o.history_inserted, "pplns"))
-                .map_err(|e| e.to_string()),
-            _ => {
-                warn!(
-                    address = address_str,
-                    height, "block-found: no engine wired for this block — NOT booked"
-                );
-                return;
-            }
-        };
+        let mode = SettlementMode::of(group.as_ref());
+        let label = mode.label();
+        let applied = settle_block(
+            self.pplns.as_ref(),
+            self.group_solo.as_ref(),
+            mode,
+            height,
+            actual,
+            weight_snapshot,
+            payouts_fingerprint,
+        )
+        .await;
         match applied {
-            Ok((history_inserted, mode)) => {
+            Ok(history_inserted) => {
                 self.settle_distributions().await;
                 info!(
                     address = address_str,
                     height,
                     reward_sats = reward,
-                    mode,
+                    mode = label,
                     history_inserted,
                     "block-found: payout history applied (immediate)"
                 );
             }
-            Err(err) => warn!(
+            Err(SettleFailure::NoEngine) => warn!(
+                address = address_str,
+                height,
+                mode = label,
+                "block-found: no engine wired for this block — NOT booked"
+            ),
+            Err(SettleFailure::UnusableGroup) => warn!(
+                address = address_str,
+                group_id = group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
+                height,
+                "block-found: Group-Solo group id or finder unusable — NOT booked"
+            ),
+            Err(SettleFailure::Engine(err)) => warn!(
                 %err, address = address_str, height,
                 "block-found: immediate apply failed"
             ),
@@ -972,12 +1017,11 @@ impl BlockFoundApplier {
     /// Apply a block-found event to the per-mode engine ledger + dispatcher.
     /// Reads everything it needs from the (Core-stamped) event — no mode
     /// gate, no RPC, no `blocks_entity` write — so it runs unchanged on a
-    /// Satellite consuming the event off a stream. `reward_sats == None`
+    /// Satellite consuming the event off a stream. [`Booking::RecordOnly`]
     /// skips the engine ledger-write but still fires the notification.
     /// Best-effort: every step's failure is logged and the others continue.
     pub(crate) async fn apply_block_found(&self, event: &BlockFoundEvent) {
         let address_str = event.address.as_str();
-        let reward_sats = event.reward_sats;
         let block_hash_hex = event.block_hash.clone();
         let height = event.height;
 
@@ -993,7 +1037,7 @@ impl BlockFoundApplier {
             }
         };
 
-        match (event.mode, reward_sats) {
+        match (event.mode, event.booking()) {
             (MiningMode::Solo, _) => {
                 info!(
                     address = address_str,
@@ -1001,32 +1045,23 @@ impl BlockFoundApplier {
                     "block-found: solo mode — no engine ledger-write needed (single-payout coinbase)"
                 );
             }
-            (_, None) => {
-                // Two callers reach this, and only one of them is a fault.
-                //
-                // Legitimate: `record_declared_block_without_booking` — a JDP
-                // block whose distribution was never bookable. It passes no
-                // reward precisely to keep the ledger out while still writing
-                // the row, so the block appears in the API instead of only in
-                // a log.
-                //
-                // A fault: anything else. Both SV1 and SV2 thread the per-job
-                // reward into the ShareAccept, so an ordinary non-Solo
-                // block-found always carries `Some(reward)`.
-                //
-                // The two are told apart by the log line that precedes this
-                // one, not here — this side has no way to know. Either way the
-                // ledger write is skipped and the dispatch below still runs.
+            (_, Booking::RecordOnly) => {
+                // The producer said why (see `Booking::RecordOnly`); this side
+                // only skips the ledger. The Core already wrote the
+                // `blocks_entity` row, and the dispatch below still runs.
                 warn!(
                     address = address_str,
                     height,
                     mode = ?event.mode,
-                    "block-found: non-Solo mode with no reward — engine ledger-write skipped. \
-                     Expected for a JDP block recorded without a booking; a caller regression \
-                     otherwise."
+                    "block-found: recorded without booking — engine ledger-write skipped"
                 );
             }
-            (MiningMode::Pplns, Some(reward)) => match self.pplns.as_ref() {
+            (
+                MiningMode::Pplns,
+                Booking::Book {
+                    reward_sats: reward,
+                },
+            ) => match self.pplns.as_ref() {
                 Some(_) => {
                     self.gate_or_apply(
                         address_str,
@@ -1045,7 +1080,12 @@ impl BlockFoundApplier {
                     height, "block-found: PPLNS mode but engine not configured"
                 ),
             },
-            (MiningMode::Blockparty, Some(reward)) => {
+            (
+                MiningMode::Blockparty,
+                Booking::Book {
+                    reward_sats: reward,
+                },
+            ) => {
                 let svc = match self.blockparty.as_ref() {
                     Some(s) => s,
                     None => {
@@ -1153,7 +1193,12 @@ impl BlockFoundApplier {
                     ),
                 }
             }
-            (MiningMode::GroupSolo, Some(reward)) => {
+            (
+                MiningMode::GroupSolo,
+                Booking::Book {
+                    reward_sats: reward,
+                },
+            ) => {
                 match (event.group_id.as_deref(), self.group_solo.as_ref()) {
                     (Some(group_id_str), Some(_engine)) => {
                         // Refuse early rather than park a blob the apply
@@ -1264,15 +1309,6 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
         session_id: &str,
         stream: StreamKind,
     ) {
-        // Pull version / timestamp / nonce back out of the assembled
-        // 80-byte header. The header bytes are LE per the Bitcoin
-        // consensus rules; `u32::from_le_bytes` over the four-byte
-        // slices is the canonical decoder.
-        let header = &accept.header;
-        let version = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let header_timestamp = u32::from_le_bytes([header[68], header[69], header[70], header[71]]);
-        let header_nonce = u32::from_le_bytes([header[76], header[77], header[78], header[79]]);
-
         // Assemble the witness-form coinbase. `witness_coinbase_with_
         // extranonce` returns the full bytes including the SegWit
         // witness for the coinbase input (single `[0x00; 32]` reserved
@@ -1281,10 +1317,83 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
         let coinbase_tx = accept
             .mining_job
             .witness_coinbase_with_extranonce(&accept.enonce1, &accept.extranonce2);
-        let coinbase_bytes = coinbase_tx.clone();
+        self.submit_and_emit(
+            PoolBuiltSolution {
+                protocol: "sv1",
+                template_id: accept.template.template_id,
+                header: &accept.header,
+                coinbase_tx,
+                // For pool-built SV1 jobs this equals the full block reward.
+                reward_sats: accept.template.coinbase_tx_value_remaining,
+                // The job the winning share was built on — so the apply
+                // books the distribution this coinbase actually pays.
+                payouts_fingerprint: *accept.mining_job.payouts_fingerprint(),
+            },
+            address,
+            worker,
+            session_id,
+            stream,
+        )
+        .await;
+    }
+}
+
+/// A solution on a job whose coinbase the pool built, as either protocol
+/// hands it over.
+pub(crate) struct PoolBuiltSolution<'a> {
+    /// Log label only.
+    pub(crate) protocol: &'static str,
+    pub(crate) template_id: u64,
+    pub(crate) header: &'a [u8; 80],
+    /// The witness-form coinbase of the winning job.
+    pub(crate) coinbase_tx: Vec<u8>,
+    /// Block-reward portion the job's coinbase claims, pinned at job send
+    /// time.
+    pub(crate) reward_sats: u64,
+    pub(crate) payouts_fingerprint: [u8; 32],
+}
+
+/// `(version, header_timestamp, header_nonce)` from an assembled 80-byte
+/// header: bytes 0..4, 68..72 and 76..80, little-endian per the consensus
+/// encoding. The version is the miner-rolled one, which is why it is read
+/// back from the header rather than taken from the template.
+fn header_fields(header: &[u8; 80]) -> (u32, u32, u32) {
+    let version = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let header_timestamp = u32::from_le_bytes([header[68], header[69], header[70], header[71]]);
+    let header_nonce = u32::from_le_bytes([header[76], header[77], header[78], header[79]]);
+    (version, header_timestamp, header_nonce)
+}
+
+impl TdpBlockSubmissionSink {
+    /// Submit a pool-built solution through the stream's TDP handle, then
+    /// emit the block-found. The one path SV1 and SV2 share; they differ
+    /// only in where `solution.coinbase_tx` comes from.
+    ///
+    /// The submit is best-effort (a failure only logs): the block-found is
+    /// emitted either way, as it always was.
+    pub(crate) async fn submit_and_emit(
+        &self,
+        solution: PoolBuiltSolution<'_>,
+        address: &str,
+        worker: &str,
+        session_id: &str,
+        stream: StreamKind,
+    ) {
+        let PoolBuiltSolution {
+            protocol,
+            template_id,
+            header,
+            coinbase_tx,
+            reward_sats,
+            payouts_fingerprint,
+        } = solution;
+        let (version, header_timestamp, header_nonce) = header_fields(header);
+        // Decoded before the bytes move into the submit.
+        let actual = decode_actual_coinbase(&coinbase_tx, self.network);
 
         info!(
-            template_id = accept.template.template_id,
+            protocol,
+            template_id,
             version,
             header_timestamp,
             header_nonce,
@@ -1296,10 +1405,14 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
             "block-found: submitting solution via TDP"
         );
 
+        // `submit_solution` only queues the solution for the TDP worker, and
+        // fails only when that worker is gone: the block then never reached
+        // bitcoin-core. Reporting it anyway would record a found block, send
+        // a "block found" push and park a booking that can never confirm.
         if let Err(err) = self
             .select_handle(stream)
             .submit_solution(
-                accept.template.template_id,
+                template_id,
                 version,
                 header_timestamp,
                 header_nonce,
@@ -1307,31 +1420,27 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
             )
             .await
         {
-            warn!(
+            error!(
                 %err,
-                template_id = accept.template.template_id,
+                protocol,
+                template_id,
                 address,
                 worker,
                 session_id,
-                "block-found: TDP submit_solution failed (best-effort)"
+                "block-found: TDP submit_solution failed — the block did NOT reach \
+                 bitcoin-core and is lost; not reported as found"
             );
+            return;
         }
 
-        // Fan-out to engine ledger + dispatcher. `coinbase_tx_value_remaining`
-        // is the share of the block reward our coinbase claims (subsidy +
-        // fees after the JDC's `coinbase_outputs` for JDP-declared jobs);
-        // for pool-built SV1 jobs it equals the full block reward.
-        let actual = decode_actual_coinbase(&coinbase_bytes, self.network);
         self.emit_block_found(BlockFoundInputs {
             address: address.to_string(),
             worker: worker.to_string(),
             session_id: session_id.to_string(),
-            reward_sats: Some(accept.template.coinbase_tx_value_remaining),
-            block_hash: block_hash_display(&accept.header),
-            block_data: hex::encode(accept.header),
-            // The job the winning share was built on — so the PPLNS apply
-            // books the distribution this coinbase actually pays.
-            pplns_payouts_fingerprint: Some(*accept.mining_job.payouts_fingerprint()),
+            booking: Booking::Book { reward_sats },
+            block_hash: block_hash_display(header),
+            block_data: hex::encode(header),
+            pplns_payouts_fingerprint: Some(payouts_fingerprint),
             actual_coinbase: actual,
         })
         .await;
@@ -1385,7 +1494,13 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
             // The reward follows from it for the same reason: a reference
             // figure would be the pool's intention, not what the block paid.
             let actual = decode_actual_coinbase(&accept.witness_coinbase, self.network);
-            let reward_sats = actual.as_ref().map(|a| a.total_value_sats);
+            // A coinbase that did not decode has nothing to book from.
+            let booking = match actual.as_ref() {
+                Some(a) => Booking::Book {
+                    reward_sats: a.total_value_sats,
+                },
+                None => Booking::RecordOnly,
+            };
             // Zeroed unless ext 0x0003 published a distribution this coinbase
             // was proven to pay (`emit_block_found` filters the zero out).
             // With it, a Coinbase-only 0x0003 block settles from its own
@@ -1406,7 +1521,7 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
                 address: address.to_string(),
                 worker: worker.to_string(),
                 session_id: session_id_hex.to_string(),
-                reward_sats,
+                booking,
                 block_hash: block_hash_display(&accept.header),
                 block_data: hex::encode(accept.header),
                 pplns_payouts_fingerprint: Some(fingerprint),
@@ -1416,82 +1531,69 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
             return;
         }
         let template_id = accept.template_id.expect("checked is_some above");
-        let header = &accept.header;
-        let version = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let header_timestamp = u32::from_le_bytes([header[68], header[69], header[70], header[71]]);
-        let header_nonce = u32::from_le_bytes([header[76], header[77], header[78], header[79]]);
-
-        info!(
-            template_id,
-            version,
-            header_timestamp,
-            header_nonce,
+        self.submit_and_emit(
+            PoolBuiltSolution {
+                protocol: "sv2",
+                template_id,
+                header: &accept.header,
+                coinbase_tx: accept.witness_coinbase.clone(),
+                // Pinned on the `ShareAccept` at NewMiningJob /
+                // NewExtendedMiningJob send time.
+                reward_sats: accept.coinbase_tx_value_remaining,
+                payouts_fingerprint: accept.payouts_fingerprint,
+            },
             address,
             worker,
             session_id_hex,
-            ?stream,
-            coinbase_tx_len = accept.witness_coinbase.len(),
-            "sv2 block-found: submitting solution via TDP"
-        );
-
-        if let Err(err) = self
-            .select_handle(stream)
-            .submit_solution(
-                template_id,
-                version,
-                header_timestamp,
-                header_nonce,
-                accept.witness_coinbase.clone(),
-            )
-            .await
-        {
-            warn!(
-                %err,
-                template_id,
-                address,
-                worker,
-                session_id_hex,
-                "sv2 block-found: TDP submit_solution failed (best-effort)"
-            );
-        }
-
-        // Fan-out to engine ledger + dispatcher. `coinbase_tx_value_remaining`
-        // is the per-job pinned block-reward portion the coinbase claims —
-        // now carried on the SV2 `ShareAccept` (pinned at NewMiningJob/
-        // NewExtendedMiningJob send-time), so the per-mode engine ledger-write
-        // fires for SV2-found blocks exactly as it does for SV1.
-        let actual = decode_actual_coinbase(&accept.witness_coinbase, self.network);
-        self.emit_block_found(BlockFoundInputs {
-            address: address.to_string(),
-            worker: worker.to_string(),
-            session_id: session_id_hex.to_string(),
-            reward_sats: Some(accept.coinbase_tx_value_remaining),
-            block_hash: block_hash_display(&accept.header),
-            block_data: hex::encode(accept.header),
-            pplns_payouts_fingerprint: Some(accept.payouts_fingerprint),
-            actual_coinbase: actual,
-        })
+            stream,
+        )
         .await;
     }
 }
 
 /// Decode the submitted witness coinbase into its per-address payment
-/// record. `None` (with a warn) if the bytes don't parse — settlement
-/// then has no actuals and the block is reported-not-booked rather
-/// than booked from a guess.
+/// record. `None` (with a warn) if the bytes are not exactly one
+/// transaction — settlement then has no actuals and the block is
+/// reported-not-booked rather than booked from a guess.
+///
+/// Strict through [`decode_whole_tx`], as the JDP path always was: a
+/// coinbase decoded from a prefix would book the prefix's outputs.
 fn decode_actual_coinbase(
     witness_coinbase: &[u8],
     network: bitcoin::Network,
 ) -> Option<ActualCoinbase> {
-    match <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(
-        &mut &witness_coinbase[..],
-    ) {
-        Ok(tx) => Some(ActualCoinbase::from_coinbase(&tx, network)),
-        Err(err) => {
-            warn!(%err, "block-found: submitted coinbase failed to decode — no actuals for settlement");
-            None
-        }
+    let Some(tx) = decode_whole_tx(witness_coinbase) else {
+        warn!(
+            len = witness_coinbase.len(),
+            "block-found: submitted coinbase is not exactly one transaction — no actuals for \
+             settlement"
+        );
+        return None;
+    };
+    Some(ActualCoinbase::from_coinbase(&tx, network))
+}
+
+/// Decode a transaction and require that it consumed EVERY byte.
+///
+/// `Transaction::consensus_decode` reads from a slice and stops when it has a
+/// complete transaction. On a malformed input that happens to start with a
+/// valid one it therefore SUCCEEDS, silently, on a prefix — which is how a
+/// double-wrapped coinbase turned into a 21-byte transaction with no inputs
+/// instead of an error. Anything reassembled into a block, or booked from,
+/// has to be the whole thing, so a remainder is a failure.
+pub(crate) fn decode_whole_tx(bytes: &[u8]) -> Option<bitcoin::Transaction> {
+    let mut cursor = bytes;
+    let tx = <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(&mut cursor)
+        .ok()?;
+    if !cursor.is_empty() {
+        warn!(
+            total = bytes.len(),
+            consumed = bytes.len() - cursor.len(),
+            "transaction decoded from a PREFIX only — treating as malformed"
+        );
+        return None;
     }
+    Some(tx)
 }
 
 /// Compute the standard Bitcoin block hash display form (big-endian
@@ -1522,10 +1624,7 @@ fn prev_hash_display_from_header(header_hex: &str) -> Option<String> {
 mod tests {
     use super::*;
     use bitcoin::Network;
-    use bp_jobs_lifecycle::JobClassification;
     use bp_mining_job::{build_mining_job, CoinbaseTemplate, PayoutEntry, EXTRANONCE_SLOT_LEN};
-    use bp_stratum_v1::ActiveSV1Template;
-    use bp_template_distribution::TdpConfig;
 
     /// ext 0x0003/Implementation Notes: a block booked through a Stratum
     /// sink's IMMEDIATE (ungated) apply must invalidate every published payout
@@ -1543,7 +1642,7 @@ mod tests {
         use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
         use bp_stratum_v2::jdp::payout_distribution::WeightedOutput;
         use bp_stratum_v2::jdp_server::{JdpServerHooks, StratumV2JdpServer};
-        use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+        use bp_stratum_v2::noise::NoiseConfig;
 
         let bridge = std::sync::Arc::new(std::sync::RwLock::new(JdpDeclaredJobRegistry::new()));
         bridge
@@ -1551,19 +1650,21 @@ mod tests {
             .unwrap()
             .publish_pool_wide(PayoutDistributionEntry {
                 distribution_id: 1,
-                pool_payout: WeightedOutput {
-                    script_pubkey: vec![0x51],
-                    weight: 1,
+                built: bp_stratum_v2::bridge::BuiltPayoutDistribution {
+                    pool_payout: WeightedOutput {
+                        script_pubkey: vec![0x51],
+                        weight: 1,
+                    },
+                    payouts: vec![WeightedOutput {
+                        script_pubkey: vec![0x00, 0x14, 0xAA],
+                        weight: 100,
+                    }],
+                    dust_limits: vec![546],
+                    additional_outputs: vec![],
+                    reference_reward_sats: 312_500_000,
+                    payouts_fingerprint: Some([1u8; 32]),
+                    bookable: true,
                 },
-                payouts: vec![WeightedOutput {
-                    script_pubkey: vec![0x00, 0x14, 0xAA],
-                    weight: 100,
-                }],
-                dust_limits: vec![546],
-                additional_outputs: vec![],
-                reference_reward_sats: 312_500_000,
-                payouts_fingerprint: Some([1u8; 32]),
-                bookable: true,
                 accounting: bp_stratum_v2::bridge::DistributionAccounting::PoolWide,
                 jdp_session_id: None,
                 published_at_ms: 1_001,
@@ -1573,12 +1674,14 @@ mod tests {
             "precondition: a distribution is published and current"
         );
 
-        let noise = NoiseConfig::parse_strings(
-            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72",
-            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n",
-            DEFAULT_CERT_VALIDITY,
-        )
-        .expect("noise config");
+        let noise = NoiseConfig::new(
+            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+                .parse()
+                .unwrap(),
+            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+                .parse()
+                .unwrap(),
+        );
         let server = StratumV2JdpServer::spawn(
             noise,
             JdpServerHooks::no_op(),
@@ -1601,6 +1704,42 @@ mod tests {
              mining it would pay the pre-settlement balances a second time"
         );
         server.shutdown().await;
+    }
+
+    /// The SV1/SV2 block path books from `decode_actual_coinbase`, so it must
+    /// be as strict as the JDP path: bytes that decode from a PREFIX would
+    /// book the prefix's outputs. Both directions in one test — the real
+    /// witness coinbase still decodes, so strictness cannot cost a block.
+    #[test]
+    fn a_coinbase_with_trailing_bytes_books_nothing() {
+        let miner = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let job = build_mining_job(
+            Network::Regtest,
+            &[PayoutEntry::static_address(miner, 5_000_000_000)],
+            &CoinbaseTemplate {
+                block_height: 42,
+                coinbase_value_sats: 5_000_000_000,
+                witness_commitment: [0x77; 32],
+            },
+            "BP",
+            EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
+        )
+        .expect("build job");
+        let mut witness = job.witness_coinbase_with_extranonce(&[0xAA; 4], &[0xBB; 8]);
+
+        let actual = decode_actual_coinbase(&witness, Network::Regtest)
+            .expect("the coinbase a job really builds must decode");
+        assert_eq!(
+            actual.total_value_sats, 5_000_000_000,
+            "precondition: the clean bytes carry the whole payout"
+        );
+
+        witness.extend_from_slice(&[0xAB; 8]);
+        assert!(
+            decode_actual_coinbase(&witness, Network::Regtest).is_none(),
+            "trailing bytes mean this is not the coinbase the block paid"
+        );
     }
 
     /// No JDP server (the common deployment): settling is a no-op, not a
@@ -1637,104 +1776,64 @@ mod tests {
         assert!(prev_hash_display_from_header("").is_none());
     }
 
-    /// We don't have a live bitcoind IPC socket in unit tests; the TDP
-    /// spawn returns an error for an unreachable socket, so we just
-    /// assert the `submit_block` path doesn't panic when the underlying
-    /// handle is broken — the hook is best-effort, errors only log.
-    fn synthetic_accept() -> Sv1ShareAccept {
-        let payouts = [PayoutEntry::static_address(
-            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            5_000_000_000,
-        )];
-        let cb = CoinbaseTemplate {
-            block_height: 1,
-            coinbase_value_sats: 5_000_000_000,
-            witness_commitment: [0u8; 32],
-        };
-        let job = build_mining_job(
-            Network::Regtest,
-            &payouts,
-            &cb,
-            "test",
-            EXTRANONCE_SLOT_LEN,
-            [0u8; 32],
-        )
-        .expect("build job");
-        // Header: version=1 (LE), then 32B prev_hash + 32B merkle +
-        // 4B ntime (0x12345678) + 4B n_bits (0x1d00ffff) + 4B nonce
-        // (0xdeadbeef). Filled to taste — only positions 0..4, 68..72,
-        // 76..80 are read by the sink.
+    /// `submit_and_emit` hands bitcoin-core these three fields; a wrong
+    /// offset submits a header core rebuilds differently, and the block is
+    /// rejected. Each field gets a distinct value so a swapped or shifted
+    /// slice cannot read back right by accident.
+    #[test]
+    fn header_fields_reads_version_time_and_nonce_at_their_offsets() {
         let mut header = [0u8; 80];
-        header[0..4].copy_from_slice(&1u32.to_le_bytes());
-        header[68..72].copy_from_slice(&0x12345678u32.to_le_bytes());
-        header[72..76].copy_from_slice(&0x1d00ffffu32.to_le_bytes());
-        header[76..80].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
-
-        Sv1ShareAccept {
-            classification: JobClassification::Active,
-            effective_difficulty: 1024.0,
-            submission_difficulty: 1e18,
-            header,
-            hash: [0u8; 32],
-            is_block_candidate: true,
-            mining_job: Arc::new(job),
-            template: Arc::new(ActiveSV1Template {
-                template_id: 42,
-                version: 1,
-                prev_hash: [0u8; 32],
-                n_bits: 0x1d00ffff,
-                header_timestamp: 0x12345678,
-                network_target: [0xff; 32],
-                network_difficulty: 1.0,
-                coinbase_prefix: vec![],
-                coinbase_tx_version: 2,
-                coinbase_tx_input_sequence: 0xffff_ffff,
-                coinbase_tx_value_remaining: 5_000_000_000,
-                coinbase_tx_outputs: vec![],
-                coinbase_tx_outputs_count: 0,
-                coinbase_tx_locktime: 0,
-                merkle_path: vec![],
-                merkle_branch_hex: vec![],
-                prev_hash_hex: String::new(),
-                version_hex: String::new(),
-                n_bits_hex: String::new(),
-                header_timestamp_hex: String::new(),
-            }),
-            enonce1: [0xaa, 0xbb, 0xcc, 0xdd],
-            extranonce2: [0; 8],
-        }
+        header[0..4].copy_from_slice(&0x2000_0004u32.to_le_bytes());
+        header[68..72].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        header[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes());
+        header[76..80].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        assert_eq!(
+            header_fields(&header),
+            (0x2000_0004, 0x1234_5678, 0xdead_beef)
+        );
     }
 
-    #[tokio::test]
-    async fn submit_block_does_not_panic_when_tdp_socket_unreachable() {
-        // Spawning TDP against a non-existent socket fails the spawn
-        // step itself — there's no `TdpHandle` to exercise the
-        // submit_block code path with. This is the closest we can
-        // get to an isolated unit test without spinning up a real
-        // bitcoin-core IPC. The header-parse + coinbase-assembly are
-        // covered by the synthetic_accept builder and would panic on
-        // bad indexing if regressed.
-        let cfg = TdpConfig::new("/definitely/does/not/exist/bp-tdp.sock");
-        let spawn_result = TdpHandle::spawn(cfg);
-        assert!(
-            spawn_result.is_err(),
-            "spawning against a bogus socket should fail synchronously"
-        );
-        // Header-byte decoding sanity: we expect to read back the
-        // values written by `synthetic_accept`.
-        let a = synthetic_accept();
-        assert_eq!(
-            u32::from_le_bytes([a.header[0], a.header[1], a.header[2], a.header[3]]),
-            1
-        );
-        assert_eq!(
-            u32::from_le_bytes([a.header[68], a.header[69], a.header[70], a.header[71]]),
-            0x12345678
-        );
-        assert_eq!(
-            u32::from_le_bytes([a.header[76], a.header[77], a.header[78], a.header[79]]),
-            0xdeadbeef
-        );
+    /// `Booking` rides the stream as the old `reward_sats` field, so an
+    /// event from a producer that predates the enum must mean the same
+    /// thing to a new consumer, and the other way round.
+    #[test]
+    fn booking_round_trips_through_the_wire_reward_field() {
+        for booking in [
+            Booking::Book {
+                reward_sats: 312_500_000,
+            },
+            Booking::RecordOnly,
+        ] {
+            let event = BlockFoundEvent {
+                reward_sats: booking.wire_reward_sats(),
+                ..record_only_event()
+            };
+            let json = serde_json::to_string(&event).expect("serialize");
+            let back: BlockFoundEvent = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back.booking(), booking);
+        }
+        // What an older producer wrote for a record-only block.
+        let mut old = serde_json::to_value(record_only_event()).expect("to value");
+        old["reward_sats"] = serde_json::Value::Null;
+        let back: BlockFoundEvent = serde_json::from_value(old).expect("from value");
+        assert_eq!(back.booking(), Booking::RecordOnly);
+    }
+
+    fn record_only_event() -> BlockFoundEvent {
+        BlockFoundEvent {
+            address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+            worker: "jdp".to_string(),
+            session_id: "sess1".to_string(),
+            reward_sats: None,
+            block_hash: Some("00000000deadbeef".to_string()),
+            block_data: "ab".repeat(80),
+            mode: MiningMode::Pplns,
+            group_id: None,
+            height: 870_123,
+            weight_snapshot: None,
+            pplns_payouts_fingerprint: None,
+            actual_coinbase: None,
+        }
     }
 
     /// The block-found event is the Core→Satellite wire unit: it must

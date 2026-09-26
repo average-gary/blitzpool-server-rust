@@ -118,9 +118,8 @@ pub(crate) async fn spawn(
     payout_resolver: Arc<ProductionPayoutResolver>,
     template_tx_cache: Option<Arc<TemplateTxCache>>,
     // Books a JDC-found block against the distribution its coinbase was
-    // proven to pay. `None` on a deployment with no ledger fan-out wired —
-    // such a block is then reported but not booked.
-    ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
+    // proven to pay.
+    ledger_booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
     // Allocator backing for the strictly-increasing ext 0x0003
     // `distribution_id` (ext 0x0003/SetPayoutDistribution).
     redis: redis::aio::ConnectionManager,
@@ -138,7 +137,7 @@ pub(crate) async fn spawn(
     }
     let port = cfg.sv2.jdp_port.ok_or(JdpSpawnError::PortMissing)?;
     let noise = stratum_v2::build_noise_config(cfg)?;
-    let network = crate::network::config_network_to_bitcoin(cfg.network);
+    let network = crate::boot::bitcoin_network(cfg.network);
     // ext 0x0003 payout-distribution source: same resolver + engines the
     // allocate path uses, so the published weight distribution and the
     // pool's own coinbase always agree. The fee address anchors tailored
@@ -234,7 +233,7 @@ async fn jdp_accept_loop(
             res = listener.accept() => match res {
                 Ok((socket, peer)) => {
                     debug!(?peer, "jdp: accepted");
-                    server.accept_connection(socket, peer.to_string());
+                    server.accept_connection(socket);
                 }
                 Err(err) => {
                     warn!(%err, "jdp: accept failed");

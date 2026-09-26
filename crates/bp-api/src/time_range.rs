@@ -60,17 +60,6 @@ impl Range {
         }
     }
 
-    /// Slot granularity is a fixed 10 minutes for every range — the
-    /// stats are persisted in 10-min slots and the chart / accepted /
-    /// worker endpoints surface them at that native resolution (longer
-    /// ranges simply return more points). Coarser per-range bucketing
-    /// would both drop resolution and, on the hashrate charts, inflate
-    /// the value (the `* 2^32 / 600s` conversion assumes a 10-min slot).
-    pub fn slot_size_ms(self) -> i64 {
-        const MIN: i64 = 60 * 1000;
-        10 * MIN
-    }
-
     /// Short string for cache keys / log lines (`1d`, `3d`, `7d`,
     /// `14d`, `1m`). Round-trips through `Range::parse`.
     pub fn label(self) -> &'static str {
@@ -84,22 +73,26 @@ impl Range {
     }
 }
 
-/// Snap `t_ms` down to the nearest multiple of `slot_size_ms`. Stable
-/// — `t_ms` already aligned returns itself.
-pub fn snap_to_slot(t_ms: i64, slot_size_ms: i64) -> i64 {
-    if slot_size_ms <= 0 {
-        return t_ms;
-    }
-    (t_ms / slot_size_ms) * slot_size_ms
+/// Slot size of every chart: the stats are persisted in 10-min slots and
+/// surfaced at that native resolution (longer ranges simply return more
+/// points). Coarser bucketing would both drop resolution and, on the
+/// hashrate charts, inflate the value (the `* 2^32 / 600s` conversion
+/// assumes a 10-min slot).
+const SLOT_MS: i64 = bp_stats::SLOT_DURATION_MS;
+
+/// Snap `t_ms` down to the nearest slot boundary. Stable — `t_ms`
+/// already aligned returns itself.
+pub fn snap_to_slot(t_ms: i64) -> i64 {
+    (t_ms / SLOT_MS) * SLOT_MS
 }
 
 /// Wrapper around [`slot_boundaries`] that uses the chart-visibility
 /// cutoff as the upper bound, so the in-progress slot is hidden
 /// until the flush mechanism has had at least
 /// `CHART_VISIBILITY_BUFFER_MS` to commit its residual to PG.
-pub fn chart_slot_boundaries(since_ms: i64, slot_size_ms: i64) -> Vec<i64> {
+pub fn chart_slot_boundaries(since_ms: i64) -> Vec<i64> {
     let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
-    slot_boundaries(since_ms, cutoff, slot_size_ms)
+    slot_boundaries(since_ms, cutoff)
 }
 
 /// Chart-visibility cutoff in epoch milliseconds — exposed so chart
@@ -114,30 +107,54 @@ pub fn chart_visibility_cutoff_ms() -> i64 {
 /// the slot covering `[13:50, 14:00)`. First boundary is the first
 /// slot-end at or after `since_ms`; emission stops once a boundary
 /// would reach or exceed `until_ms`.
-pub fn slot_boundaries(since_ms: i64, until_ms: i64, slot_size_ms: i64) -> Vec<i64> {
+pub fn slot_boundaries(since_ms: i64, until_ms: i64) -> Vec<i64> {
     let mut out = Vec::new();
-    if slot_size_ms <= 0 || since_ms >= until_ms {
+    if since_ms >= until_ms {
         return out;
     }
     // First slot END at or after `since_ms`: floor(since / slot) * slot + slot.
-    let mut t = snap_to_slot(since_ms, slot_size_ms) + slot_size_ms;
+    let mut t = snap_to_slot(since_ms) + SLOT_MS;
     while t < until_ms {
         out.push(t);
-        t += slot_size_ms;
+        t += SLOT_MS;
     }
     out
 }
 
-/// Bucket key for in-memory aggregation — the snapped slot start.
-pub fn bucket_key(time_ms: i64, slot_size_ms: i64) -> i64 {
-    snap_to_slot(time_ms, slot_size_ms)
+/// Fold `(time_ms, sample)` pairs into the slot grid: one accumulator per
+/// boundary, in boundary order, starting from `T::default()`. A sample
+/// belongs to the boundary its time snaps to; one that snaps to no
+/// boundary is dropped.
+pub fn fold_into_slots<T: Default, S>(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, S)>,
+    mut add: impl FnMut(&mut T, S),
+) -> Vec<(i64, T)> {
+    let mut slots: BTreeMap<i64, T> = boundaries.iter().map(|&b| (b, T::default())).collect();
+    for (t, sample) in samples {
+        if let Some(acc) = slots.get_mut(&snap_to_slot(t)) {
+            add(acc, sample);
+        }
+    }
+    slots.into_iter().collect()
 }
 
-/// Render a snapped slot timestamp as an ISO-8601 string with
-/// millisecond precision and a trailing `Z`. UI consumers parse it
-/// straight back into a Date.
-pub fn format_slot_label(slot_ms: i64) -> String {
-    format_iso_ms(slot_ms)
+/// [`fold_into_slots`] summing the sample values; an empty slot is `0.0`.
+pub fn sum_into_slots(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, f64)>,
+) -> Vec<(i64, f64)> {
+    fold_into_slots(boundaries, samples, |sum: &mut f64, v| *sum += v)
+}
+
+/// The `/accepted` shape: one `{"accepted": sum}` bucket per slot.
+pub fn accepted_slot_data(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, f64)>,
+) -> SlotDataResponse {
+    SlotDataResponse::from_slots(sum_into_slots(boundaries, samples), |sum| {
+        BTreeMap::from([("accepted".to_string(), sum)])
+    })
 }
 
 /// Render an epoch-ms timestamp as an ISO-8601 string with
@@ -160,11 +177,8 @@ pub fn format_iso_ms_opt(ms: Option<i64>) -> Option<String> {
 
 // ─── shared constants ──────────────────────────────────────────────
 
-/// 2^32 — converts share-difficulty sums to H/s.
-pub const DIFFICULTY_1: f64 = 4_294_967_296.0;
-
 /// 10-minute slot duration in seconds; divisor in hashrate conversion.
-pub const SLOT_SECONDS: f64 = 600.0;
+pub const SLOT_SECONDS: f64 = SLOT_MS as f64 / 1000.0;
 
 // ─── shared response shapes ────────────────────────────────────────
 
@@ -275,27 +289,22 @@ pub struct SlotDataResponse {
     pub slot_data: Vec<SlotCounts>,
 }
 
-/// Build a fully-populated chart by snapping every (time_ms, value)
-/// sample into its slot, summing per slot, and returning one point per
-/// boundary in `boundaries`. Slots with no samples render `0.0`.
-pub fn aggregate_to_chart<I>(boundaries: &[i64], samples: I, slot_size_ms: i64) -> Vec<ChartPoint>
-where
-    I: IntoIterator<Item = (i64, f64)>,
-{
-    let mut buckets: BTreeMap<i64, f64> = boundaries.iter().map(|&b| (b, 0.0)).collect();
-    for (t, v) in samples {
-        let k = bucket_key(t, slot_size_ms);
-        if let Some(slot) = buckets.get_mut(&k) {
-            *slot += v;
+impl SlotDataResponse {
+    /// One [`SlotCounts`] per folded slot, its counts built by `counts`.
+    pub fn from_slots<T>(
+        slots: Vec<(i64, T)>,
+        mut counts: impl FnMut(T) -> BTreeMap<String, f64>,
+    ) -> Self {
+        Self {
+            slot_data: slots
+                .into_iter()
+                .map(|(b, acc)| SlotCounts {
+                    time: format_iso_ms(b),
+                    counts: counts(acc),
+                })
+                .collect(),
         }
     }
-    boundaries
-        .iter()
-        .map(|&b| ChartPoint {
-            label: format_slot_label(b),
-            data: buckets.get(&b).copied().unwrap_or(0.0),
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -313,59 +322,46 @@ mod tests {
         assert_eq!(Range::parse(Some("30d")).unwrap(), Range::Month);
     }
 
-    /// Every range must surface native 10-min slots — no coarser
-    /// per-range bucketing (keeps chart resolution + correct hashrate).
+    /// Every chart surfaces native 10-min slots — no coarser bucketing
+    /// (keeps chart resolution + correct hashrate).
     #[test]
-    fn slot_size_is_always_ten_minutes() {
-        for r in [
-            Range::Day,
-            Range::ThreeDays,
-            Range::SevenDays,
-            Range::FourteenDays,
-            Range::Month,
-        ] {
-            assert_eq!(
-                r.slot_size_ms(),
-                10 * 60 * 1000,
-                "{r:?} must use 10-min slots"
-            );
-        }
+    fn slot_size_is_ten_minutes() {
+        assert_eq!(SLOT_MS, 10 * 60 * 1000);
         assert!(Range::parse(Some("forever")).is_err());
     }
 
     #[test]
     fn snap_to_slot_floors_to_boundary() {
-        let slot = 600_000_i64; // 10 min
-                                // Reference boundary used throughout this test — known multiple
-                                // of `slot` (computed below so any future slot tweak still
-                                // satisfies the multiplicity invariant).
+        let slot = SLOT_MS;
+        // Reference boundary used throughout this test — a known multiple
+        // of `slot`.
         let base = (1_700_000_001_234_i64 / slot) * slot;
         // Anything between `base` and `base + slot - 1` snaps to `base`.
-        assert_eq!(snap_to_slot(base, slot), base);
-        assert_eq!(snap_to_slot(base + 1, slot), base);
-        assert_eq!(snap_to_slot(base + slot - 1, slot), base);
+        assert_eq!(snap_to_slot(base), base);
+        assert_eq!(snap_to_slot(base + 1), base);
+        assert_eq!(snap_to_slot(base + slot - 1), base);
         // The first ms above the slot boundary snaps to the next slot.
-        assert_eq!(snap_to_slot(base + slot, slot), base + slot);
+        assert_eq!(snap_to_slot(base + slot), base + slot);
     }
 
     #[test]
     fn slot_boundaries_covers_window() {
-        let slot = 600_000;
+        let slot = SLOT_MS;
         // Window [0, 1_800_000) = three 10-min slots ending at
         // 600_000, 1_200_000, 1_800_000. The 1_800_000 boundary is
         // EXCLUDED because t < until.
-        let boundaries = slot_boundaries(0, 1_800_000, slot);
+        let boundaries = slot_boundaries(0, 1_800_000);
         assert_eq!(boundaries, vec![600_000, 1_200_000]);
         // since=0, until=2*slot+1 → includes both slot ends within range.
-        let boundaries = slot_boundaries(0, 2 * slot + 1, slot);
+        let boundaries = slot_boundaries(0, 2 * slot + 1);
         assert_eq!(boundaries, vec![slot, 2 * slot]);
         // Empty window → empty list.
-        assert!(slot_boundaries(1_000, 1_000, slot).is_empty());
+        assert!(slot_boundaries(1_000, 1_000).is_empty());
     }
 
     #[test]
-    fn aggregate_to_chart_sums_into_buckets() {
-        let slot = 600_000;
+    fn sum_into_slots_sums_into_buckets() {
+        let slot = SLOT_MS;
         // Slot-END boundaries: data at time=slot-end belongs in
         // the bucket carrying that end timestamp.
         let boundaries = vec![slot, 2 * slot, 3 * slot];
@@ -375,10 +371,8 @@ mod tests {
             (2 * slot, 5.0),  // second bucket
             (4 * slot, 99.0), // outside the boundary list — dropped
         ];
-        let chart = aggregate_to_chart(&boundaries, samples, slot);
-        assert_eq!(chart[0].data, 3.0);
-        assert_eq!(chart[1].data, 5.0);
-        assert_eq!(chart[2].data, 0.0);
+        let sums = sum_into_slots(&boundaries, samples);
+        assert_eq!(sums, vec![(slot, 3.0), (2 * slot, 5.0), (3 * slot, 0.0)]);
     }
 
     #[test]

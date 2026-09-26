@@ -35,7 +35,6 @@ use bp_group_mgmt_engine::{
 };
 use bp_group_solo_engine::reader::WindowTimeline;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -43,6 +42,7 @@ use crate::middleware::admin_auth::{require_admin, AdminAuth};
 use crate::middleware::rate_limit;
 use crate::response_cache::{JsonBytes, TtlKind};
 use crate::state::SharedState;
+use crate::utils::{build_member_labels, member_id};
 
 pub(crate) fn routes<H, M>(state: SharedState<H, M>) -> Router<SharedState<H, M>>
 where
@@ -101,6 +101,14 @@ where
         .route(
             "/api/pplns/groups/by-address/:address",
             get(by_address::<H, M>),
+        )
+        .route(
+            "/api/pplns/groups/membership/:address",
+            get(membership::<H, M>),
+        )
+        .route(
+            "/api/pplns/groups/:id/admin-check",
+            get(admin_check::<H, M>),
         )
         .route("/api/pplns/groups/:id/hashrate", get(hashrate::<H, M>))
         .route("/api/pplns/groups/:id/chart", get(group_chart::<H, M>))
@@ -740,6 +748,30 @@ fn admin_token(headers: &HeaderMap) -> Option<&str> {
     headers.get("x-admin-token").and_then(|v| v.to_str().ok())
 }
 
+/// The admin token from `x-admin-token`, checked against the group — `None`
+/// when the header is absent, an error when it is present and wrong.
+///
+/// Call this BEFORE a response-cache lookup whose key carries the admin
+/// flag. A check inside the cached computation only runs on a miss, so any
+/// token would read the admin body a real admin just cached.
+async fn verified_admin_token<'h, H, M>(
+    state: &SharedState<H, M>,
+    id: Uuid,
+    headers: &'h HeaderMap,
+) -> Result<Option<&'h str>, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let Some(token) = admin_token(headers) else {
+        return Ok(None);
+    };
+    require_group_service(state)?
+        .require_admin_token(id, Some(token))
+        .await?;
+    Ok(Some(token))
+}
+
 // ─── DTOs ────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -762,7 +794,7 @@ struct GroupSummary {
     finder_bonus_ppm: i32,
     last_round_reset_at: Option<String>,
     /// Computed next-reset wall-clock (ISO), derived from the preset +
-    /// timezone + interval by [`compute_next_reset_at`]. `None` when the
+    /// timezone + interval by [`next_reset_at`]. `None` when the
     /// group has no preset / no timezone (UI tiles then render a neutral
     /// "no schedule" state).
     next_reset_at: Option<String>,
@@ -781,30 +813,21 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
         // sliding-window LENGTH, not a wipe. Don't advertise a phantom
         // `nextResetAt` (it made the UI show a countdown to a reset that never
         // fires); the UI renders the window length instead.
-        let next_reset_at = if PayoutMode::parse_or_default(&r.payout_mode) == PayoutMode::Window {
-            None
-        } else {
-            compute_next_reset_at(
-                r.round_reset_preset.as_deref(),
-                r.round_reset_timezone.as_deref(),
-                r.round_reset_interval_days,
-                r.last_round_reset_at,
-            )
-            .map(crate::time_range::format_slot_label)
+        let next_reset_at = match PayoutMode::parse_or_default(&r.payout_mode) {
+            PayoutMode::Window => None,
+            PayoutMode::Prop => next_reset_at(&r).map(crate::time_range::format_iso_ms),
         };
         Self {
             id: r.id,
             name: r.name,
             creator_address: Some(r.creator_address.as_str().to_string()),
             active: r.active,
-            created_at: crate::time_range::format_slot_label(r.created_at),
+            created_at: crate::time_range::format_iso_ms(r.created_at),
             round_reset_preset: r.round_reset_preset,
             round_reset_interval_days: r.round_reset_interval_days,
             round_reset_timezone: r.round_reset_timezone,
             finder_bonus_ppm: r.finder_bonus_ppm.unwrap_or(0),
-            last_round_reset_at: r
-                .last_round_reset_at
-                .map(crate::time_range::format_slot_label),
+            last_round_reset_at: r.last_round_reset_at.map(crate::time_range::format_iso_ms),
             next_reset_at,
             is_public: r.is_public,
             reset_round_on_block: r.reset_round_on_block,
@@ -814,77 +837,22 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
     }
 }
 
-/// Compute the next round-reset wall-clock as epoch milliseconds.
-/// Returns `None` when the group has no preset, no timezone, the
-/// timezone string fails to parse against the IANA database, or the
-/// custom preset is missing `interval_days`.
-fn compute_next_reset_at(
-    preset: Option<&str>,
-    timezone: Option<&str>,
-    interval_days: Option<i32>,
-    last_reset_at: Option<i64>,
-) -> Option<i64> {
-    use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc, Weekday};
-    use chrono_tz::Tz;
-
-    let preset = preset?;
-    let tz: Tz = timezone?.parse().ok()?;
-    let now_utc = Utc::now();
-    let now_local = now_utc.with_timezone(&tz);
-
-    let next_midnight = |date: NaiveDate| -> Option<i64> {
-        let naive = date.and_hms_opt(0, 0, 0)?;
-        tz.from_local_datetime(&naive)
-            .single()
-            .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
-    };
-
-    match preset {
-        "daily" => next_midnight(now_local.date_naive() + Duration::days(1)),
-        "weekly" => {
-            let mut date = now_local.date_naive() + Duration::days(1);
-            while date.weekday() != Weekday::Mon {
-                date += Duration::days(1);
-            }
-            next_midnight(date)
-        }
-        "monthly" => {
-            let (y, m) = if now_local.month() == 12 {
-                (now_local.year() + 1, 1)
-            } else {
-                (now_local.year(), now_local.month() + 1)
-            };
-            let date = NaiveDate::from_ymd_opt(y, m, 1)?;
-            next_midnight(date)
-        }
-        "custom" => {
-            let days = interval_days?;
-            if days < 1 {
-                return None;
-            }
-            let interval_ms = (days as i64) * 86_400_000;
-            // 4h DST tolerance — matches the gate inside the fireIfDue
-            // path so the displayed and actual fire times agree.
-            const DST_TOLERANCE_MS: i64 = 4 * 3_600_000;
-            let earliest_ms = match last_reset_at {
-                Some(last) => last + interval_ms - DST_TOLERANCE_MS,
-                None => now_utc.timestamp_millis(),
-            };
-            let earliest_local = Utc
-                .timestamp_millis_opt(earliest_ms)
-                .single()?
-                .with_timezone(&tz);
-            let mut date = earliest_local.date_naive();
-            if earliest_local.hour() > 0
-                || earliest_local.minute() > 0
-                || earliest_local.second() > 0
-            {
-                date += Duration::days(1);
-            }
-            next_midnight(date)
-        }
-        _ => None,
-    }
+/// The next scheduled round reset as epoch milliseconds — the instant the
+/// engine's reset cron will fire, computed by that same cron's
+/// [`compute_next_fire`](bp_group_solo_engine::reset::compute_next_fire).
+/// `None` when the group has no usable schedule (no preset, no timezone, an
+/// unknown preset or timezone, or a custom preset without an interval).
+fn next_reset_at(r: &bp_db::PplnsGroupRow) -> Option<i64> {
+    use bp_group_solo_engine::reset::{compute_next_fire, ResetSchedule};
+    let schedule = ResetSchedule::from_row_fields(
+        r.id,
+        r.round_reset_preset.as_deref(),
+        r.round_reset_timezone.as_deref(),
+        r.round_reset_interval_days
+            .and_then(|d| u32::try_from(d).ok()),
+    )
+    .ok()??;
+    Some(compute_next_fire(&schedule, r.last_round_reset_at, chrono::Utc::now()).timestamp_millis())
 }
 
 // ─── GET /api/groups/public ──────────────────────────────────────
@@ -1058,8 +1026,8 @@ where
                             id: h.id,
                             group_id: h.group_id,
                             block_height: h.block_height,
-                            created_at: crate::time_range::format_slot_label(h.created_at),
-                            address_label: mask_address_tail(h.address.as_str(), 5),
+                            created_at: crate::time_range::format_iso_ms(h.created_at),
+                            address_label: bp_common::short_address(h.address.as_str()),
                             paid_sats: h.paid_sats.to_i64(),
                             percent: h.percent as f64,
                             shares_in_round: h.shares_in_round,
@@ -1075,65 +1043,6 @@ where
         )
         .await?;
     Ok(JsonBytes(bytes))
-}
-
-// ─── member pseudonymisation ─────────────────────────────────────
-//
-// The group-detail endpoints are anonymous (a group id alone opens them), so
-// they must never hand out a member's full payout address — the id would then
-// be a scraper key for every member's on-chain address. Instead each member is
-// exposed as an opaque `memberId` (the stable join key the UI uses across the
-// detail endpoints) plus a masked `addressLabel` for display. The full address
-// never leaves the server; the viewer's own row is flagged via `?viewer=`, and
-// the UI already knows its own address (from the route) for the self-link.
-
-/// Opaque, stable per-(group, member) id. Deterministic so every detail
-/// endpoint produces the same id for the same member (the UI joins on it), and
-/// one-way + group-scoped so it reveals neither the address nor cross-group
-/// membership.
-fn member_id(group_id: Uuid, address: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(group_id.as_bytes());
-    h.update([0u8]); // domain-separate the two fields
-    h.update(address.as_bytes());
-    hex::encode(&h.finalize()[..8]) // 64-bit → collision-free within a group
-}
-
-/// Masked address for display: first 4 + "..." + last `tail` chars, mirroring
-/// the UI's `formatBtcAddress` (tail = 5). Returns the input unchanged when
-/// it's too short to shorten.
-fn mask_address_tail(address: &str, tail: usize) -> String {
-    let a = address.trim();
-    let n = a.chars().count();
-    if n <= 4 + tail {
-        return a.to_string();
-    }
-    let first: String = a.chars().take(4).collect();
-    let last: String = a.chars().skip(n - tail).collect();
-    format!("{first}...{last}")
-}
-
-/// Masked labels for a group's members, guaranteed unique within the group.
-/// Base = last-5 (like the UI); if two members would collapse to the same
-/// label, both are widened to last-9, which makes an intra-group visual
-/// collision astronomically unlikely. (The `memberId` join is collision-free
-/// regardless — this only keeps two rows from *looking* identical.)
-fn build_member_labels(addresses: &[String]) -> HashMap<String, String> {
-    let mut base_counts: HashMap<String, usize> = HashMap::new();
-    for a in addresses {
-        *base_counts.entry(mask_address_tail(a, 5)).or_insert(0) += 1;
-    }
-    let mut out = HashMap::with_capacity(addresses.len());
-    for a in addresses {
-        let base = mask_address_tail(a, 5);
-        let label = if base_counts.get(&base).copied().unwrap_or(0) > 1 {
-            mask_address_tail(a, 9)
-        } else {
-            base
-        };
-        out.insert(a.clone(), label);
-    }
-    out
 }
 
 // ─── GET /api/groups/:id ─────────────────────────────────────────
@@ -1211,19 +1120,9 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    // Validate the admin token (if supplied) BEFORE cache lookup so a
-    // bad token returns 401 instead of a stale cached body. The cache
-    // key includes the `admin` flag so admin + non-admin views are
-    // stored separately.
-    let svc = require_group_service(&state)?;
-    let token = admin_token(&headers);
-    let is_admin = match token {
-        None => false,
-        Some(t) => match svc.require_admin_token(id, Some(t)).await {
-            Ok(_) => true,
-            Err(e) => return Err(e.into()),
-        },
-    };
+    // The cache key includes the `admin` flag so admin + non-admin views
+    // are stored separately.
+    let is_admin = verified_admin_token(&state, id, &headers).await?.is_some();
     // Viewer's own address (from the UI route) — only ever used to flag their
     // own row `isSelf`; never echoed back for other members. Keyed into the
     // cache so the self-flag is per-viewer (anonymous viewers share "none").
@@ -1330,16 +1229,16 @@ where
                     address_label: labels
                         .get(addr_str)
                         .cloned()
-                        .unwrap_or_else(|| mask_address_tail(addr_str, 5)),
+                        .unwrap_or_else(|| bp_common::short_address(addr_str)),
                     address: is_admin.then(|| addr_str.to_string()),
                     is_self: viewer.as_deref() == Some(addr_str),
                     role: m.role,
-                    joined_at: crate::time_range::format_slot_label(m.joined_at),
+                    joined_at: crate::time_range::format_iso_ms(m.joined_at),
                     hashrate,
                     best_difficulty,
-                    start_time: start_time.map(crate::time_range::format_slot_label),
-                    last_seen: last_seen.map(crate::time_range::format_slot_label),
-                    last_accepted_share_at: last_active.map(crate::time_range::format_slot_label),
+                    start_time: start_time.map(crate::time_range::format_iso_ms),
+                    last_seen: last_seen.map(crate::time_range::format_iso_ms),
+                    last_accepted_share_at: last_active.map(crate::time_range::format_iso_ms),
                     email: email_out,
                     verified_via,
                 });
@@ -1394,6 +1293,75 @@ where
         viewer: Some(addr.as_str().to_string()),
     });
     by_id(State(state), Path(member.group_id), viewer, headers).await
+}
+
+// ─── GET /api/pplns/groups/membership/:address ───────────────────
+
+/// `{ groupId, groupName, role }` for a member, `{ groupId: null }` otherwise
+/// — the Blockparty `by-address` shape minus its status FSM (a Group-Solo
+/// member's group is never dissolved: the dissolve deletes the members).
+/// A yes/no answer without the roster, hashrate and sessions that
+/// `by-address` computes.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MembershipResponse {
+    Member {
+        #[serde(rename = "groupId")]
+        group_id: Uuid,
+        #[serde(rename = "groupName")]
+        group_name: String,
+        role: String,
+    },
+    None {
+        // Always `None` — emits `{ "groupId": null }`.
+        #[serde(rename = "groupId")]
+        group_id: Option<Uuid>,
+    },
+}
+
+async fn membership<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(address): Path<String>,
+) -> Result<Json<MembershipResponse>, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
+    let none = || Json(MembershipResponse::None { group_id: None });
+    let Some(member) = bp_db::find_group_member_by_address(&state.pool, &addr).await? else {
+        return Ok(none());
+    };
+    let Some(group) = require_group_service(&state)?
+        .get_group(member.group_id)
+        .await?
+    else {
+        return Ok(none());
+    };
+    Ok(Json(MembershipResponse::Member {
+        group_id: group.id,
+        group_name: group.name,
+        role: member.role,
+    }))
+}
+
+// ─── GET /api/pplns/groups/:id/admin-check ───────────────────────
+
+/// 204 when `x-admin-token` is this group's admin token; 401 when missing or
+/// wrong, 404 for an unknown or dissolved group. Nothing else is read.
+async fn admin_check<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    require_group_service(&state)?
+        .require_admin_token(id, admin_token(&headers))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─── GET /api/groups/:id/hashrate ────────────────────────────────
@@ -1451,7 +1419,7 @@ where
                         address_label: labels
                             .get(a.as_str())
                             .cloned()
-                            .unwrap_or_else(|| mask_address_tail(a.as_str(), 5)),
+                            .unwrap_or_else(|| bp_common::short_address(a.as_str())),
                     })
                     .collect(),
             })
@@ -1559,7 +1527,7 @@ fn distribution_entries(
                 address_label: labels
                     .get(&address)
                     .cloned()
-                    .unwrap_or_else(|| mask_address_tail(&address, 5)),
+                    .unwrap_or_else(|| bp_common::short_address(&address)),
                 total_shares: shares,
                 percent,
                 total_rejected: rejected_per_address.get(&address).copied().unwrap_or(0.0),
@@ -1643,7 +1611,7 @@ fn build_window_timeline_response(
     let days = per_day
         .into_iter()
         .map(|(day_start, addr_map)| TimelineDay {
-            date: crate::time_range::format_slot_label(day_start),
+            date: crate::time_range::format_iso_ms(day_start),
             values: addresses
                 .iter()
                 .map(|a| addr_map.get(a).copied().unwrap_or(0.0))
@@ -1660,7 +1628,7 @@ fn build_window_timeline_response(
             address_label: labels
                 .get(a)
                 .cloned()
-                .unwrap_or_else(|| mask_address_tail(a, 5)),
+                .unwrap_or_else(|| bp_common::short_address(a)),
         })
         .collect();
 
@@ -1743,8 +1711,8 @@ where
                 };
                 Ok(BestDifficultyResponse {
                     best_difficulty: best.difficulty.floor() as u64,
-                    address_label: Some(mask_address_tail(&best.address, 5)),
-                    time: Some(crate::time_range::format_slot_label(best.timestamp_ms)),
+                    address_label: Some(bp_common::short_address(&best.address)),
+                    time: Some(crate::time_range::format_iso_ms(best.timestamp_ms)),
                 })
             },
         )
@@ -1800,8 +1768,8 @@ where
                     id: h.id,
                     group_id: h.group_id,
                     block_height: h.block_height,
-                    created_at: crate::time_range::format_slot_label(h.created_at),
-                    address_label: mask_address_tail(h.address.as_str(), 5),
+                    created_at: crate::time_range::format_iso_ms(h.created_at),
+                    address_label: bp_common::short_address(h.address.as_str()),
                     paid_sats: h.paid_sats.to_i64(),
                     percent: h.percent as f64,
                     shares_in_round: h.shares_in_round,
@@ -1839,7 +1807,9 @@ where
     // Admin and non-admin responses both omit the secret token when
     // the caller isn't an admin — key on `is_admin` so we don't leak
     // the admin variant to a public viewer via shared cache.
-    let token = admin_token(&headers).map(|s| s.to_string());
+    let token = verified_admin_token(&state, id, &headers)
+        .await?
+        .map(str::to_string);
     let is_admin = token.is_some();
     let key = format!(
         "GROUP_OPEN_INVITE_ACTIVE_{id}_{}",
@@ -1918,7 +1888,9 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let token = admin_token(&headers).map(|s| s.to_string());
+    let token = verified_admin_token(&state, id, &headers)
+        .await?
+        .map(str::to_string);
     let is_admin = token.is_some();
     let include_decided = q
         .include_decided
@@ -2043,9 +2015,13 @@ fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError
 // time window and bins them into the same slot grid the per-address
 // endpoints use.
 
-use crate::time_range::{chart_slot_boundaries, ChartPoint, Range, SlotCounts, SlotDataResponse};
+use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
+use crate::time_range::{
+    accepted_slot_data, chart_slot_boundaries, ChartPoint, Range, SlotDataResponse,
+};
 
-use crate::time_range::{DIFFICULTY_1, SLOT_SECONDS};
+use crate::time_range::SLOT_SECONDS;
+use bp_common::HASHES_PER_DIFFICULTY_1;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2100,8 +2076,8 @@ where
             Ok(slot_shares
                 .into_iter()
                 .map(|(t, shares)| ChartPoint {
-                    label: crate::time_range::format_slot_label(t),
-                    data: (shares * DIFFICULTY_1 / SLOT_SECONDS).round(),
+                    label: crate::time_range::format_iso_ms(t),
+                    data: (shares * HASHES_PER_DIFFICULTY_1 / SLOT_SECONDS).round(),
                 })
                 .collect())
         })
@@ -2126,68 +2102,23 @@ where
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::GroupAccepted, async move {
             let now = bp_common::now_ms();
             let since = now - range.window_ms();
-            let cutoff = bp_stats::slot::chart_visibility_cutoff_slot().as_millis();
             let addrs = collect_group_member_addresses(&s, id).await?;
-            let mut buckets: std::collections::BTreeMap<i64, f64> =
-                std::collections::BTreeMap::new();
+            let mut rows = Vec::new();
             for a in &addrs {
-                let rows =
-                    bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?;
-                for r in rows.iter().filter(|r| r.time < cutoff) {
-                    // Diff-1-weighted accepted shares (sum of share difficulty),
-                    // matching the per-client `/accepted` endpoint — tracks work,
-                    // not raw share count, so it stays flat at constant hashrate.
-                    *buckets.entry(r.time).or_insert(0.0) += r.shares as f64;
-                }
+                rows.extend(
+                    bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?,
+                );
             }
-            let boundaries: Vec<i64> = chart_slot_boundaries(since, range.slot_size_ms())
-                .into_iter()
-                .filter(|&b| b < cutoff)
-                .collect();
-            let slot_data: Vec<SlotCounts> = boundaries
-                .iter()
-                .map(|&b| {
-                    let mut counts = std::collections::BTreeMap::new();
-                    let sum: f64 = buckets
-                        .iter()
-                        .filter(|(k, _)| {
-                            crate::time_range::bucket_key(**k, range.slot_size_ms()) == b
-                        })
-                        .map(|(_, v)| *v)
-                        .sum();
-                    counts.insert("accepted".into(), sum);
-                    SlotCounts {
-                        time: crate::time_range::format_slot_label(b),
-                        counts,
-                    }
-                })
-                .collect();
-            Ok(SlotDataResponse { slot_data })
+            // Diff-1-weighted accepted shares (sum of share difficulty),
+            // matching the per-client `/accepted` endpoint — tracks work,
+            // not raw share count, so it stays flat at constant hashrate.
+            Ok(accepted_slot_data(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.shares as f64)),
+            ))
         })
         .await?;
     Ok(JsonBytes(bytes))
-}
-
-#[derive(Serialize, Default, Clone)]
-#[serde(rename_all = "camelCase")]
-struct GroupRejectCounts {
-    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
-    count: f64,
-    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
-    diff_minus_one: f64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GroupRejectedSlot {
-    time: String,
-    counts: std::collections::BTreeMap<String, GroupRejectCounts>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GroupRejectedResponse {
-    slot_data: Vec<GroupRejectedSlot>,
 }
 
 async fn group_rejected<H, M>(
@@ -2204,56 +2135,75 @@ where
     let s = state.clone();
     let bytes = state
         .cache
-        .get_or_fetch::<GroupRejectedResponse, _, ApiError>(
-            key,
-            TtlKind::GroupRejected,
-            async move {
-                let now = bp_common::now_ms();
-                let since = now - range.window_ms();
-                let addrs = collect_group_member_addresses(&s, id).await?;
-                let mut buckets: std::collections::BTreeMap<
-                    i64,
-                    std::collections::BTreeMap<String, GroupRejectCounts>,
-                > = std::collections::BTreeMap::new();
-                for a in &addrs {
-                    let rows =
-                        bp_db::find_client_rejected_statistics_since_for_address(&s.pool, a, since)
-                            .await?;
-                    for r in rows {
-                        let k = crate::time_range::bucket_key(r.time, range.slot_size_ms());
-                        let key = crate::controllers::info::normalise_reject_reason(&r.reason)
-                            .to_string();
-                        let entry = buckets.entry(k).or_default().entry(key).or_default();
-                        entry.count += r.count as f64;
-                        entry.diff_minus_one += r.shares as f64;
-                    }
-                }
-                let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-                Ok(GroupRejectedResponse {
-                    slot_data: boundaries
-                        .iter()
-                        .map(|&b| {
-                            let mut counts: std::collections::BTreeMap<String, GroupRejectCounts> =
-                                crate::controllers::info::REJECT_REASON_KEYS
-                                    .iter()
-                                    .map(|&k| (k.to_string(), GroupRejectCounts::default()))
-                                    .collect();
-                            if let Some(seen) = buckets.remove(&b) {
-                                for (k, v) in seen {
-                                    counts.insert(k, v);
-                                }
-                            }
-                            GroupRejectedSlot {
-                                time: crate::time_range::format_slot_label(b),
-                                counts,
-                            }
-                        })
-                        .collect(),
-                })
-            },
-        )
+        .get_or_fetch::<RejectSlotsResponse, _, ApiError>(key, TtlKind::GroupRejected, async move {
+            let now = bp_common::now_ms();
+            let since = now - range.window_ms();
+            let addrs = collect_group_member_addresses(&s, id).await?;
+            let mut rows = Vec::new();
+            for a in &addrs {
+                rows.extend(
+                    bp_db::find_client_rejected_statistics_since_for_address(&s.pool, a, since)
+                        .await?,
+                );
+            }
+            Ok(rejected_by_reason_slots(
+                &chart_slot_boundaries(since),
+                rows.iter()
+                    .map(|r| (r.time, (r.reason.as_str(), r.count as f64, r.shares as f64))),
+            ))
+        })
         .await?;
     Ok(JsonBytes(bytes))
+}
+
+#[cfg(test)]
+mod slot_json_tests {
+    use super::*;
+
+    const S: i64 = 600_000;
+    const T0: i64 = 1_700_000_400_000;
+    const BOUNDARIES: [i64; 3] = [T0, T0 + S, T0 + 2 * S];
+
+    fn json<T: Serialize>(v: &T) -> String {
+        serde_json::to_string(v).unwrap()
+    }
+
+    /// `/api/groups/:id/accepted` — rows of several members, one member's
+    /// slot rows adding up, a row at the visibility cutoff dropped. The
+    /// handler's boundaries all lie below the cutoff.
+    #[test]
+    fn group_accepted_json_is_unchanged() {
+        let cutoff = T0 + 2 * S;
+        let samples = vec![
+            (T0, 1.5),
+            (T0, 0.1_f32 as f64),
+            (T0, 0.2_f32 as f64),
+            (T0 + S, 2.0),
+            (T0 + S + 123, 3.0),
+            (T0 - S, 99.0),
+            (cutoff, 5.0),
+        ];
+        assert_eq!(
+            json(&accepted_slot_data(&BOUNDARIES[..2], samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"accepted":1.8000000044703484}},{"time":"2023-11-14T22:30:00.000Z","counts":{"accepted":5}}]}"#
+        );
+    }
+
+    /// `/api/groups/:id/rejected` — same shape as the per-address endpoint.
+    #[test]
+    fn group_rejected_json_is_unchanged() {
+        let samples = vec![
+            (T0, ("job-not-found", 2.0, 0.25)),
+            (T0, ("JobNotFound", 1.0, 1.5)),
+            (T0, ("something-new", 3.0, 3.0)),
+            (T0 + S + 7, ("Stale", 4.0, 0.1_f32 as f64)),
+            (T0 + 3 * S, ("Stale", 50.0, 50.0)),
+        ];
+        assert_eq!(
+            json(&rejected_by_reason_slots(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"DuplicateShare":{"count":0,"diffMinusOne":0},"JobNotFound":{"count":3,"diffMinusOne":1.75},"LowDifficultyShare":{"count":0,"diffMinusOne":0},"NotSubscribed":{"count":0,"diffMinusOne":0},"OtherUnknown":{"count":3,"diffMinusOne":3},"Stale":{"count":0,"diffMinusOne":0},"UnauthorizedWorker":{"count":0,"diffMinusOne":0},"VersionRollingNotAllowed":{"count":0,"diffMinusOne":0}}},{"time":"2023-11-14T22:30:00.000Z","counts":{"DuplicateShare":{"count":0,"diffMinusOne":0},"JobNotFound":{"count":0,"diffMinusOne":0},"LowDifficultyShare":{"count":0,"diffMinusOne":0},"NotSubscribed":{"count":0,"diffMinusOne":0},"OtherUnknown":{"count":0,"diffMinusOne":0},"Stale":{"count":4,"diffMinusOne":0.10000000149011612},"UnauthorizedWorker":{"count":0,"diffMinusOne":0},"VersionRollingNotAllowed":{"count":0,"diffMinusOne":0}}},{"time":"2023-11-14T22:40:00.000Z","counts":{"DuplicateShare":{"count":0,"diffMinusOne":0},"JobNotFound":{"count":0,"diffMinusOne":0},"LowDifficultyShare":{"count":0,"diffMinusOne":0},"NotSubscribed":{"count":0,"diffMinusOne":0},"OtherUnknown":{"count":0,"diffMinusOne":0},"Stale":{"count":0,"diffMinusOne":0},"UnauthorizedWorker":{"count":0,"diffMinusOne":0},"VersionRollingNotAllowed":{"count":0,"diffMinusOne":0}}}]}"#
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2370,11 +2320,11 @@ mod tests {
         // Days are the two day-starts, oldest→newest.
         assert_eq!(
             resp.days[0].date,
-            crate::time_range::format_slot_label(4 * DAY_MS)
+            crate::time_range::format_iso_ms(4 * DAY_MS)
         );
         assert_eq!(
             resp.days[1].date,
-            crate::time_range::format_slot_label(5 * DAY_MS)
+            crate::time_range::format_iso_ms(5 * DAY_MS)
         );
     }
 
@@ -2492,34 +2442,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_address_tail_shows_first4_and_last_n() {
-        let a = "bc1qxyzabcdefghijklmnop9k2p4";
-        assert_eq!(mask_address_tail(a, 5), "bc1q...9k2p4");
-        assert_eq!(mask_address_tail(a, 9), "bc1q...mnop9k2p4");
-        // Too short to shorten → returned verbatim.
-        assert_eq!(mask_address_tail("bc1qab", 5), "bc1qab");
-        // Never contains the full middle of the address.
-        assert!(!mask_address_tail(a, 5).contains("xyzabc"));
-    }
-
-    #[test]
-    fn member_id_is_stable_group_scoped_and_opaque() {
-        let g1 = Uuid::from_u128(1);
-        let g2 = Uuid::from_u128(2);
-        let a = "bc1qsomeaddressaaaa";
-        // Deterministic.
-        assert_eq!(member_id(g1, a), member_id(g1, a));
-        // Group-scoped: same address, different group → different id.
-        assert_ne!(member_id(g1, a), member_id(g2, a));
-        // Different address → different id.
-        assert_ne!(member_id(g1, a), member_id(g1, "bc1qsomeaddressbbbb"));
-        // Opaque: doesn't leak the address, fixed 16-hex width.
-        let id = member_id(g1, a);
-        assert_eq!(id.len(), 16);
-        assert!(!id.contains("address"));
-    }
-
-    #[test]
     fn distribution_entries_keep_a_reject_only_member_as_a_zero_share_row() {
         let gid = Uuid::nil();
         let per_address = HashMap::from([("bc1qAAAAAAAAA11111".to_string(), 75.0)]);
@@ -2540,21 +2462,6 @@ mod tests {
         // Sum of the rows is the figure the mini-card shows, in both columns.
         let rejected_sum: f64 = rows.iter().map(|r| r.total_rejected).sum();
         assert_eq!(rejected_sum, 14.0);
-    }
-
-    #[test]
-    fn build_member_labels_disambiguates_collisions() {
-        // Same first-4 ("bc1q") AND same last-5 ("12345") → base labels collide
-        // → both widened so two rows never render identically.
-        let a = "bc1qAAAAAAAAA12345".to_string();
-        let b = "bc1qBBBBBBBBB12345".to_string();
-        let labels = build_member_labels(&[a.clone(), b.clone()]);
-        assert_eq!(mask_address_tail(&a, 5), mask_address_tail(&b, 5)); // base collides
-        assert_ne!(labels[&a], labels[&b], "colliding labels must be widened");
-        // A non-colliding address keeps the short last-5 label.
-        let c = "bc1qCCCCCCCCCC99999".to_string();
-        let labels2 = build_member_labels(&[a, c.clone()]);
-        assert_eq!(labels2[&c], mask_address_tail(&c, 5));
     }
 
     #[test]

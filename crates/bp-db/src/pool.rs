@@ -40,7 +40,7 @@ impl Db {
     /// are written idempotent (`ADD COLUMN IF NOT EXISTS`) so they also
     /// no-op against a fresh DB bootstrapped from `db/schema.sql`.
     pub async fn run_migrations(&self) -> Result<(), DbError> {
-        sqlx::migrate!().run(&self.pool).await?;
+        with_boot_policy(sqlx::migrate!()).run(&self.pool).await?;
         Ok(())
     }
 
@@ -54,6 +54,21 @@ impl Db {
     pub async fn close(&self) {
         self.pool.close().await
     }
+}
+
+/// How every process treats the migration table at boot: a migration it does
+/// not know is fine. The processes of the Core/Satellite split are deployed
+/// one at a time, so the api can apply a migration while core still runs the
+/// previous image. Without this, that older core would refuse to boot
+/// (`VersionMissing`) on its next restart and the Stratum port would stay
+/// closed until someone redeploys it.
+///
+/// The price is a rule for every migration: it must not break a binary that
+/// is one release older. Add, don't rename; drop a column only once no
+/// running image reads it.
+pub fn with_boot_policy(mut migrator: sqlx::migrate::Migrator) -> sqlx::migrate::Migrator {
+    migrator.set_ignore_missing(true);
+    migrator
 }
 
 /// Pool sizing + timeout knobs. Defaults are conservative for a single

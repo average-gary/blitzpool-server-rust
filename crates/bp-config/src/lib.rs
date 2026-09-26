@@ -46,11 +46,6 @@ pub struct AppConfig {
     /// Required when SMTP + email features are enabled.
     #[serde(default)]
     pub pool_base_url: Option<String>,
-    /// `true` ⇒ the `/api` HTTP server expects to be fronted by a
-    /// TLS-terminating proxy and emits `Strict-Transport-Security`
-    /// + secure-cookie hints. `false` ⇒ plain HTTP.
-    #[serde(default)]
-    pub api_secure: bool,
 
     /// The roles this process runs — the single source of deployment topology.
     /// Required: set it here or, more commonly, via `--roles` /
@@ -62,8 +57,6 @@ pub struct AppConfig {
     pub roles: Vec<Role>,
 
     pub bitcoin_rpc: BitcoinRpcConfig,
-    #[serde(default)]
-    pub bitcoin_zmq: Option<BitcoinZmqConfig>,
     pub tdp: TdpConfig,
     pub database: DatabaseConfig,
     pub redis: RedisConfig,
@@ -89,12 +82,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub smtp: Option<SmtpConfig>,
     #[serde(default)]
-    pub aggregation: AggregationConfig,
-    #[serde(default)]
     pub metrics: MetricsConfig,
 
     /// Optional `[debug]` section. Holds the protocol-level debug
-    /// switches (frame dumps, per-share traces, Noise-handshake debug).
+    /// switches (frame dumps, per-share traces, submit latency).
     #[serde(default)]
     pub debug: DebugConfig,
 
@@ -133,10 +124,10 @@ pub struct PayoutIdentityConfig {
     pub allow_rotating: bool,
 }
 
-/// Protocol-level debug logging switches. Both default to `false`
+/// Protocol-level debug logging switches. All default to `false`
 /// because the SV1+SV2 share traces are noisy under production load
 /// — flip to `true` in staging / regtest when diagnosing a miner
-/// rejection rate or a Noise handshake.
+/// rejection rate.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
@@ -153,11 +144,6 @@ pub struct DebugConfig {
     /// regardless of this flag.
     #[serde(default)]
     pub stratum_share_logs: bool,
-    /// `true` ⇒ SV2 Noise handshake byte-level logging (Act1/Act2
-    /// hex dumps, first-chunk preview). Very noisy — only enable when
-    /// diagnosing handshake-layer issues.
-    #[serde(default)]
-    pub noise_debug: bool,
     /// `true` ⇒ log the pool-internal submit→ack latency for **both**
     /// SV1 and SV2 (µs from the inbound submit line/frame being read to
     /// its response being written) at INFO, one line per share.
@@ -179,33 +165,6 @@ pub enum Network {
     /// `bitcoin::Network::Testnet` byte set.
     Testnet4,
     Regtest,
-}
-
-impl Network {
-    /// Every variant, for tests that must visit all of them.
-    ///
-    /// **This list is not compiler-enforced, and the honest version of that is
-    /// worth writing down.** A four-element array keeps compiling when a fifth
-    /// variant appears above, and no `match` trick fixes it: forcing an arm
-    /// requires a value to match on, which requires the list. Short of a
-    /// derive, proximity is the only guard there is — so the list lives three
-    /// lines from the variants, where adding one without extending it is a
-    /// visible omission at the edit site.
-    ///
-    /// What *is* enforced lives at the consumer: `blitzpool`'s `network` module
-    /// states each variant's mapping in an exhaustive `match`, so a new variant
-    /// cannot compile there until someone writes down what it means. This array
-    /// only decides which of those mappings a test actually exercises. That
-    /// split is the lesson from the copy this replaced — `stratum_v1`'s was the
-    /// one mapping with a test, and the test pinned three of four variants,
-    /// leaving out `Testnet4`, the newest arm and the only one carrying a
-    /// judgement call.
-    pub const ALL: [Network; 4] = [
-        Network::Mainnet,
-        Network::Testnet,
-        Network::Testnet4,
-        Network::Regtest,
-    ];
 }
 
 /// Fine-grained deployment role. A process runs one or more roles; the set it
@@ -285,16 +244,6 @@ pub struct BitcoinRpcConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BitcoinZmqConfig {
-    /// e.g. `"tcp://192.168.1.100:28332"` — matches Core's
-    /// `zmqpubrawblock` socket. Optional in the Rust port (TDP is
-    /// the primary template source); kept here for operators still
-    /// wiring a ZMQ source during cut-over.
-    pub host: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TdpConfig {
     /// Path to the bitcoin-core IPC Unix-domain socket. The Rust port
     /// uses TDP-direkt (see memory `project-tdp-direct-architecture`)
@@ -327,10 +276,6 @@ pub struct TdpConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
-    /// Currently always `"postgres"` for the Rust port. The schema
-    /// uses PG-only types (BIGINT-epoch-ms etc.); SQLite is not
-    /// supported.
-    pub driver: String,
     pub host: String,
     #[serde(default = "default_pg_port")]
     pub port: u16,
@@ -341,18 +286,10 @@ pub struct DatabaseConfig {
     pub ssl: bool,
     #[serde(default = "default_pg_pool_size")]
     pub pool_size: u32,
-    #[serde(default = "default_pg_max_query_time_ms")]
-    pub max_query_time_ms: u64,
     #[serde(default = "default_pg_acquire_timeout_ms")]
     pub acquire_timeout_ms: u64,
     #[serde(default = "default_pg_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
-    /// `true` ⇒ run pending migrations on startup. **Note**: the Rust
-    /// port reads from the existing schema and doesn't ship migrations
-    /// itself; this flag is honoured by the deployment stack that owns
-    /// the migration set against the same DB.
-    #[serde(default)]
-    pub run_migrations: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -365,8 +302,6 @@ pub struct RedisConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub db: u8,
-    #[serde(default = "default_redis_ttl_secs")]
-    pub ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -544,6 +479,10 @@ fn ttl_site_info() -> u64 {
 fn ttl_pool_info() -> u64 {
     600
 }
+fn default_job_retention_ms() -> u64 {
+    600_000
+}
+
 fn default_cache_capacity() -> u64 {
     10_000
 }
@@ -557,8 +496,10 @@ pub struct StratumConfig {
     /// High-difficulty SV1 listener port.
     pub solo_high_diff_port: u16,
     pub high_diff_start_difficulty: u64,
-    /// How long an emitted job stays valid before the engine refuses
-    /// shares against it.
+    /// How long a retired job stays stored before aging drops it; a share
+    /// against a dropped job is rejected as an unknown job. Applies to SV1
+    /// and SV2. Defaults to 600 000 (10 min).
+    #[serde(default = "default_job_retention_ms")]
     pub job_retention_ms: u64,
     pub target_shares_per_minute: u32,
     pub high_diff_target_shares_per_minute: u32,
@@ -581,14 +522,6 @@ pub struct Sv2Config {
     /// pin a pool identity that way — fine for staging, not prod).
     #[serde(default)]
     pub authority_privkey_hex: Option<String>,
-    /// 32-byte Ed25519 seed in hex for the SV2 certificate-signing
-    /// authority key.
-    #[serde(default)]
-    pub ed25519_authority_seed_hex: Option<String>,
-    /// SV2 certificate `signed_part` byte — operator-tunable for
-    /// future cert-rotation flows.
-    #[serde(default)]
-    pub cert_signed_part: Option<u8>,
     #[serde(default)]
     pub jdp_enabled: bool,
     #[serde(default)]
@@ -682,9 +615,6 @@ pub struct PplnsConfig {
     pub coinbase_weight_budget: u32,
     /// VarDiff floor for the PPLNS port (sub-ASIC hardware gate).
     pub min_difficulty: u64,
-    /// Per-session share warmup — first N accepted shares are
-    /// counted in stats but NOT recorded in the PPLNS ledger.
-    pub warmup_shares: u32,
     /// Minimum on-chain payout in sats. Outputs below this stay as
     /// pending credit in the signed ledger. Always clamped upward
     /// to `DUST_LIMIT_SATS` (546) by the engine.
@@ -1055,8 +985,6 @@ impl Default for DeviceStatusConfig {
 #[serde(deny_unknown_fields)]
 pub struct TelegramConfig {
     pub bot_token: String,
-    #[serde(default)]
-    pub diff_notifications: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1067,8 +995,6 @@ pub struct NtfyConfig {
     pub access_token: Option<String>,
     #[serde(default)]
     pub topic_prefix: Option<String>,
-    #[serde(default)]
-    pub diff_notifications: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1104,37 +1030,12 @@ pub struct SmtpConfig {
     pub from: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AggregationConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// `pool_stats` aggregation tick (ms). Default 600 000.
-    #[serde(default = "default_pool_stats_interval_ms")]
-    pub pool_stats_interval_ms: u64,
-    /// `chart_data` aggregation tick (ms). Default 300 000.
-    #[serde(default = "default_chart_data_interval_ms")]
-    pub chart_data_interval_ms: u64,
-}
-
-impl Default for AggregationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            pool_stats_interval_ms: default_pool_stats_interval_ms(),
-            chart_data_interval_ms: default_chart_data_interval_ms(),
-        }
-    }
-}
-
 /// Prometheus `/metrics` exporter configuration.
 ///
-/// Default `enabled = false`: the exporter is "off until somebody asks
-/// for a dashboard". Flip `[metrics] enabled = true` in
-/// the TOML to spawn the `:9000` HTTP listener; the actual `record_*`
-/// instrumentation across the share-accept / block-found / cron-tick
-/// hot paths is tracked as a follow-up — until then the exporter
-/// serves an empty body but the listener is reachable.
+/// Default `enabled = false`. Flip `[metrics] enabled = true` in the TOML
+/// to spawn the `:9000` HTTP listener. It serves what the pool emits: the
+/// Core→Satellite stream-consumer lag, the parked-block depths, vardiff
+/// adjustments and the lost-accepted-share counter.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -1161,9 +1062,6 @@ fn default_tdp_staleness_threshold_secs() -> u64 {
 fn default_pg_pool_size() -> u32 {
     10
 }
-fn default_pg_max_query_time_ms() -> u64 {
-    30_000
-}
 fn default_pg_acquire_timeout_ms() -> u64 {
     60_000
 }
@@ -1172,9 +1070,6 @@ fn default_pg_idle_timeout_ms() -> u64 {
 }
 fn default_redis_port() -> u16 {
     6379
-}
-fn default_redis_ttl_secs() -> u64 {
-    600
 }
 fn default_true() -> bool {
     true
@@ -1187,12 +1082,6 @@ fn default_confirmation_depth() -> u32 {
 }
 fn default_bucket_shares() -> u64 {
     10_000
-}
-fn default_pool_stats_interval_ms() -> u64 {
-    600_000
-}
-fn default_chart_data_interval_ms() -> u64 {
-    300_000
 }
 
 // ─── loader + errors ──────────────────────────────────────────────
@@ -1280,7 +1169,6 @@ mod tests {
         socket_path = "/var/run/bitcoind/bp-tdp.sock"
 
         [database]
-        driver = "postgres"
         host = "localhost"
         user = "postgres"
         password = "postgres"
@@ -1443,7 +1331,6 @@ mod tests {
             fee_percent = 1.5
             coinbase_weight_budget = 50000
             min_difficulty = 500
-            warmup_shares = 5
             min_payout_sats = 5000
             dust_sweep_enabled = false
             abandoned_balance_days = 45
@@ -1531,7 +1418,6 @@ mod tests {
         let text = r#"
             network = "mainnet"
             pool_identifier = "blitzpool"
-            api_secure = false
             stratum_garbage = 42
 
             [bitcoin_rpc]
@@ -1544,7 +1430,6 @@ mod tests {
             socket_path = "/var/run/bitcoind/bp-tdp.sock"
 
             [database]
-            driver = "postgres"
             host = "localhost"
             user = "postgres"
             password = "postgres"
@@ -1589,7 +1474,6 @@ mod tests {
             socket_path = "/var/run/bitcoind/bp-tdp.sock"
 
             [database]
-            driver = "postgres"
             host = "localhost"
             user = "postgres"
             password = "postgres"
@@ -1606,7 +1490,6 @@ mod tests {
             solo_start_difficulty = 5000
             solo_high_diff_port = 3339
             high_diff_start_difficulty = 1000000
-            job_retention_ms = 90000
             target_shares_per_minute = 6
             high_diff_target_shares_per_minute = 6
             difficulty_check_interval_ms = 60000
@@ -1616,7 +1499,8 @@ mod tests {
         assert!(cfg.notifications.fcm.is_none());
         assert!(cfg.smtp.is_none());
         assert_eq!(cfg.solo.coinbase_weight_budget, 4_000);
-        assert_eq!(cfg.aggregation.pool_stats_interval_ms, 600_000);
+        // [stratum] job_retention_ms defaults to 10 min when unset.
+        assert_eq!(cfg.stratum.job_retention_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);
         // §6.4.9 makes propagating a pushed solution a MUST for the JDS, and

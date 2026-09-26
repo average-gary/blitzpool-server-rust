@@ -34,6 +34,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_share::{calculate_difficulty, Difficulty};
 use bp_stratum_v2::mining::channel::ChannelState;
 use bp_stratum_v2::mining::jobs::ExtendedJob;
@@ -73,15 +74,22 @@ static GLOBAL: Counting = Counting;
 // a ~64-byte prefix and ~100-byte suffix, and a merkle path whose depth
 // matches a real block (~3–4k txs → ~12 levels). The job difficulty is
 // set trivially easy so the share is Accepted (the hot path), and the
-// pinned network difficulty is set unreachably hard so it is NOT a
-// block-candidate (no witness-coinbase assembly).
+// job's n_bits is difficulty 1, out of reach for the synthetic share, so
+// it is NOT a block-candidate (no witness-coinbase assembly).
 
 const MERKLE_DEPTH_MAINNET: usize = 12;
 const MERKLE_DEPTH_SHALLOW: usize = 1;
 
 fn ext_channel() -> ChannelState {
     // channel_id=2, 4-byte extranonce prefix, 8-byte extranonce size.
-    ChannelState::new_extended(2, vec![0u8; 4], 8, Difficulty(1024.0), [0xFF; 32])
+    ChannelState::new_extended(
+        2,
+        vec![0u8; 4],
+        8,
+        Difficulty(1024.0),
+        [0xFF; 32],
+        LifecycleConfig::DEFAULT,
+    )
 }
 
 fn ext_job(merkle_depth: usize) -> ExtendedJob {
@@ -100,7 +108,6 @@ fn ext_job(merkle_depth: usize) -> ExtendedJob {
         // Trivially easy → target ≈ MAX → any hash meets it → Accepted.
         difficulty: Difficulty(1.0 / 4_294_967_296.0),
         // Unreachably hard → never a block candidate (no witness assembly).
-        network_difficulty: Difficulty(1e15),
         coinbase_tx_value_remaining: 5_000_000_000,
         template_id: Some(1),
         jdp_claims_the_block: false,
@@ -122,7 +129,7 @@ fn ext_submission(nonce: u32) -> SubmitSharesExtendedInput {
         version: 0x2000_0000,
         ntime: 0x6500_0001,
         extranonce: ExtranonceBytes::from_slice(&[0x11; 8]),
-        tail_tlvs: Vec::new(),
+        tlvs: Vec::new(),
     }
 }
 
@@ -136,6 +143,7 @@ fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job
         kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
+        job_lifecycle: *channel.standard_jobs.lifecycle(),
     };
     let v = validate_submit_extended(
         &mut channel.submission_cache,

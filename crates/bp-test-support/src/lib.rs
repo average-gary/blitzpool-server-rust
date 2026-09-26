@@ -421,10 +421,7 @@ pub mod redis_db {
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
     pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
 
-    /// `bp-session-persistence`'s `live_store_integration`. ⚠️ This is
-    /// the LAST free 32-slice of the 512-DB test container
-    /// (`15 * 32 + 31 = 511`) — the next binary that needs a base must
-    /// recreate `bp-test-redis` with `--databases` raised past 512.
+    /// `bp-session-persistence`'s `live_store_integration`.
     ///
     /// ⚠️ Index **31** of this range is lent to TWO `bp-api` test
     /// binaries — `smoke.rs` and `custom_extranonce_guard.rs` — both
@@ -438,14 +435,20 @@ pub mod redis_db {
     /// 31 (the two `bp-api` borrowers above).
     pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
 
+    /// `bp-api`'s unit tests (the `lib` test binary). ⚠️ This is the LAST
+    /// 32-slice of the 544-DB test container (`16 * 32 + 31 = 543`) — the
+    /// next binary that needs a base must recreate `bp-test-redis` with
+    /// `--databases` raised past 544.
+    pub const API: u16 = 16 * RANGE;
+
     /// `bp-pplns-engine`'s `regtest_rotating_pplns_block` — a rotating miner
     /// through the whole PPLNS path, twice.
     ///
     /// **A lodger in [`SESSION_PERSISTENCE`]'s range, not a base of its own.**
-    /// 15 is the last usable base: `redis_db_in_range` is
-    /// `(base + test_db) % redis_database_count()`, so a sixteenth base would
-    /// be `16 * 32 = 512`, which folds straight back onto `BLITZPOOL_BIN = 0`
-    /// on the 512-database container — silently, and onto a range that
+    /// 16 ([`API`]) is the last usable base: `redis_db_in_range` is
+    /// `(base + test_db) % redis_database_count()`, so a seventeenth base would
+    /// be `17 * 32 = 544`, which folds straight back onto `BLITZPOOL_BIN = 0`
+    /// on the 544-database container — silently, and onto a range that
     /// flushes.
     ///
     /// Sharing the base is safe because the two never share a *database*:
@@ -455,14 +458,14 @@ pub mod redis_db {
     /// serial-binary assumption does not survive.
     ///
     /// A binary that needs a whole 32-slice of its own is the one that has to
-    /// recreate `bp-test-redis` with `--databases` past 512.
+    /// recreate `bp-test-redis` with `--databases` past 544.
     pub const RT_ROTATING_PPLNS_BLOCK: u16 = SESSION_PERSISTENCE;
 }
 
 /// How many logical databases this Redis actually has.
 ///
 /// Read once per process, because it decides where every test in it
-/// lands. The local test container runs `valkey-server --databases 512`;
+/// lands. The local test container runs `valkey-server --databases 544`;
 /// a stock server has 16, and **GitHub Actions service containers cannot
 /// override a container's command**, so CI's Valkey has 16 and there is
 /// no way to pass `--databases` to it as a service.

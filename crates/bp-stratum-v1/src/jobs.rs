@@ -53,17 +53,7 @@ use bp_mining_job::MiningJob;
 use crate::config::ServerConfig;
 use crate::notify::ActiveSV1Template;
 
-pub use bp_jobs_lifecycle::JobClassification;
-
-/// Build a [`LifecycleConfig`] from the SV1 [`ServerConfig`] field
-/// names. Free helper so the `JobRegistry` constructors stay simple.
-pub fn lifecycle_from_server_config(cfg: &ServerConfig) -> LifecycleConfig {
-    LifecycleConfig {
-        grace_ms: cfg.stale_grace_ms,
-        retention_ms: cfg.job_retention_ms,
-        min_retained: cfg.min_retained_jobs,
-    }
-}
+pub(crate) use bp_jobs_lifecycle::JobClassification;
 
 /// Snapshot returned by [`JobRegistry::classify`] when a job is found.
 /// Holds `Arc` handles to the shared [`MiningJob`] and
@@ -137,7 +127,7 @@ impl JobRegistry {
     }
 
     pub fn from_server_config(cfg: &ServerConfig) -> Self {
-        Self::new(lifecycle_from_server_config(cfg))
+        Self::new(cfg.lifecycle)
     }
 
     pub fn config(&self) -> LifecycleConfig {
@@ -424,14 +414,12 @@ mod tests {
     }
 
     fn dummy_active_template() -> ActiveSV1Template {
-        let mut active = ActiveSV1Template {
+        ActiveSV1Template::from_template(bp_template_distribution::ActiveTemplate {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
             header_timestamp: 0x65a1_b2c3,
-            network_target: [0xFF; 32],
-            network_difficulty: 1.0,
             coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
             coinbase_tx_version: 2,
             coinbase_tx_input_sequence: 0xffff_ffff,
@@ -446,16 +434,7 @@ mod tests {
             coinbase_tx_outputs_count: 1,
             coinbase_tx_locktime: 0,
             merkle_path: vec![[0x11; 32]],
-            merkle_branch_hex: vec![
-                "1111111111111111111111111111111111111111111111111111111111111111".into(),
-            ],
-            prev_hash_hex: String::new(),
-            version_hex: String::new(),
-            n_bits_hex: String::new(),
-            header_timestamp_hex: String::new(),
-        };
-        active.recompute_notify_header_hex();
-        active
+        })
     }
 
     fn dummy_mining_job() -> MiningJob {
@@ -703,12 +682,10 @@ mod tests {
     // ── cleanup_for_tip: prev-hash-conditioned retire ──────────────────
 
     fn template_with_prev(prev: u8) -> ActiveSV1Template {
-        let mut active = ActiveSV1Template {
-            prev_hash: [prev; 32],
-            ..dummy_active_template()
-        };
-        // The struct-update inherited the base fixture's prev_hash_hex, which
-        // is for the OLD prev_hash — re-sync now that prev_hash changed.
+        let mut active = dummy_active_template();
+        active.template.prev_hash = [prev; 32];
+        // The base fixture's prev_hash_hex is for the OLD prev_hash — re-sync
+        // now that prev_hash changed.
         active.recompute_notify_header_hex();
         active
     }

@@ -12,5 +12,4 @@ workspace = true
 
 [dependencies]
 bp-common = { workspace = true }
-bp-pplns = { workspace = true }
 serde = { workspace = true }

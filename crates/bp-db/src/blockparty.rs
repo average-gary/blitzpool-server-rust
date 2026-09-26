@@ -3,7 +3,8 @@
 //! Blockparty mining mode — group / member / block-history rows.
 //!
 //! - `blockparty_group` — UUID PK, status FSM (draft/confirming/ready/active/dissolved)
-//! - `blockparty_member` — bigint PK, UNIQUE on address (pool-wide single membership)
+//! - `blockparty_member` — bigint PK, UNIQUE on address (pool-wide single membership).
+//!   A dissolve deletes the group's rows, so the address is free again.
 //! - `blockparty_block_history` — bigint PK, UNIQUE (groupId, blockHash) for replay-safety
 
 use bp_common::{AddressId, Sats};
@@ -95,6 +96,8 @@ pub async fn find_blockparty_group_by_name(
     .map_err(DbError::from)
 }
 
+/// The live (non-dissolved) party this address administers. A dissolved
+/// party keeps its row for the history but no longer holds the address.
 pub async fn find_blockparty_group_by_admin_address(
     pool: &PgPool,
     admin_address: &AddressId,
@@ -113,7 +116,9 @@ pub async fn find_blockparty_group_by_admin_address(
             "updatedAt" AS "updated_at!",
             "dissolvedAt" AS "dissolved_at?",
             "confirmationRequestedAt" AS "confirmation_requested_at?"
-           FROM blockparty_group WHERE "adminAddress" = $1 LIMIT 1"#,
+           FROM blockparty_group
+           WHERE "adminAddress" = $1 AND status <> 'dissolved'
+           LIMIT 1"#,
         admin_address.as_str(),
     )
     .fetch_optional(pool)
@@ -229,12 +234,15 @@ pub async fn update_blockparty_group_last_share_and_status(
     .map_err(DbError::from)
 }
 
-pub async fn update_blockparty_group_dissolved(
-    pool: &PgPool,
+pub async fn update_blockparty_group_dissolved<'e, E>(
+    executor: E,
     id: Uuid,
     dissolved_at: i64,
     updated_at: i64,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query!(
         r#"UPDATE blockparty_group
            SET status = 'dissolved', "dissolvedAt" = $2, "updatedAt" = $3
@@ -243,7 +251,7 @@ pub async fn update_blockparty_group_dissolved(
         dissolved_at,
         updated_at,
     )
-    .execute(pool)
+    .execute(executor)
     .await
     .map(|_| ())
     .map_err(DbError::from)
@@ -503,6 +511,25 @@ where
     .map_err(DbError::from)
 }
 
+/// Delete every member row of a group — the dissolve cascade. Mirrors
+/// `delete_pplns_group_members_for_group` on the Group-Solo side.
+pub async fn delete_blockparty_members_for_group<'e, E>(
+    executor: E,
+    group_id: Uuid,
+) -> Result<u64, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query!(
+        r#"DELETE FROM blockparty_member WHERE "groupId" = $1"#,
+        group_id,
+    )
+    .execute(executor)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(DbError::from)
+}
+
 pub async fn delete_blockparty_member(
     pool: &PgPool,
     group_id: Uuid,
@@ -656,12 +683,15 @@ pub async fn upsert_blockparty_join_link(
     Ok(())
 }
 
-pub async fn delete_blockparty_join_link(pool: &PgPool, group_id: Uuid) -> Result<u64, DbError> {
+pub async fn delete_blockparty_join_link<'e, E>(executor: E, group_id: Uuid) -> Result<u64, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let r = sqlx::query!(
         r#"DELETE FROM blockparty_join_link WHERE "groupId" = $1"#,
         group_id,
     )
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(DbError::from)?;
     Ok(r.rows_affected())

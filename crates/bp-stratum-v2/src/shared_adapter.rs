@@ -1,88 +1,52 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bridges the SV2-specific
-//! [`AcceptedShareSink`] trait to the
-//! protocol-agnostic
-//! [`SharedAcceptedShareSink`].
+//! Projects SV2's native share types into the protocol-agnostic
+//! `bp_share_hook` views the server hands its sinks.
 //!
-//! Symmetric counterpart to `bp_stratum_v1::Sv1AcceptedShareAdapter`.
-//! See the `bp-share-hook` crate-level docs for the architecture.
+//! Symmetric counterpart to `bp_stratum_v1`'s `shared_adapter`. See the
+//! `bp-share-hook` crate-level docs for the architecture.
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
 use bp_share::Difficulty;
-use bp_share_hook::{
-    RejectedReason, SharedAcceptedShare, SharedAcceptedShareSink, SharedRejectedShare,
-    SharedRejectedShareSink, SharedSessionPersistence,
-};
+use bp_share_hook::{RejectedReason, SharedAcceptedShare, SharedRejectedShare};
 
-use crate::hooks::{AcceptedShareSink, RejectedShareSink, SessionPersistence};
 use crate::mining::submit::{RejectReason, ShareAccept};
 
-/// SV2 → shared adapter. Cheap to clone (single `Arc`).
-pub struct Sv2AcceptedShareAdapter<S: SharedAcceptedShareSink + ?Sized> {
-    inner: Arc<S>,
-}
-
-impl<S: SharedAcceptedShareSink + ?Sized> Sv2AcceptedShareAdapter<S> {
-    pub fn new(inner: Arc<S>) -> Self {
-        Self { inner }
+/// The shared view of an accepted SV2 share. `channel_count` is how many
+/// mining channels the connection holds (`> 1` for a bundled rig).
+pub(crate) fn shared_accepted<'a>(
+    address: &'a str,
+    worker: &'a str,
+    session_id_hex: &'a str,
+    user_agent: Option<&'a str>,
+    accept: &ShareAccept,
+    hash_rate: f64,
+    channel_count: u32,
+) -> SharedAcceptedShare<'a> {
+    SharedAcceptedShare {
+        address,
+        worker,
+        session_id: session_id_hex,
+        user_agent,
+        effective_difficulty: accept.effective_difficulty.as_f64(),
+        submission_difficulty: accept.submission_difficulty.as_f64(),
+        is_block_candidate: accept.is_block_candidate,
+        hash_rate,
+        channel_count,
+        ts_ms: bp_common::now_ms(),
+        // Producer-assigned downstream at the single fan-out point; the
+        // protocol side has no global share sequence and no mode-gate, so it
+        // leaves share_id/mode/group_id blank.
+        share_id: "",
+        mode: bp_common::MiningMode::Solo,
+        group_id: None,
     }
 }
 
-#[async_trait]
-impl<S: SharedAcceptedShareSink + ?Sized> AcceptedShareSink for Sv2AcceptedShareAdapter<S> {
-    async fn record_accepted(
-        &self,
-        address: &str,
-        worker: &str,
-        session_id_hex: &str,
-        user_agent: Option<&str>,
-        accept: &ShareAccept,
-        hash_rate: f64,
-        channel_count: u32,
-    ) {
-        self.inner
-            .record_accepted(SharedAcceptedShare {
-                address,
-                worker,
-                session_id: session_id_hex,
-                user_agent,
-                effective_difficulty: accept.effective_difficulty.as_f64(),
-                submission_difficulty: accept.submission_difficulty.as_f64(),
-                is_block_candidate: accept.is_block_candidate,
-                hash_rate,
-                channel_count,
-                ts_ms: bp_common::now_ms(),
-                // Producer-assigned downstream at the single fan-out point;
-                // the per-protocol adapter has no global share sequence and
-                // no mode-gate, so it leaves share_id/mode/group_id blank.
-                share_id: "",
-                mode: bp_common::MiningMode::Solo,
-                group_id: None,
-            })
-            .await;
-    }
-}
-
-/// SV2 → shared rejected-share adapter. Maps SV2's per-protocol reject
-/// reasons into the canonical 3-variant `bp_stats::RejectedReason`.
-/// SV2's extra wire-codes (`bad-extranonce-size`,
-/// `invalid-channel-id`, `invalid-job-id`, `stale-share`,
-/// `difficulty-too-low`) are mapped/dropped here. `BadExtranonceSize`
-/// never reaches this hook (it's pre-share-validation reject — see
+/// Maps SV2's per-protocol reject reasons into the canonical 3-variant
+/// `bp_stats::RejectedReason`. `None` for the protocol-validity rejects
+/// that do not count toward the per-address rejected-stats. `BadExtranonceSize`
+/// never reaches this (it's a pre-share-validation reject — see
 /// `feedback-sv2-bad-extranonce-size-hard-reject`).
-pub struct Sv2RejectedShareAdapter<S: SharedRejectedShareSink + ?Sized> {
-    inner: Arc<S>,
-}
-
-impl<S: SharedRejectedShareSink + ?Sized> Sv2RejectedShareAdapter<S> {
-    pub fn new(inner: Arc<S>) -> Self {
-        Self { inner }
-    }
-}
-
 fn map_sv2_reject(reason: RejectReason) -> Option<RejectedReason> {
     match reason {
         // Retired-past-grace + unknown-job-id both bucket as JobNotFound
@@ -98,90 +62,31 @@ fn map_sv2_reject(reason: RejectReason) -> Option<RejectedReason> {
     }
 }
 
-#[async_trait]
-impl<S: SharedRejectedShareSink + ?Sized> RejectedShareSink for Sv2RejectedShareAdapter<S> {
-    async fn record_rejected(
-        &self,
-        address: Option<&str>,
-        worker: Option<&str>,
-        session_id_hex: &str,
-        reason: RejectReason,
-        difficulty: Difficulty,
-    ) {
-        if let Some(mapped) = map_sv2_reject(reason) {
-            self.inner
-                .record_rejected(SharedRejectedShare {
-                    address,
-                    worker,
-                    session_id: session_id_hex,
-                    reason: mapped,
-                    difficulty: difficulty.as_f64(),
-                    // The producer (Core composite) stamps the group id from
-                    // the mode gate; the protocol adapter has none.
-                    group_id: None,
-                })
-                .await;
-        }
-    }
-}
-
-/// SV2 → shared session-persistence adapter. Symmetric to SV1.
-pub struct Sv2SessionPersistenceAdapter<S: SharedSessionPersistence + ?Sized> {
-    inner: Arc<S>,
-}
-
-impl<S: SharedSessionPersistence + ?Sized> Sv2SessionPersistenceAdapter<S> {
-    pub fn new(inner: Arc<S>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait]
-impl<S: SharedSessionPersistence + ?Sized> SessionPersistence for Sv2SessionPersistenceAdapter<S> {
-    async fn register_session(
-        &self,
-        session_id_hex: &str,
-        address: &str,
-        worker: &str,
-        _channel_id: u32,
-        user_agent: Option<&str>,
-    ) {
-        self.inner
-            .register_session(session_id_hex, address, worker, user_agent)
-            .await;
-    }
-    async fn deregister_session(&self, session_id_hex: &str) {
-        self.inner.deregister_session(session_id_hex).await;
-    }
+/// The shared view of a rejected SV2 share, or `None` when the reject is a
+/// protocol-validity failure the stats do not count (see [`map_sv2_reject`]).
+pub(crate) fn shared_rejected<'a>(
+    address: Option<&'a str>,
+    worker: Option<&'a str>,
+    session_id_hex: &'a str,
+    reason: RejectReason,
+    difficulty: Difficulty,
+) -> Option<SharedRejectedShare<'a>> {
+    Some(SharedRejectedShare {
+        address,
+        worker,
+        session_id: session_id_hex,
+        reason: map_sv2_reject(reason)?,
+        difficulty: difficulty.as_f64(),
+        // The producer (Core composite) stamps the group id from the mode
+        // gate; the protocol side has none.
+        group_id: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bp_jobs_lifecycle::JobClassification;
-    use std::sync::Mutex;
-
-    type SharedTuple = (String, String, String, f64, f64, bool, Option<String>, u32);
-
-    struct CapturingSink {
-        captured: Mutex<Vec<SharedTuple>>,
-    }
-
-    #[async_trait]
-    impl SharedAcceptedShareSink for CapturingSink {
-        async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-            self.captured.lock().unwrap().push((
-                share.address.to_string(),
-                share.worker.to_string(),
-                share.session_id.to_string(),
-                share.effective_difficulty,
-                share.submission_difficulty,
-                share.is_block_candidate,
-                share.user_agent.map(str::to_string),
-                share.channel_count,
-            ));
-        }
-    }
 
     fn synthetic_accept(eff: f64, sub: f64, candidate: bool) -> ShareAccept {
         ShareAccept {
@@ -200,80 +105,63 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn adapter_projects_share_accept_into_shared_view() {
-        let inner = Arc::new(CapturingSink {
-            captured: Mutex::new(Vec::new()),
-        });
-        let adapter = Sv2AcceptedShareAdapter::new(inner.clone());
+    #[test]
+    fn projects_share_accept_into_shared_view() {
         let accept = synthetic_accept(512.0, 8192.0, false);
-        adapter
-            .record_accepted(
-                "bc1qbob",
-                "rig2",
-                "sess-sv2-1",
-                Some("antminer/sv2"),
-                &accept,
-                0.0,
-                4,
-            )
-            .await;
-        let cap = inner.captured.lock().unwrap();
-        assert_eq!(cap.len(), 1);
-        assert_eq!(cap[0].0, "bc1qbob");
-        assert_eq!(cap[0].1, "rig2");
-        assert_eq!(cap[0].2, "sess-sv2-1");
-        assert_eq!(cap[0].3, 512.0);
-        assert_eq!(cap[0].4, 8192.0);
-        assert!(!cap[0].5);
-        assert_eq!(cap[0].6.as_deref(), Some("antminer/sv2"));
-        assert_eq!(cap[0].7, 4, "channel_count forwarded into shared view");
+        let share = shared_accepted(
+            "bc1qbob",
+            "rig2",
+            "sess-sv2-1",
+            Some("antminer/sv2"),
+            &accept,
+            0.0,
+            4,
+        );
+        assert_eq!(share.address, "bc1qbob");
+        assert_eq!(share.worker, "rig2");
+        assert_eq!(share.session_id, "sess-sv2-1");
+        assert_eq!(share.effective_difficulty, 512.0);
+        assert_eq!(share.submission_difficulty, 8192.0);
+        assert!(!share.is_block_candidate);
+        assert_eq!(share.user_agent, Some("antminer/sv2"));
+        assert_eq!(
+            share.channel_count, 4,
+            "channel_count forwarded into shared view"
+        );
     }
 
-    #[tokio::test]
-    async fn adapter_propagates_block_candidate_flag() {
-        let inner = Arc::new(CapturingSink {
-            captured: Mutex::new(Vec::new()),
-        });
-        let adapter = Sv2AcceptedShareAdapter::new(inner.clone());
+    #[test]
+    fn propagates_block_candidate_flag() {
         let accept = synthetic_accept(100.0, 1e15, true);
-        adapter
-            .record_accepted("a", "w", "s", None, &accept, 0.0, 1)
-            .await;
-        assert!(inner.captured.lock().unwrap()[0].5);
+        assert!(shared_accepted("a", "w", "s", None, &accept, 0.0, 1).is_block_candidate);
     }
 
-    /// The adapter is the birth point of `ts_ms` — it must stamp the
-    /// Core accept time so downstream sinks (and, later, the Core→Satellite
-    /// stream) carry the real share time instead of a sink-side `now()`.
-    #[tokio::test]
-    async fn adapter_stamps_accept_time() {
-        struct TsSink {
-            ts: Mutex<Option<i64>>,
-        }
-        #[async_trait]
-        impl SharedAcceptedShareSink for TsSink {
-            async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-                *self.ts.lock().unwrap() = Some(share.ts_ms);
-            }
-        }
-
+    /// The projection is the birth point of `ts_ms` — it must stamp the
+    /// Core accept time so downstream sinks (and the Core→Satellite stream)
+    /// carry the real share time instead of a sink-side `now()`.
+    #[test]
+    fn stamps_accept_time() {
         let before = bp_common::now_ms();
-        let inner = Arc::new(TsSink {
-            ts: Mutex::new(None),
-        });
-        let adapter = Sv2AcceptedShareAdapter::new(inner.clone());
         let accept = synthetic_accept(512.0, 8192.0, false);
-        adapter
-            .record_accepted("a", "w", "s", None, &accept, 0.0, 1)
-            .await;
+        let ts = shared_accepted("a", "w", "s", None, &accept, 0.0, 1).ts_ms;
         let after = bp_common::now_ms();
-
-        let ts = inner.ts.lock().unwrap().expect("share recorded");
         assert!(
             ts >= before && ts <= after,
             "ts_ms must be stamped at accept time (got {ts}, window [{before}, {after}])"
         );
+    }
+
+    /// A protocol-validity reject never reaches the stats sink.
+    #[test]
+    fn a_channel_id_reject_is_not_forwarded() {
+        let r = shared_rejected(
+            Some("a"),
+            Some("w"),
+            "s",
+            RejectReason::InvalidChannelId,
+            Difficulty(1.0),
+        );
+        assert!(r.is_none());
     }
 
     #[test]

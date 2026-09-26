@@ -101,14 +101,12 @@ pub struct MarkMemberConfirmedResult {
     pub member_token: Option<String>,
 }
 
-/// Result of [`BlockpartyService::pending_party_fee_route`]. Wraps the
-/// concrete pool-fee output the Solo-fallback path must emit when the
-/// admin's address belongs to an unconfirmed party.
+/// Result of [`BlockpartyService::pending_party_fee_route`]. Names the
+/// pool-fee address the Solo-fallback path must pay the WHOLE block reward
+/// to when the admin's address belongs to an unconfirmed party.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPartyFeeRoute {
     pub fee_address: AddressId,
-    /// Always 100. Encoded as a field so the type doesn't lie.
-    pub percent: u8,
 }
 
 // ─── Service struct ────────────────────────────────────────────────
@@ -230,10 +228,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
     ) -> Option<PendingPartyFeeRoute> {
         let _gid = self.cache.pending_fee_route_admin(address).await?;
         let fee_address = self.config.fee_address.clone()?;
-        Some(PendingPartyFeeRoute {
-            fee_address,
-            percent: 100,
-        })
+        Some(PendingPartyFeeRoute { fee_address })
     }
 
     /// Member-side lookup. Returns the party's group id if `address`
@@ -989,8 +984,16 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             }
         }
 
+        // Members and join link go with the status flip, in one TX: a dissolved
+        // party must not keep its addresses (UNIQUE (address) would lock them
+        // out of every later party, and the custom-extranonce Solo check
+        // reads the same rows). The history keeps its own split snapshot.
         let now = now_ms();
-        bp_db::update_blockparty_group_dissolved(&self.pool, group_id, now, now).await?;
+        let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
+        bp_db::delete_blockparty_members_for_group(&mut *tx, group_id).await?;
+        bp_db::delete_blockparty_join_link(&mut *tx, group_id).await?;
+        bp_db::update_blockparty_group_dissolved(&mut *tx, group_id, now, now).await?;
+        tx.commit().await.map_err(bp_db::DbError::from)?;
         self.cache
             .set_admin_status(&group.admin_address, group_id, BlockpartyStatus::Dissolved)
             .await;

@@ -385,9 +385,12 @@ impl GroupSoloEngine {
         // Window-mode groups never calendar-reset (the window self-trims); the
         // reset config is reinterpreted as the window length, so leave the cron
         // unscheduled regardless of preset.
-        if PayoutMode::parse_or_default(&group.payout_mode) == PayoutMode::Window {
-            info!(group_id = %group.id, "round-reset cron unscheduled (window payout mode)");
-            return;
+        match PayoutMode::parse_or_default(&group.payout_mode) {
+            PayoutMode::Window => {
+                info!(group_id = %group.id, "round-reset cron unscheduled (window payout mode)");
+                return;
+            }
+            PayoutMode::Prop => {}
         }
         let interval = group
             .round_reset_interval_days
@@ -892,17 +895,21 @@ impl GroupSoloEngine {
         )
         .await?;
 
-        if mode == PayoutMode::Window {
-            info!(%group_id,
-                "group-solo: window mode — no per-block round reset (window self-trims by age)");
-        } else if reset_on_block {
-            if let Err(e) = self.inner.round.reset_for_block_found(&group_key).await {
-                warn!(%group_id, error = %e, "round.reset_for_block_found failed — non-fatal");
+        match mode {
+            PayoutMode::Window => {
+                info!(%group_id,
+                    "group-solo: window mode — no per-block round reset (window self-trims by age)");
             }
-        } else {
-            info!(%group_id,
-                "group-solo: per-block round reset disabled (resetRoundOnBlock=false) — \
-                 round accumulates until calendar/manual reset");
+            PayoutMode::Prop if reset_on_block => {
+                if let Err(e) = self.inner.round.reset_for_block_found(&group_key).await {
+                    warn!(%group_id, error = %e, "round.reset_for_block_found failed — non-fatal");
+                }
+            }
+            PayoutMode::Prop => {
+                info!(%group_id,
+                    "group-solo: per-block round reset disabled (resetRoundOnBlock=false) — \
+                     round accumulates until calendar/manual reset");
+            }
         }
 
         let mut conn = self.inner.round.connection_for_snapshot();
@@ -959,7 +966,6 @@ fn history_rows_from_coinbase(
     total_shares_in_round: i64,
     paid_at: &bp_coinbase_snapshot::PaidAtHeight,
 ) -> Vec<AuditRow> {
-    let t = actual.total_value_sats;
     let mut rows: Vec<AuditRow> = Vec::new();
 
     for (addr_str, paid) in &actual.paid_by_address {
@@ -1002,11 +1008,7 @@ fn history_rows_from_coinbase(
         rows.push(AuditRow {
             address,
             paid_sats: Sats(*paid as i64),
-            percent: if t > 0 {
-                (*paid as f64 / t as f64 * 100.0) as f32
-            } else {
-                0.0
-            },
+            percent: actual.percent_of_total(*paid),
             // Round shares are recorded against the miner's ledger key, not
             // against whatever address the coinbase happened to pay it.
             shares_in_round: round_by_addr

@@ -418,14 +418,22 @@ async fn upsert_client_distinct_sessions_stay_independent() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
+    // Its own address: the sweep tests below commit `mk` rows under
+    // `test_client_addr`/`wkr` while this runs, and a count over that pair
+    // would include them.
+    const ADDR: &str = "test_client_distinct_addr";
+    let at = |session: &str| ClientUpsert {
+        address: ADDR.to_string(),
+        ..mk(session)
+    };
     let mut tx = pool.begin().await.expect("begin tx");
-    upsert_client(&mut *tx, &mk("sessD003")).await.unwrap();
-    upsert_client(&mut *tx, &mk("sessD004")).await.unwrap();
+    upsert_client(&mut *tx, &at("sessD003")).await.unwrap();
+    upsert_client(&mut *tx, &at("sessD004")).await.unwrap();
     let n: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM client_entity
            WHERE address = $1 AND "clientName" = $2"#,
     )
-    .bind("test_client_addr")
+    .bind(ADDR)
     .bind("wkr")
     .fetch_one(&mut *tx)
     .await

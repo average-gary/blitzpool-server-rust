@@ -117,7 +117,7 @@ mod tests {
 
     use bp_common::MiningMode;
     use bp_notifications::command::ChatLanguageMap;
-    use bp_notifications::dispatcher::{DispatcherConfig, NotificationDispatcher};
+    use bp_notifications::dispatcher::NotificationDispatcher;
     use bp_share_stream::{Consumed, StreamConsumer, StreamProducer, BLOCK_FOUND_STREAM_KEY};
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
@@ -149,7 +149,7 @@ mod tests {
     /// applier (dispatcher = None) must never try to notify. Pure, no I/O.
     #[tokio::test]
     async fn notify_is_noop_without_dispatcher() {
-        let ledger = BlockFoundApplier::new(None, None, None, None, None);
+        let ledger = BlockFoundApplier::new(None, None, None, None, None, None);
         // Must return cleanly (no panic, no dispatcher access).
         ledger.notify_block_found(&solo_event()).await;
     }
@@ -168,13 +168,7 @@ mod tests {
         let chat: ChatLanguageMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         Arc::new(NotificationDispatcher::new(
-            pool,
-            DispatcherConfig::default_zurich(),
-            None,
-            None,
-            None,
-            None,
-            chat,
+            pool, None, None, None, None, chat,
         ))
     }
 
@@ -214,8 +208,14 @@ mod tests {
 
         // Notify group: dispatcher present (no adapters → fan-out finds no subs
         // and is a clean no-op), no engines.
-        let notify_applier =
-            BlockFoundApplier::new(None, None, None, Some(no_adapter_dispatcher(pg)), None);
+        let notify_applier = BlockFoundApplier::new(
+            None,
+            None,
+            None,
+            Some(no_adapter_dispatcher(pg)),
+            None,
+            None,
+        );
         let notify_consumer: StreamConsumer<BlockFoundEvent> = StreamConsumer::new(
             redis.clone(),
             BLOCK_FOUND_STREAM_KEY,
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(acked, 1);
 
         // Ledger group: no dispatcher, no engines → Solo branch logs, no notify.
-        let ledger_applier = BlockFoundApplier::new(None, None, None, None, None);
+        let ledger_applier = BlockFoundApplier::new(None, None, None, None, None, None);
         let ledger_consumer: StreamConsumer<BlockFoundEvent> = StreamConsumer::new(
             redis,
             BLOCK_FOUND_STREAM_KEY,

@@ -32,7 +32,7 @@ mod controllers;
 pub mod email_hooks;
 pub mod error;
 pub mod middleware;
-pub mod push_hooks;
+mod mode;
 pub mod response_cache;
 pub mod state;
 pub mod time_range;
@@ -42,7 +42,6 @@ pub use email_hooks::{
     BindingChangeContext, EmailVerificationHooks, NoopVerificationHooks, VerificationContext,
 };
 pub use error::ApiError;
-pub use push_hooks::{FcmRegisterContext, NoopPushHooks, PushHooks, UnifiedPushRegisterContext};
 pub use state::{AppState, SharedState};
 
 use axum::Router;
@@ -67,7 +66,6 @@ where
         .merge(controllers::blockparty::routes())
         .merge(controllers::client::routes())
         .merge(controllers::invitation::routes())
-        .merge(controllers::external_share::routes())
         .merge(controllers::downstream_report::routes())
         .merge(controllers::email::routes())
         .merge(controllers::push::routes())

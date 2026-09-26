@@ -16,6 +16,12 @@
 //! the JDP codec could not see it. Counting the write paths, that one function
 //! existed in four spellings.
 //!
+//! The messages both sub-protocols carry — `SetupConnection` and ext 0x0001
+//! `RequestExtensions`, with their `.Success` / `.Error` replies — are decoded
+//! and encoded here too, for the same reason: they are not mining's or JDP's,
+//! and the per-codec copies were identical down to the owned input struct,
+//! which each client module used to declare for itself.
+//!
 //! [`CodecError`] lives here for the same reason: both codecs return it. It is
 //! not the mining codec's type — it only used to be declared there. The same
 //! goes for the write side: both server tasks put a message into its frame
@@ -23,9 +29,19 @@
 //! with, so `write_message` and `write_raw_frame` live here too.
 
 use stratum_core::codec_sv2::MessageFrame;
+use stratum_core::common_messages_sv2::{
+    SetupConnection, SetupConnectionErrorOwned, SetupConnectionSuccessOwned,
+};
+use stratum_core::extensions_sv2::extensions_negotiation::{
+    RequestExtensions as Sv2RequestExtensions, RequestExtensionsErrorOwned,
+    RequestExtensionsSuccessOwned,
+};
 use stratum_core::framing_sv2::framing::SerializedFrame;
-use stratum_core::parsers_sv2::{AnyMessageOwned, ParserError};
+use stratum_core::parsers_sv2::{
+    AnyMessageOwned, CommonMessagesOwned, ExtensionsNegotiationOwned, ExtensionsOwned, ParserError,
+};
 
+use crate::extensions::RequestExtensions;
 use crate::noise::{NoiseError, NoiseTcpWriteHalf};
 use crate::tokens::Token;
 
@@ -158,4 +174,99 @@ pub(crate) fn token_from_bytes(b: &[u8]) -> Result<Token, CodecError> {
 
 pub(crate) fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255Owned, CodecError> {
     s.try_into().map_err(CodecError::from_conv)
+}
+
+// ── Messages both sub-protocols carry ───────────────────────────────
+
+/// Inputs from a deserialized `SetupConnection` frame, narrowed to what the
+/// handlers read. The mining and the JDP handler both take it.
+#[derive(Clone, Debug)]
+pub struct SetupConnectionInput {
+    pub protocol: u8,
+    pub min_version: u16,
+    pub max_version: u16,
+    pub flags: u32,
+    pub vendor: String,
+    pub firmware: String,
+    pub hardware_version: String,
+    pub device_id: String,
+}
+
+pub(crate) fn decode_setup_connection(
+    m: SetupConnection<'_>,
+) -> Result<SetupConnectionInput, CodecError> {
+    Ok(SetupConnectionInput {
+        protocol: m.protocol as u8,
+        min_version: m.min_version,
+        max_version: m.max_version,
+        flags: m.flags,
+        vendor: utf8_from_bytes(m.vendor.as_bytes())?,
+        firmware: utf8_from_bytes(m.firmware.as_bytes())?,
+        hardware_version: utf8_from_bytes(m.hardware_version.as_bytes())?,
+        device_id: utf8_from_bytes(m.device_id.as_bytes())?,
+    })
+}
+
+pub(crate) fn decode_request_extensions(m: Sv2RequestExtensions<'_>) -> RequestExtensions {
+    RequestExtensions {
+        request_id: m.request_id,
+        requested_extensions: m.requested_extensions.into_inner(),
+    }
+}
+
+pub(crate) fn setup_connection_success(used_version: u16, flags: u32) -> AnyMessageOwned {
+    AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(
+        SetupConnectionSuccessOwned {
+            used_version,
+            flags,
+        },
+    ))
+}
+
+pub(crate) fn setup_connection_error(
+    flags: u32,
+    error_code: String,
+) -> Result<AnyMessageOwned, CodecError> {
+    Ok(AnyMessageOwned::Common(
+        CommonMessagesOwned::SetupConnectionError(SetupConnectionErrorOwned {
+            flags,
+            error_code: str0255(error_code)?,
+        }),
+    ))
+}
+
+pub(crate) fn request_extensions_success(
+    request_id: u16,
+    supported_extensions: Vec<u16>,
+) -> Result<AnyMessageOwned, CodecError> {
+    Ok(AnyMessageOwned::Extensions(
+        ExtensionsOwned::ExtensionsNegotiation(
+            ExtensionsNegotiationOwned::RequestExtensionsSuccess(RequestExtensionsSuccessOwned {
+                request_id,
+                supported_extensions: supported_extensions
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+            }),
+        ),
+    ))
+}
+
+pub(crate) fn request_extensions_error(
+    request_id: u16,
+    unsupported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+) -> Result<AnyMessageOwned, CodecError> {
+    Ok(AnyMessageOwned::Extensions(
+        ExtensionsOwned::ExtensionsNegotiation(ExtensionsNegotiationOwned::RequestExtensionsError(
+            RequestExtensionsErrorOwned {
+                request_id,
+                unsupported_extensions: unsupported_extensions
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+                required_extensions: required_extensions
+                    .try_into()
+                    .map_err(CodecError::from_conv)?,
+            },
+        )),
+    ))
 }

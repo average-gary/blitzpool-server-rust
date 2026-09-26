@@ -14,6 +14,7 @@ use axum::{
     Router,
 };
 use base64::Engine;
+use bp_common::AddressId;
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +68,7 @@ where
     // Canonicalise (lowercase bech32, preserve Base58) so the binding is keyed
     // identically to what every verification gate looks up — otherwise a
     // mixed-case Base58 / upper-case bech32 email binding would never match.
-    let address = crate::utils::normalized_address_id(&body.address)
+    let address = AddressId::normalized(&body.address)
         .map_err(|_| email_error("invalid-address", StatusCode::BAD_REQUEST))?;
     let email = body.email.trim().to_ascii_lowercase();
     if !is_email_shape(&email) {
@@ -199,7 +200,7 @@ where
     // Invalid address returns the empty shape since the lookup
     // naturally returns null (no 4xx on bad address). Canonicalise so the
     // lookup key matches the (canonical) stored binding.
-    let Ok(addr) = crate::utils::normalized_address_id(&address) else {
+    let Ok(addr) = AddressId::normalized(&address) else {
         return Ok(Json(ByAddressResponse {
             email: None,
             verified_at: None,

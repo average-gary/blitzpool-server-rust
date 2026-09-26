@@ -8,9 +8,8 @@
 //! so the caller sees field-level errors before the engine spins up.
 //!
 //! Only knobs the *engine itself* needs at construction live here. Things
-//! like the listener port, vardiff start-difficulty, warmup-shares-per-
-//! session are bp-stratum-v1/v2's concern (warmup specifically lives in
-//! `SessionState` per the 2026-05-16 decision) and not duplicated here.
+//! like the listener port and vardiff start-difficulty are
+//! bp-stratum-v1/v2's concern and not duplicated here.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
@@ -122,12 +121,6 @@ pub struct PplnsEngineConfig {
     /// without taking a dep on bp-stratum-v1.
     pub min_difficulty: u64,
 
-    /// Per-session ledger-warmup gate: first N accepted shares of a
-    /// new session are validated but not credited to the PPLNS
-    /// ledger. Mirrored from the per-port toml for the same reason
-    /// as `min_difficulty`.
-    pub warmup_shares: u32,
-
     /// Blocks between subsidy halvings on the network this pool runs
     /// on — the input to the settlement gate's floor
     /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
@@ -152,7 +145,6 @@ impl Default for PplnsEngineConfig {
             dust_sweep_enabled: true,
             abandoned_balance_days: 90,
             min_difficulty: 500,
-            warmup_shares: 5,
             subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
@@ -165,7 +157,7 @@ impl PplnsEngineConfig {
     pub fn try_new(self) -> Result<Self, ConfigError> {
         // The fee / min-payout / coinbase-budget invariants are shared with
         // the Group-Solo engine; the checks + thresholds live in bp-pplns and
-        // map into this engine's ConfigError via `From` (field order preserved).
+        // pass through this engine's ConfigError unchanged (field order preserved).
         validate_fee_payout_budget(
             self.fee_address.as_ref().map(|a| a.as_str()),
             self.fee_percent,
@@ -204,47 +196,23 @@ impl PplnsEngineConfig {
 /// Field-level validation errors for [`PplnsEngineConfig::try_new`].
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ConfigError {
-    #[error(
-        "no fee_address configured — the pool output is structural under the \
-         weight model (SV2 ext 0x0003 §4). Without it every block of this mode \
-         falls back to a solo coinbase paying 100 % to one miner"
-    )]
-    MissingFeeAddress,
-    #[error(
-        "fee_address {value:?} is not a usable payout address — same effect as \
-         none at all: every block falls back to a solo coinbase"
-    )]
-    InvalidFeeAddress { value: String },
-    #[error("fee_percent must be in [0.0, 100.0] and finite, got {value}")]
-    InvalidFeePercent { value: f64 },
-    #[error("min_payout_sats must be ≥ DUST_LIMIT_SATS ({dust}), got {value}")]
-    MinPayoutBelowDustLimit { value: i64, dust: u64 },
-    #[error("coinbase_weight_budget must be > {min} (base + safety margin), got {value}")]
-    WeightBudgetTooLow { value: u32, min: u32 },
+    /// The fee / min-payout / coinbase-budget checks shared with the other
+    /// payout engine; see [`FeePayoutBudgetError`].
+    #[error(transparent)]
+    FeePayoutBudget(#[from] FeePayoutBudgetError),
     #[error("window_factor must be > 0.0 and finite, got {value}")]
     InvalidWindowFactor { value: f64 },
     #[error("{field} must be > 0, got 0")]
     ZeroUnsignedField { field: &'static str },
 }
 
-impl From<FeePayoutBudgetError> for ConfigError {
-    fn from(e: FeePayoutBudgetError) -> Self {
-        match e {
-            FeePayoutBudgetError::MissingFeeAddress => ConfigError::MissingFeeAddress,
-            FeePayoutBudgetError::InvalidFeeAddress { value } => {
-                ConfigError::InvalidFeeAddress { value }
-            }
-            FeePayoutBudgetError::InvalidFeePercent { value } => {
-                ConfigError::InvalidFeePercent { value }
-            }
-            FeePayoutBudgetError::MinPayoutBelowDust { value, dust } => {
-                ConfigError::MinPayoutBelowDustLimit { value, dust }
-            }
-            FeePayoutBudgetError::WeightBudgetTooLow { value, min } => {
-                ConfigError::WeightBudgetTooLow { value, min }
-            }
-        }
-    }
+/// Epoch-ms before which an owner counts as gone after `abandoned_days`
+/// without a share. The one place that turns `[pplns]
+/// abandoned_balance_days` into a boundary: the dust sweep's abandoned
+/// credits, the window trim's age rule and the ledger summary's abandoned
+/// buckets all read it through here.
+pub(crate) fn abandoned_cutoff_ms(now_ms: i64, abandoned_days: u32) -> i64 {
+    now_ms - (abandoned_days as i64) * 86_400_000
 }
 
 #[cfg(test)]
@@ -271,7 +239,7 @@ mod tests {
     fn the_default_config_is_refused_because_it_has_no_fee_address() {
         assert_eq!(
             PplnsEngineConfig::default().try_new().unwrap_err(),
-            ConfigError::MissingFeeAddress
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::MissingFeeAddress)
         );
     }
 
@@ -286,9 +254,9 @@ mod tests {
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
-            ConfigError::InvalidFeeAddress {
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeeAddress {
                 value: typo.to_string()
-            }
+            })
         );
     }
 
@@ -305,7 +273,7 @@ mod tests {
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
-            ConfigError::InvalidFeePercent { value: -0.1 }
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeePercent { value: -0.1 })
         );
     }
 
@@ -317,7 +285,7 @@ mod tests {
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
-            ConfigError::InvalidFeePercent { value: 100.5 }
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeePercent { value: 100.5 })
         );
     }
 
@@ -330,7 +298,9 @@ mod tests {
         // NaN can't compare equal to NaN in the error variant; just
         // check the variant tag.
         match cfg.try_new().unwrap_err() {
-            ConfigError::InvalidFeePercent { value } => assert!(value.is_nan()),
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::InvalidFeePercent { value }) => {
+                assert!(value.is_nan())
+            }
             other => panic!("expected InvalidFeePercent, got {other:?}"),
         }
     }
@@ -343,10 +313,10 @@ mod tests {
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
-            ConfigError::MinPayoutBelowDustLimit {
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::MinPayoutBelowDust {
                 value: 545,
                 dust: DUST_LIMIT_SATS,
-            }
+            })
         );
     }
 
@@ -366,7 +336,10 @@ mod tests {
             ..valid()
         };
         let err = cfg.try_new().unwrap_err();
-        assert!(matches!(err, ConfigError::WeightBudgetTooLow { .. }));
+        assert!(matches!(
+            err,
+            ConfigError::FeePayoutBudget(FeePayoutBudgetError::WeightBudgetTooLow { .. })
+        ));
     }
 
     #[test]

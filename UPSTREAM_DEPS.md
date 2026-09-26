@@ -5,11 +5,11 @@
 > ops uses this as the bump-checklist (which crates need attention,
 > which are pinned, what could break on update).
 
-**Last touched:** 2026-09-03 — corrected a month of drift. The pins moved to
-upstream tag `v0.7.0` back on 2026-08-03 (in `ebce898`) and **this file was
-not updated with them**, so it still described a fork we no longer use. The
-fork is gone: upstream fixed #541 in `a4a9b840`, which `v0.7.0` carries. See
-§2 for why we sit on the tag and do **not** follow `main`.
+**Last touched:** 2026-09-18. The pins moved to upstream tag `v0.8.0` on
+2026-09-17 (in `b34b4e6`) and **this file was again not updated in the same
+commit**; it was caught a day later. The previous miss (tag `v0.7.0`, a month
+of drift, corrected 2026-09-03) is in the audit log. See §2 for why we sit on
+a tag and do **not** follow `main`.
 
 ---
 
@@ -60,8 +60,8 @@ track them differently.
 - **What's inside (subdirs we care about)**:
   - `stratum-apps/` — crate name `stratum-apps`. Convenience layer:
     Noise-wrapped tokio `TcpStream` (`NoiseTcpStream`,
-    `accept_noise_connection`), `task_manager`, `custom_mutex`,
-    `key_utils`. Feature-flagged (`pool` / `jd_server` / `jd_client` /
+    `accept_noise_connection`), `task_manager`, `key_utils`
+    (`custom_mutex` was removed upstream in `v0.8.0`). Feature-flagged (`pool` / `jd_server` / `jd_client` /
     `translator` / `mining_device`). We use feature `pool`.
   - `bitcoin-core-sv2/` — crate name `bitcoin_core_sv2`. IPC bridge to
     bitcoin-core v31 over Cap'n-Proto. Provides
@@ -105,15 +105,19 @@ crate uses `<dep> = { workspace = true }` so the version is centralised.
 
 | Crate | Source | Pin type | Current pin |
 |---|---|---|---|
-| `stratum-core` | crates.io | `version` | `0.5.1` (→ `binary_sv2 v6`) |
-| `stratum-apps` | `github.com/stratum-mining/sv2-apps.git` (upstream) | `tag = "..."` | `v0.7.0` |
-| `bitcoin_core_sv2` | `github.com/stratum-mining/sv2-apps.git` (upstream) | `tag = "..."` | `v0.7.0` |
+| `stratum-core` | crates.io | `version` | `0.6.0` (→ `binary_sv2 v7`) |
+| `stratum-apps` | `github.com/stratum-mining/sv2-apps.git` (upstream) | `tag = "..."` | `v0.8.0` |
+| `bitcoin_core_sv2` | `github.com/stratum-mining/sv2-apps.git` (upstream) | `tag = "..."` | `v0.8.0` |
+| `jd_server_sv2` | `github.com/stratum-mining/sv2-apps.git` (upstream) | `tag = "..."` | `v0.8.0` |
 
-**Why they must agree**: `bitcoin_core_sv2` at `v0.7.0` *transitively* pins
-`stratum-core = "0.5.1"` from crates.io. We declare the SAME `0.5.1` at the
+**Why they must agree**: `bitcoin_core_sv2` at `v0.8.0` *transitively* pins
+`stratum-core = "0.6.0"` from crates.io. We declare the SAME `0.6.0` at the
 workspace level so Cargo de-duplicates into one `stratum-core` build instead
-of two. Both sv2-apps crates carry the same tag for the same reason — a
-mismatch splits the transitive `stratum` graph and the build breaks.
+of two. All three sv2-apps crates carry the same tag for the same reason — a
+mismatch splits the transitive `stratum` graph and the build breaks. It is
+not only a build-size concern: `jdp_hooks.rs` hands `DeclareMiningJobOwned`
+values to `jd_server_sv2`, and two `binary_sv2` majors side by side do not
+type-check.
 
 We consume the **`v31x`** backend (prod runs Bitcoin Core v31):
 `bitcoin_core_sv2::unix_capnp::v31x::{template_distribution_protocol,
@@ -123,35 +127,40 @@ module; it landed in `v0.7.0` and our call sites already use it.)
 
 ### ⚠️ Why we sit on the tag and do NOT follow upstream `main`
 
-This is the one thing to read before proposing a bump. Since roughly
-2026-08, upstream `main` no longer pins `stratum-core` to a crates.io
-version — it tracks a moving branch:
+This is the one thing to read before proposing a bump. Between its release
+tags, upstream `main` does not pin `stratum-core` to a crates.io version; it
+tracks a moving branch:
 
 ```toml
-# sv2-apps main, bitcoin-core-sv2/Cargo.toml
+# sv2-apps main between tags, bitcoin-core-sv2/Cargo.toml
 stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main" }
 ```
 
 Its history is a stream of `chore(deps): update stratum-core to <sha>`
-commits. Following `main` therefore means:
+commits (50 of them between `v0.7.0` and `v0.8.0`). Following `main`
+therefore means:
 
 - **No reproducible build.** The dependency resolves to whatever that branch
   points at, recorded only as a Cargo.lock SHA.
-- **A `binary_sv2` major bump comes with it** (6 → 7). The 0.5.0 move alone
-  cost ~63 migrated call sites; expect the same class of work again.
-- Tags remain the only reproducible anchor. `v0.7.0` is the newest.
+- **Every `binary_sv2` major lands unannounced.** The 6 → 7 move (borrowed
+  `X<'a>` and owned `XOwned` wire types split, `Sv2Frame` replaced by
+  `MessageFrame` / `SerializedFrame`) arrived that way.
+- Tags remain the only reproducible anchor: the release commit switches the
+  pin back to a crates.io version (`946e7fdf` did that for `v0.8.0`).
+  `v0.8.0` is the newest.
 
 So: bump **tag to tag**, never onto `main`, and only when a tag carries
 something we actually need. Drift on its own only adds risk — that rule has
-held through three bumps now.
+held through four bumps now.
 
 #### When to bump `stratum-core` (crates.io semver)
 
-`stratum-core` is a crates.io version pin (`"0.5.1"`). It moves only
+`stratum-core` is a crates.io version pin (`"0.6.0"`). It moves only
 when we bump the sv2-apps **tag** to a release that pins a newer `stratum-core`
 (each release pins an exact crates.io version). Bumping can introduce
 breaking changes (renamed types, field-shape changes, message-variant
-additions) — e.g. the `0.4.0 → 0.5.0` bump brought `binary_sv2 v6`.
+additions) — e.g. the `0.4.0 → 0.5.0` bump brought `binary_sv2 v6`, and
+`0.5.1 → 0.6.0` brought `binary_sv2 v7`.
 
 **Trigger**: when the `sv2-apps` tag we track moves to a release that pins
 a newer `stratum-core`. Otherwise leave alone — drift
@@ -170,10 +179,10 @@ version identical to what the pinned `bitcoin_core_sv2` pins.
    wire-codec tests if any SV2 byte-layout drifted (very unusual).
 5. Document the new commit in this file's audit log below.
 
-#### When to bump `bitcoin_core_sv2` + `stratum-apps` (tag-pinned)
+#### When to bump `bitcoin_core_sv2` + `stratum-apps` + `jd_server_sv2` (tag-pinned)
 
-Both carry the **same** sv2-apps tag. Bumping one without the other breaks
-the build (transitive `stratum` graph disagreement).
+All three carry the **same** sv2-apps tag. Bumping one without the others
+breaks the build (transitive `stratum` graph disagreement).
 
 **Trigger**: bitcoin-core protocol changes (new TDP/JDP message
 variants), security fixes to sv2-apps, or when we need a fresh
@@ -187,19 +196,20 @@ pinned rev.
    `stratum-apps/Cargo.toml` changes.
 2. Pick the target **tag** (`git -C ~/github_repos/sv2-apps tag | sort -V`).
    Never a branch — see §2 for why.
-3. Update **both** lines in workspace `Cargo.toml`:
+3. Update **all three** lines in workspace `Cargo.toml`:
    ```toml
    bitcoin_core_sv2 = { ... tag = "<new>" }
    stratum-apps     = { ... tag = "<new>", features = ["pool"] }
+   jd_server_sv2    = { ... tag = "<new>" }
    ```
-   The tag MUST match between the two lines so Cargo dedupes the
+   The tag MUST match between the three lines so Cargo dedupes the
    transitive `stratum` crate-graph.
 4. Reconcile `stratum-core`: read `bitcoin-core-sv2/Cargo.toml` at the new
    tag and copy the crates.io version it pins into our workspace pin.
    ⚠️ If that tag pins `stratum-core` by **git branch** rather than by
    version, stop and re-read §2 — that is the unreproducible case, and
    taking it means a `binary_sv2` major migration.
-5. `cargo update -p bitcoin_core_sv2 -p stratum-apps -p stratum-core`.
+5. `cargo update -p bitcoin_core_sv2 -p stratum-apps -p jd_server_sv2 -p stratum-core`.
 6. **Verify bitcoin-core version compatibility**: the
    `bitcoin_core_sv2` crate's Cap'n-Proto schema is pinned to a
    specific bitcoin-core release. If we bump, confirm the schema
@@ -247,8 +257,10 @@ discipline, no special procedure.
 
 Run this checklist on any rev/branch bump in section A:
 
-- [ ] Both sv2-apps crates (`bitcoin_core_sv2` + `stratum-apps`) carry
-      the **same** tag — and it is a tag, not `branch = "main"`
+- [ ] All three sv2-apps crates (`bitcoin_core_sv2` + `stratum-apps` +
+      `jd_server_sv2`) carry the **same** tag — and it is a tag, not
+      `branch = "main"`
+- [ ] **This file is updated in the same commit** (missed twice so far)
 - [ ] `stratum-core` pin doesn't conflict with what sv2-apps
       transitively requires (Cargo will warn loudly if it does)
 - [ ] `cargo update -p <bumped-crates>` ran cleanly
@@ -283,6 +295,7 @@ Run this checklist on any rev/branch bump in section A:
 | 2026-06-25 | `bitcoin_core_sv2` + `stratum-apps` | `4c0a6568` (0.2.0) → **FORK** `8f7043b6` (0.4.0) | Took the #516 multi-version refactor (`unix_capnp::v30x/v31x` + `common`) early, on our schedule, rather than mid-production. Refactor is unreleased (upstream `main` `27985c63`, no tag); fork = that commit + ONE patch carrying the #541 min_interval skip-instead-of-sleep fix (still unfixed upstream). Adaptation was tiny: wrapper imports → `unix_capnp::v31x` + `common::job_declaration_protocol::io`, one `error_code.to_string()`. `cargo test-strict` GREEN (1695 passed); v31x TDP+JDP regtests pass against real Core v31. stratum-core stays branch=main. Revert recipe: §2 "FORK pin". | feature branch `bump-bitcoin-core-sv2-0.4.0` |
 | 2026-07-16 | `bitcoin_core_sv2` + `stratum-apps` + `stratum-core` | **FORK** `8f7043b6` (main `27985c63`) → **FORK** `c2cf6f2f` (release tag `v0.6.0`); `stratum-core` git-`main` `7af1b737` (0.4.0) → crates.io `0.5.0` | Moved off tracking upstream `main` onto the first tagged release containing the refactor (`v0.6.0`), rebasing our one #541 skip-patch onto it. v0.6.0 pins `stratum-core 0.5.0` = **`binary_sv2 v6`**, which dropped `inner_as_ref()`/`Seq::to_vec()` → migrated ~63 call sites (`.as_bytes()` for `B0xx`/`U256`, `.as_slice()`/`.iter_bytes()` for `Seq`, `TryFrom` for `Seq` construction) across `bp-template-distribution`, `bp-job-declaration`, `bp-stratum-v2` codecs + regtests. v0.6.0 keeps the `common` module (the `runtime_api` rename is post-v0.6.0 on `main` — deferred). `cargo test-strict` GREEN (1316 passed); TDP/JDP/mining/block-submit regtests pass against real Core v31 (blocks accepted). Revert recipe: §2 "FORK pin". | feature branch `migrate/sv2-apps-v0.6.0` |
 | 2026-08-03 | `bitcoin_core_sv2` + `stratum-apps` + `stratum-core` | **FORK** `c2cf6f2f` (tag `v0.6.0` + patch) → **upstream** tag `v0.7.0`; `stratum-core` crates.io `0.5.0` → `0.5.1` | **Fork dropped — upstream fixed the reason for it.** `a4a9b840` (*throttle fee templates inside waitNext instead of sleeping*) supersedes our one skip-patch, and issue #541 is closed; `v0.7.0` carries it, so there is nothing left to carry ourselves. The tag also lands the `common` → `runtime_api` rename that v0.6.0 had deferred — our call sites use `runtime_api` accordingly. Still the `v31x` backend against Core v31. ⚠️ This bump rode along inside an unrelated PR and **this file was not updated with it**; the drift was only caught on 2026-09-03, a month later. That is exactly what the header rule exists to prevent. | `ebce898` (inside PR #11) |
+| 2026-09-17 | `bitcoin_core_sv2` + `stratum-apps` + `jd_server_sv2` + `stratum-core` | tag `v0.7.0` → tag `v0.8.0` (rev `7f490743`); `stratum-core` crates.io `0.5.1` → `0.6.0` | Took the first tag after `v0.7.0`: it pins `stratum-core` to crates.io again and carries `caeda86b` (*stage declared txs until checkBlock succeeds*), the `MempoolMirror` leak that runs inside OUR process via `BitcoinCoreIPCEngine`. Cost: **`binary_sv2 v7`** splits borrowed `X<'a>` from owned `XOwned` wire types and drops `into_static()`; `Sv2Frame` became `MessageFrame` / `SerializedFrame`; the noise helpers lost their `<Message>` generic; `custom_mutex` is gone. Decode now borrows from the frame, encode builds owned messages. Workspace MSRV 1.85 → 1.88 (upstream's). Still `v30x` + `v31x` only, no Core v32 backend (#593 not landed). Full suite 2253 passed, all 24 regtest binaries ran against real Core v31. ⚠️ This file was not updated in that commit; corrected 2026-09-18. | `b34b4e6` |
 
 ---
 
@@ -294,10 +307,10 @@ omission survives onboarding:
 | Component | Source | Why we skip |
 |---|---|---|
 | `pool_sv2` | `sv2-apps/pool-apps/pool/` | Reference pool binary. Different channel topology and different hook points than ours. We use it as a behaviour reference (see `mining_message_handler.rs` for the `bad-extranonce-size` wire-code precedent — see memory `feedback-sv2-bad-extranonce-size-hard-reject`), never as a library. |
-| `jd_server_sv2` | `sv2-apps/pool-apps/jd-server/` | Designed as a standalone service tightly coupled to its own bitcoin-core IPC wiring. We can't drop it in as a library — we write our own JDS state machine in `bp-stratum-v2/src/jdp/*` on top of the message types in `stratum-core::job_declaration_sv2`. |
+| `jd_server_sv2` as a **service** | `sv2-apps/pool-apps/jd-server/` | We do not run it and write our own JDS state machine in `bp-stratum-v2/src/jdp/*`. We DO depend on the crate as a library for exactly one item, `job_declarator::job_validation::bitcoin_core_ipc::BitcoinCoreIPCEngine` (declared-job validation through Core's `checkBlock`, used in `bin/blitzpool/src/jdp_hooks.rs`), which is why it is pinned in §2 A. |
 | `jd_client_sv2` / `translator_sv2` / `mining_device_sv2` | `sv2-apps/miner-apps/*` | Miner-side reference binaries. We're a pool, not a miner. |
 | `sv1_api` | `stratum-core` (feature-gated `sv1`) | We use our own SV1 stack (`bp-stratum-v1`). It predates this dependency set and carries pool-side behaviour the generic API does not. |
-| `with_buffer_pool` | feature on `stratum-core` + `stratum-apps` | Object-pooling for serialisation. Defer until profiling shows a hot path benefiting. |
+| `with_buffer_pool` as our own choice | feature on `stratum-core` + `stratum-apps` | Not something we opted into: `stratum-apps`' `pool` feature enables it, so it is on. We have not profiled it and make no claim about its effect. |
 | `monitoring` | feature on `stratum-apps` | HTTP-API for channel metrics. Our own metrics path lives in `bp-metrics` (Phase 6). |
 
 Updating these decisions: when one of these gets adopted (e.g. a
@@ -311,17 +324,24 @@ to remove the deferred status + document why in the audit log.
 When prepping a bump:
 
 ```bash
-# stratum-mining/stratum changes since our pinned commit
-git -C ~/github_repos/stratum log --oneline v0.5.1..main | head -40
+# stratum-mining/stratum changes since the commit our stratum-core was
+# published from. That repo's tags are v1.x and do not follow the crate
+# version, so take the commit from the published crate itself:
+SHA=$(grep -o '"sha1": "[0-9a-f]*"' \
+  ~/.cargo/registry/src/*/stratum-core-0.6.0/.cargo_vcs_info.json | cut -d'"' -f4)
+git -C ~/github_repos/stratum log --oneline "$SHA"..origin/main | head -40
 
 # sv2-apps changes since our pinned tag
-git -C ~/github_repos/sv2-apps log --oneline v0.7.0..main | head -40
+git -C ~/github_repos/sv2-apps log --oneline v0.8.0..origin/main | head -40
 
 # bitcoin_core_sv2-specific changes
-git -C ~/github_repos/sv2-apps log --oneline v0.7.0..main -- bitcoin-core-sv2/
+git -C ~/github_repos/sv2-apps log --oneline v0.8.0..origin/main -- bitcoin-core-sv2/
 
 # stratum-apps-specific changes
-git -C ~/github_repos/sv2-apps log --oneline v0.7.0..main -- stratum-apps/
+git -C ~/github_repos/sv2-apps log --oneline v0.8.0..origin/main -- stratum-apps/
+
+# jd_server_sv2-specific changes (we use only the validation engine)
+git -C ~/github_repos/sv2-apps log --oneline v0.8.0..origin/main -- pool-apps/jd-server/
 ```
 
 Look for:

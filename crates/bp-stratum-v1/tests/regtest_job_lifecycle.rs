@@ -26,6 +26,7 @@
 use std::time::Duration;
 
 use bitcoin::Network;
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_stratum_v1::{PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
 use bp_template_distribution::{TdpConfig, TdpHandle};
@@ -70,8 +71,11 @@ async fn sv1_job_lifecycle_stale_and_pruning_against_regtest() {
     height = generate_and_assert_height(&node, height).await;
 
     let mut server_config = ServerConfig::defaults_for(Network::Regtest);
-    server_config.stale_grace_ms = GRACE_MS;
-    server_config.job_retention_ms = RETENTION_MS;
+    server_config.lifecycle = LifecycleConfig {
+        grace_ms: GRACE_MS,
+        retention_ms: RETENTION_MS,
+        ..LifecycleConfig::DEFAULT
+    };
     let server = StratumV1Server::spawn(
         server_config,
         updates_rx,

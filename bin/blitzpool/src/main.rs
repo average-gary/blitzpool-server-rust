@@ -60,7 +60,6 @@ mod jdp_hooks;
 mod listeners;
 mod live_mode_marker;
 mod live_sessions;
-mod network;
 mod network_difficulty;
 mod payout_identities;
 mod payout_resolver;
@@ -152,7 +151,7 @@ struct Cli {
     /// SV1+SV2 Stratum listeners (solo + solo-high-diff + optionally
     /// pplns + pplns-high-diff). Exits cleanly once all listeners
     /// are up. Each port multiplexes SV1 + SV2 via
-    /// [`bp_protocol_detect`]; JDP runs on its own `[sv2].jdp_port`
+    /// first-byte detection in `stratum.rs`; JDP runs on its own `[sv2].jdp_port`
     /// and is verified together with the stratum stack.
     #[arg(long)]
     check_stratum: bool,
@@ -779,6 +778,7 @@ async fn main() -> ExitCode {
             engines.blockparty.clone(),
             None,
             Some(handles.redis.clone()),
+            Some(settle_signal.clone()),
         );
         let bf_redis = handles
             .dedicated_redis(&cfg.redis, "block-found-ledger")
@@ -801,8 +801,14 @@ async fn main() -> ExitCode {
                 let bf_notify_redis = handles
                     .dedicated_redis(&cfg.redis, "block-found-notify")
                     .await;
-                let applier =
-                    crate::block_sink::BlockFoundApplier::new(None, None, None, Some(d), None);
+                let applier = crate::block_sink::BlockFoundApplier::new(
+                    None,
+                    None,
+                    None,
+                    Some(d),
+                    None,
+                    None,
+                );
                 Some(crate::block_found_consumer::spawn(
                     bf_notify_redis,
                     applier,
@@ -972,7 +978,7 @@ async fn main() -> ExitCode {
                         // here would resolve every rotating miner to its
                         // `payout_id` as an address and fail the coinbase.
                         engines.payout_identities.clone(),
-                        crate::network::config_network_to_bitcoin(cfg.network),
+                        crate::boot::bitcoin_network(cfg.network),
                     ));
                 // Spawn the JDP template-tx cache when the pool needs the txs
                 // (`jdp_orphan_submitblock` → reconstruct the full block +
@@ -995,32 +1001,18 @@ async fn main() -> ExitCode {
                     None
                 };
                 // Ledger fan-out for JDC-found blocks. Its own sink instance
-                // (all cheap handle clones) wired exactly like the Stratum
-                // ones, so a declared block books through the same path a
-                // pool-built one does.
-                let jdp_ledger_booker = {
-                    let mut sink =
-                        crate::block_sink::TdpBlockSubmissionSink::new(tdp_handle.clone())
-                            .with_network(crate::network::config_network_to_bitcoin(cfg.network))
-                            .with_fanout(
-                                engines.mode_gate.clone(),
-                                engines.pplns.clone(),
-                                engines.group_solo.clone(),
-                                dispatcher.clone(),
-                                handles.bitcoin_rpc.clone(),
-                            )
-                            .with_blockparty(engines.blockparty.clone())
-                            .with_pool(handles.db.pool().clone())
-                            .with_redis(handles.redis.clone());
-                    if is_front {
-                        sink =
-                            sink.with_block_found_producer(bp_share_stream::StreamProducer::new(
-                                handles.redis.clone(),
-                                bp_share_stream::BLOCK_FOUND_STREAM_KEY,
-                            ));
-                    }
-                    Some(std::sync::Arc::new(sink))
-                };
+                // (all cheap handle clones), built by the same constructor as
+                // the Stratum ones, so a declared block books through the same
+                // path a pool-built one does.
+                let jdp_ledger_booker =
+                    std::sync::Arc::new(crate::block_sink::TdpBlockSubmissionSink::wired(
+                        tdp_handle.clone(),
+                        &cfg,
+                        &handles,
+                        &engines,
+                        dispatcher.clone(),
+                        settle_signal.clone(),
+                    ));
                 let jdp = match jdp::spawn(
                     &cfg,
                     jdp_bridge,
@@ -1354,7 +1346,7 @@ fn print_stratum_error_help(err: &StratumSpawnError) {
                  non-empty when set)."
             );
         }
-        StratumSpawnError::Sv2(stratum_v2::StratumV2SpawnError::AuthorityKeyMissing) => {
+        StratumSpawnError::Sv2(stratum_v2::StratumV2SpawnError::PrivkeyMissing) => {
             eprintln!(
                 "hint: SV2 needs `[sv2] authority_privkey_hex` (32-byte \
                  secp256k1 secret key, hex-encoded). Generate one with \

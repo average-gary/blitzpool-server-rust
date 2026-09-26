@@ -992,6 +992,38 @@ pub async fn find_addresses_for_ntfy_listener(pool: &PgPool) -> Result<Vec<Addre
     Ok(rows.into_iter().map(|r| r.address).collect())
 }
 
+/// Every address with a live subscription on ANY transport that carries
+/// best-difficulty notifications: Telegram, ntfy or push. The best-difficulty
+/// cron scans exactly these.
+///
+/// Deliberately NOT filtered on `bestDiffNotificationsEnabled`. The flag is
+/// honoured per transport at send time; the scan also keeps each address's
+/// tracker baseline current, so a user who switches best-diff back on is not
+/// greeted with a stale "new best" for work done while it was off.
+///
+/// Scanning push rows only (what the cron used to do) meant an address
+/// subscribed on Telegram or ntfy alone never got a best-diff message,
+/// whatever its flag said.
+pub async fn find_best_difficulty_scan_addresses(pool: &PgPool) -> Result<Vec<AddressId>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT address AS "address!: AddressId"
+           FROM telegram_subscriptions_entity
+           WHERE "deletedAt" IS NULL
+           UNION
+           SELECT address AS "address!: AddressId"
+           FROM ntfy_subscriptions_entity
+           WHERE "deletedAt" IS NULL
+           UNION
+           SELECT address AS "address!: AddressId"
+           FROM push_subscription_entity
+           WHERE "deletedAt" IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows.into_iter().map(|r| r.address).collect())
+}
+
 /// Every address that has at least one **device-status** subscriber, on
 /// either transport that carries the notification (Telegram and push;
 /// ntfy is deliberately not routed for device status).

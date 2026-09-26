@@ -48,8 +48,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bp_common::{AddressId, Sats, StreamKind};
-use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
+use bp_common::{AddressId, StreamKind};
+use bp_stratum_v2::bridge::{
+    BuiltPayoutDistribution, JdpDeclaredJobRegistry, PayoutDistributionEntry,
+};
 use bp_stratum_v2::extensions::{
     encode_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
@@ -59,16 +61,15 @@ use bp_stratum_v2::jdp::client::{
     FLAG_DECLARE_TX_DATA,
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
-    encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
+    designated_output_blob, CandidateBacking, PayoutBooking,
 };
 use bp_stratum_v2::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
 use bp_stratum_v2::jdp_server::{
-    AllocateOutcome, BuiltPayoutDistribution, CurrentPrevHashProvider, JdpAllocateResolver,
-    JdpBlockSubmissionSink, JdpServerHooks, PayoutDistributionSource, StratumV2JdpServer,
-    TailoredDistribution,
+    AllocateOutcome, CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink,
+    JdpServerHooks, PayoutDistributionSource, StratumV2JdpServer, TailoredDistribution,
 };
 use bp_stratum_v2::jdp_server_codec::EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION;
-use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+use bp_stratum_v2::noise::NoiseConfig;
 use bp_stratum_v2::tokens::Token;
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
@@ -189,7 +190,6 @@ impl JdpAllocateResolver for BaseModeAllocateResolver {
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
-        _remote_addr: &str,
         payout_distribution_negotiated: bool,
     ) -> AllocateOutcome {
         let Some(miner_address) = parse_user_identifier_as_address(user_identifier) else {
@@ -198,14 +198,11 @@ impl JdpAllocateResolver for BaseModeAllocateResolver {
         let coinbase_outputs = if payout_distribution_negotiated {
             Vec::new()
         } else {
-            match encode_coinbase_outputs(
+            match bp_mining_job::address_to_script(
                 bitcoin::Network::Regtest,
-                &[DynamicOutput {
-                    address: miner_address.clone(),
-                    sats: Sats(0),
-                }],
+                miner_address.as_str(),
             ) {
-                Ok(bytes) => bytes,
+                Ok(script) => designated_output_blob(&script),
                 Err(_) => {
                     return AllocateOutcome::Refused {
                         reason: "fixture address does not encode",
@@ -257,8 +254,7 @@ impl JdpBlockSubmissionSink for RecordingSink {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jdp_push_distribution_end_to_end() {
-    let noise_config = NoiseConfig::parse_strings(TEST_PUB, TEST_PRV, DEFAULT_CERT_VALIDITY)
-        .expect("noise config");
+    let noise_config = NoiseConfig::new(TEST_PUB.parse().unwrap(), TEST_PRV.parse().unwrap());
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
     let sink = Arc::new(RecordingSink::default());
 
@@ -296,11 +292,11 @@ async fn jdp_push_distribution_end_to_end() {
     let server_accept = server.clone();
     let accept_handle = tokio::spawn(async move {
         loop {
-            let Ok((socket, peer)) = listener.accept().await else {
+            let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
             socket.set_nodelay(true).ok();
-            server_accept.accept_connection(socket, peer.to_string());
+            server_accept.accept_connection(socket);
         }
     });
 
@@ -795,13 +791,15 @@ fn conformant_suffix(pool: &bitcoin::TxOut, payouts: &[WeightedOutput], dust: &[
 fn entry_with_id(id: u64) -> PayoutDistributionEntry {
     PayoutDistributionEntry {
         distribution_id: id,
-        pool_payout: pool_slot(),
-        payouts: miner_slots(),
-        dust_limits: dust_limits(),
-        additional_outputs: Vec::new(),
-        reference_reward_sats: REFERENCE_REWARD,
-        payouts_fingerprint: Some(FINGERPRINT),
-        bookable: true,
+        built: BuiltPayoutDistribution {
+            pool_payout: pool_slot(),
+            payouts: miner_slots(),
+            dust_limits: dust_limits(),
+            additional_outputs: Vec::new(),
+            reference_reward_sats: REFERENCE_REWARD,
+            payouts_fingerprint: Some(FINGERPRINT),
+            bookable: true,
+        },
         accounting: bp_stratum_v2::bridge::DistributionAccounting::PoolWide,
         jdp_session_id: None,
         published_at_ms: 2_000,
@@ -1073,8 +1071,7 @@ async fn try_read_jdc(reader: &mut Reader, within: Duration) -> Option<JdcInboun
 /// `custom-jobs-require-solo` — a wrong distribution traded for a fatal one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_is_served_nothing_until_its_mode_is_known() {
-    let noise_config = NoiseConfig::parse_strings(TEST_PUB, TEST_PRV, DEFAULT_CERT_VALIDITY)
-        .expect("noise config");
+    let noise_config = NoiseConfig::new(TEST_PUB.parse().unwrap(), TEST_PRV.parse().unwrap());
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
     let source = Arc::new(ModeGatedSource {
         known: AtomicBool::new(false),
@@ -1104,11 +1101,11 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
     let server_accept = server.clone();
     let accept_handle = tokio::spawn(async move {
         loop {
-            let Ok((socket, peer)) = listener.accept().await else {
+            let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
             socket.set_nodelay(true).ok();
-            server_accept.accept_connection(socket, peer.to_string());
+            server_accept.accept_connection(socket);
         }
     });
 
@@ -1397,8 +1394,7 @@ fn spawn_jdp_server(
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     interval: Duration,
 ) -> StratumV2JdpServer {
-    let noise_config = NoiseConfig::parse_strings(TEST_PUB, TEST_PRV, DEFAULT_CERT_VALIDITY)
-        .expect("noise config");
+    let noise_config = NoiseConfig::new(TEST_PUB.parse().unwrap(), TEST_PRV.parse().unwrap());
     let mut hooks = JdpServerHooks::no_op();
     hooks.distribution_source = source;
     hooks.prev_hash_provider = Arc::new(FixedPrevHash);
@@ -1413,11 +1409,11 @@ async fn accept_loop(
     let addr = listener.local_addr().expect("local_addr");
     let handle = tokio::spawn(async move {
         loop {
-            let Ok((socket, peer)) = listener.accept().await else {
+            let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
             socket.set_nodelay(true).ok();
-            server.accept_connection(socket, peer.to_string());
+            server.accept_connection(socket);
         }
     });
     (addr, handle)

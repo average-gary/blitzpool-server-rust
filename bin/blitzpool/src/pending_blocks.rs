@@ -66,16 +66,46 @@ pub(crate) struct PendingBlock {
     /// The weights fingerprint the winning job carried.
     #[serde(default)]
     pub payouts_fingerprint: Option<[u8; 32]>,
-    /// `Some` → Group-Solo, `None` → PPLNS.
+    /// `Some` → Group-Solo, `None` → PPLNS. Branch on
+    /// [`PendingBlock::mode`], not on this field.
     #[serde(default)]
     pub group: Option<PendingGroup>,
 }
 
-/// Persist a pending block under `key`, field = block hash (idempotent —
+/// Which engine settles a block. The stored shape stays `group: Option`:
+/// parked blocks carry no TTL, so a format change would have the watcher
+/// prune every block parked before the deploy as unparsable.
+pub(crate) enum SettlementMode<'a> {
+    Pplns,
+    GroupSolo(&'a PendingGroup),
+}
+
+impl<'a> SettlementMode<'a> {
+    pub(crate) fn of(group: Option<&'a PendingGroup>) -> Self {
+        match group {
+            Some(g) => Self::GroupSolo(g),
+            None => Self::Pplns,
+        }
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Pplns => "pplns",
+            Self::GroupSolo(_) => "group-solo",
+        }
+    }
+}
+
+impl PendingBlock {
+    pub(crate) fn mode(&self) -> SettlementMode<'_> {
+        SettlementMode::of(self.group.as_ref())
+    }
+}
+
+/// Write `pending` into the HASH at `key`, field = block hash (idempotent —
 /// the same hash overwrites). No TTL, so `volatile-lru` eviction (which
-/// only touches keys with an expiry) can never drop a pending apply
-/// inside the confirmation window.
-pub(crate) async fn put_pending_at(
+/// only touches keys with an expiry) can never drop it.
+async fn put_at(
     conn: &mut ConnectionManager,
     key: &str,
     pending: &PendingBlock,
@@ -92,24 +122,25 @@ pub(crate) async fn put_pending_block(
     conn: &mut ConnectionManager,
     pending: &PendingBlock,
 ) -> Result<(), RedisError> {
-    put_pending_at(conn, PENDING_KEY, pending).await
+    put_at(conn, PENDING_KEY, pending).await
 }
 
-/// Drop a pending entry by hash under `key` (applied or orphaned). Idempotent.
-pub(crate) async fn remove_pending_at(
+/// Copy a block no automatic path can book into [`UNBOOKABLE_KEY`]. The
+/// caller removes it from the pending store only once this succeeded.
+pub(crate) async fn park_unbookable_block(
     conn: &mut ConnectionManager,
-    key: &str,
-    block_hash: &str,
+    pending: &PendingBlock,
 ) -> Result<(), RedisError> {
-    conn.hdel::<_, _, ()>(key, block_hash).await
+    put_at(conn, UNBOOKABLE_KEY, pending).await
 }
 
-/// Drop a pending block by hash (applied or orphaned). Idempotent.
+/// Drop a pending block by hash (applied, orphaned, unparsable or moved
+/// to the unbookable store). Idempotent.
 pub(crate) async fn remove_pending_block(
     conn: &mut ConnectionManager,
     block_hash: &str,
 ) -> Result<(), RedisError> {
-    remove_pending_at(conn, PENDING_KEY, block_hash).await
+    conn.hdel::<_, _, ()>(PENDING_KEY, block_hash).await
 }
 
 /// How many blocks are parked under `key`.
@@ -126,14 +157,13 @@ pub(crate) async fn count_pending_at(
     conn.hlen(key).await
 }
 
-/// Load every parked block under `key`. A field whose JSON fails to parse
+/// Load every block in the pending store. A field whose JSON fails to parse
 /// (corrupt / schema-drifted) is skipped, its hash returned in the second
 /// tuple element so the caller can prune it.
 pub(crate) async fn load_pending_blocks(
     conn: &mut ConnectionManager,
-    key: &str,
 ) -> Result<(Vec<PendingBlock>, Vec<String>), RedisError> {
-    let map: std::collections::HashMap<String, String> = conn.hgetall(key).await?;
+    let map: std::collections::HashMap<String, String> = conn.hgetall(PENDING_KEY).await?;
     let mut ok = Vec::with_capacity(map.len());
     let mut unparsable = Vec::new();
     for (hash, json) in map {

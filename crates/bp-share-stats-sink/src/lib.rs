@@ -21,7 +21,7 @@
 //!   success → update `FlushHealthMonitor`.
 //! - [`seed`] — boot-time one-shot `seedIfEmpty` for `worker_shares_entity`
 //!   (mirrors `WorkerSharesService.seedIfEmpty`).
-//! - [`hooks`] — `AcceptedShareSink` + `RejectedShareSink` impls fan
+//! - [`hooks`] — `SharedAcceptedShareSink` + `SharedRejectedShareSink` impls fan
 //!   shares into the accumulators; block + session hooks are no-ops.
 //! - [`reader`] — read-only handle for `/api/admin/stats-health`
 //!   surface.

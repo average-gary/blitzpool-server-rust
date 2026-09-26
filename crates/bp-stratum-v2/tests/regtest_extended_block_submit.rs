@@ -45,6 +45,7 @@
 use std::time::Duration;
 
 use bitcoin::Network;
+use bp_jobs_lifecycle::LifecycleConfig;
 use bp_mining_job::{
     build_block_header, build_mining_job_from_tdp, merkle_root_from_coinbase,
     version_meets_consensus_floor, PayoutEntry, TdpCoinbaseTemplate,
@@ -282,8 +283,6 @@ async fn run_block_submit_case(
         n_bits: prev_hash.n_bits,
         min_ntime: prev_hash.header_timestamp,
         difficulty: job_difficulty,
-        // Trivial pinned network difficulty → every share is a block candidate.
-        network_difficulty: Difficulty(1.0e-18),
         coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
         template_id: Some(template.template_id),
         jdp_claims_the_block: false,
@@ -297,6 +296,7 @@ async fn run_block_submit_case(
         miner_extranonce_size,
         job_difficulty,
         [0xFFu8; 32],
+        LifecycleConfig::DEFAULT,
     );
     channel.extended_jobs.insert(job_id, ext_job.clone());
 
@@ -363,13 +363,14 @@ async fn run_block_submit_case(
         version: header_version,
         ntime: prev_hash.header_timestamp,
         extranonce: miner_extranonce,
-        tail_tlvs: Vec::new(),
+        tlvs: Vec::new(),
     };
     let job_target = channel.target_for(job_difficulty);
     let view = ExtendedChannelView {
         kind: channel.kind,
         extranonce_size: channel.extranonce_size,
         job_target,
+        job_lifecycle: *channel.standard_jobs.lifecycle(),
     };
     let validation = validate_submit_extended(
         &mut channel.submission_cache,

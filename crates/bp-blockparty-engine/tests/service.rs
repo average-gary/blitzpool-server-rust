@@ -14,6 +14,7 @@
 //!   guards both flip in lockstep with the DB
 //! - onShareAccepted promotes READY → ACTIVE (and ONLY from READY)
 //! - dissolve cooldown gates ACTIVE within the 7-day silence window
+//! - dissolve frees member and admin addresses for the next party
 //! - onBlockFound is idempotent on duplicate (groupId, blockHash)
 //! - name collision rejects second create
 
@@ -642,6 +643,76 @@ async fn dissolve_blocked_during_active_cooldown() {
     assert!(svc.member_group_id(&addr(admin)).await.is_none());
 
     cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn dissolve_frees_every_address_for_the_next_party() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-dissolve-free";
+    let next = "bp-test-dissolve-free-next";
+    let again = "bp-test-dissolve-free-again";
+    let admin = "bc1qadminfree1";
+    let bob = "bc1qbobfree1xx";
+    let other_admin = "bc1qadminfree2";
+    for (n, a) in [(name, admin), (next, other_admin), (again, admin)] {
+        cleanup(&pool, n, a).await;
+    }
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(bob)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool);
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
+    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
+        .await
+        .expect("add");
+    // Precondition: bob really is a member before the dissolve.
+    assert_eq!(svc.member_group_id(&addr(bob)).await, Some(create.group.id));
+
+    // CONFIRMING dissolves without a cooldown.
+    svc.dissolve_group(create.group.id, Some(&create.admin_token))
+        .await
+        .expect("dissolve");
+
+    assert_eq!(
+        svc.get_group(create.group.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "dissolved"
+    );
+    assert!(svc.list_members(create.group.id).await.unwrap().is_empty());
+    assert!(svc.member_group_id(&addr(bob)).await.is_none());
+    assert!(svc.member_group_id(&addr(admin)).await.is_none());
+
+    // Bob can join another party, and the old admin can found a new one.
+    let other = svc
+        .create_group(next, other_admin, 5_000)
+        .await
+        .expect("create next");
+    svc.add_member(other.group.id, bob, 5_000, Some(&other.admin_token))
+        .await
+        .expect("former member joins the next party");
+    let refounded = svc
+        .create_group(again, admin, 10_000)
+        .await
+        .expect("former admin founds a new party");
+    assert_eq!(
+        svc.member_group_id(&addr(admin)).await,
+        Some(refounded.group.id)
+    );
+
+    for (n, a) in [(name, admin), (next, other_admin), (again, admin)] {
+        cleanup(&pool, n, a).await;
+    }
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(bob)
+        .execute(&pool)
+        .await;
 }
 
 #[tokio::test]
